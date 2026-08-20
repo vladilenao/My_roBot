@@ -1,0 +1,7 @@
+pip>=23
+numba
+pandas-ta-classic
+t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+ipython-autotime
+python-dotenv
+requests
