@@ -16,14 +16,18 @@ def run_bot(instruments=None):
     """Бесконечный цикл – проверяет сигналы и отправляет уведомления."""
 
     if instruments is None:
-        instruments = [(TICKER, INSTRUMENT_TYPE)]
+        instruments = [(TICKER, TICKER, INSTRUMENT_TYPE)]
 
     print("Бот запущен. Для остановки нажмите Ctrl+C.")
 
     while True:
         try:
-            for ticker, instrument_type in instruments:
-                instrument_label = f"{ticker} {instrument_type}"
+            for item in instruments:
+                if len(item) == 3:
+                    instrument_label, ticker, instrument_type = item
+                else:
+                    ticker, instrument_type = item
+                    instrument_label = f"{ticker} {instrument_type}"
 
                 df, instrument_id = load_candles(
                     ticker=ticker,
@@ -35,7 +39,7 @@ def run_bot(instruments=None):
                 )
 
                 if df.empty:
-                    print(f"Нет данных для {ticker} - пропускаем.")
+                    print(f"Нет данных для {instrument_label} - пропускаем.")
                     continue
 
                 data_ta = tech_analyze(df)

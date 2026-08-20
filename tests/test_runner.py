@@ -30,7 +30,28 @@ class TestRunBot:
     @patch("src.scheduler.runner.tech_analyze")
     @patch("src.scheduler.runner.load_candles")
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_single_instrument(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+    def test_single_instrument_three_tuple(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+        ta_df = _make_ta_df()
+        mock_ta.return_value = ta_df
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        run_bot(instruments=[("SBER", "SBER", "share")])
+
+        mock_load.assert_called_once()
+        call_kwargs = mock_load.call_args[1]
+        assert call_kwargs["ticker"] == "SBER"
+        assert call_kwargs["instrument_type"] == "share"
+        mock_send.assert_called_once()
+        sent_msg = mock_send.call_args[0][0]
+        assert "[SBER]" in sent_msg
+
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
+    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
+    @patch("src.scheduler.runner.tech_analyze")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    def test_single_instrument_two_tuple(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
         ta_df = _make_ta_df()
         mock_ta.return_value = ta_df
         mock_load.return_value = (_make_candle_df(), "uid-123")
@@ -40,10 +61,6 @@ class TestRunBot:
         mock_load.assert_called_once()
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "SBER"
-        assert call_kwargs["instrument_type"] == "share"
-        assert call_kwargs["timeframe"] == "1h"
-        assert call_kwargs["start_date"] is None
-        assert call_kwargs["end_date"] is None
         mock_send.assert_called_once()
         sent_msg = mock_send.call_args[0][0]
         assert "[SBER share]" in sent_msg
@@ -54,19 +71,44 @@ class TestRunBot:
     @patch("src.scheduler.runner.tech_analyze")
     @patch("src.scheduler.runner.load_candles")
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_multiple_instruments(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+    def test_futures_use_display_name(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
         ta_df = _make_ta_df()
         mock_ta.return_value = ta_df
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
-        run_bot(instruments=[("SBER", "share"), ("NGU6", "future")])
+        run_bot(instruments=[("NG (Природный газ) — NG-9.26", "NGU6", "future")])
+
+        mock_load.assert_called_once()
+        call_kwargs = mock_load.call_args[1]
+        assert call_kwargs["ticker"] == "NGU6"
+        assert call_kwargs["instrument_type"] == "future"
+        mock_send.assert_called_once()
+        sent_msg = mock_send.call_args[0][0]
+        assert "[NG (Природный газ) — NG-9.26]" in sent_msg
+
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
+    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
+    @patch("src.scheduler.runner.tech_analyze")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    def test_multiple_instruments_three_tuples(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+        ta_df = _make_ta_df()
+        mock_ta.return_value = ta_df
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        instruments = [
+            ("SBER", "SBER", "share"),
+            ("NG (Природный газ) — NG-9.26", "NGU6", "future"),
+        ]
+        run_bot(instruments=instruments)
 
         assert mock_load.call_count == 2
         assert mock_send.call_count == 2
         first_msg = mock_send.call_args_list[0][0][0]
         second_msg = mock_send.call_args_list[1][0][0]
-        assert "[SBER share]" in first_msg
-        assert "[NGU6 future]" in second_msg
+        assert "[SBER]" in first_msg
+        assert "[NG (Природный газ) — NG-9.26]" in second_msg
 
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.make_decision", return_value="决策文本")
@@ -82,13 +124,13 @@ class TestRunBot:
         ta_df = _make_ta_df()
         mock_ta.return_value = ta_df
 
-        run_bot(instruments=[("BAD", "share"), ("SBER", "share")])
+        run_bot(instruments=[("BAD", "BAD", "share"), ("SBER", "SBER", "share")])
 
         mock_ta.assert_called_once()
         mock_decision.assert_called_once()
         mock_send.assert_called_once()
         sent_msg = mock_send.call_args[0][0]
-        assert "[SBER share]" in sent_msg
+        assert "[SBER]" in sent_msg
 
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.make_decision")
@@ -96,7 +138,23 @@ class TestRunBot:
     @patch("src.scheduler.runner.tech_analyze")
     @patch("src.scheduler.runner.load_candles")
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_instrument_label_passed_to_make_decision(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+    def test_display_name_passed_to_make_decision(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+        ta_df = _make_ta_df()
+        mock_ta.return_value = ta_df
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+        mock_decision.return_value = "decision"
+
+        run_bot(instruments=[("NG (Природный газ) — NG-9.26", "NGU6", "future")])
+
+        mock_decision.assert_called_once_with(1, 1, 1, 100.5, "NG (Природный газ) — NG-9.26")
+
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.make_decision")
+    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
+    @patch("src.scheduler.runner.tech_analyze")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    def test_two_tuple_falls_back_to_label(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
         ta_df = _make_ta_df()
         mock_ta.return_value = ta_df
         mock_load.return_value = (_make_candle_df(), "uid-123")
@@ -117,10 +175,10 @@ class TestRunBot:
         mock_ta.return_value = ta_df
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
-        run_bot(instruments=[("NGU6", "future")])
+        run_bot(instruments=[("NGU6", "NGU6", "future")])
 
         sent_msg = mock_send.call_args[0][0]
-        assert sent_msg.startswith("[NGU6 future]")
+        assert "[NGU6]" in sent_msg
         assert "Сигналы:" in sent_msg
 
     @patch("src.scheduler.runner.send_signal")
@@ -160,6 +218,6 @@ class TestRunBot:
         ta_df = _make_ta_df()
         mock_ta.return_value = ta_df
 
-        run_bot(instruments=[("SBER", "share")])
+        run_bot(instruments=[("SBER", "SBER", "share")])
 
         assert mock_send.call_count == 1

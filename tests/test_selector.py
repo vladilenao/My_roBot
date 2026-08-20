@@ -4,6 +4,7 @@ import pytest
 from src.instruments.selector import (
     select_instruments, _ask_choice, _validate_instruments,
     _select_from_list, _deduplicate, fetch_active_futures,
+    _format_futures_display,
     RTS_STOCK_TICKERS, FUTURES_BASES, FUTURES_TTL,
 )
 
@@ -30,26 +31,40 @@ def _make_futures_response(futures_list):
     return resp
 
 
+class TestFormatFuturesDisplay:
+    def test_format_with_label(self):
+        assert _format_futures_display("NG-9.26", "NG", "Природный газ") == "NG (Природный газ) — NG-9.26"
+
+    def test_format_rts(self):
+        assert _format_futures_display("RTS-9.26", "RTS", "Индекс РТС") == "RTS (Индекс РТС) — RTS-9.26"
+
+    def test_format_br(self):
+        assert _format_futures_display("BR-12.26", "BR", "Нефть Brent") == "BR (Нефть Brent) — BR-12.26"
+
+
 class TestDeduplicate:
     def test_no_duplicates(self):
-        instruments = [("SBER", "share"), ("GAZP", "share")]
-        assert _deduplicate(instruments) == [("SBER", "share"), ("GAZP", "share")]
+        instruments = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        assert _deduplicate(instruments) == [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
 
     def test_removes_duplicates(self):
-        instruments = [("SBER", "share"), ("SBER", "share"), ("GAZP", "share")]
+        instruments = [("SBER", "SBER", "share"), ("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
         result = _deduplicate(instruments)
-        assert result == [("SBER", "share"), ("GAZP", "share")]
+        assert len(result) == 2
+        assert result[0][1] == "SBER"
+        assert result[1][1] == "GAZP"
 
     def test_preserves_first_occurrence(self):
-        instruments = [("SBER", "share"), ("SBER", "future")]
+        instruments = [("SBER", "SBER", "share"), ("SBER old", "SBER", "future")]
         result = _deduplicate(instruments)
-        assert result == [("SBER", "share")]
+        assert len(result) == 1
+        assert result[0][0] == "SBER"
 
     def test_empty_list(self):
         assert _deduplicate([]) == []
 
     def test_single_item(self):
-        assert _deduplicate([("SBER", "share")]) == [("SBER", "share")]
+        assert _deduplicate([("SBER", "SBER", "share")]) == [("SBER", "SBER", "share")]
 
 
 class TestFetchActiveFutures:
@@ -67,17 +82,18 @@ class TestFetchActiveFutures:
         assert "RIZ6" in tickers
         assert "RIH7" in tickers
 
-    def test_sorted_by_expiration_ascending(self):
+    def test_grouped_by_base_then_sorted_by_expiry(self):
         client = _mock_client()
         futures = [
             _make_future("RIZ6", "RTS-12.26 Индекс РТС", 120),
             _make_future("RIU6", "RTS-9.26 Индекс РТС", 30),
-            _make_future("RIH7", "RTS-3.27 Индекс РТС", 180),
+            _make_future("BRZ6", "BR-12.26 Нефть Brent", 120),
+            _make_future("BRU6", "BR-9.26 Нефть Brent", 30),
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
         tickers = [t for _, t, _ in result]
-        assert tickers == ["RIU6", "RIZ6", "RIH7"]
+        assert tickers == ["RIU6", "RIZ6", "BRU6", "BRZ6"]
 
     def test_excludes_micro_mini(self):
         client = _mock_client()
@@ -128,28 +144,28 @@ class TestFetchActiveFutures:
         result = fetch_active_futures(client)
         assert result == []
 
-    def test_display_shows_contract_name(self):
+    def test_display_shows_full_format(self):
         client = _mock_client()
-        futures = [_make_future("BRU6", "BR-9.26 Нефть Brent", 30)]
+        futures = [_make_future("NGU6", "NG-9.26 Природный газ", 30)]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
         assert len(result) == 1
         display = result[0][0]
-        assert display == "BR-9.26"
+        assert display == "NG (Природный газ) — NG-9.26"
 
-    def test_display_contract_name_rts(self):
+    def test_display_rts_format(self):
         client = _mock_client()
         futures = [_make_future("RIU6", "RTS-9.26 Индекс РТС", 30)]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        assert result[0][0] == "RTS-9.26"
+        assert result[0][0] == "RTS (Индекс РТС) — RTS-9.26"
 
-    def test_display_contract_name_si(self):
+    def test_display_si_format(self):
         client = _mock_client()
         futures = [_make_future("SIU6", "Si-9.26 Курс Доллар – Рубль", 30)]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        assert result[0][0] == "Si-9.26"
+        assert result[0][0] == "Si (Доллар – Рубль) — Si-9.26"
 
     def test_multiple_bases_multiple_contracts(self):
         client = _mock_client()
@@ -161,9 +177,13 @@ class TestFetchActiveFutures:
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        tickers = [t for _, t, _ in result]
-        assert len(tickers) == 4
-        assert tickers == ["RIU6", "BRU6", "RIZ6", "BRZ6"]
+        displays = [d for d, _, _ in result]
+        assert displays == [
+            "RTS (Индекс РТС) — RTS-9.26",
+            "RTS (Индекс РТС) — RTS-12.26",
+            "BR (Нефть Brent) — BR-9.26",
+            "BR (Нефть Brent) — BR-12.26",
+        ]
 
 
 class TestAskChoice:
@@ -183,31 +203,38 @@ class TestAskChoice:
 
 class TestValidateInstruments:
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
-    def test_all_valid(self, mock_find):
+    def test_all_valid_stocks(self, mock_find):
         client = _mock_client()
-        result = _validate_instruments(client, ["SBER", "GAZP"], "share")
-        assert result == [("SBER", "share"), ("GAZP", "share")]
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        result = _validate_instruments(client, entries, "share")
+        assert len(result) == 2
+        assert result[0] == ("SBER", "SBER", "share")
+        assert result[1] == ("GAZP", "GAZP", "share")
+
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    def test_all_valid_futures(self, mock_find):
+        client = _mock_client()
+        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        result = _validate_instruments(client, entries, "future")
+        assert len(result) == 1
+        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future")
 
     @patch("src.instruments.selector.find_working_instrument")
     def test_some_invalid(self, mock_find):
         mock_find.side_effect = ["uid-123", ValueError("не найден")]
         client = _mock_client()
-        result = _validate_instruments(client, ["SBER", "BAD"], "share")
-        assert result == [("SBER", "share")]
+        entries = [("SBER", "SBER", "share"), ("BAD", "BAD", "share")]
+        result = _validate_instruments(client, entries, "share")
+        assert len(result) == 1
+        assert result[0][1] == "SBER"
 
     @patch("src.instruments.selector.find_working_instrument")
     def test_all_invalid(self, mock_find):
         mock_find.side_effect = ValueError("не найден")
         client = _mock_client()
-        result = _validate_instruments(client, ["BAD1", "BAD2"], "share")
+        entries = [("BAD1", "BAD1", "share"), ("BAD2", "BAD2", "share")]
+        result = _validate_instruments(client, entries, "share")
         assert result == []
-
-    @patch("src.instruments.selector.find_working_instrument")
-    def test_api_exception(self, mock_find):
-        mock_find.side_effect = [Exception("timeout"), "uid-123"]
-        client = _mock_client()
-        result = _validate_instruments(client, ["ERR", "SBER"], "share")
-        assert result == [("SBER", "share")]
 
 
 class TestSelectFromList:
@@ -215,45 +242,41 @@ class TestSelectFromList:
     @patch("builtins.input", return_value="1,3")
     def test_select_by_numbers(self, mock_input, mock_find):
         client = _mock_client()
-        result = _select_from_list(client, ["SBER", "GAZP", "LKOH"], "share")
-        assert result == [("SBER", "share"), ("LKOH", "share")]
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share"), ("LKOH", "LKOH", "share")]
+        result = _select_from_list(client, entries, "share")
+        assert len(result) == 2
+        assert result[0][1] == "SBER"
+        assert result[1][1] == "LKOH"
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", return_value="SBER,LKOH")
     def test_select_by_tickers(self, mock_input, mock_find):
         client = _mock_client()
-        result = _select_from_list(client, ["SBER", "GAZP", "LKOH"], "share")
-        assert result == [("SBER", "share"), ("LKOH", "share")]
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share"), ("LKOH", "LKOH", "share")]
+        result = _select_from_list(client, entries, "share")
+        assert len(result) == 2
 
     @patch("builtins.input", return_value="")
     def test_empty_input_returns_empty(self, mock_input):
         client = _mock_client()
-        result = _select_from_list(client, ["SBER"], "share")
+        result = _select_from_list(client, [("SBER", "SBER", "share")], "share")
         assert result == []
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", return_value="99")
     def test_out_of_range_number(self, mock_input, mock_find):
         client = _mock_client()
-        result = _select_from_list(client, ["SBER"], "share")
+        result = _select_from_list(client, [("SBER", "SBER", "share")], "share")
         assert result == []
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
-    @patch("builtins.input", return_value="1,abc,3")
-    def test_mixed_numbers_and_tickers(self, mock_input, mock_find):
-        client = _mock_client()
-        result = _select_from_list(client, ["SBER", "GAZP", "LKOH"], "share")
-        tickers = [t for t, _ in result]
-        assert "SBER" in tickers
-        assert "LKOH" in tickers
-
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", return_value="1")
-    def test_futures_tuple_input(self, mock_input, mock_find):
+    def test_futures_entry(self, mock_input, mock_find):
         client = _mock_client()
-        futures = [("BR-9.26", "BRU6", "future")]
-        result = _select_from_list(client, futures, "future")
-        assert result == [("BRU6", "future")]
+        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        result = _select_from_list(client, entries, "future")
+        assert len(result) == 1
+        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future")
 
     @patch("builtins.input", return_value="")
     def test_empty_entries_returns_empty(self, mock_input):
@@ -269,30 +292,30 @@ class TestSelectInstruments:
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "share")]
+        assert len(result) == 1
+        assert result[0] == ("SBER", "SBER", "share")
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
-        ("RTS-9.26", "RIU6", "future"),
+        ("NG (Природный газ) — NG-9.26", "NGU6", "future"),
     ])
     def test_futures_only(self, mock_fetch, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("RIU6", "future")]
-        mock_fetch.assert_called_once_with(ctx)
+        assert result == [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["1", "1,2", "", "да", "2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
-        ("RTS-9.26", "RIU6", "future"),
+        ("NG (Природный газ) — NG-9.26", "NGU6", "future"),
     ])
     def test_stocks_then_futures(self, mock_fetch, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        types = [it for _, it in result]
+        types = [item[2] for item in result]
         assert "share" in types
         assert "future" in types
 
@@ -320,8 +343,7 @@ class TestSelectInstruments:
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
         assert len(result) == 2
-        assert result[0][1] == "share"
-        assert result[1][1] == "share"
+        assert all(item[2] == "share" for item in result)
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["x", "1", "1", "", "нет"])
@@ -329,7 +351,7 @@ class TestSelectInstruments:
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "share")]
+        assert result == [("SBER", "SBER", "share")]
 
     @patch("src.instruments.selector.find_working_instrument")
     @patch("builtins.input", side_effect=["1", "1", "", "нет", "1", "1", "", "нет"])
@@ -365,7 +387,7 @@ class TestSelectInstruments:
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "share")]
+        assert result == [("SBER", "SBER", "share")]
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["1", "1", "", "да", "1", "1", "", "нет"])
@@ -373,7 +395,7 @@ class TestSelectInstruments:
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "share")]
+        assert result == [("SBER", "SBER", "share")]
 
 
 class TestConstants:

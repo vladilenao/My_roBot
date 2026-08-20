@@ -1,4 +1,3 @@
-2
 from datetime import datetime, timedelta, timezone
 from t_tech.invest import InstrumentStatus
 
@@ -27,6 +26,10 @@ FUTURES_BASES = [
 FUTURES_TTL = timedelta(days=183)
 
 
+def _format_futures_display(contract_name, base_name, label):
+    return f"{base_name} ({label}) — {contract_name}"
+
+
 def fetch_active_futures(client):
     now = datetime.now(timezone.utc)
     cutoff = now + FUTURES_TTL
@@ -34,7 +37,7 @@ def fetch_active_futures(client):
         client.instruments.futures, instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
     )
 
-    result = []
+    by_base = {b["prefix"]: [] for b in FUTURES_BASES}
     for f in resp.instruments:
         name_lower = f.name.lower()
         if "микро" in name_lower or "мини" in name_lower:
@@ -48,10 +51,16 @@ def fetch_active_futures(client):
         for base in FUTURES_BASES:
             if ticker_upper.startswith(base["prefix"].upper()):
                 contract_name = f.name.split()[0]
-                result.append((contract_name, f.ticker, "future", f.expiration_date))
+                display = _format_futures_display(contract_name, base["name"], base["label"])
+                by_base[base["prefix"]].append((display, f.ticker, "future", f.expiration_date))
                 break
 
-    result.sort(key=lambda x: x[3])
+    result = []
+    for base in FUTURES_BASES:
+        entries = by_base[base["prefix"]]
+        entries.sort(key=lambda x: x[3])
+        result.extend(entries)
+
     return [(display, ticker, inst_type) for display, ticker, inst_type, _ in result]
 
 
@@ -64,17 +73,22 @@ def _ask_choice(prompt, options):
         print(f"Неверный ввод. Допустимые варианты: {allowed}")
 
 
-def _validate_instruments(client, tickers, inst_type):
+def _validate_instruments(client, entries, inst_type):
     valid = []
-    for ticker in tickers:
+    for entry in entries:
+        if isinstance(entry, tuple):
+            display_name, ticker, _ = entry
+        else:
+            display_name = entry
+            ticker = entry
         try:
             find_working_instrument(client, ticker, inst_type)
-            valid.append((ticker, inst_type))
-            print(f"  ✓ {ticker} ({inst_type})")
+            valid.append((display_name, ticker, inst_type))
+            print(f"  ✓ {display_name} ({inst_type})")
         except ValueError as e:
-            print(f"  ✗ {ticker}: {e}")
+            print(f"  ✗ {display_name}: {e}")
         except Exception as e:
-            print(f"  ✗ {ticker}: ошибка API — {e}")
+            print(f"  ✗ {display_name}: ошибка API — {e}")
     return valid
 
 
@@ -96,7 +110,7 @@ def _select_from_list(client, entries, inst_type):
     if not raw:
         return []
 
-    selected = []
+    selected_entries = []
     for part in raw.replace(",", " ").split():
         part = part.strip()
         if not part:
@@ -104,37 +118,36 @@ def _select_from_list(client, entries, inst_type):
         if part.isdigit():
             idx = int(part) - 1
             if 0 <= idx < len(entries):
-                if isinstance(entries[idx], tuple):
-                    selected.append(entries[idx][1])
-                else:
-                    selected.append(entries[idx].upper())
+                selected_entries.append(entries[idx])
             else:
                 print(f"  ⚠ Номер {part} вне диапазона (1-{len(entries)})")
         else:
-            selected.append(part.upper())
+            ticker = part.upper()
+            selected_entries.append((ticker, ticker, inst_type) if inst_type == "share" else (ticker, ticker, inst_type))
 
-    if not selected:
+    if not selected_entries:
         return []
 
     print()
-    return _validate_instruments(client, selected, inst_type)
+    return _validate_instruments(client, selected_entries, inst_type)
 
 
 def _deduplicate(instruments):
     seen = set()
     result = []
-    for ticker, inst_type in instruments:
+    for item in instruments:
+        display_name, ticker, inst_type = item
         if ticker not in seen:
             seen.add(ticker)
-            result.append((ticker, inst_type))
+            result.append(item)
     return result
 
 
 def _show_current(instruments):
     if instruments:
         print(f"\nТекущий список ({len(instruments)}):")
-        for t, it in instruments:
-            print(f"  - {t} ({it})")
+        for display_name, ticker, inst_type in instruments:
+            print(f"  - {display_name} ({inst_type})")
 
 
 def select_instruments():
@@ -149,7 +162,8 @@ def select_instruments():
             choice = _ask_choice("Ваш выбор (1/2): ", ("1", "2"))
 
             if choice == "1":
-                found = _select_from_list(client, RTS_STOCK_TICKERS, "share")
+                stock_entries = [(t, t, "share") for t in RTS_STOCK_TICKERS]
+                found = _select_from_list(client, stock_entries, "share")
                 instruments.extend(found)
                 instruments = _deduplicate(instruments)
             else:
@@ -179,8 +193,8 @@ def select_instruments():
         return select_instruments()
 
     print(f"\nИтого выбрано: {len(instruments)}")
-    for t, it in instruments:
-        print(f"  - {t} ({it})")
+    for display_name, ticker, inst_type in instruments:
+        print(f"  - {display_name} ({inst_type})")
     print()
 
     return instruments
