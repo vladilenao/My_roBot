@@ -4,6 +4,7 @@ from t_tech.invest import CandleInterval, Client
 from t_tech.invest.utils import now
 from src.config import TIMEFRAMES, TINKOFF_TOKEN
 from src.api.instruments import find_working_instrument
+from src.api.retry import api_call_with_retry
 
 
 def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None):
@@ -36,7 +37,8 @@ def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=N
     with Client(token) as client:
         instrument_id = find_working_instrument(client, ticker, instrument_type)
 
-        for candle in client.get_all_candles(
+        for candle in api_call_with_retry(
+            client.get_all_candles,
             instrument_id=instrument_id,
             from_=start_date,
             to=end_date,
