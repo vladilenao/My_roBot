@@ -2,71 +2,84 @@
 
 ## Purpose
 
-Загружает исторические OHLCV-данные свечей из Invest API Т-Банка для заданного инструмента, таймфрейма и диапазона дат, возвращая их в виде структурированного pandas DataFrame, готового к техническому анализу.
+Загружает исторические OHLCV-данные свечей из Invest API Т-Банка для заданного инструмента, таймфрейма и диапазона дат. Возвращает pandas DataFrame, готовый к техническому анализу. Все вызовы API защищены механизмом повторных вызовов.
 
 ## Requirements
 
 ### Requirement: Основная функция загрузки свечей
-- Система ДОЛЖНА предоставлять функцию `load_candles(ticker, instrument_type, timeframe, start_date, end_date, token)`.
+- Система ДОЛЖНА предоставлять функцию `load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None)`.
 
 #### Scenario: Успешная загрузка свечей
 - **WHEN** свечи доступны для запрошенного диапазона
-- **THEN** возвращается DataFrame со столбцами `['datetime', 'open', 'high', 'low', 'close', 'volume']`, где все значения цен — float, а `datetime` — без часового пояса
+- **THEN** возвращается кортеж `(DataFrame, instrument_id)`, где DataFrame содержит столбцы `['datetime', 'open', 'high', 'low', 'close', 'volume']`
+
+### Requirement: Использование контекстного менеджера клиента
+- Функция ДОЛЖНА создавать клиент через `with Client(token) as client:` для доступа к API.
+
+#### Scenario: Клиент автоматически закрывается
+- **WHEN** загрузка завершается (успешно или с ошибкой)
+- **THEN** контекстный менеджер клиента корректно закрывается
 
 ### Requirement: Валидация таймфрейма
-- Если `timeframe` не является ключом словаря `TIMEFRAMES`, система ДОЛЖНА выбросить `ValueError`.
+- Если `timeframe` не ключ словаря `TIMEFRAMES`, система ДОЛЖНА выбросить `ValueError`.
 
 #### Scenario: Недопустимый таймфрейм
-- **WHEN** `load_candles` вызывается с `timeframe="2h"` (отсутствует в `TIMEFRAMES`)
-- **THEN** выбрасывается `ValueError` с сообщением "Неподдерживаемый таймфрейм"
+- **WHEN** `timeframe="2h"`
+- **THEN** выбрасывается `ValueError` "Неподдерживаемый таймфрейм"
 
 ### Requirement: Диапазон дат по умолчанию
-- Если `start_date` равен `None`, система ДОЛЖНА использовать значение по умолчанию — 30 дней от текущего момента (`now() - timedelta(days=30)`).
-- Если `end_date` равен `None`, система ДОЛЖНА использовать текущий момент (`now()`).
+- Если `start_date=None`, используется `now() - timedelta(days=30)`.
+- Если `end_date=None`, используется `now()`.
 
-#### Scenario: Диапазон дат по умолчанию загружает последние 30 дней
-- **WHEN** `load_candles` вызывается с `start_date=None` и `end_date=None`
-- **THEN** загружаются свечи от 30 дней назад до текущего момента для указанного тикера и таймфрейма
+#### Scenario: Дефолтный диапазон
+- **WHEN** обе даты `None`
+- **THEN** загружаются свечи за последние 30 дней
 
 ### Requirement: Парсинг строковых дат
-- Если `start_date` или `end_date` переданы в виде строк, система ДОЛЖНА разобрать их с использованием формата `%Y-%m-%d`.
+- Строковые даты разбираются в формате `%Y-%m-%d`.
 
-#### Scenario: Строковые даты преобразуются в datetime
-- **WHEN** `load_candles` вызывается с `start_date="2025-01-01"` и `end_date="2025-02-01"`
-- **THEN** обе строки преобразуются в объекты `datetime` и используются для диапазона загрузки свечей
+#### Scenario: Строковые даты
+- **WHEN** `start_date="2025-01-01"`
+- **THEN** строка преобразуется в `datetime`
 
 ### Requirement: Валидация порядка дат
-- Если `start_date >= end_date`, система ДОЛЖНА выбросить `ValueError`.
+- Если `start_date >= end_date`, выбрасывается `ValueError`.
 
-#### Scenario: Дата начала позже даты окончания
-- **WHEN** `load_candles` вызывается с `start_date` больше или равным `end_date`
-- **THEN** выбрасывается `ValueError` с сообщением "Дата начала должна быть меньше даты окончания"
+#### Scenario: Неверный порядок
+- **WHEN** `start_date >= end_date`
+- **THEN** `ValueError` "Дата начала должна быть меньше даты окончания"
 
 ### Requirement: Определение UID инструмента
-- Система ДОЛЖНА определить UID инструмента вызовом `find_working_instrument(client, ticker, instrument_type)`.
+- Система ДОЛЖНА вызвать `find_working_instrument(client, ticker, instrument_type)` для получения UID.
 
-#### Scenario: UID успешно определён
-- **WHEN** тикер существует и доступен через API
-- **THEN** вызывается `find_working_instrument` и возвращённый UID используется для запроса свечей
+#### Scenario: UID определён
+- **WHEN** тикер доступен
+- **THEN** возвращённый UID используется для запроса свечей
 
 ### Requirement: Конвертация формата цен
-- Система ДОЛЖНА конвертировать цену каждой свечи из формата Т-Банка `units + nano/1e9` в стандартные float-значения OHLCV.
+- Цены конвертируются из формата `units + nano/1e9` в `float`.
 
-#### Scenario: Конвертация units+nano в float
-- **WHEN** свеча от API имеет `open.units=3` и `open.nano=500000000`
-- **THEN** результирующее значение `open` равно `3.5`
+#### Scenario: Конвертация units+nano
+- **WHEN** `open.units=3` и `open.nano=500000000`
+- **THEN** `open = 3.5`
 
-### Requirement: Структура возвращаемого DataFrame
-- Система ДОЛЖНА вернуть кортеж `(DataFrame, instrument_id)`, где DataFrame содержит столбцы `['datetime', 'open', 'high', 'low', 'close', 'volume']`.
-- Столбец `datetime` ДОЛЖЕН иметь удалённую информацию о часовом поясе (`tz_localize(None)`).
+### Requirement: Удаление часового пояса
+- Столбец `datetime` ДОЛЖЕН иметь `tz_localize(None)`.
 
-#### Scenario: Формат возвращаемых данных
-- **WHEN** `load_candles` успешно загружает свечи
-- **THEN** возвращается кортеж `(DataFrame, instrument_id)`, где DataFrame содержит ровно 6 столбцов: `datetime`, `open`, `high`, `low`, `close`, `volume`
+#### Scenario: Время без таймзоны
+- **WHEN** DataFrame возвращён
+- **THEN** `datetime` не содержит информации о часовом поясе
 
 ### Requirement: Обработка пустого результата
-- Если свечи не возвращены, система ДОЛЖНА вернуть пустой DataFrame вместе с instrument_id.
+- Если свечей нет, возвращается `(пустой DataFrame, instrument_id)`.
 
-#### Scenario: Свечи не возвращены
-- **WHEN** API возвращает ноль свечей для заданного диапазона
-- **THEN** возвращается пустой `pd.DataFrame` вместе с `instrument_id`
+#### Scenario: Нет свечей
+- **WHEN** API вернул 0 свечей
+- **THEN** возвращается `(pd.DataFrame(), instrument_id)`
+
+### Requirement: Повторные вызовы API
+- Все вызовы API (`get_all_candles`, `find_working_instrument`) обёрнуты в `api_call_with_retry`.
+
+#### Scenario: Rate-limit при загрузке свечей
+- **WHEN** API возвращает RESOURCE_EXHAUSTED при запросе свечей
+- **THEN** вызов повторяется с экспоненциальной задержкой
