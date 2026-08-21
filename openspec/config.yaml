@@ -1,5 +1,13 @@
 schema: spec-driven
 
+context: |
+  Python-бот для торговых сигналов (Tinkoff Invest API): src/ — рабочий код, tests/ — pytest.
+  Правило наименования snapshot-тестов (обязательное):
+  - Стратегия = файл tests/strategies/test_<стратегия>.py
+  - Кейс = папка tests/data/<ИНСТРУМЕНТ>_<ТАЙМФРЕЙМ>/ с ровно одним candles.csv
+  - Эталон = tests/data/<кейс>/<стратегия>_expected_signals.csv (без префиксов, точное имя)
+  - Свечи кейса общие для всех стратегий; уровень стратегии в путях данных запрещён
+
 # Project context (optional)
 # This is shown to AI when creating artifacts.
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
