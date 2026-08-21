@@ -10,7 +10,7 @@ from src.config import SIGNAL_WINDOW
 from src.indicators.calculator import tech_analyze
 
 STRATEGY_NAME = "macd_rsi_stoch"
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 EXPECTED_FILENAME = f"{STRATEGY_NAME}_expected_signals.csv"
 EVENT_COLUMNS = ["datetime", "signal", "price", "macd_sum", "rsi_sum", "stoch_sum"]
 FLOAT_COLUMNS = ["price", "macd_sum", "rsi_sum", "stoch_sum"]
