@@ -2,7 +2,8 @@
 Однократное скачивание фикстур для snapshot-тестов.
 
 Скачивает свечи из Invest API и записывает входную фикстуру candles.csv вместе
-с эталоном <strategy>_expected_signals.csv в tests/snapshot/data/<case>/. Запускается
+с эталоном <strategy>_expected_signals.csv в tests/snapshot/data/<case>/. Глубина
+запроса равна жёсткому потолку HARD_LIMIT (300 свечей). Запускается
 вручную; pytest сеть не использует.
 
 Пример:
@@ -27,8 +28,7 @@ from src.data.loader import load_candles
 from src.indicators.calculator import tech_analyze
 from t_tech.invest.utils import now
 
-WARMUP_RESERVE = 50  # запас на прогрев самого долгого индикатора (MACD 12,26,9 ~ 35 бар)
-HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс
+HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
 
 TIMEFRAME_DURATIONS = {
     '1m': timedelta(minutes=1),
@@ -39,11 +39,6 @@ TIMEFRAME_DURATIONS = {
     '1w': timedelta(weeks=1),
     '1M': timedelta(days=30),  # приближение календарного месяца
 }
-
-
-def calculate_depth(signal_window):
-    """Глубина истории: следует за конфигом, с запасом на прогрев и потолком 300."""
-    return min(max(signal_window * 4, WARMUP_RESERVE), HARD_LIMIT)
 
 
 def build_request_dates(timeframe, depth):
@@ -88,7 +83,7 @@ def save_case(ticker, instrument_type, timeframe, strategy, case_name):
             f"Неподдерживаемый таймфрейм '{timeframe}'. Доступные: {list(TIMEFRAMES.keys())}"
         )
 
-    depth = calculate_depth(SIGNAL_WINDOW)
+    depth = HARD_LIMIT
     start_date, end_date = build_request_dates(timeframe, depth)
 
     df, instrument_id = load_candles(
