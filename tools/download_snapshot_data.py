@@ -2,7 +2,7 @@
 Однократное скачивание фикстур для snapshot-тестов.
 
 Скачивает свечи из Invest API и записывает входную фикстуру candles.csv вместе
-с эталоном <strategy>_expected_signals.csv в tests/data/<case>/. Запускается
+с эталоном <strategy>_expected_signals.csv в tests/snapshot/data/<case>/. Запускается
 вручную; pytest сеть не использует.
 
 Пример:
@@ -108,7 +108,7 @@ def save_case(ticker, instrument_type, timeframe, strategy, case_name):
 
     expected = compute_expected_signals(df, SIGNAL_WINDOW)
 
-    case_dir = PROJECT_ROOT / 'tests' / 'data' / case_name
+    case_dir = PROJECT_ROOT / 'tests' / 'snapshot' / 'data' / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
 
     candles_path = case_dir / 'candles.csv'
