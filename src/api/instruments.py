@@ -18,7 +18,7 @@ def find_working_instrument(client, ticker, instrument_type="share"):
         response = api_call_with_retry(
             client.instruments.futures, instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
         )
-    elif instrument_type == "etf":2
+    elif instrument_type == "etf":
         response = api_call_with_retry(
             client.instruments.etfs, instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
         )
