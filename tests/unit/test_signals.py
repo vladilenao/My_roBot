@@ -1,67 +1,74 @@
-import pytest
-from src.signals.generator import make_decision, get_last_signals
 import pandas as pd
+import pytest
+
+from src.strategies.base import Decision, SignalType
+from src.strategies.macd_rsi_stoch.signals.aggregate import get_last_signals
+from src.strategies.macd_rsi_stoch.strategy import MacdRsiStochStrategy
 
 
-class TestMakeDecision:
-    def test_buy_without_label(self):
-        result = make_decision(1, 1, 1, 100.0)
-        assert "ПОКУПАТЬ" in result
-        assert "100.0" in result
-        assert "[" not in result
+def _make_ta(macd_values, rsi_values, stoch_values):
+    n = len(macd_values)
+    return pd.DataFrame({
+        "macd_signal": macd_values,
+        "rsi_signal": rsi_values,
+        "stoch_signal": stoch_values,
+        "close": [100.0] * n,
+    })
 
-    def test_sell_without_label(self):
-        result = make_decision(-1, -1, -1, 50.0)
-        assert "ПРОДАВАТЬ" in result
-        assert "50.0" in result
-        assert "[" not in result
 
-    def test_hold_without_label(self):
-        result = make_decision(1, -1, 0, 50.0)
-        assert "Отдыхаем" in result
-        assert "[" not in result
+class TestDecide:
+    def setup_method(self):
+        self.strategy = MacdRsiStochStrategy()
 
-    def test_buy_with_label(self):
-        result = make_decision(1, 1, 1, 100.0, instrument_label="SBER share")
-        assert result.startswith("[SBER share]")
-        assert "ПОКУПАТЬ" in result
-        assert "100.0" in result
+    def test_buy_when_consensus_positive(self):
+        ta = _make_ta([1] * 5, [1] * 5, [1] * 5)
+        decision = self.strategy.decide(ta)
+        assert decision.signal_type is SignalType.BUY
+        assert decision.price == 100.0
 
-    def test_sell_with_label(self):
-        result = make_decision(-1, -1, -1, 50.0, instrument_label="NGU6 future")
-        assert result.startswith("[NGU6 future]")
-        assert "ПРОДАВАТЬ" in result
-        assert "50.0" in result
+    def test_sell_when_consensus_negative(self):
+        ta = _make_ta([-1] * 5, [-1] * 5, [-1] * 5)
+        decision = self.strategy.decide(ta)
+        assert decision.signal_type is SignalType.SELL
+        assert decision.price == 100.0
 
-    def test_hold_with_label(self):
-        result = make_decision(1, -1, 0, 50.0, instrument_label="GAZP share")
-        assert result.startswith("[GAZP share]")
-        assert "Отдыхаем" in result
+    def test_hold_on_mixed_signals(self):
+        ta = _make_ta([1] * 5, [1] * 5, [-1] * 5)
+        decision = self.strategy.decide(ta)
+        assert decision.signal_type is SignalType.HOLD
 
-    def test_price_rounding(self):
-        result = make_decision(1, 1, 1, 3.14159)
-        assert "3.142" in result
+    def test_hold_on_zero_signals(self):
+        ta = _make_ta([0] * 5, [0] * 5, [0] * 5)
+        decision = self.strategy.decide(ta)
+        assert decision.signal_type is SignalType.HOLD
 
-    def test_price_rounding_sell(self):
-        result = make_decision(-1, -1, -1, 3.14159)
-        assert "3.142" in result
+    def test_decide_uses_only_last_candle_window(self):
+        ta = _make_ta([1, 1, -1, -1, -1], [1, 1, -1, -1, -1], [1, 1, -1, -1, -1])
+        decision = self.strategy.decide(ta)
+        assert decision.signal_type is SignalType.SELL
 
-    def test_empty_label(self):
-        result = make_decision(1, 1, 1, 100.0, instrument_label="")
-        assert "[" not in result
-        assert "ПОКУПАТЬ" in result
+    def test_decision_is_frozen_dataclass(self):
+        ta = _make_ta([1] * 5, [1] * 5, [1] * 5)
+        decision = self.strategy.decide(ta)
+        assert isinstance(decision, Decision)
+        with pytest.raises(Exception):
+            decision.price = 0.0
 
-    def test_zero_signals_hold(self):
-        result = make_decision(0, 0, 0, 100.0)
-        assert "Отдыхаем" in result
 
-    def test_mixed_signals_hold(self):
-        result = make_decision(1, 1, -1, 100.0)
-        assert "Отдыхаем" in result
+class TestStrategyContract:
+    def test_name_and_window(self):
+        strategy = MacdRsiStochStrategy()
+        assert strategy.NAME == "macd_rsi_stoch"
+        assert strategy.STRATEGY_WINDOW == 5
 
-    def test_label_with_multiple_spaces(self):
-        result = make_decision(1, 1, 1, 100.0, instrument_label="SBER  share")
-        assert result.startswith("[SBER  share]")
+    def test_registered_in_registry(self):
+        from src.strategies import get_strategy
+
+        assert isinstance(get_strategy("macd_rsi_stoch"), MacdRsiStochStrategy)
+
+    def test_required_history(self):
+        strategy = MacdRsiStochStrategy()
+        assert strategy.required_history() == strategy.STRATEGY_WINDOW + 35
 
 
 class TestGetLastSignals:
