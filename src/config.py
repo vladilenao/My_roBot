@@ -26,9 +26,17 @@ TIMEFRAMES = {
 SLEEP_SECONDS = 9 # пауза между циклами (15 минут)
 TIMEFRAME = "1h" # любой из ключей TIMEFRAMES
 
-# Привязка тикеров к активным стратегиям (имена из реестра src.strategies)
-STRATEGY_ASSIGNMENTS: dict[str, list[StrategyName]] = {
-    "NGU6": ["macd_rsi_stoch"],
+# Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
+# Акции и прочие нефьючерсные инструменты: ключ — точный тикер.
+SHARE_STRATEGIES: dict[str, list[StrategyName]] = {
+    "SBER": ["macd_rsi_stoch"],
+}
+
+# Фьючерсы: ключ — двухбуквенный код базового актива в верхнем регистре.
+# Запись не привязана к конкретному контракту и действует на любой контракт актива
+# (например "NG" покрывает NGU6, NGZ7 и любые последующие контракты природного газа).
+FUTURE_STRATEGIES: dict[str, list[StrategyName]] = {
+    "NG": ["macd_rsi_stoch"],
 }
 
 # Значения по умолчанию для fallback (тесты, одиночный запуск).
