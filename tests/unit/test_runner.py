@@ -33,17 +33,21 @@ def _make_strategy(name="mock_strat", decision=None):
     return strategy
 
 
-ASSIGNMENTS = {
+SHARE_STRATEGIES = {
     "SBER": ["macd_rsi_stoch"],
-    "NGU6": ["macd_rsi_stoch"],
     "GAZP": ["macd_rsi_stoch"],
     "BAD": ["macd_rsi_stoch"],
-    "MULTI": ["macd_rsi_stoch", "macd_rsi_stoch"],
+}
+
+FUTURE_STRATEGIES = {
+    "NG": ["macd_rsi_stoch"],
+    "MU": ["macd_rsi_stoch", "macd_rsi_stoch"],
 }
 
 
 class TestRunBot:
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -64,7 +68,8 @@ class TestRunBot:
         strategy.decide.assert_called_once_with(strategy.compute.return_value)
         mock_send.assert_called_once()
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -80,7 +85,8 @@ class TestRunBot:
         assert sent_msg.startswith("[GAZP share]")
         assert "ПОКУПАТЬ" in sent_msg
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -98,7 +104,8 @@ class TestRunBot:
         sent_msg = mock_send.call_args[0][0]
         assert sent_msg.startswith("[NG (Природный газ) — NG-9.26]")
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -119,7 +126,59 @@ class TestRunBot:
         labels = [call[0][0].split("]")[0] for call in mock_send.call_args_list]
         assert labels == ["[SBER", "[NG (Природный газ) — NG-9.26"]
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", {"SBER": ["macd_rsi_stoch"]})
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", {"NG": ["macd_rsi_stoch"]})
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_future_binding_by_base_ignores_contract_suffix(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        run_bot(instruments=[("NG (Природный газ) — NG-12.26", "NGZ7", "future")])
+
+        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_load.assert_called_once()
+        call_kwargs = mock_load.call_args[1]
+        assert call_kwargs["ticker"] == "NGZ7"
+
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", {})
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", {"SI": ["macd_rsi_stoch"]})
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_future_base_lookup_is_case_insensitive(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        run_bot(instruments=[("Si (Доллар – Рубль) — SiZ6", "SiZ6", "future")])
+
+        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_load.assert_called_once()
+
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", {"SBER": ["macd_rsi_stoch"]})
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", {})
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_share_ticker_not_looked_up_in_futures_dict(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        run_bot(instruments=[("SBER", "SBER", "share")])
+
+        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_load.assert_called_once()
+        mock_send.assert_called_once()
+
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -139,7 +198,8 @@ class TestRunBot:
         sent_msg = mock_send.call_args[0][0]
         assert "[SBER]" in sent_msg
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", {})
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", {})
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", {})
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -152,7 +212,8 @@ class TestRunBot:
         mock_send.assert_not_called()
         assert "не назначено стратегий" in capsys.readouterr().out
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -169,7 +230,8 @@ class TestRunBot:
         assert working.compute.called is True
         mock_send.assert_called_once()
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -185,7 +247,8 @@ class TestRunBot:
         assert sent_msg == "[NGU6] 🚀 ПОКУПАТЬ! Цена: 100.457"
         assert "Сигналы:" not in sent_msg
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -201,7 +264,8 @@ class TestRunBot:
         assert "😴 Отдыхаем, сигналов нет." in sent_msg
         assert "Цена" not in sent_msg
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -217,8 +281,10 @@ class TestRunBot:
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "NGU6"
         assert call_kwargs["instrument_type"] == "future"
+        mock_get.assert_called_once_with("macd_rsi_stoch")
 
-    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
+    @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)
     @patch("src.scheduler.runner.time.sleep")
     @patch("src.scheduler.runner.send_signal")
     @patch("src.scheduler.runner.load_candles")
@@ -240,13 +306,19 @@ class TestRunBot:
 
         assert mock_send.call_count == 1
 
+    @pytest.mark.parametrize(
+        "invalid_share, invalid_future, instrument",
+        [
+            ({"SBER": ["no_such_strategy"]}, {}, ("SBER", "SBER", "share")),
+            ({}, {"NG": ["no_such_strategy"]}, ("NGU6", "future")),
+        ],
+    )
     @patch("src.scheduler.runner.load_candles")
-    def test_fail_fast_on_unknown_strategy_name(self, mock_load):
-        invalid_assignments = {"NGU6": ["no_such_strategy"]}
-
-        with patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", invalid_assignments):
+    def test_fail_fast_on_unknown_strategy_name(self, mock_load, invalid_share, invalid_future, instrument):
+        with patch("src.scheduler.runner.SHARE_STRATEGIES", invalid_share), \
+             patch("src.scheduler.runner.FUTURE_STRATEGIES", invalid_future):
             with pytest.raises(ValueError) as exc_info:
-                run_bot(instruments=[("NGU6", "future")])
+                run_bot(instruments=[instrument])
 
         message = str(exc_info.value)
         assert "no_such_strategy" in message
