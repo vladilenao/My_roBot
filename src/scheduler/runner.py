@@ -2,21 +2,23 @@ import time
 import warnings
 from src.config import (
     TINKOFF_TOKEN, TIMEFRAME, TICKER, INSTRUMENT_TYPE,
-    SIGNAL_WINDOW, SLEEP_SECONDS
+    STRATEGY_ASSIGNMENTS, SLEEP_SECONDS
 )
 from src.data.loader import load_candles
-from src.indicators.calculator import tech_analyze
-from src.signals.generator import get_last_signals, make_decision
+from src.notifier.formatter import format_decision
 from src.notifier.sender import send_signal
+from src.strategies import get_strategy, validate_assignments
 
 warnings.filterwarnings('ignore')
 
 
 def run_bot(instruments=None):
-    """Бесконечный цикл – проверяет сигналы и отправляет уведомления."""
+    """Бесконечный цикл: для каждого инструмента обрабатывает назначенные стратегии."""
 
     if instruments is None:
         instruments = [(TICKER, TICKER, INSTRUMENT_TYPE)]
+
+    validate_assignments(STRATEGY_ASSIGNMENTS)
 
     print("Бот запущен. Для остановки нажмите Ctrl+C.")
 
@@ -28,6 +30,11 @@ def run_bot(instruments=None):
                 else:
                     ticker, instrument_type = item
                     instrument_label = f"{ticker} {instrument_type}"
+
+                strategy_names = STRATEGY_ASSIGNMENTS.get(ticker, [])
+                if not strategy_names:
+                    print(f"Для {instrument_label} не назначено стратегий - пропускаем.")
+                    continue
 
                 df, instrument_id = load_candles(
                     ticker=ticker,
@@ -42,12 +49,15 @@ def run_bot(instruments=None):
                     print(f"Нет данных для {instrument_label} - пропускаем.")
                     continue
 
-                data_ta = tech_analyze(df)
-                macd_sum, rsi_sum, stoch_sum = get_last_signals(data_ta, window=SIGNAL_WINDOW)
-                current_price = data_ta['close'].iloc[-1]
-                decision_text = make_decision(macd_sum, rsi_sum, stoch_sum, current_price, instrument_label)
-                message = f"[{instrument_label}] Сигналы: MACD={macd_sum}, RSI={rsi_sum}, Stoch={stoch_sum}\n{decision_text}"
-                send_signal(message)
+                for strategy_name in strategy_names:
+                    try:
+                        strategy = get_strategy(strategy_name)
+                        data_ta = strategy.compute(df)
+                        decision = strategy.decide(data_ta)
+                        message = format_decision(decision, instrument_label)
+                        send_signal(message)
+                    except Exception as e:
+                        print(f"Ошибка стратегии '{strategy_name}' на {instrument_label}: {e}")
 
             time.sleep(SLEEP_SECONDS)
 

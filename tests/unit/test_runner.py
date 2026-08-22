@@ -1,7 +1,9 @@
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 import pandas as pd
 import pytest
+
 from src.scheduler.runner import run_bot
+from src.strategies.base import Decision, SignalType
 
 
 def _make_candle_df():
@@ -23,16 +25,32 @@ def _make_ta_df():
     return df
 
 
+def _make_strategy(name="mock_strat", decision=None):
+    strategy = MagicMock()
+    strategy.NAME = name
+    strategy.compute.return_value = _make_ta_df()
+    strategy.decide.return_value = decision or Decision(SignalType.BUY, 100.5)
+    return strategy
+
+
+ASSIGNMENTS = {
+    "SBER": ["macd_rsi_stoch"],
+    "NGU6": ["macd_rsi_stoch"],
+    "GAZP": ["macd_rsi_stoch"],
+    "BAD": ["macd_rsi_stoch"],
+    "MULTI": ["macd_rsi_stoch", "macd_rsi_stoch"],
+}
+
+
 class TestRunBot:
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_single_instrument_three_tuple(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_single_instrument_three_tuple(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         run_bot(instruments=[("SBER", "SBER", "share")])
@@ -41,60 +59,53 @@ class TestRunBot:
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "SBER"
         assert call_kwargs["instrument_type"] == "share"
+        mock_get.assert_called_once_with("macd_rsi_stoch")
+        strategy.compute.assert_called_once()
+        strategy.decide.assert_called_once_with(strategy.compute.return_value)
         mock_send.assert_called_once()
-        sent_msg = mock_send.call_args[0][0]
-        assert "[SBER]" in sent_msg
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_single_instrument_two_tuple(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_single_instrument_two_tuple_label_fallback(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
-        run_bot(instruments=[("SBER", "share")])
+        run_bot(instruments=[("GAZP", "share")])
 
-        mock_load.assert_called_once()
-        call_kwargs = mock_load.call_args[1]
-        assert call_kwargs["ticker"] == "SBER"
-        mock_send.assert_called_once()
         sent_msg = mock_send.call_args[0][0]
-        assert "[SBER share]" in sent_msg
+        assert sent_msg.startswith("[GAZP share]")
+        assert "ПОКУПАТЬ" in sent_msg
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_futures_use_display_name(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_futures_use_display_name(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         run_bot(instruments=[("NG (Природный газ) — NG-9.26", "NGU6", "future")])
 
-        mock_load.assert_called_once()
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "NGU6"
         assert call_kwargs["instrument_type"] == "future"
-        mock_send.assert_called_once()
         sent_msg = mock_send.call_args[0][0]
-        assert "[NG (Природный газ) — NG-9.26]" in sent_msg
+        assert sent_msg.startswith("[NG (Природный газ) — NG-9.26]")
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_multiple_instruments_three_tuples(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_multiple_instruments_processed_in_order(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         instruments = [
@@ -105,91 +116,99 @@ class TestRunBot:
 
         assert mock_load.call_count == 2
         assert mock_send.call_count == 2
-        first_msg = mock_send.call_args_list[0][0][0]
-        second_msg = mock_send.call_args_list[1][0][0]
-        assert "[SBER]" in first_msg
-        assert "[NG (Природный газ) — NG-9.26]" in second_msg
+        labels = [call[0][0].split("]")[0] for call in mock_send.call_args_list]
+        assert labels == ["[SBER", "[NG (Природный газ) — NG-9.26"]
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_empty_df_skips_instrument(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_empty_df_skips_instrument(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.side_effect = [
-            (pd.DataFrame(), "uid-123"),
-            (_make_candle_df(), "uid-456"),
+            (pd.DataFrame(), "uid-bad"),
+            (_make_candle_df(), "uid-ok"),
         ]
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
 
         run_bot(instruments=[("BAD", "BAD", "share"), ("SBER", "SBER", "share")])
 
-        mock_ta.assert_called_once()
-        mock_decision.assert_called_once()
+        strategy.compute.assert_called_once()
         mock_send.assert_called_once()
         sent_msg = mock_send.call_args[0][0]
         assert "[SBER]" in sent_msg
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", {})
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_display_name_passed_to_make_decision(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_unassigned_ticker_skipped_without_load(self, mock_get, mock_load, mock_send, mock_sleep, capsys):
+        run_bot(instruments=[("XXX", "XXX", "share"), ("SBER", "SBER", "share")])
+
+        mock_load.assert_not_called()
+        mock_get.assert_not_called()
+        mock_send.assert_not_called()
+        assert "не назначено стратегий" in capsys.readouterr().out
+
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_strategy_failure_does_not_block_next(self, mock_get, mock_load, mock_send, mock_sleep):
+        failing = _make_strategy()
+        failing.compute.side_effect = Exception("boom")
+        working = _make_strategy()
+        mock_get.side_effect = [failing, working]
         mock_load.return_value = (_make_candle_df(), "uid-123")
-        mock_decision.return_value = "decision"
 
-        run_bot(instruments=[("NG (Природный газ) — NG-9.26", "NGU6", "future")])
+        run_bot(instruments=[("MULTI", "MULTI", "future")])
 
-        mock_decision.assert_called_once_with(1, 1, 1, 100.5, "NG (Природный газ) — NG-9.26")
+        assert working.compute.called is True
+        mock_send.assert_called_once()
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_two_tuple_falls_back_to_label(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
-        mock_load.return_value = (_make_candle_df(), "uid-123")
-        mock_decision.return_value = "decision"
-
-        run_bot(instruments=[("GAZP", "share")])
-
-        mock_decision.assert_called_once_with(1, 1, 1, 100.5, "GAZP share")
-
     @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
     @patch("src.scheduler.runner.load_candles")
-    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_message_format_includes_instrument(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.get_strategy")
+    def test_message_format_no_diagnostics_line(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.4567))
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         run_bot(instruments=[("NGU6", "NGU6", "future")])
 
         sent_msg = mock_send.call_args[0][0]
-        assert "[NGU6]" in sent_msg
-        assert "Сигналы:" in sent_msg
+        assert sent_msg == "[NGU6] 🚀 ПОКУПАТЬ! Цена: 100.457"
+        assert "Сигналы:" not in sent_msg
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
-    def test_default_instruments_from_config(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_hold_message(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
+        mock_get.return_value = strategy
+        mock_load.return_value = (_make_candle_df(), "uid-123")
+
+        run_bot(instruments=[("SBER", "SBER", "share")])
+
+        sent_msg = mock_send.call_args[0][0]
+        assert "😴 Отдыхаем, сигналов нет." in sent_msg
+        assert "Цена" not in sent_msg
+
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
+    @patch("src.scheduler.runner.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_default_instruments_from_config(self, mock_get, mock_load, mock_send, mock_sleep):
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         run_bot()
@@ -199,25 +218,37 @@ class TestRunBot:
         assert call_kwargs["ticker"] == "NGU6"
         assert call_kwargs["instrument_type"] == "future"
 
-    @patch("src.scheduler.runner.send_signal")
-    @patch("src.scheduler.runner.make_decision", return_value="决策文本")
-    @patch("src.scheduler.runner.get_last_signals", return_value=(1, 1, 1))
-    @patch("src.scheduler.runner.tech_analyze")
-    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", ASSIGNMENTS)
     @patch("src.scheduler.runner.time.sleep")
-    def test_exception_continues_loop(self, mock_sleep, mock_load, mock_ta, mock_signals, mock_decision, mock_send):
-        call_count = [0]
+    @patch("src.scheduler.runner.send_signal")
+    @patch("src.scheduler.runner.load_candles")
+    @patch("src.scheduler.runner.get_strategy")
+    def test_exception_continues_loop(self, mock_get, mock_load, mock_send, mock_sleep):
+        calls = [0]
 
         def sleep_side_effect(secs):
-            call_count[0] += 1
-            if call_count[0] >= 2:
+            calls[0] += 1
+            if calls[0] >= 2:
                 raise KeyboardInterrupt
 
         mock_sleep.side_effect = sleep_side_effect
+        strategy = _make_strategy()
+        mock_get.return_value = strategy
         mock_load.side_effect = [Exception("API error"), (_make_candle_df(), "uid-123")]
-        ta_df = _make_ta_df()
-        mock_ta.return_value = ta_df
 
         run_bot(instruments=[("SBER", "SBER", "share")])
 
         assert mock_send.call_count == 1
+
+    @patch("src.scheduler.runner.load_candles")
+    def test_fail_fast_on_unknown_strategy_name(self, mock_load):
+        invalid_assignments = {"NGU6": ["no_such_strategy"]}
+
+        with patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", invalid_assignments):
+            with pytest.raises(ValueError) as exc_info:
+                run_bot(instruments=[("NGU6", "future")])
+
+        message = str(exc_info.value)
+        assert "no_such_strategy" in message
+        assert "macd_rsi_stoch" in message
+        mock_load.assert_not_called()

@@ -2,6 +2,8 @@ import os
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
 
+from src.strategies.names import StrategyName
+
 load_dotenv() # загружает переменные из .env
 
 # Токены
@@ -20,12 +22,16 @@ TIMEFRAMES = {
 '1M': CandleInterval.CANDLE_INTERVAL_MONTH
 }
 
-# Параметры стратегии (можно менять)
-SIGNAL_WINDOW = 5 # сколько последних свечей анализировать
+# Параметры бота (можно менять)
 SLEEP_SECONDS = 9 # пауза между циклами (15 минут)
 TIMEFRAME = "1h" # любой из ключей TIMEFRAMES
 
+# Привязка тикеров к активным стратегиям (имена из реестра src.strategies)
+STRATEGY_ASSIGNMENTS: dict[str, list[StrategyName]] = {
+    "NGU6": ["macd_rsi_stoch"],
+}
+
 # Значения по умолчанию для fallback (тесты, одиночный запуск).
-# При обычном запуске интерактивный выбор取代 эти константы.
+# При обычном запуске интерактивный выбор заменяет эти константы.
 INSTRUMENT_TYPE = "future"
 TICKER = "NGU6"
