@@ -7,7 +7,7 @@ from src.config import (
 from src.data.loader import load_candles
 from src.notifier.formatter import format_decision
 from src.notifier.sender import send_signal
-from src.strategies import get_strategy
+from src.strategies import get_strategy, validate_assignments
 
 warnings.filterwarnings('ignore')
 
@@ -17,6 +17,8 @@ def run_bot(instruments=None):
 
     if instruments is None:
         instruments = [(TICKER, TICKER, INSTRUMENT_TYPE)]
+
+    validate_assignments(STRATEGY_ASSIGNMENTS)
 
     print("Бот запущен. Для остановки нажмите Ctrl+C.")
 

@@ -38,7 +38,7 @@ ASSIGNMENTS = {
     "NGU6": ["macd_rsi_stoch"],
     "GAZP": ["macd_rsi_stoch"],
     "BAD": ["macd_rsi_stoch"],
-    "MULTI": ["strat_one", "strat_two"],
+    "MULTI": ["macd_rsi_stoch", "macd_rsi_stoch"],
 }
 
 
@@ -158,10 +158,10 @@ class TestRunBot:
     @patch("src.scheduler.runner.load_candles")
     @patch("src.scheduler.runner.get_strategy")
     def test_strategy_failure_does_not_block_next(self, mock_get, mock_load, mock_send, mock_sleep):
-        failing = _make_strategy("strat_one")
+        failing = _make_strategy()
         failing.compute.side_effect = Exception("boom")
-        working = _make_strategy("strat_two")
-        mock_get.side_effect = lambda name: {"strat_one": failing, "strat_two": working}[name]
+        working = _make_strategy()
+        mock_get.side_effect = [failing, working]
         mock_load.return_value = (_make_candle_df(), "uid-123")
 
         run_bot(instruments=[("MULTI", "MULTI", "future")])
@@ -239,3 +239,16 @@ class TestRunBot:
         run_bot(instruments=[("SBER", "SBER", "share")])
 
         assert mock_send.call_count == 1
+
+    @patch("src.scheduler.runner.load_candles")
+    def test_fail_fast_on_unknown_strategy_name(self, mock_load):
+        invalid_assignments = {"NGU6": ["no_such_strategy"]}
+
+        with patch("src.scheduler.runner.STRATEGY_ASSIGNMENTS", invalid_assignments):
+            with pytest.raises(ValueError) as exc_info:
+                run_bot(instruments=[("NGU6", "future")])
+
+        message = str(exc_info.value)
+        assert "no_such_strategy" in message
+        assert "macd_rsi_stoch" in message
+        mock_load.assert_not_called()
