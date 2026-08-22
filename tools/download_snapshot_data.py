@@ -3,8 +3,11 @@
 
 Скачивает свечи из Invest API и записывает входную фикстуру candles.csv вместе
 с эталоном <strategy>_expected_signals.csv в tests/snapshot/data/<case>/. Глубина
-запроса равна жёсткому потолку HARD_LIMIT (300 свечей). Запускается
-вручную; pytest сеть не использует.
+запроса равна жёсткому потолку HARD_LIMIT (300 свечей). Стратегия выбирается по
+имени из реестра src.strategies; эталон рассчитывается её методом expected_events().
+Перед записью файлов проверяется достаточность истории: полученных свечей должно
+быть не меньше, чем требует strategy.required_history(), иначе файлы не записываются.
+Запускается вручную; pytest сеть не использует.
 
 Пример:
     python tools/download_snapshot_data.py --ticker NGU6 --instrument-type future \
@@ -16,16 +19,13 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import SIGNAL_WINDOW, TIMEFRAMES, TINKOFF_TOKEN
+from src.config import TIMEFRAMES, TINKOFF_TOKEN
 from src.data.loader import load_candles
-from src.indicators.calculator import tech_analyze
+from src.strategies import get_strategy
 from t_tech.invest.utils import now
 
 HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
@@ -47,41 +47,13 @@ def build_request_dates(timeframe, depth):
     return start, end
 
 
-def compute_expected_signals(df, signal_window):
-    """Эталон событий: rolling-агрегация сигналов + консенсус BUY/SELL."""
-    data_ta = tech_analyze(df)
-    sums = data_ta[['macd_signal', 'rsi_signal', 'stoch_signal']].rolling(signal_window).sum()
-
-    events = pd.DataFrame({
-        'datetime': data_ta['datetime'],
-        'price': data_ta['close'],
-        'macd_sum': sums['macd_signal'],
-        'rsi_sum': sums['rsi_signal'],
-        'stoch_sum': sums['stoch_signal'],
-    }).dropna(subset=['macd_sum', 'rsi_sum', 'stoch_sum'])
-
-    buy = (
-        (events['macd_sum'] > 0)
-        & (events['rsi_sum'] > 0)
-        & (events['stoch_sum'] > 0)
-    )
-    sell = (
-        (events['macd_sum'] < 0)
-        & (events['rsi_sum'] < 0)
-        & (events['stoch_sum'] < 0)
-    )
-    events = events[buy | sell].copy()
-    events['signal'] = np.where(events['macd_sum'] > 0, 'BUY', 'SELL')
-
-    columns = ['datetime', 'signal', 'price', 'macd_sum', 'rsi_sum', 'stoch_sum']
-    return events[columns].reset_index(drop=True)
-
-
-def save_case(ticker, instrument_type, timeframe, strategy, case_name):
+def save_case(ticker, instrument_type, timeframe, strategy_name, case_name):
     if timeframe not in TIMEFRAMES or timeframe not in TIMEFRAME_DURATIONS:
         raise SystemExit(
             f"Неподдерживаемый таймфрейм '{timeframe}'. Доступные: {list(TIMEFRAMES.keys())}"
         )
+
+    strategy = get_strategy(strategy_name)
 
     depth = HARD_LIMIT
     start_date, end_date = build_request_dates(timeframe, depth)
@@ -101,13 +73,21 @@ def save_case(ticker, instrument_type, timeframe, strategy, case_name):
     if len(df) > depth:
         raise SystemExit(f"Получено {len(df)} свечей - больше лимита {depth}.")
 
-    expected = compute_expected_signals(df, SIGNAL_WINDOW)
+    required = strategy.required_history()
+    if len(df) < required:
+        raise SystemExit(
+            f"Недостаточно истории для окна стратегии '{strategy_name}': "
+            f"получено {len(df)} свечей, требуется {required}. Файлы не записаны."
+        )
+
+    data_ta = strategy.compute(df)
+    expected = strategy.expected_events(data_ta)
 
     case_dir = PROJECT_ROOT / 'tests' / 'snapshot' / 'data' / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
 
     candles_path = case_dir / 'candles.csv'
-    expected_path = case_dir / f'{strategy}_expected_signals.csv'
+    expected_path = case_dir / f'{strategy_name}_expected_signals.csv'
 
     df.to_csv(candles_path, index=False)
     expected.to_csv(expected_path, index=False)
@@ -121,10 +101,10 @@ def save_case(ticker, instrument_type, timeframe, strategy, case_name):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Скачивание фикстур для snapshot-тестов.")
-    parser.add_argument('--ticker', required=True, help='Тикер инструмента (например NG)')
+    parser.add_argument('--ticker', required=True, help='Тикер инструмента (например NGU6)')
     parser.add_argument('--instrument-type', default='future', choices=['share', 'future', 'etf', 'currency'], help='Тип инструмента')
     parser.add_argument('--timeframe', default='1h', help='Таймфрейм из src.config.TIMEFRAMES')
-    parser.add_argument('--strategy', default='macd_rsi_stoch', help='Имя стратегии (входит в имя файла эталона)')
+    parser.add_argument('--strategy', default='macd_rsi_stoch', help='Имя стратегии из реестра src.strategies')
     parser.add_argument('--case', default=None, help='Имя кейса (по умолчанию TICKER_timeframe)')
     return parser.parse_args()
 
