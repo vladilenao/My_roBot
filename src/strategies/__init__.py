@@ -40,13 +40,14 @@ def strategy_names():
     return sorted(_registry)
 
 
-def validate_assignments(assignments):
+def validate_assignments(assignments, source=None):
     _ensure_registered()
     unknown = sorted(
         {name for names in assignments.values() for name in names} - set(_registry)
     )
     if unknown:
+        where = f" в словаре '{source}'" if source else ""
         raise ValueError(
-            f"Неизвестные стратегии в привязках: {', '.join(unknown)}. "
+            f"Неизвестные стратегии{where}: {', '.join(unknown)}. "
             f"Доступны: {', '.join(sorted(_registry))}"
         )

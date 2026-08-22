@@ -2,7 +2,7 @@ import time
 import warnings
 from src.config import (
     TINKOFF_TOKEN, TIMEFRAME, TICKER, INSTRUMENT_TYPE,
-    STRATEGY_ASSIGNMENTS, SLEEP_SECONDS
+    SHARE_STRATEGIES, FUTURE_STRATEGIES, SLEEP_SECONDS
 )
 from src.data.loader import load_candles
 from src.notifier.formatter import format_decision
@@ -18,7 +18,8 @@ def run_bot(instruments=None):
     if instruments is None:
         instruments = [(TICKER, TICKER, INSTRUMENT_TYPE)]
 
-    validate_assignments(STRATEGY_ASSIGNMENTS)
+    validate_assignments(SHARE_STRATEGIES, source="SHARE_STRATEGIES")
+    validate_assignments(FUTURE_STRATEGIES, source="FUTURE_STRATEGIES")
 
     print("Бот запущен. Для остановки нажмите Ctrl+C.")
 
@@ -31,7 +32,10 @@ def run_bot(instruments=None):
                     ticker, instrument_type = item
                     instrument_label = f"{ticker} {instrument_type}"
 
-                strategy_names = STRATEGY_ASSIGNMENTS.get(ticker, [])
+                if instrument_type == "future":
+                    strategy_names = FUTURE_STRATEGIES.get(ticker[:2].upper(), [])
+                else:
+                    strategy_names = SHARE_STRATEGIES.get(ticker, [])
                 if not strategy_names:
                     print(f"Для {instrument_label} не назначено стратегий - пропускаем.")
                     continue

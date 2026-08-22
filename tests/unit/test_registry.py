@@ -142,6 +142,32 @@ def test_validate_assignments_lists_unknown_and_available():
     assert message.index("a_ghost") < message.index("z_ghost")
 
 
+def test_validate_assignments_reports_source_dictionary():
+    register(DummyStrategy)
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_assignments({"NG": ["z_ghost"]}, source="FUTURE_STRATEGIES")
+
+    message = str(exc_info.value)
+    assert "FUTURE_STRATEGIES" in message
+    assert "z_ghost" in message
+    assert "dummy_a" in message
+
+
+def test_validate_assignments_applies_to_both_dictionaries():
+    register(DummyStrategy)
+
+    validate_assignments({"SBER": ["dummy_a"]}, source="SHARE_STRATEGIES")
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_assignments({"NG": ["a_ghost", "z_ghost"]}, source="FUTURE_STRATEGIES")
+
+    message = str(exc_info.value)
+    assert "FUTURE_STRATEGIES" in message
+    assert "a_ghost" in message
+    assert "z_ghost" in message
+
+
 def test_import_names_module_is_light():
     import subprocess
     import sys
