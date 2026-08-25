@@ -5,8 +5,7 @@ from src.config import (
     SHARE_STRATEGIES, FUTURE_STRATEGIES, SLEEP_SECONDS
 )
 from src.data.loader import load_candles
-from src.notifier.formatter import format_decision
-from src.notifier.sender import send_signal
+from src.notifier import get_notifier
 from src.strategies import get_strategy, validate_assignments
 
 warnings.filterwarnings('ignore')
@@ -21,6 +20,7 @@ def run_bot(instruments=None):
     validate_assignments(SHARE_STRATEGIES, source="SHARE_STRATEGIES")
     validate_assignments(FUTURE_STRATEGIES, source="FUTURE_STRATEGIES")
 
+    notifier = get_notifier()
     print("Бот запущен. Для остановки нажмите Ctrl+C.")
 
     while True:
@@ -58,8 +58,7 @@ def run_bot(instruments=None):
                         strategy = get_strategy(strategy_name)
                         data_ta = strategy.compute(df)
                         decision = strategy.decide(data_ta)
-                        message = format_decision(decision, instrument_label)
-                        send_signal(message)
+                        notifier.notify_decision(decision, instrument_label)
                     except Exception as e:
                         print(f"Ошибка стратегии '{strategy_name}' на {instrument_label}: {e}")
 
