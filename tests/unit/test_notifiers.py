@@ -9,7 +9,7 @@ from src.notifier import (
     TelegramNotifier,
     get_notifier,
 )
-from src.strategies.base import Decision, SignalType
+from src.strategies.contracts import Decision, SignalType
 
 
 class RecordingNotifier(AbstractNotifier):

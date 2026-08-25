@@ -4,7 +4,7 @@ import pytest
 
 from src.notifier import AbstractNotifier
 from src.scheduler.runner import run_bot
-from src.strategies.base import Decision, SignalType
+from src.strategies.contracts import Decision, SignalType
 
 
 class RecordingNotifier(AbstractNotifier):

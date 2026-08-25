@@ -2,21 +2,21 @@ import pandas as pd
 import pytest
 from typing import get_args
 
-from src.strategies import (
-    _ensure_registered,
+from src.strategies.contracts import Decision, SignalType
+from src.strategies.registry import (
+    _discover_strategies,
     all_strategies,
     get_strategy,
     register,
     strategy_names,
     validate_assignments,
 )
-from src.strategies.base import Decision, SignalType
 from src.strategies.names import StrategyName
 
 
 @pytest.fixture(autouse=True)
 def clean_registry(monkeypatch):
-    monkeypatch.setattr("src.strategies._registry", {})
+    monkeypatch.setattr("src.strategies.registry._registry", {})
 
 
 class DummyStrategy:
@@ -70,37 +70,57 @@ def test_all_strategies_returns_instances():
 
 
 def test_registry_starts_empty_in_isolation(monkeypatch):
-    monkeypatch.setattr("src.strategies._registry", {})
-    from src.strategies import _registry as fresh
+    monkeypatch.setattr("src.strategies.registry._registry", {})
+    from src.strategies.registry import _registry as fresh
 
     assert fresh == {}
 
 
 def test_literal_names_match_registry():
-    from src.strategies import _registry as live
+    from src.strategies.registry import _registry as live
     from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy
 
     register(MacdRsiStochStrategy)
     assert set(get_args(StrategyName)) == set(live)
 
 
-def test_ensure_registered_imports_packages_once(monkeypatch):
+def test_discover_strategies_imports_packages_once(monkeypatch):
+    import types
+
     calls = []
-    monkeypatch.setattr("src.strategies._packages_loaded", False)
-    monkeypatch.setattr("src.strategies._import_module", lambda name: calls.append(name))
+    monkeypatch.setattr("src.strategies.registry._packages_loaded", False)
 
-    _ensure_registered()
-    _ensure_registered()
+    mock_package = types.ModuleType("src.strategies")
+    mock_package.__path__ = []
 
-    assert calls == ["src.strategies.macd_rsi_stoch"]
+    def mock_import(name):
+        calls.append(name)
+        return mock_package
+
+    monkeypatch.setattr("src.strategies.registry.importlib.import_module", mock_import)
+
+    _discover_strategies()
+    _discover_strategies()
+
+    assert calls == ["src.strategies"]
 
 
-def test_ensure_registered_skips_when_already_loaded(monkeypatch):
+def test_discover_strategies_skips_when_already_loaded(monkeypatch):
+    import types
+
     calls = []
-    monkeypatch.setattr("src.strategies._packages_loaded", True)
-    monkeypatch.setattr("src.strategies._import_module", lambda name: calls.append(name))
+    monkeypatch.setattr("src.strategies.registry._packages_loaded", True)
 
-    _ensure_registered()
+    mock_package = types.ModuleType("src.strategies")
+    mock_package.__path__ = []
+
+    def mock_import(name):
+        calls.append(name)
+        return mock_package
+
+    monkeypatch.setattr("src.strategies.registry.importlib.import_module", mock_import)
+
+    _discover_strategies()
 
     assert calls == []
 
