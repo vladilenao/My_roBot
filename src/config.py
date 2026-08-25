@@ -11,6 +11,9 @@ TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
+# Канал уведомлений: "telegram" | "console"
+NOTIFIER = "console"
+
 # Словарь таймфреймов (используется в загрузчике)
 TIMEFRAMES = {
 '1m': CandleInterval.CANDLE_INTERVAL_1_MIN,
