@@ -1,5 +1,5 @@
 from src.notifier import DecisionFormatter
-from src.strategies.base import Decision, SignalType
+from src.strategies.contracts import Decision, SignalType
 
 
 class TestFormatDecision:

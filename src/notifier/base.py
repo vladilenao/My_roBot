@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from src.strategies.base import Decision, SignalType
+from src.strategies.contracts import Decision, SignalType
 
 
 class DecisionFormatter:

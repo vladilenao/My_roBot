@@ -1,9 +1,9 @@
 import pandas as pd
 import pytest
 
-from src.strategies.base import Decision, SignalType
-from src.strategies.macd_rsi_stoch.signals.aggregate import get_last_signals
-from src.strategies.macd_rsi_stoch.strategy import MacdRsiStochStrategy
+from src.strategies.contracts import Decision, SignalType
+from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy
+from src.strategies.signals import get_last_signals
 
 
 def _make_ta(macd_values, rsi_values, stoch_values):
@@ -81,28 +81,20 @@ class TestGetLastSignals:
 
     def test_basic_window(self):
         df = self._make_df([1, 1, 1, 1, 1], [0, 0, 0, 0, 0], [-1, -1, -1, -1, -1])
-        macd, rsi, stoch = get_last_signals(df, window=3)
-        assert macd == 3
-        assert rsi == 0
-        assert stoch == -3
+        result = get_last_signals(df, window=3, signal_columns=["macd_signal", "rsi_signal", "stoch_signal"])
+        assert result == [3, 0, -3]
 
     def test_window_larger_than_data(self):
         df = self._make_df([1, 1], [0, 0], [-1, -1])
-        macd, rsi, stoch = get_last_signals(df, window=10)
-        assert macd == 2
-        assert rsi == 0
-        assert stoch == -2
+        result = get_last_signals(df, window=10, signal_columns=["macd_signal", "rsi_signal", "stoch_signal"])
+        assert result == [2, 0, -2]
 
     def test_window_equals_data(self):
         df = self._make_df([1, 2, 3], [4, 5, 6], [7, 8, 9])
-        macd, rsi, stoch = get_last_signals(df, window=3)
-        assert macd == 6
-        assert rsi == 15
-        assert stoch == 24
+        result = get_last_signals(df, window=3, signal_columns=["macd_signal", "rsi_signal", "stoch_signal"])
+        assert result == [6, 15, 24]
 
-    def test_default_window(self):
+    def test_subset_of_columns(self):
         df = self._make_df([1] * 10, [0] * 10, [-1] * 10)
-        macd, rsi, stoch = get_last_signals(df)
-        assert macd == 5
-        assert rsi == 0
-        assert stoch == -5
+        result = get_last_signals(df, window=5, signal_columns=["macd_signal"])
+        assert result == [5]
