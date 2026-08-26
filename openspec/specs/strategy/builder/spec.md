@@ -39,7 +39,7 @@
 `StrategyBuilder` ДОЛЖЕН предоставлять методы: `set_name(name)`, `set_strategy_window(window)`, `add_indicator(indicator)`, `build()`. Все setter-ы возвращают `self` для chaining.
 
 #### Scenario: Полная сборка
-- **WHEN** вызывается `StrategyBuilder().set_name("test").set_strategy_window(5).add_indicator(MacdIndicator()).build()`
+- **WHEN** вызывается `StrategyBuilder().set_name("test").set_strategy_window(5).add_indicator(MacdIndicator(fast=12, slow=26, signal=9)).build()`
 - **THEN** возвращается `StrategyConfig` с указанными параметрами
 
 #### Scenario: Имя обязательно

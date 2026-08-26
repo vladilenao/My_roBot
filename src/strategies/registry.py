@@ -5,6 +5,7 @@ import pkgutil
 from typing import TypeVar
 
 from src.strategies.contracts import Strategy
+from src.strategies.strategy import StrategyConfig
 
 T = TypeVar("T", bound=Strategy)
 
@@ -43,12 +44,12 @@ def _discover_strategies() -> None:
     _packages_loaded = True
 
 
-def get_strategy(name: str) -> Strategy:
+def get_strategy(name: str, config: StrategyConfig) -> Strategy:
     _discover_strategies()
     if name not in _registry:
         available = ", ".join(sorted(_registry)) or "нет зарегистрированных"
         raise ValueError(f"Неизвестная стратегия '{name}'. Доступны: {available}")
-    return _registry[name]()
+    return _registry[name](config=config)
 
 
 def all_strategies() -> list[Strategy]:

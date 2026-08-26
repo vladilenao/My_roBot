@@ -4,26 +4,32 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import pandas_ta_classic as ta
 
-from src.strategies.indicators.base import Indicator
+from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.macd.signalEnum import MacdSignalEnum
 
 
 @dataclass(frozen=True)
 class MacdIndicator(Indicator):
-    """MACD индикатор с конфигурируемыми параметрами.
+    """MACD индикатор с обязательными параметрами."""
 
-    Параметры по умолчанию соответствуют текущему хардкоду:
-    fast=12, slow=26, signal=9.
-    """
+    fast: int
+    slow: int
+    signal: int
 
-    fast: int = 12
-    slow: int = 26
-    signal: int = 9
-    signal_column: str = "macd_signal"
+    @property
+    def signal_column(self) -> str:
+        """Имя столбца сигнала."""
+        return "macd_signal"
+
+    @property
+    def signal_enum(self) -> type[BaseSignalEnum]:
+        """Перечень возможных сигналов данного индикатора."""
+        return MacdSignalEnum
 
     @property
     def warmup(self) -> int:
+        """Количество баров для прогрева индикатора."""
         return self.slow + self.signal
 
     def __post_init__(self) -> None:
@@ -56,38 +62,14 @@ class MacdIndicator(Indicator):
             & (data[macds_col] > data[macd_col].shift(1))
             & (data[macd_col] < 0)
             & (data[macds_col] < 0),
-            1,
+            MacdSignalEnum.BULLISH_CROSSOVER_BELOW_ZERO,
             np.where(
                 (data[macds_col] < data[macds_col].shift(1))
                 & (data[macds_col] < data[macd_col].shift(1))
                 & (data[macd_col] > 0)
                 & (data[macds_col] > 0),
-                -1,
-                0,
+                MacdSignalEnum.BEARISH_CROSSOVER_ABOVE_ZERO,
+                MacdSignalEnum.NO_SIGNAL,
             ),
         )
         return data
-
-
-class MacdIndicatorBuilder:
-    """Builder для MacdIndicator с method chaining."""
-
-    def __init__(self) -> None:
-        self._fast: int = 12
-        self._slow: int = 26
-        self._signal: int = 9
-
-    def set_fast(self, val: int) -> MacdIndicatorBuilder:
-        self._fast = val
-        return self
-
-    def set_slow(self, val: int) -> MacdIndicatorBuilder:
-        self._slow = val
-        return self
-
-    def set_signal(self, val: int) -> MacdIndicatorBuilder:
-        self._signal = val
-        return self
-
-    def build(self) -> MacdIndicator:
-        return MacdIndicator(fast=self._fast, slow=self._slow, signal=self._signal)

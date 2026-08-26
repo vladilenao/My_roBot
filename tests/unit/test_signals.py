@@ -2,7 +2,10 @@ import pandas as pd
 import pytest
 
 from src.strategies.contracts import Decision, SignalType
-from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy
+from src.strategies.indicators.macd import MacdIndicator, MacdSignalEnum
+from src.strategies.indicators.rsi import RsiIndicator, RsiSignalEnum
+from src.strategies.indicators.stochastic import StochasticIndicator, StochasticSignalEnum
+from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy, DEFAULT_CONFIG
 from src.strategies.signals import get_last_signals
 
 
@@ -18,7 +21,7 @@ def _make_ta(macd_values, rsi_values, stoch_values):
 
 class TestDecide:
     def setup_method(self):
-        self.strategy = MacdRsiStochStrategy()
+        self.strategy = MacdRsiStochStrategy(config=DEFAULT_CONFIG)
 
     def test_buy_when_consensus_positive(self):
         ta = _make_ta([1] * 5, [1] * 5, [1] * 5)
@@ -57,17 +60,17 @@ class TestDecide:
 
 class TestStrategyContract:
     def test_name_and_window(self):
-        strategy = MacdRsiStochStrategy()
+        strategy = MacdRsiStochStrategy(config=DEFAULT_CONFIG)
         assert strategy.NAME == "macd_rsi_stoch"
         assert strategy.STRATEGY_WINDOW == 5
 
     def test_registered_in_registry(self):
         from src.strategies import get_strategy
 
-        assert isinstance(get_strategy("macd_rsi_stoch"), MacdRsiStochStrategy)
+        assert isinstance(get_strategy("macd_rsi_stoch", config=DEFAULT_CONFIG), MacdRsiStochStrategy)
 
     def test_required_history(self):
-        strategy = MacdRsiStochStrategy()
+        strategy = MacdRsiStochStrategy(config=DEFAULT_CONFIG)
         assert strategy.required_history() == strategy.STRATEGY_WINDOW + 35
 
 
@@ -98,3 +101,81 @@ class TestGetLastSignals:
         df = self._make_df([1] * 10, [0] * 10, [-1] * 10)
         result = get_last_signals(df, window=5, signal_columns=["macd_signal"])
         assert result == [5]
+
+
+class TestBaseSignalEnum:
+    def test_no_signal_is_zero_in_all_enums(self):
+        assert MacdSignalEnum.NO_SIGNAL == 0
+        assert RsiSignalEnum.NO_SIGNAL == 0
+        assert StochasticSignalEnum.NO_SIGNAL == 0
+
+    def test_all_signal_enums_are_int_enums(self):
+        assert issubclass(MacdSignalEnum, int)
+        assert issubclass(RsiSignalEnum, int)
+        assert issubclass(StochasticSignalEnum, int)
+
+    def test_all_signal_enums_inherit_base(self):
+        from src.strategies.indicators.base import BaseSignalEnum
+        assert issubclass(MacdSignalEnum, BaseSignalEnum)
+        assert issubclass(RsiSignalEnum, BaseSignalEnum)
+        assert issubclass(StochasticSignalEnum, BaseSignalEnum)
+
+
+class TestIndicatorSignalEnum:
+    def test_macd_returns_macd_signal_enum(self):
+        indicator = MacdIndicator(fast=12, slow=26, signal=9)
+        assert indicator.signal_enum is MacdSignalEnum
+
+    def test_rsi_returns_rsi_signal_enum(self):
+        indicator = RsiIndicator(period=14)
+        assert indicator.signal_enum is RsiSignalEnum
+
+    def test_stochastic_returns_stochastic_signal_enum(self):
+        indicator = StochasticIndicator(k=14, d=3, smooth_k=3)
+        assert indicator.signal_enum is StochasticSignalEnum
+
+    def test_macd_enum_contains_all_members(self):
+        indicator = MacdIndicator(fast=12, slow=26, signal=9)
+        members = list(indicator.signal_enum)
+        assert len(members) == 3
+        assert MacdSignalEnum.NO_SIGNAL in members
+        assert MacdSignalEnum.BULLISH_CROSSOVER_BELOW_ZERO in members
+        assert MacdSignalEnum.BEARISH_CROSSOVER_ABOVE_ZERO in members
+
+    def test_rsi_enum_contains_all_members(self):
+        indicator = RsiIndicator(period=14)
+        members = list(indicator.signal_enum)
+        assert len(members) == 3
+        assert RsiSignalEnum.NO_SIGNAL in members
+        assert RsiSignalEnum.CROSS_ABOVE_50 in members
+        assert RsiSignalEnum.CROSS_BELOW_50 in members
+
+    def test_stochastic_enum_contains_all_members(self):
+        indicator = StochasticIndicator(k=14, d=3, smooth_k=3)
+        members = list(indicator.signal_enum)
+        assert len(members) == 3
+        assert StochasticSignalEnum.NO_SIGNAL in members
+        assert StochasticSignalEnum.EXIT_OVERSOLD in members
+        assert StochasticSignalEnum.EXIT_OVERBOUGHT in members
+
+    def test_macd_signal_enum_validates_value(self):
+        indicator = MacdIndicator(fast=12, slow=26, signal=9)
+        assert indicator.signal_enum(1) == MacdSignalEnum.BULLISH_CROSSOVER_BELOW_ZERO
+        assert indicator.signal_enum(-1) == MacdSignalEnum.BEARISH_CROSSOVER_ABOVE_ZERO
+        assert indicator.signal_enum(0) == MacdSignalEnum.NO_SIGNAL
+        with pytest.raises(ValueError):
+            indicator.signal_enum(99)
+
+    def test_rsi_signal_enum_validates_value(self):
+        indicator = RsiIndicator(period=14)
+        assert indicator.signal_enum(1) == RsiSignalEnum.CROSS_ABOVE_50
+        assert indicator.signal_enum(-1) == RsiSignalEnum.CROSS_BELOW_50
+        with pytest.raises(ValueError):
+            indicator.signal_enum(99)
+
+    def test_stochastic_signal_enum_validates_value(self):
+        indicator = StochasticIndicator(k=14, d=3, smooth_k=3)
+        assert indicator.signal_enum(1) == StochasticSignalEnum.EXIT_OVERSOLD
+        assert indicator.signal_enum(-1) == StochasticSignalEnum.EXIT_OVERBOUGHT
+        with pytest.raises(ValueError):
+            indicator.signal_enum(99)

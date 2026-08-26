@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -15,6 +15,9 @@ class SignalType(Enum):
 class Decision:
     signal_type: SignalType
     price: float
+    timeframe: str | None = None
+    strategy_name: str | None = None
+    indicator_values: dict[str, float] | None = None
 
 
 class Strategy(Protocol):
@@ -23,7 +26,7 @@ class Strategy(Protocol):
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame: ...
 
-    def decide(self, ta: pd.DataFrame) -> Decision: ...
+    def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision: ...
 
     def expected_events(self, ta: pd.DataFrame) -> pd.DataFrame: ...
 
