@@ -33,9 +33,6 @@ class DummyStrategy:
     def decide(self, ta):
         return Decision(SignalType.HOLD, 0.0)
 
-    def expected_events(self, ta):
-        return pd.DataFrame()
-
     def required_history(self):
         return self.STRATEGY_WINDOW + 10
 
