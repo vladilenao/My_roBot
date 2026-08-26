@@ -4,45 +4,44 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.contracts import Decision, SignalType
+from src.strategies.indicators.macd import MacdIndicator
+from src.strategies.indicators.rsi import RsiIndicator
+from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.registry import register
-from src.strategies.indicators.base import Indicator
 from src.strategies.signals import get_last_signals
 from src.strategies.strategy import StrategyConfig
 
-EVENT_COLUMNS_TEMPLATE = ["datetime", "signal", "price", "{sums}"]
+# ══════════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ СТРАТЕГИИ
+# MACD: fast=12, slow=26, signal=9
+# RSI: period=14
+# Stochastic: k=14, d=3, smooth_k=3
+# Window: 5
+# ══════════════════════════════════════════════════════════════
 
-
-def _build_default_config() -> StrategyConfig:
-    """Создаёт конфигурацию, соответствующую текущему хардкоду."""
-    from src.strategies.indicators.macd import MacdIndicator
-    from src.strategies.indicators.rsi import RsiIndicator
-    from src.strategies.indicators.stochastic import StochasticIndicator
-
-    return StrategyConfig(
-        name="macd_rsi_stoch",
-        strategy_window=5,
-        indicators=(
-            MacdIndicator(),
-            RsiIndicator(),
-            StochasticIndicator(),
-        ),
-    )
+DEFAULT_CONFIG = StrategyConfig(
+    name="macd_rsi_stoch",
+    strategy_window=5,
+    indicators=(
+        MacdIndicator(fast=12, slow=26, signal=9),
+        RsiIndicator(period=14),
+        StochasticIndicator(k=14, d=3, smooth_k=3),
+    ),
+)
 
 
 @register
 class MacdRsiStochStrategy:
     """Стратегия, работающая с StrategyConfig.
 
-    Принимает конфигурацию через конструктор. Если конфиг не передан,
-    используется конфигурация по умолчанию (MACD 12/26/9, RSI 14,
-    Stoch 14/3/3, window=5).
+    Принимает конфигурацию через конструктор. Конфиг обязателен.
     """
 
     NAME = "macd_rsi_stoch"
     STRATEGY_WINDOW = 5
 
-    def __init__(self, config: StrategyConfig | None = None) -> None:
-        self._config = config or _build_default_config()
+    def __init__(self, config: StrategyConfig) -> None:
+        self._config = config
         self.NAME = self._config.name
         self.STRATEGY_WINDOW = self._config.strategy_window
 
@@ -52,17 +51,17 @@ class MacdRsiStochStrategy:
             data = indicator.compute(data)
         return data
 
-    def decide(self, ta: pd.DataFrame) -> Decision:
+    def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision:
         sums = get_last_signals(
             ta, self.STRATEGY_WINDOW, self._config.signal_columns
         )
         current_price = float(ta["close"].iloc[-1])
 
         if all(s > 0 for s in sums):
-            return Decision(SignalType.BUY, current_price)
+            return Decision(SignalType.BUY, current_price, timeframe=timeframe, strategy_name=self.NAME)
         if all(s < 0 for s in sums):
-            return Decision(SignalType.SELL, current_price)
-        return Decision(SignalType.HOLD, current_price)
+            return Decision(SignalType.SELL, current_price, timeframe=timeframe, strategy_name=self.NAME)
+        return Decision(SignalType.HOLD, current_price, timeframe=timeframe, strategy_name=self.NAME)
 
     def expected_events(self, ta: pd.DataFrame) -> pd.DataFrame:
         signal_columns = self._config.signal_columns

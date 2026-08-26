@@ -26,6 +26,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.config import TIMEFRAMES, TINKOFF_TOKEN
 from src.data.loader import load_candles
 from src.strategies import get_strategy
+from src.strategies.indicators.macd import MacdIndicator
+from src.strategies.indicators.rsi import RsiIndicator
+from src.strategies.indicators.stochastic import StochasticIndicator
+from src.strategies.strategy import StrategyConfig
 from t_tech.invest.utils import now
 
 HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
@@ -38,6 +42,18 @@ TIMEFRAME_DURATIONS = {
     '1d': timedelta(days=1),
     '1w': timedelta(weeks=1),
     '1M': timedelta(days=30),  # приближение календарного месяца
+}
+
+STRATEGY_CONFIGS = {
+    "macd_rsi_stoch": StrategyConfig(
+        name="macd_rsi_stoch",
+        strategy_window=5,
+        indicators=(
+            MacdIndicator(fast=12, slow=26, signal=9),
+            RsiIndicator(period=14),
+            StochasticIndicator(k=14, d=3, smooth_k=3),
+        ),
+    ),
 }
 
 
@@ -53,7 +69,8 @@ def save_case(ticker, instrument_type, timeframe, strategy_name, case_name):
             f"Неподдерживаемый таймфрейм '{timeframe}'. Доступные: {list(TIMEFRAMES.keys())}"
         )
 
-    strategy = get_strategy(strategy_name)
+    config = STRATEGY_CONFIGS[strategy_name]
+    strategy = get_strategy(strategy_name, config=config)
 
     depth = HARD_LIMIT
     start_date, end_date = build_request_dates(timeframe, depth)

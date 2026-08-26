@@ -7,8 +7,15 @@ from src.config import (
 from src.data.loader import load_candles
 from src.notifier import get_notifier
 from src.strategies import get_strategy, validate_assignments
+from src.strategies.macd_rsi_stoch import DEFAULT_CONFIG
+from src.strategies.flat_triangle import DEFAULT_CONFIG as FLAT_TRIANGLE_DEFAULT
 
 warnings.filterwarnings('ignore')
+
+CONFIGS = {
+    "macd_rsi_stoch": DEFAULT_CONFIG,
+    "flat_triangle": FLAT_TRIANGLE_DEFAULT,
+}
 
 
 def run_bot(instruments=None):
@@ -55,9 +62,10 @@ def run_bot(instruments=None):
 
                 for strategy_name in strategy_names:
                     try:
-                        strategy = get_strategy(strategy_name)
+                        config = CONFIGS[strategy_name]
+                        strategy = get_strategy(strategy_name, config=config)
                         data_ta = strategy.compute(df)
-                        decision = strategy.decide(data_ta)
+                        decision = strategy.decide(data_ta, timeframe=TIMEFRAME)
                         notifier.notify_decision(decision, instrument_label)
                     except Exception as e:
                         print(f"Ошибка стратегии '{strategy_name}' на {instrument_label}: {e}")

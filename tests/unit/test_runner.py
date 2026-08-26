@@ -2,9 +2,11 @@ from unittest.mock import patch, MagicMock
 import pandas as pd
 import pytest
 
+from src.config import TIMEFRAME
 from src.notifier import AbstractNotifier
 from src.scheduler.runner import run_bot
 from src.strategies.contracts import Decision, SignalType
+from src.strategies.macd_rsi_stoch import DEFAULT_CONFIG
 
 
 class RecordingNotifier(AbstractNotifier):
@@ -77,9 +79,9 @@ class TestRunBot:
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "SBER"
         assert call_kwargs["instrument_type"] == "share"
-        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_get.assert_called_once_with("macd_rsi_stoch", config=DEFAULT_CONFIG)
         strategy.compute.assert_called_once()
-        strategy.decide.assert_called_once_with(strategy.compute.return_value)
+        strategy.decide.assert_called_once_with(strategy.compute.return_value, timeframe=TIMEFRAME)
         assert len(notifier.messages) == 1
 
     @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
@@ -161,7 +163,7 @@ class TestRunBot:
 
         run_bot(instruments=[("NG (Природный газ) — NG-12.26", "NGZ7", "future")])
 
-        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_get.assert_called_once_with("macd_rsi_stoch", config=DEFAULT_CONFIG)
         mock_load.assert_called_once()
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "NGZ7"
@@ -181,7 +183,7 @@ class TestRunBot:
 
         run_bot(instruments=[("Si (Доллар – Рубль) — SiZ6", "SiZ6", "future")])
 
-        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_get.assert_called_once_with("macd_rsi_stoch", config=DEFAULT_CONFIG)
         mock_load.assert_called_once()
 
     @patch("src.scheduler.runner.SHARE_STRATEGIES", {"SBER": ["macd_rsi_stoch"]})
@@ -199,7 +201,7 @@ class TestRunBot:
 
         run_bot(instruments=[("SBER", "SBER", "share")])
 
-        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_get.assert_called_once_with("macd_rsi_stoch", config=DEFAULT_CONFIG)
         mock_load.assert_called_once()
         assert len(notifier.messages) == 1
 
@@ -320,7 +322,7 @@ class TestRunBot:
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["ticker"] == "NGU6"
         assert call_kwargs["instrument_type"] == "future"
-        mock_get.assert_called_once_with("macd_rsi_stoch")
+        mock_get.assert_called_once_with("macd_rsi_stoch", config=DEFAULT_CONFIG)
 
     @patch("src.scheduler.runner.SHARE_STRATEGIES", SHARE_STRATEGIES)
     @patch("src.scheduler.runner.FUTURE_STRATEGIES", FUTURE_STRATEGIES)

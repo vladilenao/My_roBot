@@ -6,6 +6,19 @@ from dataclasses import dataclass
 import pandas as pd
 
 
+class BaseSignalEnum:
+    """Базовый контракт для Enum-ов сигналов индикаторов.
+
+    Все индикаторные Enum-ы ДОЛЖНЫ содержать NO_SIGNAL = 0.
+    Подклассы наследуют его вместе с IntEnum:
+        class MySignalEnum(BaseSignalEnum, IntEnum):
+            NO_SIGNAL = 0
+            ...
+    """
+
+    NO_SIGNAL: int
+
+
 @dataclass(frozen=True)
 class Indicator(ABC):
     """Базовый класс всех индикаторов.
@@ -13,9 +26,19 @@ class Indicator(ABC):
     Каждый подкласс — frozen dataclass с параметрами индикатора,
     методом compute() для вычисления на DataFrame и свойством
     warmup для определения глубины истории.
+
+    signal_column — имя столбца сигнала, определяется в каждом подклассе.
     """
 
-    signal_column: str
+    @property
+    @abstractmethod
+    def signal_column(self) -> str:
+        """Имя столбца сигнала."""
+
+    @property
+    @abstractmethod
+    def signal_enum(self) -> type:
+        """Перечень возможных сигналов данного индикатора."""
 
     @property
     @abstractmethod

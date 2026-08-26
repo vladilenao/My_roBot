@@ -6,21 +6,29 @@ import numpy as np
 import pandas as pd
 import pandas_ta_classic as ta
 
-from src.strategies.indicators.base import Indicator
+from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.rsi.signalEnum import RsiSignalEnum
 
 
 @dataclass(frozen=True)
 class RsiIndicator(Indicator):
-    """RSI индикатор с конфигурируемым периодом.
+    """RSI индикатор с обязательным периодом."""
 
-    Период по умолчанию: 14 (соответствует текущему хардкоду).
-    """
+    period: int
 
-    period: int = 14
-    signal_column: str = "rsi_signal"
+    @property
+    def signal_column(self) -> str:
+        """Имя столбца сигнала."""
+        return "rsi_signal"
+
+    @property
+    def signal_enum(self) -> type[BaseSignalEnum]:
+        """Перечень возможных сигналов данного индикатора."""
+        return RsiSignalEnum
 
     @property
     def warmup(self) -> int:
+        """Количество баров для прогрева индикатора."""
         return self.period
 
     def __post_init__(self) -> None:
@@ -35,25 +43,11 @@ class RsiIndicator(Indicator):
 
         data[self.signal_column] = np.where(
             (data["rsi"] > 50) & (data["rsi"].shift(1) < 50),
-            1,
+            RsiSignalEnum.CROSS_ABOVE_50,
             np.where(
                 (data["rsi"] < 50) & (data["rsi"].shift(1) > 50),
-                -1,
-                0,
+                RsiSignalEnum.CROSS_BELOW_50,
+                RsiSignalEnum.NO_SIGNAL,
             ),
         )
         return data
-
-
-class RsiIndicatorBuilder:
-    """Builder для RsiIndicator с method chaining."""
-
-    def __init__(self) -> None:
-        self._period: int = 14
-
-    def set_period(self, val: int) -> RsiIndicatorBuilder:
-        self._period = val
-        return self
-
-    def build(self) -> RsiIndicator:
-        return RsiIndicator(period=self._period)

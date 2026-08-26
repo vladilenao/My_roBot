@@ -12,6 +12,7 @@ from src.strategies.registry import (
     validate_assignments,
 )
 from src.strategies.names import StrategyName
+from src.strategies.strategy import StrategyConfig
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +23,9 @@ def clean_registry(monkeypatch):
 class DummyStrategy:
     NAME = "dummy_a"
     STRATEGY_WINDOW = 3
+
+    def __init__(self, config=None):
+        pass
 
     def compute(self, df):
         return df
@@ -42,15 +46,17 @@ def test_register_returns_class():
 
 def test_get_strategy_returns_instance():
     register(DummyStrategy)
-    strategy = get_strategy("dummy_a")
+    config = StrategyConfig(name="dummy_a", strategy_window=3, indicators=())
+    strategy = get_strategy("dummy_a", config=config)
     assert strategy.NAME == "dummy_a"
     assert strategy.STRATEGY_WINDOW == 3
 
 
 def test_unknown_name_raises_with_available_list():
     register(DummyStrategy)
+    config = StrategyConfig(name="dummy_a", strategy_window=3, indicators=())
     with pytest.raises(ValueError, match="dummy_a"):
-        get_strategy("nonexistent")
+        get_strategy("nonexistent", config=config)
 
 
 def test_duplicate_name_raises():
@@ -79,8 +85,10 @@ def test_registry_starts_empty_in_isolation(monkeypatch):
 def test_literal_names_match_registry():
     from src.strategies.registry import _registry as live
     from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy
+    from src.strategies.flat_triangle import FlatTriangleStrategy
 
     register(MacdRsiStochStrategy)
+    register(FlatTriangleStrategy)
     assert set(get_args(StrategyName)) == set(live)
 
 
@@ -128,6 +136,9 @@ def test_discover_strategies_skips_when_already_loaded(monkeypatch):
 class AlphaDummy:
     NAME = "a_dummy"
     STRATEGY_WINDOW = 3
+
+    def __init__(self, config=None):
+        pass
 
     def compute(self, df):
         return df

@@ -10,6 +10,7 @@
 - Система ДОЛЖНА предоставлять функцию `tech_analyze(data)`, принимающую OHLCV DataFrame и возвращающую дополненную копию.
 - Исходный DataFrame НЕ ДОЛЖЕН быть изменён.
 - Альтернативно: каждый индикатор ДОЛЖЕН предоставлять метод `compute(df)`, вычисляющий индикатор и генерирующий сигнальный столбец на копии DataFrame.
+- Индикаторы НЕ ДОЛЖНЫ иметь дефолтные значения параметров — все параметры обязательны при создании.
 
 #### Scenario: Входной DataFrame не изменяется
 - **WHEN** вызывается `tech_analyze(data)` или `indicator.compute(data)`
@@ -19,12 +20,16 @@
 - **WHEN** `tech_analyze` или `indicator.compute` вызывается с OHLCV DataFrame
 - **THEN** возвращается новый DataFrame с теми же строками и дополнительными столбцами
 
+#### Scenario: Все параметры обязательны
+- **WHEN** создаётся `MacdIndicator()` без параметров
+- **THEN** выбрасывается `TypeError` (отсутствуют обязательные аргументы fast, slow, signal)
+
 ### Requirement: Вычисление MACD
-- MACD вычисляется с параметрами по умолчанию: fast=12, slow=26, signal=9, по цене `close`.
-- Параметры ДОЛЖНЫ быть конфигурируемыми через `MacdIndicator` и `MacdIndicatorBuilder`.
+- MACD вычисляется с параметрами, переданными при создании `MacdIndicator(fast, slow, signal)`, по цене `close`.
+- Параметры ОБЯЗАТЕЛЬНЫ — дефолтные значения отсутствуют.
 
 #### Scenario: MACD присутствует
-- **WHEN** `tech_analyze` или `MacdIndicator().compute()` вызывается с OHLCV DataFrame
+- **WHEN** `tech_analyze` или `MacdIndicator(fast=12, slow=26, signal=9).compute()` вызывается с OHLCV DataFrame
 - **THEN** в результате есть столбцы MACD и сигнальный столбец `macd_signal`
 
 #### Scenario: Конфигурируемые параметры
@@ -32,11 +37,11 @@
 - **THEN** MACD вычисляется с указанными параметрами
 
 ### Requirement: Вычисление Стохастик-осциллятора
-- Стохастик вычисляется с параметрами по умолчанию: K=14, D=3, smooth_k=3, по цене `close`.
-- Параметры ДОЛЖНЫ быть конфигурируемыми через `StochasticIndicator` и `StochasticIndicatorBuilder`.
+- Стохастик вычисляется с параметрами, переданными при создании `StochasticIndicator(k, d, smooth_k)`, по цене `close`.
+- Параметры ОБЯЗАТЕЛЬНЫ — дефолтные значения отсутствуют.
 
 #### Scenario: Стохастик присутствует
-- **WHEN** `tech_analyze` или `StochasticIndicator().compute()` вызывается
+- **WHEN** `tech_analyze` или `StochasticIndicator(k=14, d=3, smooth_k=3).compute()` вызывается
 - **THEN** в результате есть столбцы Stochastic и сигнальный столбец `stoch_signal`
 
 #### Scenario: Конфигурируемые параметры
@@ -44,11 +49,11 @@
 - **THEN** Stochastic вычисляется с указанными параметрами
 
 ### Requirement: Вычисление RSI
-- RSI вычисляется с периодом 14 по умолчанию.
-- Параметр ДОЛЖЕН быть конфигурируемым через `RsiIndicator` и `RsiIndicatorBuilder`.
+- RSI вычисляется с периодом, переданным при создании `RsiIndicator(period)`.
+- Параметр ОБЯЗАТЕЛЕН — дефолтное значение отсутствует.
 
 #### Scenario: RSI присутствует
-- **WHEN** `tech_analyze` или `RsiIndicator().compute()` вызывается
+- **WHEN** `tech_analyze` или `RsiIndicator(period=14).compute()` вызывается
 - **THEN** в результате есть столбец RSI и сигнальный столбец `rsi_signal`
 
 #### Scenario: Конфигурируемый период
@@ -62,39 +67,39 @@
 - **WHEN** `tech_analyze` возвращает результат
 - **THEN** все имена столбцов в нижнем регистре
 
-### Requirement: Генерация RSI-сигнала
-- `rsi_signal`: `+1` — RSI пересекает 50 снизу вверх; `-1` — сверху вниз; `0` — иначе.
-
-#### Scenario: Бычий кроссовер RSI
-- **WHEN** предыдущий RSI < 50 И текущий RSI > 50
-- **THEN** `rsi_signal = +1`
-
-#### Scenario: Медвежий кроссовер RSI
-- **WHEN** предыдущий RSI > 50 И текущий RSI < 50
-- **THEN** `rsi_signal = -1`
-
-#### Scenario: Нет кроссовера
-- **WHEN** оба значения RSI по одну сторону от 50
-- **THEN** `rsi_signal = 0`
-
 ### Requirement: Генерация MACD-сигнала
-- `macd_signal`: `+1` — сигнальная линия MACD растёт, выше линии MACD, обе ниже нуля; `-1` — сигнальная линия падает, ниже линии MACD, обе выше нуля; `0` — иначе.
+- `macd_signal` возвращает `MacdSignalType`: `BULLISH_CROSSOVER_BELOW_ZERO` (+1) — бычий кроссовер ниже нуля; `BEARISH_CROSSOVER_ABOVE_ZERO` (-1) — медвежий кроссовер выше нуля; `NO_SIGNAL` (0) — иначе.
 
 #### Scenario: Бычий сигнал MACD
 - **WHEN** `macds` растёт И `macds > macd` И `macd < 0` И `macds < 0`
-- **THEN** `macd_signal = +1`
+- **THEN** `macd_signal = MacdSignalType.BULLISH_CROSSOVER_BELOW_ZERO`
 
 #### Scenario: Медвежий сигнал MACD
 - **WHEN** `macds` падает И `macds < macd` И `macd > 0` И `macds > 0`
-- **THEN** `macd_signal = -1`
+- **THEN** `macd_signal = MacdSignalType.BEARISH_CROSSOVER_ABOVE_ZERO`
+
+### Requirement: Генерация RSI-сигнала
+- `rsi_signal` возвращает `RsiSignalType`: `CROSS_ABOVE_50` (+1) — RSI пересекает 50 снизу вверх; `CROSS_BELOW_50` (-1) — сверху вниз; `NO_SIGNAL` (0) — иначе.
+
+#### Scenario: Бычий кроссовер RSI
+- **WHEN** предыдущий RSI < 50 И текущий RSI > 50
+- **THEN** `rsi_signal = RsiSignalType.CROSS_ABOVE_50`
+
+#### Scenario: Медвежий кроссовер RSI
+- **WHEN** предыдущий RSI > 50 И текущий RSI < 50
+- **THEN** `rsi_signal = RsiSignalType.CROSS_BELOW_50`
+
+#### Scenario: Нет кроссовера
+- **WHEN** оба значения RSI по одну сторону от 50
+- **THEN** `rsi_signal = RsiSignalType.NO_SIGNAL`
 
 ### Requirement: Генерация Стохастик-сигнала
-- `stoch_signal`: `+1` — K пересекает 20 снизу вверх (текущая K > 20 и < 50, K растёт); `-1` — K пересекает 80 сверху вниз (текущая K < 80 и > 50, K падает); `0` — иначе.
+- `stoch_signal` возвращает `StochasticSignalType`: `EXIT_OVERSOLD` (+1) — выход из перепроданности; `EXIT_OVERBOUGHT` (-1) — выход из перекупленности; `NO_SIGNAL` (0) — иначе.
 
 #### Scenario: Бычий кроссовер из перепроданности
 - **WHEN** предыдущая K < 20 И текущая K > 20 и < 50 И K растёт
-- **THEN** `stoch_signal = +1`
+- **THEN** `stoch_signal = StochasticSignalType.EXIT_OVERSOLD`
 
 #### Scenario: Медвежий кроссовер из перекупленности
 - **WHEN** предыдущая K > 80 И текущая K < 80 и > 50 И K падает
-- **THEN** `stoch_signal = -1`
+- **THEN** `stoch_signal = StochasticSignalType.EXIT_OVERBOUGHT`

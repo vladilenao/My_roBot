@@ -1,6 +1,7 @@
 import pytest
 
 from src.strategies import get_strategy
+from src.strategies.macd_rsi_stoch import DEFAULT_CONFIG
 from tests.snapshot import helper
 
 
@@ -21,7 +22,7 @@ CASES = _discover_cases()
 @pytest.mark.parametrize("case,strategy_name", CASES)
 def test_strategy_snapshot(case, strategy_name, request):
     df = helper.load_candles_fixture(case)
-    strategy = get_strategy(strategy_name)
+    strategy = get_strategy(strategy_name, config=DEFAULT_CONFIG)
     ta = strategy.compute(df)
     actual = strategy.expected_events(ta)
 

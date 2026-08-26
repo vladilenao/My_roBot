@@ -1,71 +1,37 @@
 import pytest
 
-from src.strategies.indicators.macd import MacdIndicator, MacdIndicatorBuilder
-from src.strategies.indicators.rsi import RsiIndicator, RsiIndicatorBuilder
-from src.strategies.indicators.stochastic import (
-    StochasticIndicator,
-    StochasticIndicatorBuilder,
-)
+from src.strategies.indicators.macd import MacdIndicator
+from src.strategies.indicators.rsi import RsiIndicator
+from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.strategy import StrategyBuilder, StrategyConfig
 
 
 class TestMacdIndicator:
-    def test_defaults(self):
-        ind = MacdIndicator()
-        assert ind.fast == 12
-        assert ind.slow == 26
-        assert ind.signal == 9
-        assert ind.signal_column == "macd_signal"
-
     def test_warmup(self):
         ind = MacdIndicator(fast=8, slow=17, signal=5)
         assert ind.warmup == 22
 
     def test_frozen(self):
-        ind = MacdIndicator()
+        ind = MacdIndicator(fast=12, slow=26, signal=9)
         with pytest.raises(Exception):
             ind.fast = 20
 
     def test_validation_fast_gte_slow(self):
         with pytest.raises(ValueError, match="fast.*<.*slow"):
-            MacdIndicator(fast=26, slow=12)
+            MacdIndicator(fast=26, slow=12, signal=9)
 
     def test_validation_signal_gte_slow(self):
         with pytest.raises(ValueError, match="signal.*<.*slow"):
             MacdIndicator(fast=5, slow=12, signal=12)
 
 
-class TestMacdIndicatorBuilder:
-    def test_build_with_defaults(self):
-        ind = MacdIndicatorBuilder().build()
-        assert ind.fast == 12
-        assert ind.slow == 26
-        assert ind.signal == 9
-
-    def test_build_with_custom_params(self):
-        ind = MacdIndicatorBuilder().set_fast(8).set_slow(17).set_signal(5).build()
-        assert ind.fast == 8
-        assert ind.slow == 17
-        assert ind.signal == 5
-
-    def test_chaining_returns_builder(self):
-        builder = MacdIndicatorBuilder()
-        result = builder.set_fast(8)
-        assert result is builder
-
-
 class TestRsiIndicator:
-    def test_defaults(self):
-        ind = RsiIndicator()
-        assert ind.period == 14
-        assert ind.signal_column == "rsi_signal"
-
     def test_warmup(self):
         ind = RsiIndicator(period=21)
         assert ind.warmup == 21
 
     def test_frozen(self):
-        ind = RsiIndicator()
+        ind = RsiIndicator(period=14)
         with pytest.raises(Exception):
             ind.period = 7
 
@@ -74,50 +40,19 @@ class TestRsiIndicator:
             RsiIndicator(period=0)
 
 
-class TestRsiIndicatorBuilder:
-    def test_build_with_defaults(self):
-        ind = RsiIndicatorBuilder().build()
-        assert ind.period == 14
-
-    def test_build_with_custom_period(self):
-        ind = RsiIndicatorBuilder().set_period(7).build()
-        assert ind.period == 7
-
-
 class TestStochasticIndicator:
-    def test_defaults(self):
-        ind = StochasticIndicator()
-        assert ind.k == 14
-        assert ind.d == 3
-        assert ind.smooth_k == 3
-        assert ind.signal_column == "stoch_signal"
-
     def test_warmup(self):
         ind = StochasticIndicator(k=9, d=3, smooth_k=3)
         assert ind.warmup == 12
 
     def test_frozen(self):
-        ind = StochasticIndicator()
+        ind = StochasticIndicator(k=14, d=3, smooth_k=3)
         with pytest.raises(Exception):
             ind.k = 21
 
     def test_validation_k_lt_d(self):
         with pytest.raises(ValueError, match="k.*>=.*d"):
-            StochasticIndicator(k=3, d=14)
-
-
-class TestStochasticIndicatorBuilder:
-    def test_build_with_defaults(self):
-        ind = StochasticIndicatorBuilder().build()
-        assert ind.k == 14
-        assert ind.d == 3
-        assert ind.smooth_k == 3
-
-    def test_build_with_custom_params(self):
-        ind = StochasticIndicatorBuilder().set_k(9).set_d(3).set_smooth_k(3).build()
-        assert ind.k == 9
-        assert ind.d == 3
-        assert ind.smooth_k == 3
+            StochasticIndicator(k=3, d=14, smooth_k=3)
 
 
 class TestStrategyConfig:
@@ -126,9 +61,9 @@ class TestStrategyConfig:
             name="test",
             strategy_window=5,
             indicators=(
-                MacdIndicator(),
-                RsiIndicator(),
-                StochasticIndicator(),
+                MacdIndicator(fast=12, slow=26, signal=9),
+                RsiIndicator(period=14),
+                StochasticIndicator(k=14, d=3, smooth_k=3),
             ),
         )
         assert config.required_history == 40
@@ -146,9 +81,9 @@ class TestStrategyConfig:
             name="test",
             strategy_window=5,
             indicators=(
-                MacdIndicator(),
-                RsiIndicator(),
-                StochasticIndicator(),
+                MacdIndicator(fast=12, slow=26, signal=9),
+                RsiIndicator(period=14),
+                StochasticIndicator(k=14, d=3, smooth_k=3),
             ),
         )
         assert config.signal_columns == ["macd_signal", "rsi_signal", "stoch_signal"]
@@ -165,9 +100,9 @@ class TestStrategyBuilder:
             StrategyBuilder()
             .set_name("test_strategy")
             .set_strategy_window(3)
-            .add_indicator(MacdIndicatorBuilder().set_fast(8).set_slow(17).set_signal(5).build())
-            .add_indicator(RsiIndicatorBuilder().set_period(7).build())
-            .add_indicator(StochasticIndicatorBuilder().set_k(9).set_d(3).set_smooth_k(3).build())
+            .add_indicator(MacdIndicator(fast=8, slow=17, signal=5))
+            .add_indicator(RsiIndicator(period=7))
+            .add_indicator(StochasticIndicator(k=9, d=3, smooth_k=3))
             .build()
         )
         assert config.name == "test_strategy"
@@ -181,9 +116,9 @@ class TestStrategyBuilder:
         config = (
             StrategyBuilder()
             .set_name("default_test")
-            .add_indicator(MacdIndicatorBuilder().build())
-            .add_indicator(RsiIndicatorBuilder().build())
-            .add_indicator(StochasticIndicatorBuilder().build())
+            .add_indicator(MacdIndicator(fast=12, slow=26, signal=9))
+            .add_indicator(RsiIndicator(period=14))
+            .add_indicator(StochasticIndicator(k=14, d=3, smooth_k=3))
             .build()
         )
         assert config.strategy_window == 5
