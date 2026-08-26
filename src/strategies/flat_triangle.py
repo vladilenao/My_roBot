@@ -109,7 +109,7 @@ class FlatTriangleStrategy:
                 strategy_name=self.NAME,
                 indicator_values=indicators,
             )
-        return Decision(SignalType.HOLD, price)
+        return Decision(SignalType.HOLD, price, timeframe=timeframe, strategy_name=self.NAME)
 
     def required_history(self) -> int:
         return self._config.required_history
