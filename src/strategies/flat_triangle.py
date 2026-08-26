@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from src.strategies.contracts import Decision, SignalType
@@ -111,41 +110,6 @@ class FlatTriangleStrategy:
                 indicator_values=indicators,
             )
         return Decision(SignalType.HOLD, price)
-
-    def expected_events(self, ta: pd.DataFrame) -> pd.DataFrame:
-        bb_lower_col = "bbl_20_2.0"
-        bb_upper_col = "bbu_20_2.0"
-        stoch_k_col = "stochk_5_3_3"
-        stoch_d_col = "stochd_5_3_3"
-
-        buy_mask = (
-            (ta["close"] <= ta[bb_lower_col])
-            & (ta["rsi"] <= 30)
-            & (ta[stoch_k_col] < 20)
-            & (ta[stoch_k_col] > ta[stoch_d_col])
-            & (ta[stoch_k_col].shift(1) <= ta[stoch_d_col].shift(1))
-        )
-
-        sell_mask = (
-            (ta["close"] >= ta[bb_upper_col])
-            & (ta["rsi"] >= 70)
-            & (ta[stoch_k_col] > 80)
-            & (ta[stoch_k_col] < ta[stoch_d_col])
-            & (ta[stoch_k_col].shift(1) >= ta[stoch_d_col].shift(1))
-        )
-
-        events = ta[buy_mask | sell_mask].copy()
-        events["signal"] = np.where(
-            buy_mask[buy_mask | sell_mask], "BUY", "SELL"
-        )
-        events["signal"] = events["signal"].astype("string")
-
-        result_columns = [
-            "datetime", "signal", "close",
-            bb_lower_col, bb_upper_col,
-            "rsi", stoch_k_col, stoch_d_col,
-        ]
-        return events[result_columns].reset_index(drop=True)
 
     def required_history(self) -> int:
         return self._config.required_history
