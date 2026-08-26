@@ -201,7 +201,7 @@ def test_import_names_module_is_light():
     import sys
     from pathlib import Path
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     code = (
         "import sys;"
         "import src.strategies.names;"
