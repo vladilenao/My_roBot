@@ -1,7 +1,14 @@
 import pytest
 
 from src.strategies import get_strategy
+from src.strategies.macd_rsi_stoch import DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG
+from src.strategies.flat_triangle import DEFAULT_CONFIG as FLAT_TRIANGLE_CONFIG
 from tests.snapshot import helper
+
+STRATEGY_CONFIGS = {
+    "macd_rsi_stoch": MACD_RSI_STOCH_CONFIG,
+    "flat_triangle": FLAT_TRIANGLE_CONFIG,
+}
 
 
 def _discover_cases():
@@ -21,9 +28,10 @@ CASES = _discover_cases()
 @pytest.mark.parametrize("case,strategy_name", CASES)
 def test_strategy_snapshot(case, strategy_name, request):
     df = helper.load_candles_fixture(case)
-    strategy = get_strategy(strategy_name)
+    config = STRATEGY_CONFIGS[strategy_name]
+    strategy = get_strategy(strategy_name, config=config)
     ta = strategy.compute(df)
-    actual = strategy.expected_events(ta)
+    actual = helper.expected_events(strategy_name, ta, config)
 
     if request.config.getoption("--update-snapshots"):
         helper.write_expected(case, strategy_name, actual)
