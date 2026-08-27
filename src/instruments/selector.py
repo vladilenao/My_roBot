@@ -4,6 +4,7 @@ from t_tech.invest import InstrumentStatus
 from src.api.client import client_context
 from src.api.instruments import find_working_instrument
 from src.api.retry import api_call_with_retry
+from src.data.timeutil import to_naive
 
 
 RTS_STOCK_TICKERS = [
@@ -31,7 +32,7 @@ def _format_futures_display(contract_name, base_name, label):
 
 
 def fetch_active_futures(client):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now + FUTURES_TTL
     resp = api_call_with_retry(
         client.instruments.futures, instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
@@ -42,9 +43,10 @@ def fetch_active_futures(client):
         name_lower = f.name.lower()
         if "микро" in name_lower or "мини" in name_lower:
             continue
-        if f.expiration_date > cutoff:
+        expiry = to_naive(f.expiration_date)
+        if expiry > cutoff:
             continue
-        if f.expiration_date < now:
+        if expiry < now:
             continue
 
         ticker_upper = f.ticker.upper()
@@ -52,7 +54,7 @@ def fetch_active_futures(client):
             if ticker_upper.startswith(base["prefix"].upper()):
                 contract_name = f.name.split()[0]
                 display = _format_futures_display(contract_name, base["name"], base["label"])
-                by_base[base["prefix"]].append((display, f.ticker, "future", f.expiration_date))
+                by_base[base["prefix"]].append((display, f.ticker, "future", expiry))
                 break
 
     result = []
