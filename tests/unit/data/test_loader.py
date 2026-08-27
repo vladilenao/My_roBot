@@ -54,8 +54,10 @@ class TestDateParsing:
         load_candles("NGU6", "future", "1h", "2024-01-01", "2024-02-01")
 
         kwargs = api_mocks.retry.call_args.kwargs
-        assert kwargs["from_"] == datetime(2024, 1, 1)
-        assert kwargs["to"] == datetime(2024, 2, 1)
+        assert kwargs["from_"] == pd.Timestamp("2024-01-01", tz="UTC")
+        assert kwargs["to"] == pd.Timestamp("2024-02-01", tz="UTC")
+        assert kwargs["from_"].tzinfo is not None
+        assert kwargs["to"].tzinfo is not None
 
     def test_default_range_is_30_days(self, api_mocks):
         fixed_now = datetime(2024, 6, 1, 12, 0, 0)
@@ -63,8 +65,32 @@ class TestDateParsing:
             load_candles("NGU6", "future", "1h")
 
         kwargs = api_mocks.retry.call_args.kwargs
-        assert kwargs["to"] == fixed_now
-        assert kwargs["from_"] == fixed_now - timedelta(days=30)
+        assert kwargs["to"] == pd.Timestamp(fixed_now, tz="UTC")
+        assert kwargs["from_"] == pd.Timestamp(fixed_now - timedelta(days=30), tz="UTC")
+
+
+class TestNaiveBoundaries:
+    def test_aware_end_naive_start_no_crash(self, api_mocks):
+        start = datetime(2024, 1, 1)
+        end = datetime(2024, 2, 1, tzinfo=timezone.utc)
+        load_candles("NGU6", "future", "1h", start, end)
+
+        kwargs = api_mocks.retry.call_args.kwargs
+        assert kwargs["from_"].tzinfo is not None
+        assert kwargs["to"].tzinfo is not None
+        assert kwargs["from_"] == pd.Timestamp("2024-01-01", tz="UTC")
+        assert kwargs["to"] == pd.Timestamp("2024-02-01", tz="UTC")
+
+    def test_naive_end_aware_start_no_crash(self, api_mocks):
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2024, 2, 1)
+        load_candles("NGU6", "future", "1h", start, end)
+
+        kwargs = api_mocks.retry.call_args.kwargs
+        assert kwargs["from_"].tzinfo is not None
+        assert kwargs["to"].tzinfo is not None
+        assert kwargs["from_"] == pd.Timestamp("2024-01-01", tz="UTC")
+        assert kwargs["to"] == pd.Timestamp("2024-02-01", tz="UTC")
 
 
 class TestRequestContract:
