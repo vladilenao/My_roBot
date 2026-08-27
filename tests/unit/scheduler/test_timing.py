@@ -65,3 +65,58 @@ class TestCandleScheduler:
             target = sched.wait_until_candle_close()
         mock_sleep.assert_called_once()
         assert target == _utc(2024, 1, 1, 11, 0)
+
+    def test_wait_bar_published_immediate(self):
+        clock = _utc(2024, 1, 1, 10, 0)
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock)
+        calls = {"n": 0}
+
+        def bar_ready():
+            calls["n"] += 1
+            return True
+
+        with patch("src.scheduler.timing.time.monotonic", return_value=0.0), patch(
+            "src.scheduler.timing.time.sleep"
+        ):
+            sched.wait_until_bar_published(bar_ready, poll_secs=1.0, timeout_secs=5.0)
+
+        assert calls["n"] == 1
+
+    def test_wait_bar_published_waits_until_ready(self):
+        clock = _utc(2024, 1, 1, 10, 0)
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock)
+        attempts = {"n": 0}
+
+        def bar_ready():
+            attempts["n"] += 1
+            return attempts["n"] >= 3
+
+        with patch("src.scheduler.timing.time.monotonic", return_value=0.0), patch(
+            "src.scheduler.timing.time.sleep"
+        ) as mock_sleep:
+            sched.wait_until_bar_published(bar_ready, poll_secs=1.0, timeout_secs=5.0)
+
+        assert attempts["n"] == 3
+        mock_sleep.assert_called()
+
+    def test_wait_bar_published_timeout(self):
+        clock = _utc(2024, 1, 1, 10, 0)
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock)
+        mono = {"t": 100.0}
+
+        def fake_monotonic():
+            mono["t"] += 10.0
+            return mono["t"]
+
+        calls = {"n": 0}
+
+        def bar_ready():
+            calls["n"] += 1
+            return False
+
+        with patch(
+            "src.scheduler.timing.time.monotonic", side_effect=fake_monotonic
+        ), patch("src.scheduler.timing.time.sleep"):
+            sched.wait_until_bar_published(bar_ready, poll_secs=1.0, timeout_secs=5.0)
+
+        assert calls["n"] >= 1

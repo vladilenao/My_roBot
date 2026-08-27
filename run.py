@@ -5,6 +5,8 @@ from src.config import (
     SHARE_STRATEGIES,
     SLEEP_SECONDS,
     TICKER,
+    TICK_POLL_SECS,
+    TICK_TIMEOUT_SECS,
     TIMEFRAME,
     TINKOFF_TOKEN,
     INSTRUMENT_TYPE,
@@ -34,6 +36,8 @@ def main():
         share_strategies=SHARE_STRATEGIES,
         future_strategies=FUTURE_STRATEGIES,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
+        tick_poll_secs=TICK_POLL_SECS,
+        tick_timeout_secs=TICK_TIMEOUT_SECS,
     ).run()
 
 

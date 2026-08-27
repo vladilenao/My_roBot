@@ -138,5 +138,75 @@ class TestMarketDataCache:
         assert cache._last_loaded[("SBER", "share")].tzinfo is None
         assert cache._last_loaded[("SBER", "share")] == pd.Timestamp("2024-01-01 09:00")
 
+    def test_has_fresh_closed_bar_true_when_present(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        bars = _bars(["06:00", "07:00", "08:00", "09:00"])
+        cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst)
+
+        assert cache.has_fresh_closed_bar() is True
+
+    def test_has_fresh_closed_bar_false_when_missing(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        bars = _bars(["06:00", "07:00", "08:00"])
+        cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst)
+
+        assert cache.has_fresh_closed_bar() is False
+
+    def test_has_fresh_closed_bar_true_when_nothing_loaded(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        bars = _bars(["06:00"])
+        cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
+
+        assert cache.has_fresh_closed_bar() is True
+
+    def test_force_refresh_pulls_late_bar(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                                      pd.Timestamp("2024-01-01 07:00"),
+                                      pd.Timestamp("2024-01-01 08:00")]})
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst)
+
+        assert cache.has_fresh_closed_bar() is False
+
+        # свежий закрытый бар 09:00 публикуется с задержкой
+        loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
+                               pd.Timestamp("2024-01-01 07:00"),
+                               pd.Timestamp("2024-01-01 08:00"),
+                               pd.Timestamp("2024-01-01 09:00")]
+
+        cache.refresh_if_new_candle(force=True)
+
+        assert cache.has_fresh_closed_bar() is True
+        assert cache.frame_for(inst)["datetime"].max() == pd.Timestamp("2024-01-01 09:00")
+
+    def test_refresh_without_force_skips_after_observed(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                                      pd.Timestamp("2024-01-01 07:00"),
+                                      pd.Timestamp("2024-01-01 08:00")]})
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst)
+        cache.refresh_if_new_candle()
+        calls_before = len(loader.calls)
+
+        # без force граница уже отслежена — повторной загрузки нет
+        loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
+                               pd.Timestamp("2024-01-01 07:00"),
+                               pd.Timestamp("2024-01-01 08:00"),
+                               pd.Timestamp("2024-01-01 09:00")]
+        cache.refresh_if_new_candle()
+
+        assert len(loader.calls) == calls_before
+        assert cache.has_fresh_closed_bar() is False
+
 
 

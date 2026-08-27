@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 
 from src.instruments import Instrument, normalize_instrument
 from src.strategies.registry import get_strategy, validate_assignments
@@ -14,8 +15,8 @@ class TradingBot:
 
     Ритм — «один тик = одна закрытая свеча»: итерация выравнивается по границе
     закрытия свечи таймфрейма. Решения принимаются только по готовым (закрытым)
-    свечам, а уведомление выполняется об изменении сигнала (фронт), а не о каждом
-    проходе.
+    свечам, а уведомление выполняется на каждом тике по каждой активной паре
+    «инструмент × стратегия».
     """
 
     def __init__(
@@ -30,6 +31,8 @@ class TradingBot:
         share_strategies: dict[str, list[str]] | None = None,
         future_strategies: dict[str, list[str]] | None = None,
         heartbeat_every_ticks: int | None = 60,
+        tick_poll_secs: float = 1.0,
+        tick_timeout_secs: float = 65.0,
     ) -> None:
         self._notifier = notifier
         self._strategy_map = strategy_map
@@ -40,12 +43,13 @@ class TradingBot:
         self._share_strategies = share_strategies or {}
         self._future_strategies = future_strategies or {}
         self._heartbeat_every = heartbeat_every_ticks or 0
+        self._tick_poll_secs = tick_poll_secs
+        self._tick_timeout_secs = tick_timeout_secs
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
             for i in instruments
         ]
-        self._prev_state: dict[tuple, tuple] = {}
         self._tick_count = 0
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
@@ -60,7 +64,11 @@ class TradingBot:
     def _loop(self) -> None:
         while True:
             try:
-                self._timeline.wait_until_candle_close()
+                self._timeline.wait_until_bar_published(
+                    self._bar_is_ready,
+                    poll_secs=self._tick_poll_secs,
+                    timeout_secs=self._tick_timeout_secs,
+                )
                 self._tick()
             except KeyboardInterrupt:
                 log.info("Бот остановлен.")
@@ -71,10 +79,17 @@ class TradingBot:
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self) -> None:
+        for instrument in self._instruments:
+            self._data_cache.frame_for(instrument)
         self._data_cache.refresh_if_new_candle()
         for instrument in self._instruments:
             self._process(instrument)
         self._maybe_heartbeat()
+
+    # ── ПУНКТ 2.1: готов ли свежий закрытый бар (для ожидания до появления) ──
+    def _bar_is_ready(self) -> bool:
+        self._data_cache.refresh_if_new_candle(force=True)
+        return self._data_cache.has_fresh_closed_bar()
 
     # ── ПУНКТ 4: по инструменту ──
     def _process(self, instrument: Instrument) -> None:
@@ -95,20 +110,15 @@ class TradingBot:
                 strategy = self._strategy_factory(name, config=self._strategy_map[name])
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=self._timeline.timeframe)
+                decision = replace(decision, bar_time=frame["datetime"].iloc[-1])
                 self._emit(instrument, name, decision)
             except Exception:
                 log.exception(
                     "Ошибка стратегии '%s' на %s — идём дальше.", name, instrument.label
                 )
 
-    # ── ПУНКТ 4.2.3-4.2.4: фронт сигнала + доставка через порт ──
+    # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
     def _emit(self, instrument: Instrument, name: str, decision) -> None:
-        key = (instrument.ticker, name)
-        state = (decision.signal_type.value, round(decision.price, 4))
-        if state == self._prev_state.get(key):
-            log.debug("Сигнал %s по %s не изменился — пропуск.", name, instrument.label)
-            return
-        self._prev_state[key] = state
         self._execution.execute(decision, instrument)
 
     # ── диспетчеризация стратегий по типу инструмента ──

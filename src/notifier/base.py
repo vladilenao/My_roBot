@@ -7,25 +7,24 @@ class DecisionFormatter:
     """Переводит решение стратегии в текст уведомления."""
 
     def format(self, decision: Decision, instrument_label: str = "") -> str:
-        prefix = f"[{instrument_label}] " if instrument_label else ""
-        strategy_suffix = f" ({decision.strategy_name})" if decision.strategy_name else ""
+        parts: list[str] = []
+        if instrument_label:
+            parts.append(f"● {instrument_label}")
+        else:
+            parts.append("●")
+        if decision.bar_time is not None:
+            parts.append(decision.bar_time.strftime("%H:%M"))
+        if decision.strategy_name:
+            parts.append(f"| {decision.strategy_name}")
 
         if decision.signal_type is SignalType.BUY:
-            msg = f"{prefix}🚀 ПОКУПАТЬ{strategy_suffix}! Цена: {round(decision.price, 3)}"
+            signal = f"🟢 ПОКУПКА (BUY) — Цена: {round(decision.price, 3)}"
         elif decision.signal_type is SignalType.SELL:
-            msg = f"{prefix}📉 ПРОДАВАТЬ{strategy_suffix}! Цена: {round(decision.price, 3)}"
+            signal = f"🔴 ПРОДАЖА (SELL) — Цена: {round(decision.price, 3)}"
         else:
-            msg = f"{prefix}😴 Отдыхаем{strategy_suffix}, сигналов нет."
+            signal = "⏳ Нет сигнала."
 
-        if decision.timeframe:
-            msg += f"\nТаймфрейм: {decision.timeframe}"
-        if decision.indicator_values:
-            indicators = ", ".join(
-                f"{k}={v:.2f}" for k, v in decision.indicator_values.items()
-            )
-            msg += f"\nИндикаторы: {indicators}"
-
-        return msg
+        return " ".join(parts) + f" ➜ {signal}"
 
 
 class AbstractNotifier(ABC):
