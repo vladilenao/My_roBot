@@ -57,11 +57,16 @@ class MarketDataCache:
             return pd.DataFrame()
         return self._closed_only(frame)
 
-    def refresh_if_new_candle(self, now=None) -> None:
-        """Инкрементально дозагружает новые закрытые бары, если граница свечи сместилась."""
+    def refresh_if_new_candle(self, now=None, force: bool = False) -> None:
+        """Инкрементально дозагружает новые закрытые бары, если граница свечи сместилась.
+
+        ``force=True`` заставляет повторно дозагружать поверх кэша даже если граница
+        уже отслежена (используется при ожидании появления свежего закрытого бара,
+        который из-за задержки публикации может быть временно недоступен).
+        """
         boundary = _naive(self._timeline.current_candle_start(now or self._timeline.now()))
         for key in list(self._frames.keys()):
-            if self._observed.get(key, boundary) >= boundary:
+            if not force and self._observed.get(key, boundary) >= boundary:
                 continue
             frame = self._frames[key]
             if frame is None or frame.empty:
@@ -74,6 +79,27 @@ class MarketDataCache:
             closed = self._closed_only(merged)
             self._last_loaded[key] = _naive(closed["datetime"].max()) if not closed.empty else last_dt
             self._observed[key] = boundary
+
+    def has_fresh_closed_bar(self, now=None) -> bool:
+        """Появился ли свежий закрытый бар текущей закрытой минуты во всех загруженных кэшах.
+
+        Ожидаемый самый свежий закрытый бар начинается в
+        ``previous_candle_start`` (``current_candle_start - period``). Возвращает
+        ``True``, если в каждом загруженном фрейме есть закрытый бар не старше
+        этой метки. Если загруженных инструментов нет — ``True`` (нечего ждать).
+        """
+        expected = _naive(
+            self._timeline.previous_candle_start(now or self._timeline.now())
+        )
+        if not self._frames:
+            return True
+        for frame in self._frames.values():
+            if frame is None or frame.empty:
+                continue
+            closed = self._closed_only(frame)
+            if closed.empty or _naive(closed["datetime"].max()) < expected:
+                return False
+        return True
 
     # ── внутренние помощники ──
     def _initial_load(self, instrument, key: tuple) -> None:

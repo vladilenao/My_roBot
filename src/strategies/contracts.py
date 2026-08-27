@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
@@ -18,6 +18,7 @@ class Decision:
     timeframe: str | None = None
     strategy_name: str | None = None
     indicator_values: dict[str, float] | None = None
+    bar_time: pd.Timestamp | None = None
 
 
 class Strategy(Protocol):

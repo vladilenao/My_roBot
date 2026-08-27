@@ -65,6 +65,16 @@ class CandleScheduler:
         current = (t or self.now())
         return self._floor(current)
 
+    def previous_candle_start(self, t: datetime | None = None) -> datetime:
+        """Момент начала свечи, закрывающейся на ближайшей границе.
+
+        Для текущего момента -- начало только что закрывшегося бара
+        (``current_candle_start - period``).
+        """
+        current = (t or self.now())
+        start = self._floor(current)
+        return start - self._period(start)
+
 
     def next_candle_close(self, t: datetime | None = None) -> datetime:
         """Момент начала следующей свечи (= конец текущей)."""
@@ -77,12 +87,39 @@ class CandleScheduler:
         target = self.next_candle_close()
         delay = (target - self.now()).total_seconds()
         if delay > 0:
-            time.sleep(delay)
+            self._sleep(delay)
         return target
+
+    def wait_until_bar_published(
+        self,
+        bar_ready: Callable[[], bool],
+        poll_secs: float = 1.0,
+        timeout_secs: float = 65.0,
+    ) -> None:
+        """Блокирующе ждёт до границы закрытия свечи и появления свежего закрытого бара.
+
+        После наступления границы повторно вызывает ``bar_ready()`` с паузами
+        ``poll_secs``, пока она не вернёт ``True``. Останавливается по истечении
+        ``timeout_secs`` (измеряется через ``time.monotonic``), предотвращая
+        вечную блокировку при недоступности свежего бара.
+        """
+        target = self.next_candle_close()
+        delay = (target - self.now()).total_seconds()
+        if delay > 0:
+            self._sleep(delay)
+        deadline = time.monotonic() + timeout_secs
+        while not bar_ready():
+            if time.monotonic() >= deadline:
+                break
+            self._sleep(poll_secs)
 
     def fallback_secs(self) -> float:
         """Пауза при внешнем сбое — не ждать до свечи, но и не долбить API."""
         return self._fallback
+
+    def _sleep(self, secs: float) -> None:
+        """Приостанавливает поток. Выделено для подстановки в тестах."""
+        time.sleep(secs)
 
     def as_timestamp(self, when: datetime) -> pd.Timestamp:
         return pd.Timestamp(when)

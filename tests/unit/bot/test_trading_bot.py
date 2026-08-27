@@ -38,10 +38,11 @@ class FakeTimeline:
         self.timeframe = timeframe
         self.wait_calls = 0
 
-    def wait_until_candle_close(self):
+    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
         self.wait_calls += 1
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
+        bar_ready()
 
     def fallback_secs(self):
         return self.fallback
@@ -53,10 +54,13 @@ class FakeCache:
         self.refresh_error = refresh_error
         self.refresh_calls = 0
 
-    def refresh_if_new_candle(self):
+    def refresh_if_new_candle(self, force=False):
         self.refresh_calls += 1
         if self.refresh_error:
             raise self.refresh_error
+
+    def has_fresh_closed_bar(self, now=None):
+        return True
 
     def frame_for(self, instrument):
         return self.frames.get(instrument.ticker, pd.DataFrame())
@@ -68,6 +72,57 @@ class RecordingExecution:
 
     def execute(self, decision, instrument):
         self.decisions.append((decision, instrument))
+
+
+class PollingTimeline:
+    def __init__(self, ticks=1, fallback=1.0, timeframe="1h"):
+        self.ticks = ticks
+        self.fallback = fallback
+        self.timeframe = timeframe
+        self.wait_calls = 0
+
+    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
+        self.wait_calls += 1
+        if self.wait_calls > self.ticks:
+            raise KeyboardInterrupt
+        while not bar_ready():
+            pass
+
+    def fallback_secs(self):
+        return self.fallback
+
+
+class TimeoutTimeline:
+    def __init__(self, ticks=1, fallback=1.0, timeframe="1h"):
+        self.ticks = ticks
+        self.fallback = fallback
+        self.timeframe = timeframe
+        self.wait_calls = 0
+
+    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
+        self.wait_calls += 1
+        if self.wait_calls > self.ticks:
+            raise KeyboardInterrupt
+        bar_ready()
+
+    def fallback_secs(self):
+        return self.fallback
+
+
+class LateBarCache(FakeCache):
+    def __init__(self, publish_after, frames=None):
+        super().__init__(frames=frames)
+        self.publish_after = publish_after
+        self.checks = 0
+
+    def has_fresh_closed_bar(self, now=None):
+        self.checks += 1
+        return self.checks >= self.publish_after
+
+
+class NeverPublishCache(FakeCache):
+    def has_fresh_closed_bar(self, now=None):
+        return False
 
 
 class RecordingNotifier:
@@ -147,7 +202,7 @@ class TestTradingBot:
 
         assert len(execution.decisions) == 1
 
-    def test_dedup_same_signal(self):
+    def test_delivers_signal_on_every_tick(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         execution = RecordingExecution()
         bot = _make_bot(
@@ -162,14 +217,36 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 1
+        assert len(execution.decisions) == 2
 
-    def test_dedup_emits_on_change(self):
+    def test_delivers_on_signal_change(self):
         strategy = MagicMock()
         strategy.compute.return_value = _df()
         strategy.decide.side_effect = [
             Decision(SignalType.HOLD, 100.5),
             Decision(SignalType.BUY, 100.5),
+        ]
+        execution = RecordingExecution()
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=2),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.decisions) == 2
+
+    def test_delivers_on_price_change_with_same_signal(self):
+        strategy = MagicMock()
+        strategy.compute.return_value = _df()
+        strategy.decide.side_effect = [
+            Decision(SignalType.HOLD, 100.5),
+            Decision(SignalType.HOLD, 101.0),
         ]
         execution = RecordingExecution()
         bot = _make_bot(
@@ -262,10 +339,13 @@ class TestTradingBot:
             def __init__(self):
                 self.calls = 0
 
-            def refresh_if_new_candle(self):
+            def refresh_if_new_candle(self, force=False):
                 self.calls += 1
                 if self.calls == 1:
                     raise RuntimeError("boom")
+
+            def has_fresh_closed_bar(self, now=None):
+                return True
 
             def frame_for(self, instrument):
                 return _df()
@@ -286,3 +366,40 @@ class TestTradingBot:
         heartbeats = [m for m in bot._notifier.messages if "Сердцебиение" in m]
         assert len(heartbeats) == 1
         assert "ошибок за период — 1" in heartbeats[-1]
+
+    def test_tick_held_until_fresh_bar_published(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        cache = LateBarCache(publish_after=3, frames={"SBER": _df()})
+        bot = _make_bot(
+            timeline=PollingTimeline(ticks=1),
+            cache=cache,
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert cache.checks >= 3
+        assert len(execution.decisions) == 1
+
+    def test_processes_with_available_data_on_timeout(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        cache = NeverPublishCache(frames={"SBER": _df()})
+        bot = _make_bot(
+            timeline=TimeoutTimeline(ticks=1),
+            cache=cache,
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.decisions) == 1
