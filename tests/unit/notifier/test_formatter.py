@@ -85,3 +85,60 @@ class TestFormatDecision:
     def test_price_rounding_sell(self):
         result = DecisionFormatter().format(_decision(SignalType.SELL, 3.14159))
         assert "3.142" in result
+
+
+class TestTimeZoneOffset:
+    def test_zero_offset_keeps_utc(self):
+        result = DecisionFormatter(tz_offset_hours=0).format(
+            _decision(
+                SignalType.HOLD,
+                1.0,
+                bar_time=pd.Timestamp("2026-08-26 06:15"),
+                strategy_name="macd_rsi_stoch",
+            )
+        )
+        assert " 06:15 |" in result
+
+    def test_positive_offset_shifts_to_local_time(self):
+        result = DecisionFormatter(tz_offset_hours=3).format(
+            _decision(
+                SignalType.HOLD,
+                1.0,
+                bar_time=pd.Timestamp("2026-08-26 06:15"),
+                strategy_name="macd_rsi_stoch",
+            )
+        )
+        assert " 09:15 |" in result
+
+    def test_negative_offset(self):
+        result = DecisionFormatter(tz_offset_hours=-2).format(
+            _decision(
+                SignalType.HOLD,
+                1.0,
+                bar_time=pd.Timestamp("2026-08-26 06:15"),
+                strategy_name="macd_rsi_stoch",
+            )
+        )
+        assert " 04:15 |" in result
+
+    def test_offset_does_not_mutate_decision_bar_time(self):
+        decision = _decision(
+            SignalType.HOLD,
+            1.0,
+            bar_time=pd.Timestamp("2026-08-26 06:15"),
+            strategy_name="macd_rsi_stoch",
+        )
+        DecisionFormatter(tz_offset_hours=3).format(decision)
+        assert decision.bar_time == pd.Timestamp("2026-08-26 06:15")
+
+    def test_omits_time_without_bar_time_even_with_offset(self):
+        result = DecisionFormatter(tz_offset_hours=3).format(
+            _decision(
+                SignalType.HOLD,
+                1.0,
+                strategy_name="macd_rsi_stoch",
+            )
+        )
+        assert "06:15" not in result
+        assert "09:15" not in result
+        assert "| macd_rsi_stoch" in result

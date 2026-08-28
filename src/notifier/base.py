@@ -1,10 +1,14 @@
 from abc import ABC, abstractmethod
+from datetime import timedelta
 
 from src.strategies.contracts import Decision, SignalType
 
 
 class DecisionFormatter:
     """Переводит решение стратегии в текст уведомления."""
+
+    def __init__(self, tz_offset_hours: float = 0.0) -> None:
+        self._tz_offset = tz_offset_hours
 
     def format(self, decision: Decision, instrument_label: str = "") -> str:
         parts: list[str] = []
@@ -13,7 +17,9 @@ class DecisionFormatter:
         else:
             parts.append("●")
         if decision.bar_time is not None:
-            parts.append(decision.bar_time.strftime("%H:%M"))
+            parts.append(
+                (decision.bar_time + timedelta(hours=self._tz_offset)).strftime("%H:%M")
+            )
         if decision.strategy_name:
             parts.append(f"| {decision.strategy_name}")
 
