@@ -7,13 +7,17 @@ from src.strategies.contracts import Decision, SignalType
 class DecisionFormatter:
     """Переводит решение стратегии в текст уведомления."""
 
-    def __init__(self, tz_offset_hours: float = 0.0) -> None:
+    def __init__(self, tz_offset_hours: float = 0.0, timeframe: str = "") -> None:
         self._tz_offset = tz_offset_hours
+        self._timeframe = timeframe
 
     def format(self, decision: Decision, instrument_label: str = "") -> str:
         parts: list[str] = []
         if instrument_label:
-            parts.append(f"● {instrument_label}")
+            label_block = f"● {instrument_label}"
+            if self._timeframe:
+                label_block += f" ({self._timeframe})"
+            parts.append(label_block)
         else:
             parts.append("●")
         if decision.bar_time is not None:

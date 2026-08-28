@@ -16,26 +16,26 @@ def _decision(
 
 class TestForwardFormat:
     def test_buy_with_bar_time_and_strategy(self):
-        result = DecisionFormatter().format(
+        result = DecisionFormatter(timeframe="1h").format(
             _decision(
                 SignalType.BUY,
                 100.5,
                 bar_time=pd.Timestamp("2026-08-26 22:00"),
                 strategy_name="macd_rsi_stoch",
             ),
-            instrument_label="NG-10.26 (1h)",
+            instrument_label="NG-10.26",
         )
         assert result == "● NG-10.26 (1h) 22:00 | macd_rsi_stoch ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.5"
 
     def test_sell_with_bar_time_and_strategy(self):
-        result = DecisionFormatter().format(
+        result = DecisionFormatter(timeframe="1h").format(
             _decision(
                 SignalType.SELL,
                 100.5,
                 bar_time=pd.Timestamp("2026-08-26 22:00"),
                 strategy_name="macd_rsi_stoch",
             ),
-            instrument_label="NG-10.26 (1h)",
+            instrument_label="NG-10.26",
         )
         assert result == "● NG-10.26 (1h) 22:00 | macd_rsi_stoch ➜ 🔴 ПРОДАЖА (SELL) — Цена: 100.5"
 
@@ -45,20 +45,33 @@ class TestForwardFormat:
         assert "Цена" not in result
 
     def test_omits_time_without_bar_time(self):
-        result = DecisionFormatter().format(
+        result = DecisionFormatter(timeframe="1h").format(
             _decision(SignalType.BUY, 100.5, strategy_name="macd_rsi_stoch"),
-            instrument_label="NG-10.26 (1h)",
+            instrument_label="NG-10.26",
         )
         assert "22:00" not in result
         assert "| macd_rsi_stoch" in result
 
     def test_omits_strategy_without_name(self):
-        result = DecisionFormatter().format(
+        result = DecisionFormatter(timeframe="1h").format(
             _decision(SignalType.BUY, 100.5, bar_time=pd.Timestamp("2026-08-26 22:00")),
-            instrument_label="NG-10.26 (1h)",
+            instrument_label="NG-10.26",
         )
         assert "22:00" in result
         assert "|" not in result
+
+    def test_omits_timeframe_block_without_setting(self):
+        result = DecisionFormatter().format(
+            _decision(
+                SignalType.BUY,
+                100.5,
+                bar_time=pd.Timestamp("2026-08-26 22:00"),
+                strategy_name="macd_rsi_stoch",
+            ),
+            instrument_label="NG-10.26",
+        )
+        assert result == "● NG-10.26 22:00 | macd_rsi_stoch ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.5"
+        assert "(1h)" not in result
 
 
 class TestFormatDecision:

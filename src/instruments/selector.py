@@ -54,7 +54,7 @@ def fetch_active_futures(client):
             if ticker_upper.startswith(base["prefix"].upper()):
                 contract_name = f.name.split()[0]
                 display = _format_futures_display(contract_name, base["name"], base["label"])
-                by_base[base["prefix"]].append((display, f.ticker, "future", expiry))
+                by_base[base["prefix"]].append((display, f.ticker, "future", expiry, contract_name))
                 break
 
     result = []
@@ -63,7 +63,7 @@ def fetch_active_futures(client):
         entries.sort(key=lambda x: x[3])
         result.extend(entries)
 
-    return [(display, ticker, inst_type) for display, ticker, inst_type, _ in result]
+    return [(display, ticker, inst_type, contract_name) for display, ticker, inst_type, _, contract_name in result]
 
 
 def _ask_choice(prompt, options):
@@ -79,13 +79,18 @@ def _validate_instruments(client, entries, inst_type):
     valid = []
     for entry in entries:
         if isinstance(entry, tuple):
-            display_name, ticker, _ = entry
+            display_name, ticker, *_ = entry
+            short_name = entry[3] if len(entry) >= 4 else None
         else:
             display_name = entry
             ticker = entry
+            short_name = None
         try:
             find_working_instrument(client, ticker, inst_type)
-            valid.append((display_name, ticker, inst_type))
+            if short_name:
+                valid.append((display_name, ticker, inst_type, short_name))
+            else:
+                valid.append((display_name, ticker, inst_type))
             print(f"  ✓ {display_name} ({inst_type})")
         except ValueError as e:
             print(f"  ✗ {display_name}: {e}")
@@ -105,7 +110,7 @@ def _select_from_list(client, entries, inst_type):
         else:
             display = entry
         print(f"  {i}. {display}")
-    print(f"\nВведите номера через запятую (например: 1,3,5):")
+    print("\nВведите номера через запятую (например: 1,3,5):")
     print("Введите пустую строку для пропуска.\n")
 
     raw = input("Ваш выбор: ").strip()
@@ -125,7 +130,7 @@ def _select_from_list(client, entries, inst_type):
                 print(f"  ⚠ Номер {part} вне диапазона (1-{len(entries)})")
         else:
             ticker = part.upper()
-            selected_entries.append((ticker, ticker, inst_type) if inst_type == "share" else (ticker, ticker, inst_type))
+            selected_entries.append((ticker, ticker, inst_type))
 
     if not selected_entries:
         return []
@@ -138,7 +143,7 @@ def _deduplicate(instruments):
     seen = set()
     result = []
     for item in instruments:
-        display_name, ticker, inst_type = item
+        _, ticker, *_ = item
         if ticker not in seen:
             seen.add(ticker)
             result.append(item)
@@ -148,8 +153,8 @@ def _deduplicate(instruments):
 def _show_current(instruments):
     if instruments:
         print(f"\nТекущий список ({len(instruments)}):")
-        for display_name, ticker, inst_type in instruments:
-            print(f"  - {display_name} ({inst_type})")
+        for item in instruments:
+            print(f"  - {item[0]} ({item[2]})")
 
 
 def select_instruments():
@@ -195,8 +200,8 @@ def select_instruments():
         return select_instruments()
 
     print(f"\nИтого выбрано: {len(instruments)}")
-    for display_name, ticker, inst_type in instruments:
-        print(f"  - {display_name} ({inst_type})")
+    for item in instruments:
+        print(f"  - {item[0]} ({item[2]})")
     print()
 
     return instruments

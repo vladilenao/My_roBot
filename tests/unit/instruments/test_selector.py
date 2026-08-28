@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
-import pytest
 from src.instruments.selector import (
     select_instruments, _ask_choice, _validate_instruments,
     _select_from_list, _deduplicate, fetch_active_futures,
@@ -77,7 +76,7 @@ class TestFetchActiveFutures:
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        tickers = [t for _, t, _ in result]
+        tickers = [t for _, t, *_ in result]
         assert "RIU6" in tickers
         assert "RIZ6" in tickers
         assert "RIH7" in tickers
@@ -92,7 +91,7 @@ class TestFetchActiveFutures:
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        tickers = [t for _, t, _ in result]
+        tickers = [t for _, t, *_ in result]
         assert tickers == ["RIU6", "RIZ6", "BRU6", "BRZ6"]
 
     def test_excludes_micro_mini(self):
@@ -103,7 +102,7 @@ class TestFetchActiveFutures:
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        tickers = [t for _, t, _ in result]
+        tickers = [t for _, t, *_ in result]
         assert "SIU6" in tickers
         assert "RMU6" not in tickers
 
@@ -153,6 +152,13 @@ class TestFetchActiveFutures:
         display = result[0][0]
         assert display == "NG (Природный газ) — NG-9.26"
 
+    def test_returns_contract_as_short_name(self):
+        client = _mock_client()
+        futures = [_make_future("NGU6", "NG-9.26 Природный газ", 30)]
+        client.instruments.futures.return_value = _make_futures_response(futures)
+        result = fetch_active_futures(client)
+        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
+
     def test_display_rts_format(self):
         client = _mock_client()
         futures = [_make_future("RIU6", "RTS-9.26 Индекс РТС", 30)]
@@ -177,7 +183,7 @@ class TestFetchActiveFutures:
         ]
         client.instruments.futures.return_value = _make_futures_response(futures)
         result = fetch_active_futures(client)
-        displays = [d for d, _, _ in result]
+        displays = [d for d, *_ in result]
         assert displays == [
             "RTS (Индекс РТС) — RTS-9.26",
             "RTS (Индекс РТС) — RTS-12.26",
@@ -298,18 +304,18 @@ class TestSelectInstruments:
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
-        ("NG (Природный газ) — NG-9.26", "NGU6", "future"),
+        ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
     ])
     def test_futures_only(self, mock_fetch, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        assert result == [("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")]
 
     @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
     @patch("builtins.input", side_effect=["1", "1,2", "", "да", "2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
-        ("NG (Природный газ) — NG-9.26", "NGU6", "future"),
+        ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
     ])
     def test_stocks_then_futures(self, mock_fetch, mock_input, mock_find):
         ctx = _mock_client()
@@ -332,7 +338,7 @@ class TestSelectInstruments:
     def test_client_used_as_context_manager(self, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
-            result = select_instruments()
+            select_instruments()
         ctx.__enter__.assert_called_once()
         ctx.__exit__.assert_called_once()
 

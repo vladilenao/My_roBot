@@ -1,14 +1,22 @@
 import pandas as pd
 from datetime import datetime, timedelta
-from t_tech.invest import CandleInterval, Client
+from t_tech.invest import Client
 from t_tech.invest.utils import now
-from src.config import TIMEFRAMES, TINKOFF_TOKEN
+from src.config import TIMEFRAMES
 from src.api.instruments import find_working_instrument
 from src.api.retry import api_call_with_retry
 from src.data.timeutil import to_aware_utc
 
 
-def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None):
+def load_candles(
+    ticker,
+    instrument_type,
+    timeframe,
+    start_date=None,
+    end_date=None,
+    token=None,
+    instrument_id=None,
+):
 
 
     """
@@ -38,7 +46,8 @@ def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=N
         raise ValueError("Дата начала должна быть меньше даты окончания")
 
     with Client(token) as client:
-        instrument_id = find_working_instrument(client, ticker, instrument_type)
+        if instrument_id is None:
+            instrument_id = find_working_instrument(client, ticker, instrument_type)
 
         for candle in api_call_with_retry(
             client.get_all_candles,

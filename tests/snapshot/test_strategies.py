@@ -15,7 +15,7 @@ def _discover_cases():
     if not helper.DATA_DIR.exists():
         return []
     cases = set()
-    for expected_path in helper.DATA_DIR.glob(f"*/*_expected_signals.csv"):
+    for expected_path in helper.DATA_DIR.glob("*/*_expected_signals.csv"):
         case = expected_path.parent.name
         strategy_name = expected_path.name[: -len("_expected_signals.csv")]
         cases.add((case, strategy_name))
