@@ -1,4 +1,3 @@
-import pandas as pd
 import pytest
 from typing import get_args
 

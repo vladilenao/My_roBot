@@ -95,18 +95,25 @@ class CandleScheduler:
         bar_ready: Callable[[], bool],
         poll_secs: float = 1.0,
         timeout_secs: float = 65.0,
+        wait_boundary: bool = True,
     ) -> None:
         """Блокирующе ждёт до границы закрытия свечи и появления свежего закрытого бара.
 
-        После наступления границы повторно вызывает ``bar_ready()`` с паузами
+        При ``wait_boundary=True`` сначала ожидает наступления календарной границы
+        закрытия текущей свечи. Затем повторно вызывает ``bar_ready()`` с паузами
         ``poll_secs``, пока она не вернёт ``True``. Останавливается по истечении
         ``timeout_secs`` (измеряется через ``time.monotonic``), предотвращая
         вечную блокировку при недоступности свежего бара.
+
+        При ``wait_boundary=False`` ожидание границы пропускается: сразу начинается
+        ограниченный опрос появившегося закрытого бара (используется на первом тике
+        при запуске, когда граница уже пройдена или ещё не наступила).
         """
-        target = self.next_candle_close()
-        delay = (target - self.now()).total_seconds()
-        if delay > 0:
-            self._sleep(delay)
+        if wait_boundary:
+            target = self.next_candle_close()
+            delay = (target - self.now()).total_seconds()
+            if delay > 0:
+                self._sleep(delay)
         deadline = time.monotonic() + timeout_secs
         while not bar_ready():
             if time.monotonic() >= deadline:
@@ -116,6 +123,14 @@ class CandleScheduler:
     def fallback_secs(self) -> float:
         """Пауза при внешнем сбое — не ждать до свечи, но и не долбить API."""
         return self._fallback
+
+    def bar_close(self, bar_start: datetime) -> datetime:
+        """Момент закрытия бара, начавшегося в ``bar_start`` (начало + длительность периода).
+
+        Используется для отображения времени бара по моменту закрытия свечи.
+        Поддерживает переменные периоды (неделя и месяц).
+        """
+        return bar_start + self._period(bar_start)
 
     def _sleep(self, secs: float) -> None:
         """Приостанавливает поток. Выделено для подстановки в тестах."""

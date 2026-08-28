@@ -39,11 +39,18 @@ class TestAbstractNotifier:
 
 class TestNotifyDecision:
     def test_formats_and_delivers_decision(self):
-        notifier = RecordingNotifier()
+        notifier = RecordingNotifier(formatter=DecisionFormatter(timeframe="1h"))
 
         notifier.notify_decision(Decision(SignalType.BUY, 3.14159), "NG")
 
-        assert notifier.messages == ["● NG ➜ 🟢 ПОКУПКА (BUY) — Цена: 3.142"]
+        assert notifier.messages == ["● NG (1h) ➜ 🟢 ПОКУПКА (BUY) — Цена: 3.142"]
+
+    def test_default_formatter_omits_timeframe(self):
+        notifier = RecordingNotifier()
+
+        notifier.notify_decision(Decision(SignalType.HOLD, 10.0), "SBER")
+
+        assert notifier.messages == ["● SBER ➜ ⏳ Нет сигнала."]
 
     def test_custom_formatter_is_used(self):
         formatter = MagicMock()

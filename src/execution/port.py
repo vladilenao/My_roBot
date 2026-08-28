@@ -23,5 +23,5 @@ class NotifyOnlyExecutionPort(ExecutionPort):
         self._notifier = notifier
 
     def execute(self, decision, instrument) -> None:
-        label = getattr(instrument, "label", "")
+        label = getattr(instrument, "short_name", None) or getattr(instrument, "label", "")
         self._notifier.notify_decision(decision, label)

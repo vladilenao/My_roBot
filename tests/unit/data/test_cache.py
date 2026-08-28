@@ -23,15 +23,19 @@ class FakeLoader:
     def __init__(self, data):
         self.data = data
         self.calls = []
+        self.instrument_ids = []
 
-    def __call__(self, ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None):
+    def __call__(
+        self, ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None, instrument_id=None
+    ):
         self.calls.append(start_date)
+        self.instrument_ids.append(instrument_id)
         rows = [
             b
             for b in self.data[ticker]
             if start_date is None or b > pd.Timestamp(start_date)
         ]
-        return _bars_from_rows(rows), "uid-1"
+        return _bars_from_rows(rows), instrument_id or "uid-1"
 
 
 def _bars_from_rows(rows):
@@ -207,6 +211,30 @@ class TestMarketDataCache:
 
         assert len(loader.calls) == calls_before
         assert cache.has_fresh_closed_bar() is False
+
+    def test_reload_reuses_cached_instrument_id(self):
+        clock = [datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc)]
+        loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                                      pd.Timestamp("2024-01-01 07:00"),
+                                      pd.Timestamp("2024-01-01 08:00"),
+                                      pd.Timestamp("2024-01-01 09:00")]})
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst)
+
+        assert loader.instrument_ids == [None]  # первый вызов — UID ещё не известен
+
+        # появился новый закрытый бар 10:00, часы перешли — инкрементальная дозагрузка
+        loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
+                               pd.Timestamp("2024-01-01 07:00"),
+                               pd.Timestamp("2024-01-01 08:00"),
+                               pd.Timestamp("2024-01-01 09:00"),
+                               pd.Timestamp("2024-01-01 10:00")]
+        clock[0] = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+        cache.refresh_if_new_candle()
+
+        assert loader.instrument_ids == [None, "uid-1"]  # повторная загрузка переиспользует UID
 
 
 

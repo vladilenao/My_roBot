@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -8,13 +8,15 @@ import pytest
 from src.data.loader import load_candles
 
 
-def make_candle(hours, o=1, h=2, l=0, c=3, volume=10, nano=500000000):
-    price = lambda units: SimpleNamespace(units=units, nano=nano)
+def make_candle(hours, o=1, h=2, low=0, c=3, volume=10, nano=500000000):
+    def price(units):
+        return SimpleNamespace(units=units, nano=nano)
+
     return SimpleNamespace(
         time=datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(hours=hours),
         open=price(o),
         high=price(h),
-        low=price(l),
+        low=price(low),
         close=price(c),
         volume=volume,
     )
@@ -99,6 +101,13 @@ class TestRequestContract:
 
         api_mocks.find.assert_called_once()
         assert api_mocks.retry.call_args.kwargs["instrument_id"] == "uid-123"
+
+    def test_existing_instrument_id_skips_resolution(self, api_mocks):
+        df, uid = load_candles("NGU6", "future", "1h", instrument_id="uid-cached")
+
+        api_mocks.find.assert_not_called()
+        assert api_mocks.retry.call_args.kwargs["instrument_id"] == "uid-cached"
+        assert uid == "uid-cached"
 
     def test_timeframe_mapped_to_interval(self, api_mocks):
         from src.config import TIMEFRAMES
