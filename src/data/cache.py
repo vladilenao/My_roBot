@@ -30,19 +30,24 @@ class MarketDataCache:
         self._instruments: dict[tuple, object] = {}
         self._last_loaded: dict[tuple, pd.Timestamp] = {}
         self._observed: dict[tuple, pd.Timestamp] = {}
+        self._uids: dict[tuple, str] = {}
 
     def _key(self, instrument) -> tuple:
         return (instrument.ticker, instrument.instrument_type)
 
     def _load(self, instrument, start_date=None) -> pd.DataFrame:
-        df, _ = self._loader(
+        key = self._key(instrument)
+        df, instrument_id = self._loader(
             ticker=instrument.ticker,
             instrument_type=instrument.instrument_type,
             timeframe=self._timeline.timeframe,
             start_date=start_date,
             end_date=None,
             token=self._token,
+            instrument_id=self._uids.get(key),
         )
+        if instrument_id is not None:
+            self._uids[key] = instrument_id
         if df is not None and not df.empty and "datetime" in df.columns:
             df = df.sort_values("datetime").reset_index(drop=True)
         return df

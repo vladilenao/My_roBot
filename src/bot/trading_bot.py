@@ -62,20 +62,42 @@ class TradingBot:
 
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча» ──
     def _loop(self) -> None:
+        first = True
         while True:
             try:
-                self._timeline.wait_until_bar_published(
-                    self._bar_is_ready,
-                    poll_secs=self._tick_poll_secs,
-                    timeout_secs=self._tick_timeout_secs,
-                )
+                if first:
+                    self._bootstrap()
+                else:
+                    self._timeline.wait_until_bar_published(
+                        self._bar_is_ready,
+                        poll_secs=self._tick_poll_secs,
+                        timeout_secs=self._tick_timeout_secs,
+                    )
                 self._tick()
+                first = False
             except KeyboardInterrupt:
                 log.info("Бот остановлен.")
                 return
             except Exception as exc:
                 self._report_error(exc)
                 time.sleep(self._timeline.fallback_secs())
+
+    # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
+    def _bootstrap(self) -> None:
+        """Первичное наполнение кадров и ограниченное ожидание свежего закрытого бара.
+
+        Не дожидается ближайшей календарной границы: сразу анализирует последнюю
+        уже закрытую свечу. Если свежий закрытый бар ещё не опубликован (запуск
+        на границе), ждёт его появления с тем же таймаутом, что и штатный тик.
+        """
+        for instrument in self._instruments:
+            self._data_cache.frame_for(instrument)
+        self._timeline.wait_until_bar_published(
+            self._bar_is_ready,
+            poll_secs=self._tick_poll_secs,
+            timeout_secs=self._tick_timeout_secs,
+            wait_boundary=False,
+        )
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self) -> None:
@@ -88,6 +110,8 @@ class TradingBot:
 
     # ── ПУНКТ 2.1: готов ли свежий закрытый бар (для ожидания до появления) ──
     def _bar_is_ready(self) -> bool:
+        if self._data_cache.has_fresh_closed_bar():
+            return True
         self._data_cache.refresh_if_new_candle(force=True)
         return self._data_cache.has_fresh_closed_bar()
 
@@ -110,7 +134,7 @@ class TradingBot:
                 strategy = self._strategy_factory(name, config=self._strategy_map[name])
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=self._timeline.timeframe)
-                decision = replace(decision, bar_time=frame["datetime"].iloc[-1])
+                decision = replace(decision, bar_time=self._timeline.bar_close(frame["datetime"].iloc[-1]))
                 self._emit(instrument, name, decision)
             except Exception:
                 log.exception(

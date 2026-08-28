@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+from datetime import timedelta
 
 import pandas as pd
 import pytest
@@ -37,12 +38,19 @@ class FakeTimeline:
         self.fallback = fallback
         self.timeframe = timeframe
         self.wait_calls = 0
+        self.wait_boundaries = []
 
-    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
+    def wait_until_bar_published(
+        self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True
+    ):
         self.wait_calls += 1
+        self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
         bar_ready()
+
+    def bar_close(self, bar_start):
+        return bar_start + timedelta(hours=1)
 
     def fallback_secs(self):
         return self.fallback
@@ -53,9 +61,11 @@ class FakeCache:
         self.frames = frames or {}
         self.refresh_error = refresh_error
         self.refresh_calls = 0
+        self.refresh_forces = []
 
     def refresh_if_new_candle(self, force=False):
         self.refresh_calls += 1
+        self.refresh_forces.append(force)
         if self.refresh_error:
             raise self.refresh_error
 
@@ -80,13 +90,20 @@ class PollingTimeline:
         self.fallback = fallback
         self.timeframe = timeframe
         self.wait_calls = 0
+        self.wait_boundaries = []
 
-    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
+    def wait_until_bar_published(
+        self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True
+    ):
         self.wait_calls += 1
+        self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
         while not bar_ready():
             pass
+
+    def bar_close(self, bar_start):
+        return bar_start + timedelta(hours=1)
 
     def fallback_secs(self):
         return self.fallback
@@ -98,12 +115,19 @@ class TimeoutTimeline:
         self.fallback = fallback
         self.timeframe = timeframe
         self.wait_calls = 0
+        self.wait_boundaries = []
 
-    def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0):
+    def wait_until_bar_published(
+        self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True
+    ):
         self.wait_calls += 1
+        self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
         bar_ready()
+
+    def bar_close(self, bar_start):
+        return bar_start + timedelta(hours=1)
 
     def fallback_secs(self):
         return self.fallback
@@ -403,3 +427,117 @@ class TestTradingBot:
         bot.run()
 
         assert len(execution.decisions) == 1
+
+    def test_bootstrap_first_tick_runs_immediately_mid_period(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        timeline = FakeTimeline(ticks=1)
+        bot = _make_bot(
+            timeline=timeline,
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.decisions) == 1
+        assert timeline.wait_boundaries == [False, True]
+
+    def test_bootstrap_mid_period_does_not_force_refresh(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        cache = FakeCache(frames={"SBER": _df()})
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=cache,
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.decisions) == 1
+        assert not any(cache.refresh_forces)
+
+    def test_decision_bar_time_is_candle_close(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        decision = execution.decisions[0][0]
+        assert decision.bar_time == pd.Timestamp("2024-01-01 10:00")
+
+    def test_bootstrap_waits_for_fresh_bar_on_boundary_launch(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        cache = LateBarCache(publish_after=3, frames={"SBER": _df()})
+        timeline = PollingTimeline(ticks=1)
+        bot = _make_bot(
+            timeline=timeline,
+            cache=cache,
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert cache.checks >= 3
+        assert len(execution.decisions) == 1
+        assert timeline.wait_boundaries == [False, True]
+
+    def test_bootstrap_retries_after_error_then_aligns_to_boundary(self):
+        class FailOnceRefresh:
+            def __init__(self):
+                self.calls = 0
+                self.ready = False
+
+            def refresh_if_new_candle(self, force=False):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("boom")
+                self.ready = True
+
+            def has_fresh_closed_bar(self, now=None):
+                return self.ready
+
+            def frame_for(self, instrument):
+                return _df()
+
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        timeline = FakeTimeline(ticks=3)
+        bot = _make_bot(
+            timeline=timeline,
+            cache=FailOnceRefresh(),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.decisions) == 2
+        assert any("Ошибка робота" in m for m in bot._notifier.messages)
+        assert timeline.wait_boundaries == [False, False, True, True]

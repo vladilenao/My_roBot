@@ -120,3 +120,67 @@ class TestCandleScheduler:
             sched.wait_until_bar_published(bar_ready, poll_secs=1.0, timeout_secs=5.0)
 
         assert calls["n"] >= 1
+
+    def test_wait_bar_published_skips_boundary_when_wait_boundary_false(self):
+        # середина периода: при wait_boundary=False сон до границы не выполняется
+        clock = _utc(2024, 1, 1, 10, 37)
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock)
+
+        def bar_ready():
+            return True
+
+        with patch("src.scheduler.timing.time.monotonic", return_value=0.0), patch(
+            "src.scheduler.timing.time.sleep"
+        ) as mock_sleep:
+            sched.wait_until_bar_published(
+                bar_ready, poll_secs=1.0, timeout_secs=5.0, wait_boundary=False
+            )
+
+        mock_sleep.assert_not_called()
+
+    def test_wait_boundary_false_polls_with_timeout(self):
+        clock = _utc(2024, 1, 1, 10, 37)
+        sched = CandleScheduler(timeframe="1h", clock=lambda: clock)
+        mono = {"t": 100.0}
+
+        def fake_monotonic():
+            mono["t"] += 1.0
+            return mono["t"]
+
+        calls = {"n": 0}
+
+        def bar_ready():
+            calls["n"] += 1
+            return False
+
+        with patch(
+            "src.scheduler.timing.time.monotonic", side_effect=fake_monotonic
+        ), patch("src.scheduler.timing.time.sleep") as mock_sleep:
+            sched.wait_until_bar_published(
+                bar_ready, poll_secs=1.0, timeout_secs=5.0, wait_boundary=False
+            )
+
+        assert calls["n"] >= 2
+        mock_sleep.assert_called()
+
+    def test_bar_close_hour(self):
+        sched = CandleScheduler(timeframe="1h")
+        assert sched.bar_close(_utc(2024, 1, 1, 8, 0)) == _utc(2024, 1, 1, 9, 0)
+
+    def test_bar_close_week(self):
+        # понедельник 2024-01-01 -> закрытие через 7 дней
+        sched = CandleScheduler(timeframe="1w")
+        assert sched.bar_close(_utc(2024, 1, 1)) == _utc(2024, 1, 8, 0, 0)
+
+    def test_bar_close_month(self):
+        sched = CandleScheduler(timeframe="1M")
+        assert sched.bar_close(_utc(2024, 1, 1)) == _utc(2024, 2, 1, 0, 0)
+
+    def test_bar_close_month_leap_year_february(self):
+        # февраль високосного 2024 года закрывается 1 марта
+        sched = CandleScheduler(timeframe="1M")
+        assert sched.bar_close(_utc(2024, 2, 1)) == _utc(2024, 3, 1, 0, 0)
+
+    def test_bar_close_month_december(self):
+        sched = CandleScheduler(timeframe="1M")
+        assert sched.bar_close(_utc(2024, 12, 1)) == _utc(2025, 1, 1, 0, 0)
