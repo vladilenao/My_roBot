@@ -5,6 +5,7 @@ from t_tech.invest.utils import now
 from src.config import TIMEFRAMES, TINKOFF_TOKEN
 from src.api.instruments import find_working_instrument
 from src.api.retry import api_call_with_retry
+from src.data.timeutil import to_aware_utc
 
 
 def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None):
@@ -25,11 +26,13 @@ def load_candles(ticker, instrument_type, timeframe, start_date=None, end_date=N
         start_date = now() - timedelta(days=30)
     elif isinstance(start_date, str):
         start_date = datetime.strptime(start_date, '%Y-%m-%d')
+    start_date = to_aware_utc(start_date)
 
     if end_date is None:
         end_date = now()
     elif isinstance(end_date, str):
         end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    end_date = to_aware_utc(end_date)
 
     if start_date >= end_date:
         raise ValueError("Дата начала должна быть меньше даты окончания")
