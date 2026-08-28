@@ -43,7 +43,7 @@ class TestNotifyDecision:
 
         notifier.notify_decision(Decision(SignalType.BUY, 3.14159), "NG")
 
-        assert notifier.messages == ["[NG] 🚀 ПОКУПАТЬ! Цена: 3.142"]
+        assert notifier.messages == ["● NG ➜ 🟢 ПОКУПКА (BUY) — Цена: 3.142"]
 
     def test_custom_formatter_is_used(self):
         formatter = MagicMock()
