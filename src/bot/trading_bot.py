@@ -33,6 +33,9 @@ class TradingBot:
         heartbeat_every_ticks: int | None = 60,
         tick_poll_secs: float = 1.0,
         tick_timeout_secs: float = 65.0,
+        context_cache=None,
+        signal_filter=None,
+        risk_manager=None,
     ) -> None:
         self._notifier = notifier
         self._strategy_map = strategy_map
@@ -45,6 +48,9 @@ class TradingBot:
         self._heartbeat_every = heartbeat_every_ticks or 0
         self._tick_poll_secs = tick_poll_secs
         self._tick_timeout_secs = tick_timeout_secs
+        self._context_cache = context_cache
+        self._signal_filter = signal_filter
+        self._risk_manager = risk_manager
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
@@ -104,6 +110,8 @@ class TradingBot:
         for instrument in self._instruments:
             self._data_cache.frame_for(instrument)
         self._data_cache.refresh_if_new_candle()
+        if not self._data_cache.has_fresh_closed_bar():
+            return
         for instrument in self._instruments:
             self._process(instrument)
         self._maybe_heartbeat()
@@ -125,20 +133,32 @@ class TradingBot:
         if frame.empty:
             log.info("Нет готовых свечей для %s — пропускаем.", instrument.label)
             return
-        self._analyze(instrument, strategies, frame)
+        context = self._context_cache.get_context(instrument) if self._context_cache else None
+        self._analyze(instrument, strategies, frame, context)
 
     # ── ПУНКТ 4.2: анализ по каждой стратегии ──
-    def _analyze(self, instrument: Instrument, strategies: list[str], frame) -> None:
+    def _analyze(self, instrument: Instrument, strategies: list[str], frame, context=None) -> None:
         for name in strategies:
             try:
-                strategy = self._strategy_factory(name, config=self._strategy_map[name])
+                strategy = self._strategy_cache.get(name)
+                if strategy is None:
+                    log.warning(
+                        "Стратегия '%s' не построена для %s — пропускаем.",
+                        name, instrument.label,
+                    )
+                    continue
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=self._timeline.timeframe)
                 decision = replace(decision, bar_time=self._timeline.bar_close(frame["datetime"].iloc[-1]))
+                if context is not None:
+                    if self._signal_filter is not None:
+                        decision = self._signal_filter.apply(decision, context)
+                    if self._risk_manager is not None:
+                        decision = self._risk_manager.apply(decision, context)
                 self._emit(instrument, name, decision)
-            except Exception:
-                log.exception(
-                    "Ошибка стратегии '%s' на %s — идём дальше.", name, instrument.label
+            except (ValueError, TypeError, KeyError) as exc:
+                log.warning(
+                    "Проблема со стратегией '%s' на %s: %s", name, instrument.label, exc
                 )
 
     # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
@@ -151,10 +171,24 @@ class TradingBot:
             return self._future_strategies.get(instrument.ticker[:2].upper(), [])
         return self._share_strategies.get(instrument.ticker, [])
 
-    # ── валидация привязок до цикла (fail-fast) ──
+    # ── валидация привязок и построение стратегий до цикла (fail-fast) ──
     def _validate(self) -> None:
         validate_assignments(self._share_strategies, source="SHARE_STRATEGIES")
         validate_assignments(self._future_strategies, source="FUTURE_STRATEGIES")
+        # форсируем построение стратегий до цикла (fail-fast на неизвестные имена)
+        _ = self._strategy_cache
+
+    # ── ленивое построение стратегий (один раз, доступно с первого тика) ──
+    @property
+    def _strategy_cache(self) -> dict[str, object]:
+        cache = getattr(self, "_strategy_cache_internal", None)
+        if cache is None:
+            cache = {
+                name: self._strategy_factory(name, config=config)
+                for name, config in self._strategy_map.items()
+            }
+            self._strategy_cache_internal = cache
+        return cache
 
     # ── диагностика ──
     def _maybe_heartbeat(self) -> None:

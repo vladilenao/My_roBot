@@ -157,7 +157,7 @@ class RecordingNotifier:
         self.messages.append(message)
 
 
-def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None):
+def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None):
     return TradingBot(
         instruments=[],  # replace below
         notifier=notifier,
@@ -169,6 +169,9 @@ def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future
         share_strategies=share or {},
         future_strategies=future or {},
         heartbeat_every_ticks=heartbeat,
+        context_cache=context_cache,
+        signal_filter=signal_filter,
+        risk_manager=risk_manager,
     )
 
 
@@ -289,7 +292,7 @@ class TestTradingBot:
 
     def test_strategy_failure_does_not_block_next(self):
         failing = _make_strategy()
-        failing.compute.side_effect = Exception("boom")
+        failing.compute.side_effect = ValueError("boom")
         working = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
         execution = RecordingExecution()
         factory = MagicMock(side_effect=[failing, working])
@@ -410,7 +413,7 @@ class TestTradingBot:
         assert cache.checks >= 3
         assert len(execution.decisions) == 1
 
-    def test_processes_with_available_data_on_timeout(self):
+    def test_timeout_without_fresh_bar_skips_processing(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         execution = RecordingExecution()
         cache = NeverPublishCache(frames={"SBER": _df()})
@@ -426,7 +429,8 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 1
+        assert len(execution.decisions) == 0
+        assert strategy.compute.called is False
 
     def test_bootstrap_first_tick_runs_immediately_mid_period(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
@@ -541,3 +545,127 @@ class TestTradingBot:
         assert len(execution.decisions) == 2
         assert any("Ошибка робота" in m for m in bot._notifier.messages)
         assert timeline.wait_boundaries == [False, False, True, True]
+
+    def test_empty_tick_skips_process_and_heartbeat(self):
+        class FlagCache(FakeCache):
+            def __init__(self, frames=None):
+                super().__init__(frames=frames)
+                self.flag = False
+
+            def has_fresh_closed_bar(self, now=None):
+                return self.flag
+
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        cache = FlagCache(frames={"SBER": _df()})
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=cache,
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+            heartbeat=1,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        cache.flag = False
+        bot._tick()
+        assert len(execution.decisions) == 0
+        assert not any("Сердцебиение" in m for m in bot._notifier.messages)
+
+        cache.flag = True
+        bot._tick()
+        assert len(execution.decisions) == 1
+
+    def test_market_context_computed_once_per_instrument(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        context_cache = MagicMock()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch", "flat_triangle"]},
+            factory=lambda name, config: strategy,
+            context_cache=context_cache,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert context_cache.get_context.call_count == 1
+
+    def test_strategies_built_once_not_per_tick(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        factory = MagicMock(return_value=strategy)
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=3),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+            factory=factory,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        # фабрика вызывается только при построении кэша (по разу на ключ), не на каждый тик
+        assert factory.call_count == len(bot._strategy_map)
+        assert len(execution.decisions) == 3
+
+    def test_fatal_runtime_error_in_strategy_reports_globally(self):
+        failing = _make_strategy()
+        failing.compute.side_effect = RuntimeError("boom")
+        working = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
+        execution = RecordingExecution()
+        factory = MagicMock(side_effect=[failing, working])
+        notifier = RecordingNotifier()
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=FakeCache(frames={"MUZ6": _df()}),
+            execution=execution,
+            notifier=notifier,
+            strategy=failing,
+            future={"MU": ["macd_rsi_stoch", "flat_triangle"]},
+            factory=factory,
+        )
+        bot._instruments = [_inst("MU (base) — MUZ6", "MUZ6", "future")]
+
+        bot.run()
+
+        # фатальная ошибка не скрывается локально — всплывает и обрабатывается как ошибка робота
+        assert any("Ошибка робота" in m for m in notifier.messages)
+        # _analyze прерван на первой стратегии — вторая в том же тике не выполнилась
+        assert working.compute.called is False
+
+    def test_risk_manager_fatal_error_reports_globally(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        risk = MagicMock()
+        risk.apply.side_effect = RuntimeError("risk boom")
+        notifier = RecordingNotifier()
+        context_cache = MagicMock()
+        context_cache.get_context.return_value = object()
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=notifier,
+            strategy=strategy,
+            share={"SBER": ["macd_rsi_stoch"]},
+            context_cache=context_cache,
+            risk_manager=risk,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        risk.apply.assert_called_once()
+        assert any("Ошибка робота" in m for m in notifier.messages)
+        assert len(execution.decisions) == 0
