@@ -1,3 +1,10 @@
+from src.analysis import (
+    MarketContextCache,
+    RiskManager,
+    SignalFilter,
+    SRLevelsCalculator,
+    TrendAnalyzer,
+)
 from src.bot import TradingBot
 from src.config import (
     FUTURE_STRATEGIES,
@@ -23,14 +30,15 @@ def main():
     instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
     notifier = get_notifier()
     timeline = CandleScheduler(timeframe=TIMEFRAME, sleep_secs=SLEEP_SECONDS)
+    data_cache = MarketDataCache(
+        loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
+    )
 
     TradingBot(
         instruments=instruments,
         notifier=notifier,
         strategy_map=_strategy_map(),
-        data_cache=MarketDataCache(
-            loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
-        ),
+        data_cache=data_cache,
         timeline=timeline,
         execution=NotifyOnlyExecutionPort(notifier),
         share_strategies=SHARE_STRATEGIES,
@@ -38,6 +46,13 @@ def main():
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
+        context_cache=MarketContextCache(
+            data_cache=data_cache,
+            trend_analyzer=TrendAnalyzer(),
+            sr_calculator=SRLevelsCalculator(),
+        ),
+        signal_filter=SignalFilter(),
+        risk_manager=RiskManager(),
     ).run()
 
 

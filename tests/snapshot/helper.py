@@ -6,6 +6,8 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from src.strategies.strategy import StrategyConfig
+from src.analysis.sr_levels import SRLevelsCalculator
+from src.analysis.trend import TrendAnalyzer
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RTOL = 1e-9
@@ -167,3 +169,84 @@ def write_expected(case, strategy_name, events):
     events[cols["event"]].to_csv(
         DATA_DIR / case / expected_filename(strategy_name), index=False
     )
+
+
+# ── analysis expected_context ──────────────────────────────────
+
+def _trend_expected_context(df: pd.DataFrame) -> pd.DataFrame:
+    result = TrendAnalyzer().analyze(df)
+    return pd.DataFrame(
+        {
+            "datetime": [pd.Timestamp(df["datetime"].iloc[-1])],
+            "trend_direction": [result.direction.value],
+            "trend_strength": [result.strength],
+        }
+    )
+
+
+def _sr_levels_expected_context(df: pd.DataFrame) -> pd.DataFrame:
+    analyzer = SRLevelsCalculator()
+    current_price = float(df["close"].iloc[-1])
+    levels = analyzer.compute(df, current_price)
+    return pd.DataFrame(
+        [
+            {
+                "price": lev.price,
+                "type": lev.sr_type.value,
+                "strength": lev.strength,
+                "label": lev.label,
+            }
+            for lev in levels
+        ]
+    )
+
+
+def analysis_expected_events(mode: str, df: pd.DataFrame) -> pd.DataFrame:
+    if mode == "trend":
+        return _trend_expected_context(df)
+    if mode == "sr_levels":
+        return _sr_levels_expected_context(df)
+    raise ValueError(f"Неизвестный режим анализа: {mode}")
+
+
+def analysis_expected_filename(mode: str) -> str:
+    return f"{mode}_expected_context.csv"
+
+
+def load_analysis_expected(case, mode) -> pd.DataFrame:
+    expected = pd.read_csv(DATA_DIR / case / analysis_expected_filename(mode))
+    if "datetime" in expected.columns:
+        expected["datetime"] = pd.to_datetime(expected["datetime"]).dt.as_unit("ns")
+    return expected
+
+
+def write_analysis_expected(case, mode, actual) -> None:
+    actual.to_csv(DATA_DIR / case / analysis_expected_filename(mode), index=False)
+
+
+def compare_analysis(actual, expected) -> None:
+    assert_frame_equal(actual, expected, check_exact=False, rtol=RTOL)
+
+
+def first_analysis_divergence(actual, expected):
+    float_cols = [c for c in actual.columns if c != "datetime" and c not in ("type", "label", "trend_direction")]
+    text_cols = [c for c in actual.columns if c in ("type", "label", "trend_direction")]
+    n = max(len(actual), len(expected))
+
+    def close(x, y):
+        return math.isclose(float(x), float(y), rel_tol=RTOL)
+
+    for i in range(n):
+        if i >= len(actual):
+            return i, None, expected.iloc[i].to_dict()
+        if i >= len(expected):
+            return i, actual.iloc[i].to_dict(), None
+        a, e = actual.iloc[i], expected.iloc[i]
+        differs = any(a[c] != e[c] for c in text_cols)
+        if "datetime" in a and "datetime" in e and a["datetime"] != e["datetime"]:
+            differs = True
+        if not all(close(a[c], e[c]) for c in float_cols):
+            differs = True
+        if differs:
+            return i, a.to_dict(), e.to_dict()
+    return None, None, None

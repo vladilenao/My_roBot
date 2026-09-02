@@ -19,6 +19,14 @@ class Decision:
     strategy_name: str | None = None
     indicator_values: dict[str, float] | None = None
     bar_time: pd.Timestamp | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    sl_distance_pct: float | None = None
+    tp_distance_pct: float | None = None
+    sl_level_label: str | None = None
+    tp_level_label: str | None = None
+    trend_direction: str | None = None
+    trend_confidence: float | None = None
 
 
 class Strategy(Protocol):
