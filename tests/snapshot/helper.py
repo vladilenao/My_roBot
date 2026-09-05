@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from src.strategies.strategy import StrategyConfig
+from src.strategies.base_strategy import StrategyConfig
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
 

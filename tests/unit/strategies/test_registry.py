@@ -11,7 +11,7 @@ from src.strategies.registry import (
     validate_assignments,
 )
 from src.strategies.names import StrategyName
-from src.strategies.strategy import StrategyConfig
+from src.strategies.base_strategy import StrategyConfig
 
 
 @pytest.fixture(autouse=True)
@@ -80,9 +80,9 @@ def test_registry_starts_empty_in_isolation(monkeypatch):
 
 def test_literal_names_match_registry():
     from src.strategies.registry import _registry as live
-    from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy
-    from src.strategies.flat_triangle import FlatTriangleStrategy
-    from src.strategies.harmonic_abcd import HarmonicAbcdStrategy
+    from src.strategies.macd_rsi_stoch_strategy import MacdRsiStochStrategy
+    from src.strategies.flat_triangle_strategy import FlatTriangleStrategy
+    from src.strategies.harmonic_abcd_strategy import HarmonicAbcdStrategy
 
     register(MacdRsiStochStrategy)
     register(FlatTriangleStrategy)
@@ -206,7 +206,7 @@ def test_import_names_module_is_light():
     code = (
         "import sys;"
         "import src.strategies.names;"
-        "assert not any(m.startswith('src.strategies.macd_rsi_stoch') for m in sys.modules);"
+        "assert not any(m.startswith('src.strategies.macd_rsi_stoch_strategy') for m in sys.modules);"
         "assert not any('pandas_ta' in m for m in sys.modules)"
     )
     result = subprocess.run(

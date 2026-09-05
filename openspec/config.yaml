@@ -5,7 +5,7 @@ context: |
   Организация дерева тестов (обязательное):
   - tests/unit/ — быстрые изолированные unit-тесты (без файлов данных); tests/snapshot/ — тяжёлые data-driven snapshot-тесты; файлы тестов в корне tests/ запрещены (кроме conftest.py)
   - Snapshot-стратегии покрывает единый параметризованный раннер tests/snapshot/test_strategies.py; новые стратегии и кейсы подхватываются автоматически, отдельные файлы тестов на стратегию не создаются
-  - Стратегия = собственный файл `src/strategies/<имя>.py`, использующий общие `src/strategies/indicators/` (подпапки индикаторов) и `src/strategies/signals.py`; регистрируется в реестре `src.strategies` через `@register`
+  - Стратегия = собственный файл `src/strategies/<имя>_strategy.py`, использующий общие `src/strategies/indicators/` (подпапки индикаторов) и `src/strategies/signals.py`; регистрируется в реестре `src.strategies` через `@register`. Суффикс `_strategy` закреплён за файлами самих стратегий: инфраструктурные модули пакета (конфигурация и Builder — `base_strategy.py`, реестр — `registry.py`, агрегация — `signals.py`, перечень имён — `names.py`, контракты — `contracts.py`) НЕ используют его
   - Кейс = папка tests/snapshot/data/<ИНСТРУМЕНТ>_<ТАЙМФРЕЙМ>/ с ровно одним candles.csv
   - Эталон = tests/snapshot/data/<кейс>/<стратегия>_expected_signals.csv (без префиксов, точное имя), генерируется методом expected_events() стратегии скриптом tools/download_snapshot_data.py
   - Свечи кейса общие для всех стратегий; уровень стратегии в путях данных запрещён

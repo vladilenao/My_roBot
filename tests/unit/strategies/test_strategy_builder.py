@@ -3,7 +3,7 @@ import pytest
 from src.strategies.indicators.macd import MacdIndicator
 from src.strategies.indicators.rsi import RsiIndicator
 from src.strategies.indicators.stochastic import StochasticIndicator
-from src.strategies.strategy import StrategyBuilder, StrategyConfig
+from src.strategies.base_strategy import StrategyBuilder, StrategyConfig
 
 
 class TestMacdIndicator:

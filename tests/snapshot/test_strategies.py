@@ -1,9 +1,9 @@
 import pytest
 
 from src.strategies import get_strategy
-from src.strategies.macd_rsi_stoch import DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG
-from src.strategies.flat_triangle import DEFAULT_CONFIG as FLAT_TRIANGLE_CONFIG
-from src.strategies.harmonic_abcd import DEFAULT_CONFIG as HARMONIC_ABCD_CONFIG
+from src.strategies.macd_rsi_stoch_strategy import DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG
+from src.strategies.flat_triangle_strategy import DEFAULT_CONFIG as FLAT_TRIANGLE_CONFIG
+from src.strategies.harmonic_abcd_strategy import DEFAULT_CONFIG as HARMONIC_ABCD_CONFIG
 from tests.snapshot import helper
 
 STRATEGY_CONFIGS = {

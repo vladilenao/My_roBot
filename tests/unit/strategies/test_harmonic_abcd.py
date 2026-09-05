@@ -3,7 +3,7 @@ import pytest
 
 from src.strategies import get_strategy
 from src.strategies.contracts import SignalType
-from src.strategies.harmonic_abcd import DEFAULT_CONFIG, HarmonicAbcdStrategy
+from src.strategies.harmonic_abcd_strategy import DEFAULT_CONFIG, HarmonicAbcdStrategy
 from src.strategies.registry import strategy_names
 from tests.unit.market_structure.builders import bearish_series, bullish_series
 

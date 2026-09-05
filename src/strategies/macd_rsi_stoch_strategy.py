@@ -8,7 +8,7 @@ from src.strategies.indicators.rsi import RsiIndicator
 from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.registry import register
 from src.strategies.signals import get_last_signals
-from src.strategies.strategy import StrategyConfig
+from src.strategies.base_strategy import StrategyConfig
 
 # ══════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ СТРАТЕГИИ

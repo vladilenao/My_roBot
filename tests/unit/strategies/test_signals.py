@@ -5,7 +5,7 @@ from src.strategies.contracts import Decision, SignalType
 from src.strategies.indicators.macd import MacdIndicator, MacdSignalEnum
 from src.strategies.indicators.rsi import RsiIndicator, RsiSignalEnum
 from src.strategies.indicators.stochastic import StochasticIndicator, StochasticSignalEnum
-from src.strategies.macd_rsi_stoch import MacdRsiStochStrategy, DEFAULT_CONFIG
+from src.strategies.macd_rsi_stoch_strategy import MacdRsiStochStrategy, DEFAULT_CONFIG
 from src.strategies.signals import get_last_signals
 
 

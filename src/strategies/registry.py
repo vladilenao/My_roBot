@@ -5,7 +5,7 @@ import pkgutil
 from typing import TypeVar
 
 from src.strategies.contracts import Strategy
-from src.strategies.strategy import StrategyConfig
+from src.strategies.base_strategy import StrategyConfig
 
 T = TypeVar("T", bound=Strategy)
 
@@ -33,10 +33,9 @@ def _discover_strategies() -> None:
         if modname.startswith("_") or modname in (
             "registry",
             "contracts",
-            "strategy",
+            "base_strategy",
             "signals",
             "names",
-            "base",
         ):
             continue
         importlib.import_module(f"src.strategies.{modname}")
