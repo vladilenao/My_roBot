@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pandas_ta_classic as ta
 
-from src.analysis.models import TrendDirection, TrendResult
+from src.market_context.models import TrendDirection, TrendResult
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 import pandas as pd
 
-from src.analysis.context_cache import MarketContextCache
-from src.analysis.sr_levels import SRLevelsCalculator
-from src.analysis.trend import TrendAnalyzer
+from src.market_context.context_cache import MarketContextCache
+from src.market_context.sr_levels import SRLevelsCalculator
+from src.market_context.trend import TrendAnalyzer
 
 
 class _Inst:

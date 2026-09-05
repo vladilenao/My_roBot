@@ -1,6 +1,6 @@
 
-from src.analysis.filter import SignalFilter
-from src.analysis.models import MarketContext, TrendDirection, TrendResult
+from src.decision import SignalFilter
+from src.market_context.models import MarketContext, TrendDirection, TrendResult
 from src.strategies.contracts import Decision, SignalType
 
 

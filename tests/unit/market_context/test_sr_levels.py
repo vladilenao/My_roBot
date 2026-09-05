@@ -1,7 +1,7 @@
 import pandas as pd
 
-from src.analysis.models import SRLevel, SRType
-from src.analysis.sr_levels import SRLevelsCalculator
+from src.market_context.models import SRLevel, SRType
+from src.market_context.sr_levels import SRLevelsCalculator
 
 
 def _frames(opens, highs, lows, closes):

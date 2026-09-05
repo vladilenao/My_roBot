@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.analysis.models import MarketContext
-from src.analysis.sr_levels import SRLevelsCalculator
-from src.analysis.trend import TrendAnalyzer
+from src.market_context.models import MarketContext
+from src.market_context.sr_levels import SRLevelsCalculator
+from src.market_context.trend import TrendAnalyzer
 
 
 class MarketContextCache:
@@ -53,7 +53,7 @@ class MarketContextCache:
 
     def _empty_context(self, instrument) -> MarketContext:
         df = self._data_cache.frame_for(instrument)
-        from src.analysis.models import TrendDirection, TrendResult
+        from src.market_context.models import TrendDirection, TrendResult
 
         current_price = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
         return MarketContext(

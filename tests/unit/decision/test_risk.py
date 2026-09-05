@@ -1,7 +1,7 @@
 import pytest
 
-from src.analysis.models import MarketContext, SRLevel, SRType, TrendDirection, TrendResult
-from src.analysis.risk import RiskManager
+from src.decision import RiskManager
+from src.market_context.models import MarketContext, SRLevel, SRType, TrendDirection, TrendResult
 from src.strategies.contracts import Decision, SignalType
 
 

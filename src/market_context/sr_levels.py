@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from src.analysis.models import SRLevel, SRType
+from src.market_context.models import SRLevel, SRType
 
 
 @dataclass(frozen=True)

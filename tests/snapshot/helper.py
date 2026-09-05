@@ -6,8 +6,8 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from src.strategies.strategy import StrategyConfig
-from src.analysis.sr_levels import SRLevelsCalculator
-from src.analysis.trend import TrendAnalyzer
+from src.market_context.sr_levels import SRLevelsCalculator
+from src.market_context.trend import TrendAnalyzer
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RTOL = 1e-9
@@ -27,6 +27,10 @@ STRATEGY_COLUMNS = {
             "close", "bbl_20_2.0", "bbu_20_2.0",
             "rsi", "stochk_5_3_3", "stochd_5_3_3",
         ],
+    },
+    "harmonic_abcd": {
+        "event": ["datetime", "signal", "price"],
+        "float": ["price"],
     },
 }
 
@@ -106,11 +110,23 @@ def _flat_triangle_expected_events(ta: pd.DataFrame) -> pd.DataFrame:
     return events[result_columns].reset_index(drop=True)
 
 
+def _harmonic_abcd_expected_events(ta: pd.DataFrame) -> pd.DataFrame:
+    signal = ta["harmonic_signal"]
+    events = ta[signal != 0].copy()
+    events["signal"] = np.where(events["harmonic_signal"] > 0, "BUY", "SELL")
+    events["signal"] = events["signal"].astype("string")
+    result_columns = ["datetime", "signal", "close"]
+    out = events[result_columns].rename(columns={"close": "price"})
+    return out.reset_index(drop=True)
+
+
 def expected_events(strategy_name: str, ta: pd.DataFrame, config: StrategyConfig | None = None) -> pd.DataFrame:
     if strategy_name == "macd_rsi_stoch":
         return _macd_rsi_stoch_expected_events(ta, config)
     if strategy_name == "flat_triangle":
         return _flat_triangle_expected_events(ta)
+    if strategy_name == "harmonic_abcd":
+        return _harmonic_abcd_expected_events(ta)
     raise ValueError(f"Неизвестная стратегия: {strategy_name}")
 
 

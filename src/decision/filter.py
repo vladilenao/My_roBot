@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from src.analysis.models import MarketContext, TrendDirection
+from src.market_context.models import MarketContext, TrendDirection
 from src.strategies.contracts import Decision, SignalType
 
 

@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.analysis.models import TrendDirection
-from src.analysis.trend import TrendAnalyzer
+from src.market_context.models import TrendDirection
+from src.market_context.trend import TrendAnalyzer
 
 
 def _uptrend_frames(n=80):

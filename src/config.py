@@ -42,7 +42,7 @@ BAR_TIME_TZ_OFFSET_HOURS = 3
 # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
 # Акции и прочие нефьючерсные инструменты: ключ — точный тикер.
 SHARE_STRATEGIES: dict[str, list[StrategyName]] = {
-    "SBER": ["macd_rsi_stoch","flat_triangle"],
+    "SBER": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
 }
 
 # Фьючерсы: ключ — двухбуквенный код базового актива в верхнем регистре.
