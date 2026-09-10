@@ -157,11 +157,11 @@ class RecordingNotifier:
         self.messages.append(message)
 
 
-def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None):
+def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None, strategy_map=None):
     return TradingBot(
         instruments=[],  # replace below
         notifier=notifier,
-        strategy_map={"macd_rsi_stoch": object(), "flat_triangle": object()},
+        strategy_map=strategy_map or {"macd_rsi_stoch": object(), "flat_triangle": object()},
         data_cache=cache,
         timeline=timeline,
         execution=execution,
@@ -188,6 +188,22 @@ class TestTradingBot:
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
         with pytest.raises(ValueError, match="no_such_strategy"):
+            bot.run()
+
+        assert bot._data_cache.refresh_calls == 0
+
+    def test_fail_fast_when_bound_strategy_missing_from_strategy_map(self):
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"EDU6": _df()}),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(),
+            future={"ED": ["harmonic_abcd"]},
+        )
+        bot._instruments = [_inst("ED (Евро – Доллар) — ED-9.26", "EDU6", "future")]
+
+        with pytest.raises(ValueError, match="harmonic_abcd"):
             bot.run()
 
         assert bot._data_cache.refresh_calls == 0
@@ -309,7 +325,33 @@ class TestTradingBot:
 
         bot.run()
 
-        assert working.compute.called is True
+        working.compute.assert_called_once()
+
+    def test_bound_strategy_in_map_is_built(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        factory = MagicMock(return_value=strategy)
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            strategy_map={
+                "macd_rsi_stoch": object(),
+                "flat_triangle": object(),
+                "harmonic_abcd": object(),
+            },
+            factory=factory,
+            share={"SBER": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert any(call.args[0] == "harmonic_abcd" for call in factory.call_args_list)
+        assert bot._strategy_cache["harmonic_abcd"] is strategy
+        assert len(execution.decisions) == 3
 
     def test_tick_error_notifies_trader(self):
         bot = _make_bot(

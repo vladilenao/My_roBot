@@ -175,6 +175,22 @@ class TradingBot:
     def _validate(self) -> None:
         validate_assignments(self._share_strategies, source="SHARE_STRATEGIES")
         validate_assignments(self._future_strategies, source="FUTURE_STRATEGIES")
+        missing = sorted(
+            {
+                name
+                for names in (
+                    *self._share_strategies.values(),
+                    *self._future_strategies.values(),
+                )
+                for name in names
+            }
+            - set(self._strategy_map)
+        )
+        if missing:
+            raise ValueError(
+                "Стратегии заявлены в привязках, но отсутствуют в карте стратегий: "
+                + ", ".join(missing)
+            )
         # форсируем построение стратегий до цикла (fail-fast на неизвестные имена)
         _ = self._strategy_cache
 

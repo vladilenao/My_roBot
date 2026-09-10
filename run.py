@@ -58,10 +58,12 @@ def main():
 def _strategy_map():
     from src.strategies.macd_rsi_stoch_strategy import DEFAULT_CONFIG as MACD
     from src.strategies.flat_triangle_strategy import DEFAULT_CONFIG as FLAT
+    from src.strategies.harmonic_abcd_strategy import DEFAULT_CONFIG as HARMONIC
 
     return {
         "macd_rsi_stoch": MACD,
         "flat_triangle": FLAT,
+        "harmonic_abcd": HARMONIC,
     }
 
 
