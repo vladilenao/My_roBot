@@ -4,7 +4,7 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версионирование — [SemVer](https://semver.org/lang/ru/).
 
- ## 1.0.0 — 10.09.2026
+## 1.0.0 — 10.09.2026
 
 ### Добавлено
 - Версия робота (SemVer) и её вывод в лог при запуске.
