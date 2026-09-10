@@ -29,7 +29,7 @@ from src.strategies import get_strategy
 from src.strategies.indicators.macd import MacdIndicator
 from src.strategies.indicators.rsi import RsiIndicator
 from src.strategies.indicators.stochastic import StochasticIndicator
-from src.strategies.strategy import StrategyConfig
+from src.strategies.base_strategy import StrategyConfig
 from t_tech.invest.utils import now
 
 HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
