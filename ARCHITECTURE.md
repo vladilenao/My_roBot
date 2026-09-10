@@ -15,7 +15,9 @@
   `TradingBot` не знает конкретных реализаций — получает интерфейсы (`notifier`,
   `execution`, `data_cache`, `context_cache`, `signal_filter`, `risk_manager`).
 - **Стратегии зарегистрированы в реестре.** Имя стратегии → класс и конфиг; назначение
-  «стратегия × инструмент» задаётся в конфиге (`SHARE_STRATEGIES`, `FUTURE_STRATEGIES`).
+  «стратегия × инструмент» задаётся в конфиге `robot.toml` (секции
+  `strategies.share`/`strategies.future`) и подхватывается через
+  `SHARE_STRATEGIES`/`FUTURE_STRATEGIES` из `src/config.py`.
 - **Исполнение отделено от принятия решений.** Сейчас стоит безопасный
   `NotifyOnlyExecutionPort`; замена на реальный торговый порт не затрагивает оркестратор.
 
@@ -33,7 +35,7 @@
 | `execution` | `port.py` | Исполнение решений (сейчас — `NotifyOnlyExecutionPort`). |
 | `notifier` | `base.py`, `console.py`, `telegram.py` | Доставка уведомлений (консоль / Telegram). |
 | `scheduler` | `timing.py` | `CandleScheduler` — выравнивание цикла по границам свечей. |
-| `config.py` | — | Все настройки и токены (загрузка из `.env`). |
+| `config.py` | — | Параметры из `robot.toml` (внешнего или вшитого `default.toml`) и токены из `.env`; импортируется всеми модулями. |
 | `bot` | `trading_bot.py` | **Оркестратор**: связывает модули в сценарий (главный цикл). |
 
 ## Поток данных
@@ -78,3 +80,6 @@ run.py  (композиция зависимостей)
 - `tools/visualize_signals.py` — рендер SVG-картинок сигналов для спецификаций.
 - `openspec/` — спецификации и исторические изменения (OpenSpec): каждая фича
   прорабатывается через proposal → design → specs → tasks, затем архивируется.
+- Выпуск: версия живёт в `src/__init__.py` (`__version__`, SemVer), изменения — в
+  `CHANGELOG.md`; сборка `run.spec` выдаёт `dist/robot-X.Y.Z` рядом с `robot.toml`
+  и `robot-X.Y.Z.txt` (тезисы версии из CHANGELOG), токены — только в `.env`.

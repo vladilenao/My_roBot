@@ -3,6 +3,9 @@ from src.market_context import (
     SRLevelsCalculator,
     TrendAnalyzer,
 )
+import logging
+
+from src import __version__
 from src.decision import RiskManager, SignalFilter
 from src.bot import TradingBot
 from src.config import (
@@ -24,8 +27,15 @@ from src.instruments.selector import select_instruments
 from src.notifier import get_notifier
 from src.scheduler.timing import CandleScheduler
 
+log = logging.getLogger(__name__)
+
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log.info("Робот v%s запущен", __version__)
     instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
     notifier = get_notifier()
     timeline = CandleScheduler(timeframe=TIMEFRAME, sleep_secs=SLEEP_SECONDS)

@@ -1,5 +1,4 @@
 import pandas as pd
-import pytest
 
 from src.strategies import get_strategy
 from src.strategies.contracts import SignalType

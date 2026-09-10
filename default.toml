@@ -1,0 +1,28 @@
+# Вшиваемые в сборку дефолты конфигурации.
+# Используются, когда рядом с исполняемым файлом нет robot.toml.
+# Не изменяйте этот файл на вашей машине: он попадает внутрь сборки.
+
+[robot]
+timeframe = "1h"
+sleep_seconds = 3600
+heartbeat_every_ticks = 60
+
+[tick]
+poll_secs = 1
+timeout_secs = 65
+
+[instruments]
+fallback_type = "future"
+fallback_ticker = "NGU6"
+
+[notifier]
+channel = "console"
+
+[strategies.share]
+SBER = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]
+
+[strategies.future]
+NG = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]
+BR = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]
+SI = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]
+ED = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]

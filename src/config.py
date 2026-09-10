@@ -2,19 +2,17 @@ import os
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
 
+from src.config_loader import ConfigError, load_config
 from src.strategies.names import StrategyName
 
 load_dotenv() # загружает переменные из .env
 
-# Токены
+# Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Канал уведомлений: "telegram" | "console"
-NOTIFIER = "console"
-
-# Словарь таймфреймов (используется в загрузчике)
+# Словарь таймфреймов (используется в загрузчике); всегда из кода
 TIMEFRAMES = {
 '1m': CandleInterval.CANDLE_INTERVAL_1_MIN,
 '5m': CandleInterval.CANDLE_INTERVAL_5_MIN,
@@ -25,37 +23,60 @@ TIMEFRAMES = {
 '1M': CandleInterval.CANDLE_INTERVAL_MONTH
 }
 
-# Параметры бота (можно менять)
-SLEEP_SECONDS = 3600 # пауза между циклами (15 минут)
-TIMEFRAME = "1h" # любой из ключей TIMEFRAMES
-HEARTBEAT_EVERY_TICKS = 60 # «сердцебиение» каждые N тиков; 0/None — отключить
-
-# Ожидание свежего закрытого бара после границы закрытия свечи
-# (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).
-TICK_POLL_SECS = 1 # пауза между повторными попытками дозагрузки
-TICK_TIMEOUT_SECS = 65 # таймаут ожидания бара, после которого тик обрабатывается с имеющимися данными
-
 # Смещение часового пояса (в часах) для отображения времени бара в уведомлениях.
 # 0 = UTC (как хранится bar_time). Пользователь в МСК → 3.
 BAR_TIME_TZ_OFFSET_HOURS = 3
 
-# Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
-# Акции и прочие нефьючерсные инструменты: ключ — точный тикер.
-SHARE_STRATEGIES: dict[str, list[StrategyName]] = {
-    "SBER": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
+_DEFAULTS = {
+    "timeframe": "1h",
+    "sleep_seconds": 3600,
+    "heartbeat_every_ticks": 60,
+    "tick_poll_secs": 1,
+    "tick_timeout_secs": 65,
+    "instrument_type": "future",
+    "ticker": "NGU6",
+    "notifier": "console",
+    # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
+    "share_strategies": {
+        "SBER": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+    },
+    "future_strategies": {
+        "NG": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+        "BR": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+        "SI": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+        "ED": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+    },
 }
+
+_CONFIG = load_config(_DEFAULTS)
+
+TIMEFRAME = _CONFIG["timeframe"]
+if TIMEFRAME not in TIMEFRAMES:
+    raise ConfigError(
+        f"robot.toml: недопустимый таймфрейм {TIMEFRAME!r}; "
+        f"допустимые: {', '.join(sorted(TIMEFRAMES))}"
+    )
+
+# Параметры бота (можно менять в robot.toml)
+SLEEP_SECONDS = _CONFIG["sleep_seconds"]
+HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
+
+# Ожидание свежего закрытого бара после границы закрытия свечи
+# (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).
+TICK_POLL_SECS = _CONFIG["tick_poll_secs"]
+TICK_TIMEOUT_SECS = _CONFIG["tick_timeout_secs"]
+
+# Канал уведомлений: "telegram" | "console"
+NOTIFIER = _CONFIG["notifier"]
+
+SHARE_STRATEGIES: dict[str, list[StrategyName]] = _CONFIG["share_strategies"]
 
 # Фьючерсы: ключ — двухбуквенный код базового актива в верхнем регистре.
 # Запись не привязана к конкретному контракту и действует на любой контракт актива
 # (например "NG" покрывает NGU6, NGZ7 и любые последующие контракты природного газа).
-FUTURE_STRATEGIES: dict[str, list[StrategyName]] = {
-    "NG": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
-    "BR": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
-    "SI": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
-    "ED": ["macd_rsi_stoch","flat_triangle","harmonic_abcd"],
-}
+FUTURE_STRATEGIES: dict[str, list[StrategyName]] = _CONFIG["future_strategies"]
 
 # Значения по умолчанию для fallback (тесты, одиночный запуск).
 # При обычном запуске интерактивный выбор заменяет эти константы.
-INSTRUMENT_TYPE = "future"
-TICKER = "NGU6"
+INSTRUMENT_TYPE = _CONFIG["instrument_type"]
+TICKER = _CONFIG["ticker"]

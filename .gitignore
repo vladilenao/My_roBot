@@ -6,4 +6,8 @@ logs/
 .vscode/
 build/
 dist/
-*.spec
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+robot.toml
