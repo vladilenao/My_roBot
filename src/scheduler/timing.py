@@ -6,6 +6,10 @@ from typing import Callable
 
 import pandas as pd
 
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 _PERIODS = {
     "1m": ("minute", 1),
     "5m": ("minute", 5),

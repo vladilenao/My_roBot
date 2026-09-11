@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import replace
+from uuid import uuid4
 
 from src.instruments import Instrument, normalize_instrument
+from src.logging_setup import correlation_id_var, get_logger
 from src.strategies.registry import get_strategy, validate_assignments
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class TradingBot:
@@ -107,14 +108,18 @@ class TradingBot:
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self) -> None:
-        for instrument in self._instruments:
-            self._data_cache.frame_for(instrument)
-        self._data_cache.refresh_if_new_candle()
-        if not self._data_cache.has_fresh_closed_bar():
-            return
-        for instrument in self._instruments:
-            self._process(instrument)
-        self._maybe_heartbeat()
+        correlation_id_var.set(f"tick-{uuid4().hex[:8]}")
+        try:
+            for instrument in self._instruments:
+                self._data_cache.frame_for(instrument)
+            self._data_cache.refresh_if_new_candle()
+            if not self._data_cache.has_fresh_closed_bar():
+                return
+            for instrument in self._instruments:
+                self._process(instrument)
+            self._maybe_heartbeat()
+        finally:
+            correlation_id_var.set(None)
 
     # ── ПУНКТ 2.1: готов ли свежий закрытый бар (для ожидания до появления) ──
     def _bar_is_ready(self) -> bool:

@@ -9,6 +9,9 @@ from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.registry import register
 from src.strategies.signals import get_last_signals
 from src.strategies.base_strategy import StrategyConfig
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 # ══════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ СТРАТЕГИИ

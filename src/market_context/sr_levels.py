@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 
 from src.market_context.models import SRLevel, SRType
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)

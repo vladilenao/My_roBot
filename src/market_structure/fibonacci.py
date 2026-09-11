@@ -8,6 +8,10 @@ X(высокий)→A(низкий) ретрейсмент r% от точки A 
 
 from __future__ import annotations
 
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 
 def retracement_level(a: float, x: float, ratio: float) -> float:
     """Уровень ретрейсмента `ratio` волны X→A.

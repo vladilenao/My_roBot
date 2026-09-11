@@ -43,6 +43,13 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "share": "share_strategies",
         "future": "future_strategies",
     },
+    "logging": {
+        "service_uid": "logging_service_uid",
+        "file": "logging_file",
+        "level": "logging_level",
+        "max_bytes": "logging_max_bytes",
+        "backup_count": "logging_backup_count",
+    },
 }
 
 _EXPECTED_TYPES: dict[str, type] = {
@@ -56,6 +63,11 @@ _EXPECTED_TYPES: dict[str, type] = {
     "notifier": str,
     "share_strategies": dict,
     "future_strategies": dict,
+    "logging_service_uid": str,
+    "logging_file": str,
+    "logging_level": str,
+    "logging_max_bytes": int,
+    "logging_backup_count": int,
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}

@@ -4,6 +4,9 @@ from dataclasses import dataclass, replace
 
 from src.market_context.models import MarketContext, TrendDirection
 from src.strategies.contracts import Decision, SignalType
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)

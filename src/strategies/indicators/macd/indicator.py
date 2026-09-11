@@ -7,6 +7,9 @@ import pandas as pd
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
 from src.strategies.indicators.macd.signalEnum import MacdSignalEnum
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,9 @@ from src.config import TIMEFRAMES
 from src.api.instruments import find_working_instrument
 from src.api.retry import api_call_with_retry
 from src.data.timeutil import to_aware_utc
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 def load_candles(

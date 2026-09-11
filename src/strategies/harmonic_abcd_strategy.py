@@ -17,6 +17,9 @@ from src.market_structure.harmonic import (
 from src.strategies.contracts import Decision, SignalType
 from src.strategies.registry import register
 from src.strategies.base_strategy import StrategyConfig
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 SIGNAL_COLUMN = "harmonic_signal"
 

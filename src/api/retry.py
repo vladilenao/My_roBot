@@ -1,6 +1,10 @@
 import time
 import functools
 
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 10
@@ -39,7 +43,7 @@ def api_call_with_retry(fn, *args, max_retries=DEFAULT_MAX_RETRIES, base_delay=D
             last_exc = exc
             reset = _parse_reset_delay(exc)
             delay = min(base_delay * (2 ** attempt), reset, max_delay)
-            print(f"  Rate limit (попытка {attempt + 1}/{max_retries}). Ожидание {delay}с...")
+            log.warning("Rate limit (попытка %d/%d). Ожидание %dс...", attempt + 1, max_retries, delay)
             time.sleep(delay)
     raise last_exc
 

@@ -3,6 +3,9 @@ from __future__ import annotations
 import pandas as pd
 
 from src.data.timeutil import to_naive
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 def _naive(dt) -> pd.Timestamp:

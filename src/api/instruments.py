@@ -2,6 +2,9 @@ from t_tech.invest import InstrumentStatus, CandleInterval
 from t_tech.invest.utils import now
 from datetime import timedelta
 from src.api.retry import api_call_with_retry
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 def find_working_instrument(client, ticker, instrument_type="share"):

@@ -7,6 +7,9 @@ import pandas as pd
 import pandas_ta_classic as ta
 
 from src.market_context.models import TrendDirection, TrendResult
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
