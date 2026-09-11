@@ -21,6 +21,9 @@ import pandas as pd
 
 from src.market_structure.fibonacci import retracement_level
 from src.market_structure.swings import SwingDetector, SwingKind, SwingPoint
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 # Пропорции стратегии 0.2
 B_MIN = 0.382

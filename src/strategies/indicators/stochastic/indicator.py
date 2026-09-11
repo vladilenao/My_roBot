@@ -10,6 +10,9 @@ from src.strategies.indicators.stochastic.signalEnum import (
     SignalMode,
     StochasticSignalEnum,
 )
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)

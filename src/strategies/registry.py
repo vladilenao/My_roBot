@@ -6,6 +6,9 @@ from typing import TypeVar
 
 from src.strategies.contracts import Strategy
 from src.strategies.base_strategy import StrategyConfig
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 T = TypeVar("T", bound=Strategy)
 

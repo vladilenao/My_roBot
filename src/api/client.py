@@ -1,5 +1,8 @@
 from t_tech.invest import Client
 from src.config import TINKOFF_TOKEN
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 def get_client():

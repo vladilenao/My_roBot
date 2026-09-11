@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 
 class ExecutionPort(ABC):
     """Выходной слой принятых решений робота.

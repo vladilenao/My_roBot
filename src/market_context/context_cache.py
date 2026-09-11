@@ -5,6 +5,9 @@ import pandas as pd
 from src.market_context.models import MarketContext
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
+from src.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
 class MarketContextCache:

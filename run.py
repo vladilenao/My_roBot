@@ -3,7 +3,6 @@ from src.market_context import (
     SRLevelsCalculator,
     TrendAnalyzer,
 )
-import logging
 
 from src import __version__
 from src.decision import RiskManager, SignalFilter
@@ -19,21 +18,30 @@ from src.config import (
     TIMEFRAME,
     TINKOFF_TOKEN,
     INSTRUMENT_TYPE,
+    LOGGING_SERVICE_UID,
+    LOGGING_FILE,
+    LOGGING_LEVEL,
+    LOGGING_MAX_BYTES,
+    LOGGING_BACKUP_COUNT,
 )
 from src.data.cache import MarketDataCache
 from src.data.loader import load_candles
 from src.execution import NotifyOnlyExecutionPort
 from src.instruments.selector import select_instruments
+from src.logging_setup import get_logger, setup_logging
 from src.notifier import get_notifier
 from src.scheduler.timing import CandleScheduler
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    setup_logging(
+        service_uid=LOGGING_SERVICE_UID,
+        log_file=LOGGING_FILE,
+        level=LOGGING_LEVEL,
+        max_bytes=LOGGING_MAX_BYTES,
+        backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
     instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]

@@ -46,6 +46,12 @@ _DEFAULTS = {
         "SI": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
         "ED": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
     },
+    # Логирование (секция [logging] в robot.toml)
+    "logging_service_uid": "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a",
+    "logging_file": "bot_debug.log",
+    "logging_level": "DEBUG",
+    "logging_max_bytes": 10_485_760,
+    "logging_backup_count": 5,
 }
 
 _CONFIG = load_config(_DEFAULTS)
@@ -80,3 +86,10 @@ FUTURE_STRATEGIES: dict[str, list[StrategyName]] = _CONFIG["future_strategies"]
 # При обычном запуске интерактивный выбор заменяет эти константы.
 INSTRUMENT_TYPE = _CONFIG["instrument_type"]
 TICKER = _CONFIG["ticker"]
+
+# Логирование
+LOGGING_SERVICE_UID = _CONFIG["logging_service_uid"]
+LOGGING_FILE = _CONFIG["logging_file"]
+LOGGING_LEVEL = _CONFIG["logging_level"]
+LOGGING_MAX_BYTES = _CONFIG["logging_max_bytes"]
+LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
