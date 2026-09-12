@@ -16,7 +16,9 @@ class TestNotifyOnlyExecutionPort:
 
         port.execute(decision, instrument)
 
-        notifier.notify_decision.assert_called_once_with(decision, "SBER")
+        notifier.notify_decision.assert_called_once_with(
+            decision, "SBER", filter_profile="", filtered_out=False, timeframe=""
+        )
 
     def test_execute_uses_short_name_when_present(self):
         notifier = Mock()
@@ -26,7 +28,9 @@ class TestNotifyOnlyExecutionPort:
 
         port.execute(decision, instrument)
 
-        notifier.notify_decision.assert_called_once_with(decision, "NG-9.26")
+        notifier.notify_decision.assert_called_once_with(
+            decision, "NG-9.26", filter_profile="", filtered_out=False, timeframe=""
+        )
 
     def test_execute_falls_back_to_label_without_short_name(self):
         notifier = Mock()
@@ -36,7 +40,8 @@ class TestNotifyOnlyExecutionPort:
         port.execute(Decision(SignalType.BUY, 100.5), instrument)
 
         notifier.notify_decision.assert_called_once_with(
-            Decision(SignalType.BUY, 100.5), "NG (Природный газ) — NG-9.26"
+            Decision(SignalType.BUY, 100.5), "NG (Природный газ) — NG-9.26",
+            filter_profile="", filtered_out=False, timeframe="",
         )
 
     def test_execute_creates_no_orders(self):

@@ -1,8 +1,27 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
 import pandas as pd
+
+from src.strategies.names import StrategyName
+
+DEFAULT_FILTER_PROFILE = "basic_levels"
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """Привязка стратегии к инструменту: имя стратегии + профиль фильтрации + таймфрейм.
+
+    Идентичность привязки — кортеж (инструмент, стратегия, профиль, таймфрейм):
+    дубли имени стратегии на одном инструменте допустимы при разных профилях
+    или разных таймфреймах. Таймфрейм обязателен и разворачивается каскадом
+    конфигурации (tf инлайна → timeframe тикера → глобальный TIMEFRAME).
+    """
+
+    strategy: StrategyName
+    filter_profile: str = DEFAULT_FILTER_PROFILE
+    timeframe: str = field(kw_only=True)
 
 
 class SignalType(Enum):

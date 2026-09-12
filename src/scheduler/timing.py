@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, Iterable
 
 import pandas as pd
 
@@ -178,3 +178,118 @@ class CandleScheduler:
             monday = t - timedelta(days=t.weekday())
             return monday.replace(hour=0, minute=0, second=0, microsecond=0)
         return t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+class MultiTimeframeScheduler:
+    """Координатор свечных сеток нескольких активных таймфреймов.
+
+    Математика одной сетки остаётся в ``CandleScheduler``; координатор будит
+    цикл на ближайшей границе среди активных ТФ, определяет, какие ТФ закрыли
+    свечу с прошлого тика, и per-ТФ дожидается публикации свежего закрытого бара.
+    При единственном ТФ поведение совпадает с однотаймфреймным ритмом.
+    """
+
+    def __init__(
+        self,
+        timeframes: Iterable[str],
+        sleep_secs: float = 3600.0,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        unique = tuple(dict.fromkeys(timeframes))
+        if not unique:
+            raise ValueError("Нужен хотя бы один активный таймфрейм")
+        self._clock = clock or (
+            lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+        )
+        self._grids = {
+            tf: CandleScheduler(tf, sleep_secs=sleep_secs, clock=self._clock)
+            for tf in unique
+        }
+        self._fallback = sleep_secs
+        self._last_tick: datetime | None = None
+
+    def now(self) -> datetime:
+        """Текущее рыночное время (UTC)."""
+        return self._clock()
+
+    @property
+    def timeframes(self) -> tuple[str, ...]:
+        return tuple(self._grids)
+
+    def grid(self, timeframe: str) -> CandleScheduler:
+        """Сетка конкретного таймфрейма (математика границ, bar_close)."""
+        return self._grids[timeframe]
+
+    def next_boundary(self, t: datetime | None = None) -> datetime:
+        """Ближайшая граница закрытия свечи среди активных ТФ."""
+        current = t or self.now()
+        return min(g.next_candle_close(current) for g in self._grids.values())
+
+    def fallback_secs(self) -> float:
+        """Пауза при внешнем сбое: не длиннее периода наименьшего активного ТФ."""
+        now = self.now()
+        min_period = min(
+            (g.next_candle_close(now) - g.current_candle_start(now)).total_seconds()
+            for g in self._grids.values()
+        )
+        if self._fallback > min_period:
+            log.info(
+                "Fallback-пауза %ss ограничена наименьшим активным ТФ (%ss).",
+                self._fallback, int(min_period),
+            )
+            return min_period
+        return self._fallback
+
+    def wait_until_bar_published(
+        self,
+        bar_ready: Callable[[str], bool],
+        poll_secs: float = 1.0,
+        timeout_secs: float = 65.0,
+        wait_boundary: bool = True,
+    ) -> set[str]:
+        """Ждёт ближайшую границу и публикацию баров; возвращает ТФ со свежей свечой.
+
+        ``bar_ready(tf)`` сообщает, появился ли свежий закрытый бар таймфрейма.
+        При ``wait_boundary=False`` (первый тик при запуске) кандидаты — все
+        активные ТФ, ожидание границы пропускается. ТФ, бар которого не
+        опубликован за ``timeout_secs``, в результат не включается.
+        """
+        if wait_boundary:
+            target = self.next_boundary()
+            delay = (target - self.now()).total_seconds()
+            if delay > 0:
+                self._sleep(delay)
+            candidates = (
+                self._crossed_since(self._last_tick)
+                if self._last_tick is not None
+                else set(self._grids)
+            )
+        else:
+            candidates = set(self._grids)
+        self._last_tick = self.now()
+
+        deadline = time.monotonic() + timeout_secs
+        pending = set(candidates)
+        ready: set[str] = set()
+        while pending:
+            for tf in sorted(pending):
+                if bar_ready(tf):
+                    ready.add(tf)
+                    pending.discard(tf)
+            if not pending or time.monotonic() >= deadline:
+                break
+            self._sleep(poll_secs)
+        return ready
+
+    def _crossed_since(self, t0: datetime) -> set[str]:
+        """ТФ, у которых граница закрытия свечи пройдена между t0 и now."""
+        now = self.now()
+        return {
+            tf
+            for tf, g in self._grids.items()
+            if g.current_candle_start(now) > g.current_candle_start(t0)
+        }
+
+    def _sleep(self, secs: float) -> None:
+        """Приостанавливает поток. Выделено для подстановки в тестах."""
+        time.sleep(secs)

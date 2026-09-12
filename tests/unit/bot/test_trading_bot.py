@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+from dataclasses import replace
 from datetime import timedelta
 
 import pandas as pd
@@ -6,7 +7,11 @@ import pytest
 
 from src.bot import TradingBot
 from src.instruments import Instrument
-from src.strategies.contracts import Decision, SignalType
+from src.strategies.contracts import Assignment, Decision, SignalType
+
+
+def _assign(*names: str, profile: str = "basic_levels", timeframe: str = "1h") -> list[Assignment]:
+    return [Assignment(strategy=name, filter_profile=profile, timeframe=timeframe) for name in names]
 
 
 def _inst(*args):
@@ -33,10 +38,12 @@ def _make_strategy(name="macd_rsi_stoch", decision=None):
 
 
 class FakeTimeline:
-    def __init__(self, ticks=1, fallback=1.0, timeframe="1h"):
+    """Фейк координатора сеток: тики 1..ticks, далее KeyboardInterrupt."""
+
+    def __init__(self, ticks=1, fallback=1.0, timeframes=("1h",)):
         self.ticks = ticks
         self.fallback = fallback
-        self.timeframe = timeframe
+        self.timeframes = tuple(timeframes)
         self.wait_calls = 0
         self.wait_boundaries = []
 
@@ -47,7 +54,10 @@ class FakeTimeline:
         self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
-        bar_ready()
+        return {tf for tf in self.timeframes if bar_ready(tf)}
+
+    def grid(self, timeframe):
+        return self
 
     def bar_close(self, bar_start):
         return bar_start + timedelta(hours=1)
@@ -63,32 +73,43 @@ class FakeCache:
         self.refresh_calls = 0
         self.refresh_forces = []
 
-    def refresh_if_new_candle(self, force=False):
+    def refresh_if_new_candle(self, timeframe, force=False):
         self.refresh_calls += 1
         self.refresh_forces.append(force)
         if self.refresh_error:
             raise self.refresh_error
 
-    def has_fresh_closed_bar(self, now=None):
+    def has_fresh_closed_bar(self, timeframe, now=None):
         return True
 
-    def frame_for(self, instrument):
-        return self.frames.get(instrument.ticker, pd.DataFrame())
+    def frame_for(self, instrument, timeframe):
+        return self.frames.get(
+            (instrument.ticker, timeframe),
+            self.frames.get(instrument.ticker, pd.DataFrame()),
+        )
 
 
 class RecordingExecution:
     def __init__(self):
         self.decisions = []
+        self.calls = []
 
-    def execute(self, decision, instrument):
+    def execute(self, decision, instrument, *, filter_profile="", filtered_out=False, timeframe=""):
         self.decisions.append((decision, instrument))
+        self.calls.append(
+            {
+                "filter_profile": filter_profile,
+                "filtered_out": filtered_out,
+                "timeframe": timeframe,
+            }
+        )
 
 
 class PollingTimeline:
-    def __init__(self, ticks=1, fallback=1.0, timeframe="1h"):
+    def __init__(self, ticks=1, fallback=1.0, timeframes=("1h",)):
         self.ticks = ticks
         self.fallback = fallback
-        self.timeframe = timeframe
+        self.timeframes = tuple(timeframes)
         self.wait_calls = 0
         self.wait_boundaries = []
 
@@ -99,8 +120,15 @@ class PollingTimeline:
         self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
-        while not bar_ready():
-            pass
+        ready = set()
+        for tf in self.timeframes:
+            while not bar_ready(tf):
+                pass
+            ready.add(tf)
+        return ready
+
+    def grid(self, timeframe):
+        return self
 
     def bar_close(self, bar_start):
         return bar_start + timedelta(hours=1)
@@ -110,10 +138,10 @@ class PollingTimeline:
 
 
 class TimeoutTimeline:
-    def __init__(self, ticks=1, fallback=1.0, timeframe="1h"):
+    def __init__(self, ticks=1, fallback=1.0, timeframes=("1h",)):
         self.ticks = ticks
         self.fallback = fallback
-        self.timeframe = timeframe
+        self.timeframes = tuple(timeframes)
         self.wait_calls = 0
         self.wait_boundaries = []
 
@@ -124,7 +152,10 @@ class TimeoutTimeline:
         self.wait_boundaries.append(wait_boundary)
         if self.wait_calls > self.ticks:
             raise KeyboardInterrupt
-        bar_ready()
+        return {tf for tf in self.timeframes if bar_ready(tf)}
+
+    def grid(self, timeframe):
+        return self
 
     def bar_close(self, bar_start):
         return bar_start + timedelta(hours=1)
@@ -139,13 +170,13 @@ class LateBarCache(FakeCache):
         self.publish_after = publish_after
         self.checks = 0
 
-    def has_fresh_closed_bar(self, now=None):
+    def has_fresh_closed_bar(self, timeframe, now=None):
         self.checks += 1
         return self.checks >= self.publish_after
 
 
 class NeverPublishCache(FakeCache):
-    def has_fresh_closed_bar(self, now=None):
+    def has_fresh_closed_bar(self, timeframe, now=None):
         return False
 
 
@@ -183,7 +214,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            share={"SBER": ["no_such_strategy"]},
+            share={"SBER": _assign("no_such_strategy")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -199,7 +230,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            future={"ED": ["harmonic_abcd"]},
+            future={"ED": _assign("harmonic_abcd")},
         )
         bot._instruments = [_inst("ED (Евро – Доллар) — ED-9.26", "EDU6", "future")]
 
@@ -217,7 +248,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            future={"NG": ["macd_rsi_stoch"]},
+            future={"NG": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("NG (Природный газ) — NG-9.26", "NGU6", "future")]
 
@@ -237,7 +268,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -254,7 +285,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -276,7 +307,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -298,7 +329,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -318,7 +349,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=failing,
-            future={"MU": ["macd_rsi_stoch", "flat_triangle"]},
+            future={"MU": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=factory,
         )
         bot._instruments = [_inst("MU (base) — MUZ6", "MUZ6", "future")]
@@ -343,14 +374,14 @@ class TestTradingBot:
                 "harmonic_abcd": object(),
             },
             factory=factory,
-            share={"SBER": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]},
+            share={"SBER": _assign("macd_rsi_stoch", "flat_triangle", "harmonic_abcd")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
         bot.run()
 
         assert any(call.args[0] == "harmonic_abcd" for call in factory.call_args_list)
-        assert bot._strategy_cache["harmonic_abcd"] is strategy
+        assert bot._strategy_cache[("harmonic_abcd", "1h")] is strategy
         assert len(execution.decisions) == 3
 
     def test_tick_error_notifies_trader(self):
@@ -360,7 +391,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -375,7 +406,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=2,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -393,7 +424,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=5,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -408,15 +439,15 @@ class TestTradingBot:
             def __init__(self):
                 self.calls = 0
 
-            def refresh_if_new_candle(self, force=False):
+            def refresh_if_new_candle(self, timeframe, force=False):
                 self.calls += 1
                 if self.calls == 1:
                     raise RuntimeError("boom")
 
-            def has_fresh_closed_bar(self, now=None):
+            def has_fresh_closed_bar(self, timeframe, now=None):
                 return True
 
-            def frame_for(self, instrument):
+            def frame_for(self, instrument, timeframe):
                 return _df()
 
         bot = _make_bot(
@@ -425,7 +456,7 @@ class TestTradingBot:
             execution=RecordingExecution(),
             notifier=RecordingNotifier(),
             strategy=_make_strategy(),
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=1,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -446,7 +477,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -465,7 +496,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -484,7 +515,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -503,7 +534,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -521,7 +552,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -541,7 +572,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -557,16 +588,16 @@ class TestTradingBot:
                 self.calls = 0
                 self.ready = False
 
-            def refresh_if_new_candle(self, force=False):
+            def refresh_if_new_candle(self, timeframe, force=False):
                 self.calls += 1
                 if self.calls == 1:
                     raise RuntimeError("boom")
                 self.ready = True
 
-            def has_fresh_closed_bar(self, now=None):
+            def has_fresh_closed_bar(self, timeframe, now=None):
                 return self.ready
 
-            def frame_for(self, instrument):
+            def frame_for(self, instrument, timeframe):
                 return _df()
 
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
@@ -578,7 +609,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
@@ -594,7 +625,7 @@ class TestTradingBot:
                 super().__init__(frames=frames)
                 self.flag = False
 
-            def has_fresh_closed_bar(self, now=None):
+            def has_fresh_closed_bar(self, timeframe, now=None):
                 return self.flag
 
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
@@ -606,18 +637,18 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=1,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
         cache.flag = False
-        bot._tick()
+        bot._tick(set())  # пустой тик: ни у одного ТФ свеча не закрылась
         assert len(execution.decisions) == 0
         assert not any("Сердцебиение" in m for m in bot._notifier.messages)
 
         cache.flag = True
-        bot._tick()
+        bot._tick({"1h"})
         assert len(execution.decisions) == 1
 
     def test_market_context_computed_once_per_instrument(self):
@@ -630,7 +661,7 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch", "flat_triangle"]},
+            share={"SBER": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=lambda name, config: strategy,
             context_cache=context_cache,
         )
@@ -650,15 +681,15 @@ class TestTradingBot:
             execution=execution,
             notifier=RecordingNotifier(),
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             factory=factory,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
 
         bot.run()
 
-        # фабрика вызывается только при построении кэша (по разу на ключ), не на каждый тик
-        assert factory.call_count == len(bot._strategy_map)
+        # фабрика вызывается только при построении кэша (по разу на пару имя×ТФ), не на каждый тик
+        assert factory.call_count == len(bot._strategy_cache)
         assert len(execution.decisions) == 3
 
     def test_fatal_runtime_error_in_strategy_reports_globally(self):
@@ -674,7 +705,7 @@ class TestTradingBot:
             execution=execution,
             notifier=notifier,
             strategy=failing,
-            future={"MU": ["macd_rsi_stoch", "flat_triangle"]},
+            future={"MU": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=factory,
         )
         bot._instruments = [_inst("MU (base) — MUZ6", "MUZ6", "future")]
@@ -700,7 +731,7 @@ class TestTradingBot:
             execution=execution,
             notifier=notifier,
             strategy=strategy,
-            share={"SBER": ["macd_rsi_stoch"]},
+            share={"SBER": _assign("macd_rsi_stoch")},
             context_cache=context_cache,
             risk_manager=risk,
         )
@@ -711,3 +742,147 @@ class TestTradingBot:
         risk.apply.assert_called_once()
         assert any("Ошибка робота" in m for m in notifier.messages)
         assert len(execution.decisions) == 0
+
+    def test_duplicate_strategy_with_distinct_profiles_runs_both(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch", profile="raw") + _assign("macd_rsi_stoch")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        # обе привязки обрабатываются как независимые задачи с общим инстансом
+        assert len(execution.decisions) == 2
+        assert [c["filter_profile"] for c in execution.calls] == ["raw", "basic_levels"]
+        assert strategy.decide.call_count == 2
+
+    def test_unknown_filter_profile_fails_fast(self):
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(),
+            share={"SBER": _assign("macd_rsi_stoch", profile="no_such_profile")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        with pytest.raises(ValueError, match="no_such_profile"):
+            bot.run()
+
+        assert bot._data_cache.refresh_calls == 0
+
+    def test_filtered_out_detected_and_passed_to_port(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        signal_filter = MagicMock()
+        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels": replace(
+            decision, signal_type=SignalType.HOLD
+        )
+        context_cache = MagicMock()
+        context_cache.get_context.return_value = object()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch")},
+            context_cache=context_cache,
+            signal_filter=signal_filter,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        # фильтр получил профиль привязки, порт — профиль и признак отклонения
+        assert signal_filter.apply.call_args.kwargs["profile_name"] == "basic_levels"
+        assert execution.calls[0]["filtered_out"] is True
+        assert execution.calls[0]["filter_profile"] == "basic_levels"
+
+    def test_passing_signal_is_not_marked_filtered_out(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+        signal_filter = MagicMock()
+        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels": decision
+        context_cache = MagicMock()
+        context_cache.get_context.return_value = object()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch", profile="raw")},
+            context_cache=context_cache,
+            signal_filter=signal_filter,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert signal_filter.apply.call_args.kwargs["profile_name"] == "raw"
+        assert execution.calls[0]["filtered_out"] is False
+        assert execution.calls[0]["filter_profile"] == "raw"
+
+    def test_only_crossed_timeframe_is_processed(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        execution = RecordingExecution()
+
+        class Ready15mTimeline(FakeTimeline):
+            def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True):
+                self.wait_calls += 1
+                self.wait_boundaries.append(wait_boundary)
+                if self.wait_calls > self.ticks:
+                    raise KeyboardInterrupt
+                return {"15m"}  # на тике закрылась только 15m-свеча
+
+        bot = _make_bot(
+            timeline=Ready15mTimeline(timeframes=("15m", "1h")),
+            cache=FakeCache(frames={("SBER", "15m"): _df(), ("SBER", "1h"): _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch", timeframe="15m") + _assign("flat_triangle", timeframe="1h")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        # обработана только 15m-привязка, с её ТФ в decide и в порте
+        assert len(execution.decisions) == 1
+        assert strategy.decide.call_args.kwargs["timeframe"] == "15m"
+        assert execution.calls[0]["timeframe"] == "15m"
+
+    def test_duplicate_strategy_on_different_timeframes_gets_separate_instances(self):
+        inst_15m = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        inst_1h = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
+        execution = RecordingExecution()
+        factory = MagicMock(side_effect=[inst_15m, inst_1h])
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("15m", "1h")),
+            cache=FakeCache(frames={("SBER", "15m"): _df(), ("SBER", "1h"): _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=inst_15m,
+            factory=factory,
+            share={"SBER": _assign("macd_rsi_stoch", timeframe="15m") + _assign("macd_rsi_stoch", timeframe="1h")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        # два инстанса по ключу (имя, ТФ): состояние ТФ не смешивается
+        assert set(bot._strategy_cache) == {("macd_rsi_stoch", "15m"), ("macd_rsi_stoch", "1h")}
+        assert bot._strategy_cache[("macd_rsi_stoch", "15m")] is inst_15m
+        assert bot._strategy_cache[("macd_rsi_stoch", "1h")] is inst_1h
+        assert inst_15m.decide.call_args.kwargs["timeframe"] == "15m"
+        assert inst_1h.decide.call_args.kwargs["timeframe"] == "1h"
+        assert len(execution.decisions) == 2
