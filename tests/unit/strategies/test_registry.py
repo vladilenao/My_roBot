@@ -83,10 +83,12 @@ def test_literal_names_match_registry():
     from src.strategies.macd_rsi_stoch_strategy import MacdRsiStochStrategy
     from src.strategies.flat_triangle_strategy import FlatTriangleStrategy
     from src.strategies.harmonic_abcd_strategy import HarmonicAbcdStrategy
+    from src.strategies.ma_cloud_rsi_macd_strategy import MaCloudRsiMacdStrategy
 
     register(MacdRsiStochStrategy)
     register(FlatTriangleStrategy)
     register(HarmonicAbcdStrategy)
+    register(MaCloudRsiMacdStrategy)
     assert set(get_args(StrategyName)) == set(live)
 
 

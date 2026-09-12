@@ -6,4 +6,6 @@
 
 from typing import Literal
 
-StrategyName = Literal["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"]
+StrategyName = Literal[
+    "macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"
+]

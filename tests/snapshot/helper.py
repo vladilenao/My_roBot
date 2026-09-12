@@ -6,6 +6,7 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from src.strategies.base_strategy import StrategyConfig
+from src.strategies.contracts import SignalType
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
 
@@ -19,17 +20,30 @@ STRATEGY_COLUMNS = {
     },
     "flat_triangle": {
         "event": [
-            "datetime", "signal", "close",
-            "bbl_20_2.0", "bbu_20_2.0",
-            "rsi", "stochk_5_3_3", "stochd_5_3_3",
+            "datetime",
+            "signal",
+            "close",
+            "bbl_20_2.0",
+            "bbu_20_2.0",
+            "rsi",
+            "stochk_5_3_3",
+            "stochd_5_3_3",
         ],
         "float": [
-            "close", "bbl_20_2.0", "bbu_20_2.0",
-            "rsi", "stochk_5_3_3", "stochd_5_3_3",
+            "close",
+            "bbl_20_2.0",
+            "bbu_20_2.0",
+            "rsi",
+            "stochk_5_3_3",
+            "stochd_5_3_3",
         ],
     },
     "harmonic_abcd": {
         "event": ["datetime", "signal", "price"],
+        "float": ["price"],
+    },
+    "ma_cloud_rsi_macd": {
+        "event": ["datetime", "signal", "price", "action", "exit_reason"],
         "float": ["price"],
     },
 }
@@ -37,7 +51,10 @@ STRATEGY_COLUMNS = {
 
 # ── expected_events ──────────────────────────────────────────
 
-def _macd_rsi_stoch_expected_events(ta: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+
+def _macd_rsi_stoch_expected_events(
+    ta: pd.DataFrame, config: StrategyConfig
+) -> pd.DataFrame:
     signal_columns = config.signal_columns
     strategy_window = config.strategy_window
     sum_columns = [f"{col}_sum" for col in signal_columns]
@@ -97,15 +114,18 @@ def _flat_triangle_expected_events(ta: pd.DataFrame) -> pd.DataFrame:
     )
 
     events = ta[buy_mask | sell_mask].copy()
-    events["signal"] = np.where(
-        buy_mask[buy_mask | sell_mask], "BUY", "SELL"
-    )
+    events["signal"] = np.where(buy_mask[buy_mask | sell_mask], "BUY", "SELL")
     events["signal"] = events["signal"].astype("string")
 
     result_columns = [
-        "datetime", "signal", "close",
-        bb_lower_col, bb_upper_col,
-        "rsi", stoch_k_col, stoch_d_col,
+        "datetime",
+        "signal",
+        "close",
+        bb_lower_col,
+        bb_upper_col,
+        "rsi",
+        stoch_k_col,
+        stoch_d_col,
     ]
     return events[result_columns].reset_index(drop=True)
 
@@ -120,17 +140,60 @@ def _harmonic_abcd_expected_events(ta: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def expected_events(strategy_name: str, ta: pd.DataFrame, config: StrategyConfig | None = None) -> pd.DataFrame:
+def _ma_cloud_rsi_macd_expected_events(
+    ta: pd.DataFrame, config: StrategyConfig
+) -> pd.DataFrame:
+    """События стратегии MA Cloud RSI MACD, извлечённые покадровым прогоном.
+
+    Стратегия держит внутреннее состояние (pending-сигналы, контракты),
+    поэтому события воспроизводятся прогоном `decide()` по каждой свече.
+    """
+    from src.strategies import get_strategy
+
+    strategy = get_strategy("ma_cloud_rsi_macd", config=config)
+    rows = []
+    for i in range(len(ta)):
+        chunk = ta.iloc[max(0, i - 2) : i + 1]
+        decision = strategy.decide(chunk)
+        if decision.signal_type is SignalType.HOLD:
+            continue
+        rows.append(
+            {
+                "datetime": ta.iloc[i]["datetime"],
+                "signal": decision.signal_type.value,
+                "price": float(decision.price),
+                "action": decision.action or "",
+                "exit_reason": decision.exit_reason or "",
+            }
+        )
+    events = pd.DataFrame(rows)
+    if len(events):
+        events = events.astype(
+            {
+                "signal": "string",
+                "action": "string",
+                "exit_reason": "string",
+            }
+        )
+    return events
+
+
+def expected_events(
+    strategy_name: str, ta: pd.DataFrame, config: StrategyConfig | None = None
+) -> pd.DataFrame:
     if strategy_name == "macd_rsi_stoch":
         return _macd_rsi_stoch_expected_events(ta, config)
     if strategy_name == "flat_triangle":
         return _flat_triangle_expected_events(ta)
     if strategy_name == "harmonic_abcd":
         return _harmonic_abcd_expected_events(ta)
+    if strategy_name == "ma_cloud_rsi_macd":
+        return _ma_cloud_rsi_macd_expected_events(ta, config)
     raise ValueError(f"Неизвестная стратегия: {strategy_name}")
 
 
 # ── helpers ──────────────────────────────────────────────────
+
 
 def expected_filename(strategy_name):
     return f"{strategy_name}_expected_signals.csv"
@@ -151,6 +214,9 @@ def load_expected(case, strategy_name):
     for col in cols["float"]:
         expected[col] = expected[col].astype("float64")
     expected["signal"] = expected["signal"].astype("string")
+    for col in cols["event"]:
+        if col in ("action", "exit_reason"):
+            expected[col] = expected[col].astype("string").fillna("")
     return expected[cols["event"]]
 
 
@@ -159,7 +225,8 @@ def compare_events(actual, expected):
 
 
 def first_divergence(actual, expected):
-    float_cols = list(actual.columns.difference(["datetime", "signal"]))
+    text_cols = list(actual.columns.intersection(["action", "exit_reason"]))
+    float_cols = list(actual.columns.difference(["datetime", "signal"] + text_cols))
     n = max(len(actual), len(expected))
 
     def close(x, y):
@@ -174,6 +241,7 @@ def first_divergence(actual, expected):
         if (
             a["datetime"] != e["datetime"]
             or a["signal"] != e["signal"]
+            or any(a[c] != e[c] for c in text_cols)
             or not all(close(a[c], e[c]) for c in float_cols)
         ):
             return i, a.to_dict(), e.to_dict()
@@ -188,6 +256,7 @@ def write_expected(case, strategy_name, events):
 
 
 # ── analysis expected_context ──────────────────────────────────
+
 
 def _trend_expected_context(df: pd.DataFrame) -> pd.DataFrame:
     result = TrendAnalyzer().analyze(df)
@@ -245,7 +314,11 @@ def compare_analysis(actual, expected) -> None:
 
 
 def first_analysis_divergence(actual, expected):
-    float_cols = [c for c in actual.columns if c != "datetime" and c not in ("type", "label", "trend_direction")]
+    float_cols = [
+        c
+        for c in actual.columns
+        if c != "datetime" and c not in ("type", "label", "trend_direction")
+    ]
     text_cols = [c for c in actual.columns if c in ("type", "label", "trend_direction")]
     n = max(len(actual), len(expected))
 
