@@ -21,6 +21,10 @@ def _discover_visualizable_cases():
         if strategy_name not in PANEL_CONFIG:
             continue
         events = helper.load_expected(case, strategy_name)
+        # Входы — события с action="entry"; стратегии без колонки action
+        # (их эталон не содержит масштабирующих событий) учитываются целиком.
+        if "action" in events.columns:
+            events = events[events["action"] == "entry"]
         directions = sorted(events["signal"].unique())
         if "BUY" in directions:
             cases.add((case, strategy_name, "BUY"))
@@ -49,6 +53,9 @@ def test_visualize_signals_assets_exist():
         "macd_rsi_stoch": ("BUY", "SELL"),
         "flat_triangle": ("BUY", "SELL"),
         "harmonic_abcd": ("BUY",),
+        # Только SELL: на текущих кейсах стратегия даёт единственный вход —
+        # SELL по SBER_1d; BUY-событий на зафиксированных данных нет.
+        "ma_cloud_rsi_macd": ("SELL",),
     }.items():
         for direction in directions:
             assert (ASSETS_DIR / f"{strategy_name}_{direction}.svg").exists()

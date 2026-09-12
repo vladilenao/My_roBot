@@ -6,7 +6,6 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from src.strategies.base_strategy import StrategyConfig
-from src.strategies.contracts import SignalType
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
 
@@ -141,41 +140,18 @@ def _harmonic_abcd_expected_events(ta: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ma_cloud_rsi_macd_expected_events(
-    ta: pd.DataFrame, config: StrategyConfig
+    ta: pd.DataFrame, config: StrategyConfig | None = None
 ) -> pd.DataFrame:
-    """События стратегии MA Cloud RSI MACD, извлечённые покадровым прогоном.
+    """События стратегии MA Cloud RSI MACD (эталон snapshot-тестов).
 
     Стратегия держит внутреннее состояние (pending-сигналы, контракты),
-    поэтому события воспроизводятся прогоном `decide()` по каждой свече.
+    поэтому события считает сам боевой метод `expected_events()` методом
+    накопительного реплея `decide()` (та же семантика, что в боевом цикле).
     """
     from src.strategies import get_strategy
 
     strategy = get_strategy("ma_cloud_rsi_macd", config=config)
-    rows = []
-    for i in range(len(ta)):
-        chunk = ta.iloc[max(0, i - 2) : i + 1]
-        decision = strategy.decide(chunk)
-        if decision.signal_type is SignalType.HOLD:
-            continue
-        rows.append(
-            {
-                "datetime": ta.iloc[i]["datetime"],
-                "signal": decision.signal_type.value,
-                "price": float(decision.price),
-                "action": decision.action or "",
-                "exit_reason": decision.exit_reason or "",
-            }
-        )
-    events = pd.DataFrame(rows)
-    if len(events):
-        events = events.astype(
-            {
-                "signal": "string",
-                "action": "string",
-                "exit_reason": "string",
-            }
-        )
-    return events
+    return strategy.expected_events(ta)
 
 
 def expected_events(

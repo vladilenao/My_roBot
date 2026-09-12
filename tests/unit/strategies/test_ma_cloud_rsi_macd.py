@@ -26,8 +26,10 @@ SHORT_ENTRY_SERIES = np.concatenate(
 
 
 def _df_from_close(close: np.ndarray) -> pd.DataFrame:
+    start = pd.Timestamp("2024-01-01")
     return pd.DataFrame(
         {
+            "datetime": [start + pd.Timedelta(days=i) for i in range(len(close))],
             "open": close,
             "high": close + 2,
             "low": close - 2,
@@ -153,10 +155,104 @@ class TestMaCloudRsiMacdStrategy:
 
     def test_pending_indicators_cleared_on_expiry(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._pending_long = [-30, -10]
+        strat._pending_long = {"rsi": -30, "macd_zero": -10}
         ta = _ta_scenario(100.0)
         strat.decide(ta)
-        assert strat._pending_long == []
+        assert strat._pending_long == {}
+
+    def test_repeat_signal_of_same_indicator_is_not_second(self):
+        """Повторный сигнал того же индикатора не считается вторым подтверждением."""
+        strat = MaCloudRsiMacdStrategy()
+        strat._pending_long = {"rsi": 2, "macd_zero": 3}  # 2 разных в окне
+        ta = _ta_scenario(
+            close=118.0,
+            ma_signal=0,
+            rsi_signal=0,
+            macd_signal=0,
+            rsi=55.0,  # RSI бычий, но макд/ма не менялись
+        )
+        decision = strat.decide(ta)
+        assert decision.signal_type == SignalType.HOLD
+        assert strat._pending_long == {"rsi": 2, "macd_zero": 3}
+
+    def test_third_different_indicator_enters_and_clears(self):
+        """Третий РАЗНЫЙ индикатор в окне даёт BUY, состояние очищается."""
+        strat = MaCloudRsiMacdStrategy()
+        strat.decide  # noqa: B018
+        strat._pending_long = {"rsi": 2, "macd_zero": 3}
+        ta = _ta_scenario(
+            close=118.0,
+            ma_signal=1,  # облако бычье — третий индикатор
+            rsi_signal=0,
+            macd_signal=0,
+        )
+        decision = strat.decide(ta)
+        assert decision.signal_type == SignalType.BUY
+        assert decision.action == "entry"
+        assert strat._pending_long == {}
+
+    def test_third_different_indicator_short_enters_and_clears(self):
+        strat = MaCloudRsiMacdStrategy()
+        strat._pending_short = {"rsi": 200, "macd_zero": 201}
+        ta = _ta_scenario(
+            close=82.0,
+            ma_signal=-1,  # облако медвежье — третий индикатор
+            rsi_signal=0,
+            macd_signal=0,
+        )
+        decision = strat.decide(ta)
+        assert decision.signal_type == SignalType.SELL
+        assert strat._pending_short == {}
+
+    def test_indicator_refires_after_window_expiry(self):
+        """Сигнал того же индикатора может сработать заново после истечения окна."""
+        strat = MaCloudRsiMacdStrategy()
+        strat._pending_long = {"rsi": -20}  # bar за пределами окна
+        ta = _ta_scenario(
+            close=118.0,
+            ma_signal=0,
+            rsi_signal=1,  # RSI бычий снова — refire
+            macd_signal=0,
+            rsi=60.0,
+        )
+        decision = strat.decide(ta)
+        assert decision.signal_type == SignalType.HOLD
+        assert list(strat._pending_long) == ["rsi"]
+
+    def test_expected_events_cumulative_replay_is_consistent(self):
+        """expected_events() накопительным реплеем идентичен полной истории."""
+        close = LONG_ENTRY_SERIES
+        df = _df_from_close(close)
+        strat = MaCloudRsiMacdStrategy()
+        ta = strat.compute(df)
+        events = strat.expected_events(ta)
+
+        # Полный прогон через накопительный decide_through
+        full = MaCloudRsiMacdStrategy()
+        decisions = _decide_through(full, close)
+        expected = pd.DataFrame(
+            [
+                {
+                    "signal": d.signal_type.value,
+                    "price": d.price,
+                    "action": d.action or "",
+                    "exit_reason": d.exit_reason or "",
+                }
+                for d in decisions
+                if d.signal_type is not SignalType.HOLD
+            ]
+        )
+        # expected_events() выдаёт текстовые колонки как astype("string") (StringDtype).
+        # Накопительный реплей возвращает те же python-строки — приводим к тому же dtype.
+        expected["signal"] = expected["signal"].astype("string")
+        expected["action"] = expected["action"].astype("string")
+        expected["exit_reason"] = expected["exit_reason"].astype("string")
+        actual = events.drop(columns=["datetime"])
+        pd.testing.assert_frame_equal(
+            actual.reset_index(drop=True),
+            expected.reset_index(drop=True),
+            check_like=True,
+        )
 
     # ── Добор (scale-in) ──────────────────────────────────────────
     def test_scale_in_long_on_cloud_retest(self):

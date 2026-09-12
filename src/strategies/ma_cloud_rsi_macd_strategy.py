@@ -13,6 +13,15 @@ from src.strategies.indicators.rsi.signalEnum import RsiSignalEnum
 from src.strategies.registry import register
 from src.logging_setup import get_logger
 
+EVENT_COLUMNS = [
+    "datetime",
+    "signal",
+    "price",
+    "action",
+    "exit_reason",
+]
+
+
 log = get_logger(__name__)
 
 # ══════════════════════════════════════════════════════════════
@@ -33,16 +42,22 @@ DEFAULT_CONFIG = StrategyConfig(
     ),
 )
 
-_ENTRY_WINDOW = 6  # макс. свечей для фиксации предыдущих сигналов
+ENTRY_WINDOW = 6  # макс. свечей для фиксации предыдущих сигналов
 
 
 @register
 class MaCloudRsiMacdStrategy:
     """Двусторонняя трендовая стратегия MA Cloud RSI MACD.
 
-    Вход: третий индикатор (MA облако, RSI 50, MACD 0) подтверждает направление.
+    Вход: три РАЗНЫХ индикатора (MA облако, RSI 50, MACD 0) подтверждают
+    направление в пределах окна ENTRY_WINDOW; подтверждение учитывается
+    один раз на индикатор.
     Добор: ретест облака (цена в пространстве SMA 10..SMA 40).
     Выход: ступенчатый по MA 10/40/облаку в зависимости от размера позиции.
+
+    Семантика decide(ta): ta передаётся накопительно (полная история до
+    текущей свечи), поэтому bar_idx = len(ta) - 1 абсолютен. Внутреннее
+    состояние (pending-сигналы) отсчитывается от абсолютной позиции.
     """
 
     NAME = "ma_cloud_rsi_macd"
@@ -52,8 +67,8 @@ class MaCloudRsiMacdStrategy:
         self._config = config or DEFAULT_CONFIG
         self.NAME = self._config.name
         self.STRATEGY_WINDOW = self._config.strategy_window
-        self._pending_long: list[int] = []  # bar indices сработавших индикаторов Long
-        self._pending_short: list[int] = []
+        self._pending_long: dict[str, int] = {}  # индикатор → бар первого сигнала Long
+        self._pending_short: dict[str, int] = {}
         self._long_contracts = 0
         self._short_contracts = 0
 
@@ -62,6 +77,54 @@ class MaCloudRsiMacdStrategy:
         for indicator in self._config.indicators:
             data = indicator.compute(data)
         return data
+
+    def expected_events(self, ta: pd.DataFrame) -> pd.DataFrame:
+        """События BUY/SELL за всю историю (эталон snapshot-тестов).
+
+        Покадровый накопительный прогон: каждой свече от конца прогрева
+        индикаторов подаётся полная история до неё (decide(ta.iloc[:i+1])) —
+        та же семантика, что в боевом цикле. Прогон выполняется на отдельном
+        экземпляре стратегии, чтобы не менять состояние вызывающего.
+        """
+        runner = type(self)(self._config)
+        rows = []
+        start = max(0, runner.required_history() - 1)
+        for i in range(start, len(ta)):
+            decision = runner.decide(ta.iloc[: i + 1])
+            if decision.signal_type is SignalType.HOLD:
+                continue
+            rows.append(
+                {
+                    "datetime": ta.iloc[i]["datetime"],
+                    "signal": decision.signal_type.value,
+                    "price": float(decision.price),
+                    "action": decision.action or "",
+                    "exit_reason": decision.exit_reason or "",
+                }
+            )
+        # Всегда гарантируем схему событий: даже при нуле сигналов
+        # возвращаем DataFrame с каноническими колонками, чтобы
+        # snapshot-запись и сравнение пустых эталонов работали одинаково.
+        events = pd.DataFrame(rows, columns=EVENT_COLUMNS)
+        if len(events):
+            events = events.astype(
+                {
+                    "signal": "string",
+                    "action": "string",
+                    "exit_reason": "string",
+                }
+            )
+        else:
+            events = events.astype(
+                {
+                    "datetime": "datetime64[ns]",
+                    "signal": "string",
+                    "price": "float64",
+                    "action": "string",
+                    "exit_reason": "string",
+                }
+            )
+        return events
 
     def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision:
         if len(ta) < 3:
@@ -91,12 +154,18 @@ class MaCloudRsiMacdStrategy:
         indicators["rsi"] = float(row["rsi"]) if pd.notna(row.get("rsi")) else 0.0
 
         # ── Очистка устаревших pending-сигналов ──────────────────
-        self._pending_long = [
-            i for i in self._pending_long if bar_idx - i < _ENTRY_WINDOW
-        ]
-        self._pending_short = [
-            i for i in self._pending_short if bar_idx - i < _ENTRY_WINDOW
-        ]
+        # bar_idx абсолютен: decide() получает накопительную историю,
+        # поэтому len(ta) - 1 совпадает с позицией свечи в полном фрейме.
+        self._pending_long = {
+            name: bar
+            for name, bar in self._pending_long.items()
+            if bar_idx - bar < ENTRY_WINDOW
+        }
+        self._pending_short = {
+            name: bar
+            for name, bar in self._pending_short.items()
+            if bar_idx - bar < ENTRY_WINDOW
+        }
 
         # ── Определяем какие индикаторы сработали на этой свече ──
         signals_map = {
@@ -118,12 +187,14 @@ class MaCloudRsiMacdStrategy:
         }
 
         for name, (sig, bull, bear) in signals_map.items():
+            # Подтверждение учитывается по имени индикатора: повторный сигнал
+            # того же индикатора не засчитывается вторым/третьим голосом.
             if sig == bull and name not in self._pending_long:
-                self._pending_long.append(bar_idx)
+                self._pending_long[name] = bar_idx
             if sig == bear and name not in self._pending_short:
-                self._pending_short.append(bar_idx)
+                self._pending_short[name] = bar_idx
 
-        # ── Вход: третий индикатор подтверждает ──────────────────
+        # ── Вход: три РАЗНЫХ индикатора подтверждают направление ──
         if len(self._pending_long) >= 3 and self._long_contracts == 0:
             self._pending_long.clear()
             self._long_contracts = 1
