@@ -4,7 +4,7 @@ import importlib
 import pkgutil
 from typing import TypeVar
 
-from src.strategies.contracts import Strategy
+from src.strategies.contracts import Assignment, Strategy
 from src.strategies.base_strategy import StrategyConfig
 from src.logging_setup import get_logger
 
@@ -65,15 +65,29 @@ def strategy_names() -> list[str]:
 
 
 def validate_assignments(
-    assignments: dict[str, list[str]], source: str | None = None
+    assignments: dict[str, list[Assignment]], source: str | None = None
 ) -> None:
     _discover_strategies()
     unknown = sorted(
-        {name for names in assignments.values() for name in names} - set(_registry)
+        {item.strategy for items in assignments.values() for item in items}
+        - set(_registry)
     )
     if unknown:
         where = f" в словаре '{source}'" if source else ""
         raise ValueError(
             f"Неизвестные стратегии{where}: {', '.join(unknown)}. "
             f"Доступны: {', '.join(sorted(_registry))}"
+        )
+    # Ленивый импорт: пакет стратегий не тянет decision при загрузке модуля.
+    from src.decision.filters import profile_names
+
+    unknown_profiles = sorted(
+        {item.filter_profile for items in assignments.values() for item in items}
+        - set(profile_names())
+    )
+    if unknown_profiles:
+        where = f" в словаре '{source}'" if source else ""
+        raise ValueError(
+            f"Неизвестные профили фильтрации{where}: {', '.join(unknown_profiles)}. "
+            f"Доступны: {', '.join(profile_names())}"
         )

@@ -1,7 +1,7 @@
 import pytest
 from typing import get_args
 
-from src.strategies.contracts import Decision, SignalType
+from src.strategies.contracts import Assignment, Decision, SignalType
 from src.strategies.registry import (
     _discover_strategies,
     all_strategies,
@@ -154,17 +154,21 @@ def test_strategy_names_returns_sorted_keys():
     assert strategy_names() == ["a_dummy", "dummy_a"]
 
 
+def _a(name: str, profile: str = "basic_levels") -> Assignment:
+    return Assignment(strategy=name, filter_profile=profile, timeframe="1h")
+
+
 def test_validate_assignments_accepts_known_names():
     register(DummyStrategy)
 
-    validate_assignments({"T1": ["dummy_a"], "T2": []})
+    validate_assignments({"T1": [_a("dummy_a")], "T2": []})
 
 
 def test_validate_assignments_lists_unknown_and_available():
     register(DummyStrategy)
 
     with pytest.raises(ValueError) as exc_info:
-        validate_assignments({"T1": ["z_ghost", "a_ghost"], "T2": ["dummy_a"]})
+        validate_assignments({"T1": [_a("z_ghost"), _a("a_ghost")], "T2": [_a("dummy_a")]})
 
     message = str(exc_info.value)
     assert "z_ghost" in message
@@ -177,7 +181,7 @@ def test_validate_assignments_reports_source_dictionary():
     register(DummyStrategy)
 
     with pytest.raises(ValueError) as exc_info:
-        validate_assignments({"NG": ["z_ghost"]}, source="FUTURE_STRATEGIES")
+        validate_assignments({"NG": [_a("z_ghost")]}, source="FUTURE_STRATEGIES")
 
     message = str(exc_info.value)
     assert "FUTURE_STRATEGIES" in message
@@ -188,15 +192,33 @@ def test_validate_assignments_reports_source_dictionary():
 def test_validate_assignments_applies_to_both_dictionaries():
     register(DummyStrategy)
 
-    validate_assignments({"SBER": ["dummy_a"]}, source="SHARE_STRATEGIES")
+    validate_assignments({"SBER": [_a("dummy_a")]}, source="SHARE_STRATEGIES")
 
     with pytest.raises(ValueError) as exc_info:
-        validate_assignments({"NG": ["a_ghost", "z_ghost"]}, source="FUTURE_STRATEGIES")
+        validate_assignments({"NG": [_a("a_ghost"), _a("z_ghost")]}, source="FUTURE_STRATEGIES")
 
     message = str(exc_info.value)
     assert "FUTURE_STRATEGIES" in message
     assert "a_ghost" in message
     assert "z_ghost" in message
+
+
+def test_validate_assignments_accepts_known_filter_profiles():
+    register(DummyStrategy)
+
+    validate_assignments({"T1": [_a("dummy_a", profile="raw"), _a("dummy_a")]})
+
+
+def test_validate_assignments_lists_unknown_filter_profiles():
+    register(DummyStrategy)
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_assignments({"T1": [_a("dummy_a", profile="no_such_profile")]})
+
+    message = str(exc_info.value)
+    assert "no_such_profile" in message
+    assert "basic_levels" in message
+    assert "raw" in message
 
 
 def test_import_names_module_is_light():

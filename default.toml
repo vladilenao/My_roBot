@@ -18,14 +18,49 @@ fallback_ticker = "NGU6"
 [notifier]
 channel = "console"
 
-[strategies.share]
-SBER = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]
+# Покрытие всех форм привязки: строка (дефолты), инлайн-таблица с raw /
+# basic_levels, дубликаты стратегий; каскад ТФ: глобальный 1h, timeframe
+# тикера (NG → 15m), точечный tf в инлайне, дубли на разных ТФ.
+[strategies.share.SBER]
+strategies = [
+    { name = "macd_rsi_stoch", filter = "raw", tf = "15m" },  # скальпер без фильтров на 15m
+    { name = "macd_rsi_stoch", filter = "basic_levels" },     # та же стратегия на 1h с фильтром
+    "flat_triangle",                                          # строка → дефолты (1h, basic_levels)
+    { name = "ma_cloud_rsi_macd", filter = "raw" },
+]
 
-[strategies.future]
-NG = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]
-BR = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]
-SI = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]
-ED = ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]
+[strategies.future.NG]
+timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
+strategies = [
+    "macd_rsi_stoch",
+    { name = "flat_triangle", filter = "raw" },
+    { name = "harmonic_abcd", filter = "basic_levels" },
+    { name = "ma_cloud_rsi_macd", tf = "1h" },             # исключение на часовике
+]
+
+[strategies.future.BR]
+strategies = [
+    { name = "macd_rsi_stoch", filter = "raw", tf = "5m" },
+    "flat_triangle",
+    { name = "harmonic_abcd", filter = "raw" },
+    { name = "ma_cloud_rsi_macd", tf = "15m" },
+]
+
+[strategies.future.SI]
+strategies = [
+    "macd_rsi_stoch",
+    "flat_triangle",
+    { name = "ma_cloud_rsi_macd", filter = "raw", tf = "5m" },
+    { name = "ma_cloud_rsi_macd" },                         # дубликат: 1h + дефолтный профиль
+]
+
+[strategies.future.ED]
+strategies = [
+    { name = "flat_triangle", filter = "raw", tf = "15m" },
+    { name = "macd_rsi_stoch", filter = "basic_levels" },
+    "harmonic_abcd",
+    "ma_cloud_rsi_macd",
+]
 
 [logging]
 service_uid = "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a"

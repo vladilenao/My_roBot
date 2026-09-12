@@ -16,7 +16,7 @@ def _decision(
 
 class TestForwardFormat:
     def test_buy_with_bar_time_and_strategy(self):
-        result = DecisionFormatter(timeframe="1h").format(
+        result = DecisionFormatter().format(
             _decision(
                 SignalType.BUY,
                 100.5,
@@ -24,11 +24,12 @@ class TestForwardFormat:
                 strategy_name="macd_rsi_stoch",
             ),
             instrument_label="NG-10.26",
+            timeframe="1h",
         )
         assert result == "● NG-10.26 (1h) 22:00 | macd_rsi_stoch ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.5"
 
     def test_sell_with_bar_time_and_strategy(self):
-        result = DecisionFormatter(timeframe="1h").format(
+        result = DecisionFormatter().format(
             _decision(
                 SignalType.SELL,
                 100.5,
@@ -36,6 +37,7 @@ class TestForwardFormat:
                 strategy_name="macd_rsi_stoch",
             ),
             instrument_label="NG-10.26",
+            timeframe="1h",
         )
         assert result == "● NG-10.26 (1h) 22:00 | macd_rsi_stoch ➜ 🔴 ПРОДАЖА (SELL) — Цена: 100.5"
 
@@ -45,7 +47,7 @@ class TestForwardFormat:
         assert "Цена" not in result
 
     def test_omits_time_without_bar_time(self):
-        result = DecisionFormatter(timeframe="1h").format(
+        result = DecisionFormatter().format(
             _decision(SignalType.BUY, 100.5, strategy_name="macd_rsi_stoch"),
             instrument_label="NG-10.26",
         )
@@ -53,7 +55,7 @@ class TestForwardFormat:
         assert "| macd_rsi_stoch" in result
 
     def test_omits_strategy_without_name(self):
-        result = DecisionFormatter(timeframe="1h").format(
+        result = DecisionFormatter().format(
             _decision(SignalType.BUY, 100.5, bar_time=pd.Timestamp("2026-08-26 22:00")),
             instrument_label="NG-10.26",
         )
@@ -155,3 +157,47 @@ class TestTimeZoneOffset:
         assert "06:15" not in result
         assert "09:15" not in result
         assert "| macd_rsi_stoch" in result
+
+
+class TestFilterProfileBlock:
+    def test_profile_block_follows_strategy(self):
+        result = DecisionFormatter().format(
+            _decision(
+                SignalType.BUY,
+                100.5,
+                bar_time=pd.Timestamp("2026-08-26 22:00"),
+                strategy_name="macd_rsi_stoch",
+            ),
+            instrument_label="NG-10.26",
+            filter_profile="raw",
+            timeframe="1h",
+        )
+        assert result == "● NG-10.26 (1h) 22:00 | macd_rsi_stoch [raw] ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.5"
+
+    def test_profile_block_omitted_when_empty(self):
+        result = DecisionFormatter().format(
+            _decision(
+                SignalType.BUY,
+                100.5,
+                bar_time=pd.Timestamp("2026-08-26 22:00"),
+                strategy_name="macd_rsi_stoch",
+            ),
+            instrument_label="NG-10.26",
+        )
+        assert "[" not in result
+
+    def test_filtered_out_status_without_price(self):
+        result = DecisionFormatter().format(
+            _decision(
+                SignalType.HOLD,
+                100.5,
+                bar_time=pd.Timestamp("2026-08-26 22:00"),
+                strategy_name="flat_triangle",
+            ),
+            instrument_label="ED-9.26",
+            filter_profile="basic_levels",
+            filtered_out=True,
+            timeframe="1h",
+        )
+        assert result == "● ED-9.26 (1h) 22:00 | flat_triangle [basic_levels] ➜ ❌ Отклонено фильтром."
+        assert "Цена" not in result

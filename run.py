@@ -8,6 +8,7 @@ from src import __version__
 from src.decision import RiskManager, SignalFilter
 from src.bot import TradingBot
 from src.config import (
+    ACTIVE_TIMEFRAMES,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -15,7 +16,6 @@ from src.config import (
     TICKER,
     TICK_POLL_SECS,
     TICK_TIMEOUT_SECS,
-    TIMEFRAME,
     TINKOFF_TOKEN,
     INSTRUMENT_TYPE,
     LOGGING_SERVICE_UID,
@@ -30,7 +30,7 @@ from src.execution import NotifyOnlyExecutionPort
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
 from src.notifier import get_notifier
-from src.scheduler.timing import CandleScheduler
+from src.scheduler.timing import MultiTimeframeScheduler
 
 log = get_logger(__name__)
 
@@ -46,7 +46,9 @@ def main():
     log.info("Робот v%s запущен", __version__)
     instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
     notifier = get_notifier()
-    timeline = CandleScheduler(timeframe=TIMEFRAME, sleep_secs=SLEEP_SECONDS)
+    timeline = MultiTimeframeScheduler(
+        timeframes=sorted(ACTIVE_TIMEFRAMES), sleep_secs=SLEEP_SECONDS
+    )
     data_cache = MarketDataCache(
         loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
     )

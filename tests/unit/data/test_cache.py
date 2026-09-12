@@ -4,7 +4,7 @@ import pandas as pd
 
 from src.data.cache import MarketDataCache
 from src.instruments import Instrument
-from src.scheduler.timing import CandleScheduler
+from src.scheduler.timing import MultiTimeframeScheduler
 
 
 def _bars(times):
@@ -51,7 +51,7 @@ def _bars_from_rows(rows):
 
 class TestMarketDataCache:
     def _make(self, data, clock_at):
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock_at[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock_at[0])
         cache = MarketDataCache(loader=FakeLoader(data), timeline=sched)
         return cache
 
@@ -61,7 +61,7 @@ class TestMarketDataCache:
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
         inst = Instrument("SBER", "SBER", "share")
 
-        frame = cache.frame_for(inst)
+        frame = cache.frame_for(inst, "1h")
 
         assert list(frame["datetime"]) == [
             pd.Timestamp("2024-01-01 08:00"),
@@ -73,11 +73,11 @@ class TestMarketDataCache:
         bars = _bars(["08:00", "09:00", "10:00"])
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
         loader = cache._loader
         initial_calls = len(loader.calls)
 
-        cache.refresh_if_new_candle()  # граница не сместилась
+        cache.refresh_if_new_candle("1h")  # граница не сместилась
 
         assert len(loader.calls) == initial_calls
 
@@ -88,10 +88,10 @@ class TestMarketDataCache:
                    pd.Timestamp("2024-01-01 08:00"),
                    pd.Timestamp("2024-01-01 09:00")]
         loader = FakeLoader({"SBER": candles})
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
         cache = MarketDataCache(loader=loader, timeline=sched)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)  # 09:00 — живая, кэш до 08:00
+        cache.frame_for(inst, "1h")  # 09:00 — живая, кэш до 08:00
 
         assert len(loader.calls) == 1
 
@@ -99,11 +99,11 @@ class TestMarketDataCache:
         loader.data["SBER"] = candles + [pd.Timestamp("2024-01-01 10:00")]
         clock[0] = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
 
-        cache.refresh_if_new_candle()
+        cache.refresh_if_new_candle("1h")
 
         assert len(loader.calls) == 2
         assert loader.calls[-1] == pd.Timestamp("2024-01-01 08:00")  # дозагрузка с последнего бара
-        frame = cache.frame_for(inst)
+        frame = cache.frame_for(inst, "1h")
         assert frame["datetime"].max() == pd.Timestamp("2024-01-01 09:00")
         assert len(frame) == 4
 
@@ -113,7 +113,7 @@ class TestMarketDataCache:
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
         inst = Instrument("SBER", "SBER", "share")
 
-        frame = cache.frame_for(inst)
+        frame = cache.frame_for(inst, "1h")
 
         assert list(frame["datetime"]) == [pd.Timestamp("2024-01-01 09:00")]
 
@@ -126,58 +126,58 @@ class TestMarketDataCache:
             pd.Timestamp("2024-01-01 09:00"),
         ]
         loader = FakeLoader({"SBER": candles})
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
         cache = MarketDataCache(loader=loader, timeline=sched)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
 
-        assert cache._observed[("SBER", "share")].tzinfo is None
-        assert cache._last_loaded[("SBER", "share")].tzinfo is None
+        assert cache._observed[("SBER", "share", "1h")].tzinfo is None
+        assert cache._last_loaded[("SBER", "share", "1h")].tzinfo is None
 
         # новый закрытый бар 10:00, часы перешли (naive) — дозагрузка не падает
         loader.data["SBER"] = candles + [pd.Timestamp("2024-01-01 10:00")]
         clock[0] = datetime(2024, 1, 1, 10, 0)
-        cache.refresh_if_new_candle()
+        cache.refresh_if_new_candle("1h")
 
-        assert cache._last_loaded[("SBER", "share")].tzinfo is None
-        assert cache._last_loaded[("SBER", "share")] == pd.Timestamp("2024-01-01 09:00")
+        assert cache._last_loaded[("SBER", "share", "1h")].tzinfo is None
+        assert cache._last_loaded[("SBER", "share", "1h")] == pd.Timestamp("2024-01-01 09:00")
 
     def test_has_fresh_closed_bar_true_when_present(self):
         clock = [datetime(2024, 1, 1, 10, 0)]
         bars = _bars(["06:00", "07:00", "08:00", "09:00"])
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
 
-        assert cache.has_fresh_closed_bar() is True
+        assert cache.has_fresh_closed_bar("1h") is True
 
     def test_has_fresh_closed_bar_false_when_missing(self):
         clock = [datetime(2024, 1, 1, 10, 0)]
         bars = _bars(["06:00", "07:00", "08:00"])
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
 
-        assert cache.has_fresh_closed_bar() is False
+        assert cache.has_fresh_closed_bar("1h") is False
 
     def test_has_fresh_closed_bar_true_when_nothing_loaded(self):
         clock = [datetime(2024, 1, 1, 10, 0)]
         bars = _bars(["06:00"])
         cache = self._make({"SBER": bars["datetime"].tolist()}, clock)
 
-        assert cache.has_fresh_closed_bar() is True
+        assert cache.has_fresh_closed_bar("1h") is True
 
     def test_force_refresh_pulls_late_bar(self):
         clock = [datetime(2024, 1, 1, 10, 0)]
         loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
                                       pd.Timestamp("2024-01-01 07:00"),
                                       pd.Timestamp("2024-01-01 08:00")]})
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
         cache = MarketDataCache(loader=loader, timeline=sched)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
 
-        assert cache.has_fresh_closed_bar() is False
+        assert cache.has_fresh_closed_bar("1h") is False
 
         # свежий закрытый бар 09:00 публикуется с задержкой
         loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
@@ -185,21 +185,21 @@ class TestMarketDataCache:
                                pd.Timestamp("2024-01-01 08:00"),
                                pd.Timestamp("2024-01-01 09:00")]
 
-        cache.refresh_if_new_candle(force=True)
+        cache.refresh_if_new_candle("1h", force=True)
 
-        assert cache.has_fresh_closed_bar() is True
-        assert cache.frame_for(inst)["datetime"].max() == pd.Timestamp("2024-01-01 09:00")
+        assert cache.has_fresh_closed_bar("1h") is True
+        assert cache.frame_for(inst, "1h")["datetime"].max() == pd.Timestamp("2024-01-01 09:00")
 
     def test_refresh_without_force_skips_after_observed(self):
         clock = [datetime(2024, 1, 1, 10, 0)]
         loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
                                       pd.Timestamp("2024-01-01 07:00"),
                                       pd.Timestamp("2024-01-01 08:00")]})
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
         cache = MarketDataCache(loader=loader, timeline=sched)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
-        cache.refresh_if_new_candle()
+        cache.frame_for(inst, "1h")
+        cache.refresh_if_new_candle("1h")
         calls_before = len(loader.calls)
 
         # без force граница уже отслежена — повторной загрузки нет
@@ -207,10 +207,10 @@ class TestMarketDataCache:
                                pd.Timestamp("2024-01-01 07:00"),
                                pd.Timestamp("2024-01-01 08:00"),
                                pd.Timestamp("2024-01-01 09:00")]
-        cache.refresh_if_new_candle()
+        cache.refresh_if_new_candle("1h")
 
         assert len(loader.calls) == calls_before
-        assert cache.has_fresh_closed_bar() is False
+        assert cache.has_fresh_closed_bar("1h") is False
 
     def test_reload_reuses_cached_instrument_id(self):
         clock = [datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc)]
@@ -218,10 +218,10 @@ class TestMarketDataCache:
                                       pd.Timestamp("2024-01-01 07:00"),
                                       pd.Timestamp("2024-01-01 08:00"),
                                       pd.Timestamp("2024-01-01 09:00")]})
-        sched = CandleScheduler(timeframe="1h", clock=lambda: clock[0])
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
         cache = MarketDataCache(loader=loader, timeline=sched)
         inst = Instrument("SBER", "SBER", "share")
-        cache.frame_for(inst)
+        cache.frame_for(inst, "1h")
 
         assert loader.instrument_ids == [None]  # первый вызов — UID ещё не известен
 
@@ -232,9 +232,74 @@ class TestMarketDataCache:
                                pd.Timestamp("2024-01-01 09:00"),
                                pd.Timestamp("2024-01-01 10:00")]
         clock[0] = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
-        cache.refresh_if_new_candle()
+        cache.refresh_if_new_candle("1h")
 
         assert loader.instrument_ids == [None, "uid-1"]  # повторная загрузка переиспользует UID
 
 
 
+
+
+class FakeLoaderPerTf:
+    """Лоадер с данными по паре (тикер, таймфрейм)."""
+
+    def __init__(self, data):
+        self.data = data
+        self.calls = []
+
+    def __call__(
+        self, ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None, instrument_id=None
+    ):
+        self.calls.append((ticker, timeframe))
+        rows = [
+            b
+            for b in self.data.get((ticker, timeframe), [])
+            if start_date is None or b > pd.Timestamp(start_date)
+        ]
+        return _bars_from_rows(rows), instrument_id or "uid-1"
+
+
+class TestMultiTimeframeCache:
+    def _make(self, data, clock_at):
+        sched = MultiTimeframeScheduler(["15m", "1h"], clock=lambda: clock_at[0])
+        return MarketDataCache(loader=FakeLoaderPerTf(data), timeline=sched)
+
+    def test_frames_of_different_timeframes_are_independent(self):
+        clock = [datetime(2024, 1, 1, 10, 45)]
+        data = {
+            ("SBER", "15m"): [pd.Timestamp(f"2024-01-01 09:{m}") for m in (0, 15, 30, 45)]
+                             + [pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 10:15")],
+            ("SBER", "1h"): [pd.Timestamp("2024-01-01 08:00"), pd.Timestamp("2024-01-01 09:00")],
+        }
+        cache = self._make(data, clock)
+        inst = Instrument("SBER", "SBER", "share")
+
+        frame_15m = cache.frame_for(inst, "15m")
+        frame_1h = cache.frame_for(inst, "1h")
+
+        assert len(frame_15m) == 6  # все 15m-бары закрыты (живая 10:45 не загружалась)
+        assert list(frame_1h["datetime"]) == [
+            pd.Timestamp("2024-01-01 08:00"),
+            pd.Timestamp("2024-01-01 09:00"),
+        ]  # обе 1h-свечи закрыты к 10:45
+        # кадры разных ТФ — разные сетки: 1h выровнены по часу, 15m содержит четверти
+        assert all(t.minute == 0 for t in frame_1h["datetime"])
+        assert pd.Timestamp("2024-01-01 09:15") in set(frame_15m["datetime"])
+        assert pd.Timestamp("2024-01-01 09:15") not in set(frame_1h["datetime"])
+
+    def test_freshness_tracked_per_timeframe(self):
+        clock = [datetime(2024, 1, 1, 10, 45)]
+        data = {
+            # 15m: свежий закрытый бар 10:30 есть (ожидаемый previous_start)
+            ("SBER", "15m"): [pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 10:15"),
+                              pd.Timestamp("2024-01-01 10:30")],
+            # 1h: последний закрытый бар 08:00, ожидаемый 09:00 отсутствует
+            ("SBER", "1h"): [pd.Timestamp("2024-01-01 07:00"), pd.Timestamp("2024-01-01 08:00")],
+        }
+        cache = self._make(data, clock)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst, "15m")
+        cache.frame_for(inst, "1h")
+
+        assert cache.has_fresh_closed_bar("15m") is True
+        assert cache.has_fresh_closed_bar("1h") is False

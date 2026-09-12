@@ -1,4 +1,6 @@
 
+import pytest
+
 from src.decision import SignalFilter
 from src.market_context.models import MarketContext, TrendDirection, TrendResult
 from src.strategies.contracts import Decision, SignalType
@@ -56,3 +58,37 @@ class TestSignalFilter:
         decision = _decision(SignalType.BUY)
         result = filter_.apply(decision, _ctx(TrendDirection.DOWN))
         assert result is not decision
+
+
+class TestFilterProfiles:
+    def test_raw_passes_signal_against_trend(self):
+        result = SignalFilter().apply(
+            _decision(SignalType.BUY), _ctx(TrendDirection.DOWN), profile_name="raw"
+        )
+        assert result.signal_type is SignalType.BUY
+
+    def test_raw_does_not_enrich_trend_fields(self):
+        result = SignalFilter().apply(
+            _decision(SignalType.BUY), _ctx(TrendDirection.UP, strength=0.6), profile_name="raw"
+        )
+        assert result.trend_direction is None
+        assert result.trend_confidence is None
+
+    def test_default_profile_is_basic_levels(self):
+        # вызов без profile_name ведёт себя как basic_levels: BUY против down-тренда блокируется
+        result = SignalFilter().apply(_decision(SignalType.BUY), _ctx(TrendDirection.DOWN))
+        assert result.signal_type is SignalType.HOLD
+        assert result.trend_confidence == 0.0
+
+    def test_explicit_basic_levels_matches_default(self):
+        decision, ctx = _decision(SignalType.SELL), _ctx(TrendDirection.DOWN)
+        assert SignalFilter().apply(decision, ctx, profile_name="basic_levels") == SignalFilter().apply(decision, ctx)
+
+    def test_unknown_profile_raises_with_available_list(self):
+        with pytest.raises(ValueError) as exc_info:
+            SignalFilter().apply(_decision(), _ctx(TrendDirection.UP), profile_name="no_such")
+
+        message = str(exc_info.value)
+        assert "no_such" in message
+        assert "basic_levels" in message
+        assert "raw" in message

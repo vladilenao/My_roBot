@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.scheduler.timing import CandleScheduler
+from src.scheduler.timing import CandleScheduler, MultiTimeframeScheduler
 
 
 def _utc(y, m, d, hh=0, mm=0, ss=0):
@@ -184,3 +184,104 @@ class TestCandleScheduler:
     def test_bar_close_month_december(self):
         sched = CandleScheduler(timeframe="1M")
         assert sched.bar_close(_utc(2024, 12, 1)) == _utc(2025, 1, 1, 0, 0)
+
+
+class TestMultiTimeframeScheduler:
+    def test_next_boundary_is_nearest_among_timeframes(self):
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: _utc(2024, 1, 1, 10, 37))
+        assert s.next_boundary() == _utc(2024, 1, 1, 10, 45)
+
+    def test_single_timeframe_matches_plain_scheduler(self):
+        s = MultiTimeframeScheduler(["1h"], clock=lambda: _utc(2024, 1, 1, 10, 37))
+        assert s.next_boundary() == _utc(2024, 1, 1, 11, 0)
+
+    def test_non_divisible_mix_picks_nearest(self):
+        s = MultiTimeframeScheduler(["15m", "1d"], clock=lambda: _utc(2024, 1, 1, 10, 37))
+        assert s.next_boundary() == _utc(2024, 1, 1, 10, 45)
+
+    def test_bootstrap_ready_all_timeframes(self):
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: _utc(2024, 1, 1, 10, 30))
+
+        ready = s.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        assert ready == {"1h", "15m"}
+
+    def test_tick_off_hour_ready_only_15m(self):
+        now = [_utc(2024, 1, 1, 10, 30)]
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: now[0])
+        s.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        # проснулись на границе 10:45 — пересеклась только сетка 15m
+        now[0] = _utc(2024, 1, 1, 10, 45)
+        with patch("src.scheduler.timing.time.sleep"):
+            ready = s.wait_until_bar_published(lambda tf: True)
+
+        assert ready == {"15m"}
+
+    def test_tick_on_hour_ready_both(self):
+        now = [_utc(2024, 1, 1, 10, 45)]
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: now[0])
+        s.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        now[0] = _utc(2024, 1, 1, 11, 0)
+        with patch("src.scheduler.timing.time.sleep"):
+            ready = s.wait_until_bar_published(lambda tf: True)
+
+        assert ready == {"15m", "1h"}
+
+    def test_publication_waited_per_tf(self):
+        now = [_utc(2024, 1, 1, 10, 45)]
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: now[0])
+        s.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        now[0] = _utc(2024, 1, 1, 11, 0)
+        attempts = {"1h": 0}
+
+        def bar_ready(tf):
+            if tf == "15m":
+                return True
+            attempts["1h"] += 1
+            return attempts["1h"] >= 3
+
+        with patch("src.scheduler.timing.time.sleep"):
+            ready = s.wait_until_bar_published(bar_ready, poll_secs=1.0, timeout_secs=60.0)
+
+        assert ready == {"15m", "1h"}
+        assert attempts["1h"] == 3
+
+    def test_publication_timeout_skips_unready_tf(self):
+        now = [_utc(2024, 1, 1, 10, 45)]
+        s = MultiTimeframeScheduler(["1h", "15m"], clock=lambda: now[0])
+        s.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        now[0] = _utc(2024, 1, 1, 11, 0)
+        mono = {"t": 0.0}
+
+        def fake_monotonic():
+            mono["t"] += 100.0
+            return mono["t"]
+
+        with patch("src.scheduler.timing.time.sleep"), patch(
+            "src.scheduler.timing.time.monotonic", side_effect=fake_monotonic
+        ):
+            ready = s.wait_until_bar_published(
+                lambda tf: tf == "15m", poll_secs=1.0, timeout_secs=5.0
+            )
+
+        assert ready == {"15m"}
+
+    def test_fallback_clamped_to_smallest_timeframe(self):
+        s = MultiTimeframeScheduler(
+            ["15m", "1h"], sleep_secs=3600, clock=lambda: _utc(2024, 1, 1, 10, 37)
+        )
+        assert s.fallback_secs() == 900.0
+
+    def test_fallback_unchanged_when_below_smallest_tf(self):
+        s = MultiTimeframeScheduler(
+            ["1h"], sleep_secs=3600, clock=lambda: _utc(2024, 1, 1, 10, 37)
+        )
+        assert s.fallback_secs() == 3600.0
+
+    def test_empty_timeframes_raise(self):
+        with pytest.raises(ValueError):
+            MultiTimeframeScheduler([])

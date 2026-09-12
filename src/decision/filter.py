@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from typing import ClassVar
 
-from src.market_context.models import MarketContext, TrendDirection
-from src.strategies.contracts import Decision, SignalType
+from src.decision.filters import PROFILES, ProfileFilter
+from src.market_context.models import MarketContext
+from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Decision
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -11,30 +13,27 @@ log = get_logger(__name__)
 
 @dataclass(frozen=True)
 class SignalFilter:
-    """Жёсткий фильтр сигналов по направлению тренда.
+    """Фасад фильтрации сигналов: фабричный выбор профиля по имени.
 
-    Блокирует BUY при нисходящем тренде и SELL при восходящем, превращая их в
-    HOLD. Боковой тренд и совпадающие сигналы проходят без изменений. Всегда
-    обогащает Decision полями `trend_direction` и `trend_confidence`.
+    Инкапсулирует реестр профилей (`decision.filters.PROFILES`): оркестратор
+    передаёт имя профиля привязки, конкретный фильтр конструируется внутри.
+    Профиль по умолчанию — `basic_levels`. Новые профили добавляются
+    регистрацией в реестре без изменения главного цикла робота.
     """
 
-    def apply(self, decision: Decision, ctx: MarketContext) -> Decision:
-        direction = ctx.trend.direction
-        direction_str = direction.value
+    _PROFILES: ClassVar[dict[str, ProfileFilter]] = PROFILES
 
-        blocked = False
-        if decision.signal_type is SignalType.BUY and direction is TrendDirection.DOWN:
-            blocked = True
-        elif decision.signal_type is SignalType.SELL and direction is TrendDirection.UP:
-            blocked = True
-
-        confidence = 0.0 if blocked or decision.signal_type is SignalType.HOLD else ctx.trend.strength
-
-        if blocked:
-            decision = replace(decision, signal_type=SignalType.HOLD)
-
-        return replace(
-            decision,
-            trend_direction=direction_str,
-            trend_confidence=confidence,
-        )
+    def apply(
+        self,
+        decision: Decision,
+        ctx: MarketContext,
+        profile_name: str = DEFAULT_FILTER_PROFILE,
+    ) -> Decision:
+        profile = self._PROFILES.get(profile_name)
+        if profile is None:
+            available = ", ".join(sorted(self._PROFILES))
+            raise ValueError(
+                f"Неизвестный профиль фильтрации {profile_name!r}. "
+                f"Доступны: {available}"
+            )
+        return profile.apply(decision, ctx)

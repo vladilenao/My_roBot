@@ -7,16 +7,23 @@ from src.strategies.contracts import Decision, SignalType
 class DecisionFormatter:
     """Переводит решение стратегии в текст уведомления."""
 
-    def __init__(self, tz_offset_hours: float = 0.0, timeframe: str = "") -> None:
+    def __init__(self, tz_offset_hours: float = 0.0) -> None:
         self._tz_offset = tz_offset_hours
-        self._timeframe = timeframe
 
-    def format(self, decision: Decision, instrument_label: str = "") -> str:
+    def format(
+        self,
+        decision: Decision,
+        instrument_label: str = "",
+        *,
+        filter_profile: str = "",
+        filtered_out: bool = False,
+        timeframe: str = "",
+    ) -> str:
         parts: list[str] = []
         if instrument_label:
             label_block = f"● {instrument_label}"
-            if self._timeframe:
-                label_block += f" ({self._timeframe})"
+            if timeframe:
+                label_block += f" ({timeframe})"
             parts.append(label_block)
         else:
             parts.append("●")
@@ -25,9 +32,14 @@ class DecisionFormatter:
                 (decision.bar_time + timedelta(hours=self._tz_offset)).strftime("%H:%M")
             )
         if decision.strategy_name:
-            parts.append(f"| {decision.strategy_name}")
+            strategy_block = f"| {decision.strategy_name}"
+            if filter_profile:
+                strategy_block += f" [{filter_profile}]"
+            parts.append(strategy_block)
 
-        if decision.signal_type is SignalType.BUY:
+        if filtered_out:
+            signal = "❌ Отклонено фильтром."
+        elif decision.signal_type is SignalType.BUY:
             signal = f"🟢 ПОКУПКА (BUY) — Цена: {round(decision.price, 3)}"
         elif decision.signal_type is SignalType.SELL:
             signal = f"🔴 ПРОДАЖА (SELL) — Цена: {round(decision.price, 3)}"
@@ -43,8 +55,22 @@ class AbstractNotifier(ABC):
     def __init__(self, formatter: DecisionFormatter | None = None) -> None:
         self._formatter = formatter if formatter is not None else DecisionFormatter()
 
-    def notify_decision(self, decision: Decision, instrument_label: str = "") -> None:
-        self.notify(self._formatter.format(decision, instrument_label))
+    def notify_decision(
+        self,
+        decision: Decision,
+        instrument_label: str = "",
+        *,
+        filter_profile: str = "",
+        filtered_out: bool = False,
+        timeframe: str = "",
+    ) -> None:
+        self.notify(
+            self._formatter.format(
+                decision, instrument_label,
+                filter_profile=filter_profile, filtered_out=filtered_out,
+                timeframe=timeframe,
+            )
+        )
 
     @abstractmethod
     def notify(self, message: str) -> None: ...

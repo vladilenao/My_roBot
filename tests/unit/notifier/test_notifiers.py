@@ -39,9 +39,9 @@ class TestAbstractNotifier:
 
 class TestNotifyDecision:
     def test_formats_and_delivers_decision(self):
-        notifier = RecordingNotifier(formatter=DecisionFormatter(timeframe="1h"))
+        notifier = RecordingNotifier(formatter=DecisionFormatter())
 
-        notifier.notify_decision(Decision(SignalType.BUY, 3.14159), "NG")
+        notifier.notify_decision(Decision(SignalType.BUY, 3.14159), "NG", timeframe="1h")
 
         assert notifier.messages == ["● NG (1h) ➜ 🟢 ПОКУПКА (BUY) — Цена: 3.142"]
 
@@ -60,7 +60,9 @@ class TestNotifyDecision:
         notifier.notify_decision(Decision(SignalType.HOLD, 10.0), "")
 
         assert notifier.messages == ["custom text"]
-        formatter.format.assert_called_once_with(Decision(SignalType.HOLD, 10.0), "")
+        formatter.format.assert_called_once_with(
+            Decision(SignalType.HOLD, 10.0), "", filter_profile="", filtered_out=False, timeframe=""
+        )
 
 
 class TestConsoleNotifier:

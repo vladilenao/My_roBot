@@ -72,6 +72,11 @@ _EXPECTED_TYPES: dict[str, type] = {
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 
+# Таблица тикера в [strategies.*]: гибридный массив `strategies` (строка с именем
+# стратегии | инлайн-таблица {name, filter, tf}) + опциональный базовый `timeframe`.
+_STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
+_STRATEGY_ENTRY_KEYS = {"name", "filter", "tf"}
+
 
 class ConfigError(RuntimeError):
     """Некорректный файл конфигурации."""
@@ -99,6 +104,83 @@ def _type_name(expected: type) -> str:
     )
 
 
+def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
+    """Проверка одного элемента гибридного массива `strategies` таблицы тикера."""
+    if isinstance(item, str):
+        if not item:
+            raise ConfigError(
+                f"{path}: пустое имя стратегии в привязке для {ticker!r}"
+            )
+        return
+    if not isinstance(item, dict):
+        raise ConfigError(
+            f"{path}: элемент strategies для {ticker!r} должен быть строкой "
+            f"или инлайн-таблицей {{name, filter}}, получено {type(item).__name__}"
+        )
+    unknown = set(item) - _STRATEGY_ENTRY_KEYS
+    if unknown:
+        raise ConfigError(
+            f"{path}: привязка стратегии для {ticker!r}: незнакомые ключи "
+            f"{sorted(unknown)}; допустимые: {sorted(_STRATEGY_ENTRY_KEYS)}"
+        )
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        raise ConfigError(
+            f"{path}: привязка стратегии для {ticker!r} требует непустой "
+            f"строковый ключ 'name'"
+        )
+    if "filter" in item and not isinstance(item["filter"], str):
+        raise ConfigError(
+            f"{path}: привязка стратегии для {ticker!r}: ключ 'filter' "
+            f"должен быть строкой"
+        )
+    if "tf" in item and not isinstance(item["tf"], str):
+        raise ConfigError(
+            f"{path}: привязка стратегии для {ticker!r}: ключ 'tf' "
+            f"должен быть строкой"
+        )
+
+
+def _validate_strategies(value: dict, key: str, path: Path) -> dict[str, dict]:
+    """Проверка словаря привязок и нормализация таблиц тикеров.
+
+    Возвращает ``{тикер: {"strategies": [...], "timeframe": str | None}}``.
+    Допустимость значений таймфрейма проверяется доменом (``src.config``)
+    по словарю TIMEFRAMES — загрузчик отвечает только за форму.
+    """
+    unwrapped: dict[str, dict] = {}
+    for ticker, table in value.items():
+        if not isinstance(table, dict):
+            raise ConfigError(
+                f"{path}: [{key}] привязка для {ticker!r} должна быть таблицей "
+                f"с ключом 'strategies'; плоский список более не поддерживается"
+            )
+        unknown = set(table) - _STRATEGY_TABLE_KEYS
+        if unknown:
+            raise ConfigError(
+                f"{path}: [{key}.{ticker}] незнакомые ключи {sorted(unknown)}; "
+                f"допустимые: {sorted(_STRATEGY_TABLE_KEYS)}"
+            )
+        strategies = table.get("strategies")
+        if strategies is None:
+            raise ConfigError(
+                f"{path}: [{key}.{ticker}] отсутствует обязательный ключ 'strategies'"
+            )
+        if not isinstance(strategies, list):
+            raise ConfigError(
+                f"{path}: [{key}.{ticker}] strategies должен быть массивом"
+            )
+        timeframe = table.get("timeframe")
+        if timeframe is not None and not isinstance(timeframe, str):
+            raise ConfigError(
+                f"{path}: [{key}.{ticker}] timeframe должен быть строкой"
+            )
+        for item in strategies:
+            _validate_strategy_entry(item, ticker, path)
+        unwrapped[ticker] = {"strategies": strategies, "timeframe": timeframe}
+    return unwrapped
+
+
 def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
     """Проверка типов и допустимых значений ключей конфигурации."""
     cleaned: dict[str, Any] = {}
@@ -115,13 +197,7 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{sorted(_ALLOWED_NOTIFIER_VALUES)}, получено {value!r}"
             )
         if expected is dict:
-            for name, strategies in value.items():
-                if not isinstance(strategies, list) or not all(
-                    isinstance(item, str) for item in strategies
-                ):
-                    raise ConfigError(
-                        f"{path}: стратегии для {name!r} должны быть списком строк"
-                    )
+            value = _validate_strategies(value, key, path)
         cleaned[key] = value
     return cleaned
 
