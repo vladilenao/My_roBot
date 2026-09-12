@@ -77,11 +77,13 @@ def _strategy_map():
     from src.strategies.macd_rsi_stoch_strategy import DEFAULT_CONFIG as MACD
     from src.strategies.flat_triangle_strategy import DEFAULT_CONFIG as FLAT
     from src.strategies.harmonic_abcd_strategy import DEFAULT_CONFIG as HARMONIC
+    from src.strategies.ma_cloud_rsi_macd_strategy import DEFAULT_CONFIG as MA_CLOUD
 
     return {
         "macd_rsi_stoch": MACD,
         "flat_triangle": FLAT,
         "harmonic_abcd": HARMONIC,
+        "ma_cloud_rsi_macd": MA_CLOUD,
     }
 
 

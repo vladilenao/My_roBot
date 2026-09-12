@@ -5,7 +5,7 @@ from t_tech.invest import CandleInterval
 from src.config_loader import ConfigError, load_config
 from src.strategies.names import StrategyName
 
-load_dotenv() # загружает переменные из .env
+load_dotenv()  # загружает переменные из .env
 
 # Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
@@ -14,13 +14,13 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 # Словарь таймфреймов (используется в загрузчике); всегда из кода
 TIMEFRAMES = {
-'1m': CandleInterval.CANDLE_INTERVAL_1_MIN,
-'5m': CandleInterval.CANDLE_INTERVAL_5_MIN,
-'15m': CandleInterval.CANDLE_INTERVAL_15_MIN,
-'1h': CandleInterval.CANDLE_INTERVAL_HOUR,
-'1d': CandleInterval.CANDLE_INTERVAL_DAY,
-'1w': CandleInterval.CANDLE_INTERVAL_WEEK,
-'1M': CandleInterval.CANDLE_INTERVAL_MONTH
+    "1m": CandleInterval.CANDLE_INTERVAL_1_MIN,
+    "5m": CandleInterval.CANDLE_INTERVAL_5_MIN,
+    "15m": CandleInterval.CANDLE_INTERVAL_15_MIN,
+    "1h": CandleInterval.CANDLE_INTERVAL_HOUR,
+    "1d": CandleInterval.CANDLE_INTERVAL_DAY,
+    "1w": CandleInterval.CANDLE_INTERVAL_WEEK,
+    "1M": CandleInterval.CANDLE_INTERVAL_MONTH,
 }
 
 # Смещение часового пояса (в часах) для отображения времени бара в уведомлениях.
@@ -38,13 +38,18 @@ _DEFAULTS = {
     "notifier": "console",
     # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
     "share_strategies": {
-        "SBER": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+        "SBER": [
+            "macd_rsi_stoch",
+            "flat_triangle",
+            "harmonic_abcd",
+            "ma_cloud_rsi_macd",
+        ],
     },
     "future_strategies": {
-        "NG": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
-        "BR": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
-        "SI": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
-        "ED": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd"],
+        "NG": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"],
+        "BR": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"],
+        "SI": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"],
+        "ED": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"],
     },
     # Логирование (секция [logging] в robot.toml)
     "logging_service_uid": "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a",

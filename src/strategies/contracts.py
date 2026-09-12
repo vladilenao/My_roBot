@@ -27,6 +27,9 @@ class Decision:
     tp_level_label: str | None = None
     trend_direction: str | None = None
     trend_confidence: float | None = None
+    action: str | None = None
+    exit_reason: str | None = None
+    exit_contracts: int | None = None
 
 
 class Strategy(Protocol):

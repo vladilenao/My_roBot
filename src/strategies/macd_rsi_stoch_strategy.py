@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.strategies.contracts import Decision, SignalType
-from src.strategies.indicators.macd import MacdIndicator
+from src.strategies.indicators.macd import MacdIndicator, MacdMode
 from src.strategies.indicators.rsi import RsiIndicator
 from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.registry import register
@@ -25,7 +25,7 @@ DEFAULT_CONFIG = StrategyConfig(
     name="macd_rsi_stoch",
     strategy_window=5,
     indicators=(
-        MacdIndicator(fast=12, slow=26, signal=9),
+        MacdIndicator(fast=12, slow=26, signal=9, mode=MacdMode.SIGNAL_LINE_CROSS),
         RsiIndicator(period=14),
         StochasticIndicator(k=14, d=3, smooth_k=3),
     ),
@@ -54,16 +54,26 @@ class MacdRsiStochStrategy:
         return data
 
     def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision:
-        sums = get_last_signals(
-            ta, self.STRATEGY_WINDOW, self._config.signal_columns
-        )
+        sums = get_last_signals(ta, self.STRATEGY_WINDOW, self._config.signal_columns)
         current_price = float(ta["close"].iloc[-1])
 
         if all(s > 0 for s in sums):
-            return Decision(SignalType.BUY, current_price, timeframe=timeframe, strategy_name=self.NAME)
+            return Decision(
+                SignalType.BUY,
+                current_price,
+                timeframe=timeframe,
+                strategy_name=self.NAME,
+            )
         if all(s < 0 for s in sums):
-            return Decision(SignalType.SELL, current_price, timeframe=timeframe, strategy_name=self.NAME)
-        return Decision(SignalType.HOLD, current_price, timeframe=timeframe, strategy_name=self.NAME)
+            return Decision(
+                SignalType.SELL,
+                current_price,
+                timeframe=timeframe,
+                strategy_name=self.NAME,
+            )
+        return Decision(
+            SignalType.HOLD, current_price, timeframe=timeframe, strategy_name=self.NAME
+        )
 
     def required_history(self) -> int:
         return self._config.required_history

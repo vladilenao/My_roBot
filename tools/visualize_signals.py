@@ -34,13 +34,22 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.strategies import get_strategy
 from src.strategies.base_strategy import StrategyConfig
-from src.strategies.macd_rsi_stoch_strategy import DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG
+from src.strategies.macd_rsi_stoch_strategy import (
+    DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG,
+)
 from src.strategies.flat_triangle_strategy import DEFAULT_CONFIG as FLAT_TRIANGLE_CONFIG
 from src.strategies.harmonic_abcd_strategy import DEFAULT_CONFIG as HARMONIC_ABCD_CONFIG
+from src.strategies.ma_cloud_rsi_macd_strategy import (
+    DEFAULT_CONFIG as MA_CLOUD_RSI_MACD_CONFIG,
+)
 from src.market_structure.harmonic import HarmonicPatternDetector, Direction
 from src.market_structure.fibonacci import retracement_level
 from src.market_structure.swings import SwingDetector, SwingKind
-from src.strategies.indicators.macd.signalEnum import MacdSignalEnum
+from src.strategies.indicators.ma.signalEnum import MaCloudSignalEnum
+from src.strategies.indicators.macd.signalEnum import (
+    MacdSignalEnum,
+    MacdZeroCrossSignalEnum,
+)
 from src.strategies.indicators.rsi.signalEnum import RsiSignalEnum
 from src.strategies.indicators.stochastic.signalEnum import StochasticSignalEnum
 
@@ -48,28 +57,49 @@ STRATEGY_CONFIGS = {
     "macd_rsi_stoch": MACD_RSI_STOCH_CONFIG,
     "flat_triangle": FLAT_TRIANGLE_CONFIG,
     "harmonic_abcd": HARMONIC_ABCD_CONFIG,
+    "ma_cloud_rsi_macd": MA_CLOUD_RSI_MACD_CONFIG,
 }
 
 DATA_DIR = PROJECT_ROOT / "tests" / "snapshot" / "data"
 ASSETS_DIR = PROJECT_ROOT / "openspec" / "assets" / "signals"
 
-LOOKBACK = 40    # свечей до входа на рисунке
-FORWARD = 8      # свечей после входа на рисунке
+LOOKBACK = 40  # свечей до входа на рисунке
+FORWARD = 8  # свечей после входа на рисунке
 
 # ── человекочитаемые тексты сигналов индикаторов ─────────────────
 
 SIGNAL_TEXT = {
     "macd_signal": {
-        int(MacdSignalEnum.BULLISH_CROSSOVER_BELOW_ZERO): "бычий кроссовер (сигнальная пересекла MACD вверх) ниже нуля",
-        int(MacdSignalEnum.BEARISH_CROSSOVER_ABOVE_ZERO): "медвежий кроссовер (сигнальная пересекла MACD вниз) выше нуля",
+        int(
+            MacdSignalEnum.BULLISH_CROSSOVER_BELOW_ZERO
+        ): "бычий кроссовер (сигнальная пересекла MACD вверх) ниже нуля",
+        int(
+            MacdSignalEnum.BEARISH_CROSSOVER_ABOVE_ZERO
+        ): "медвежий кроссовер (сигнальная пересекла MACD вниз) выше нуля",
+    },
+    "macd_zero_signal": {
+        int(
+            MacdZeroCrossSignalEnum.MACD_CROSS_ABOVE_ZERO
+        ): "сигнальная линия пересекла 0 вверх",
+        int(
+            MacdZeroCrossSignalEnum.MACD_CROSS_BELOW_ZERO
+        ): "сигнальная линия пересекла 0 вниз",
+    },
+    "ma_cloud_signal": {
+        int(MaCloudSignalEnum.MA_CROSS_UP): "SMA 10 пересекла SMA 40 вверх",
+        int(MaCloudSignalEnum.MA_CROSS_DOWN): "SMA 10 пересекла SMA 40 вниз",
     },
     "rsi_signal": {
         int(RsiSignalEnum.CROSS_ABOVE_50): "пересечение 50 снизу вверх",
         int(RsiSignalEnum.CROSS_BELOW_50): "пересечение 50 сверху вниз",
     },
     "stoch_signal": {
-        int(StochasticSignalEnum.EXIT_OVERSOLD): "выход %K из перепроданности (<20 → >20)",
-        int(StochasticSignalEnum.EXIT_OVERBOUGHT): "выход %K из перекупленности (>80 → <80)",
+        int(
+            StochasticSignalEnum.EXIT_OVERSOLD
+        ): "выход %K из перепроданности (<20 → >20)",
+        int(
+            StochasticSignalEnum.EXIT_OVERBOUGHT
+        ): "выход %K из перекупленности (>80 → <80)",
     },
 }
 
@@ -100,7 +130,9 @@ def _bb_columns(indicator):
 
 
 def _draw_bars_classic(ax, sub, bands=None):
-    for i, (o, h, l, c) in enumerate(zip(sub["open"], sub["high"], sub["low"], sub["close"])):
+    for i, (o, h, l, c) in enumerate(
+        zip(sub["open"], sub["high"], sub["low"], sub["close"])
+    ):
         color = "#26a69a" if c >= o else "#ef5350"
         ax.plot([i, i], [l, h], color=color, lw=1.0, zorder=3)
         ax.plot([i - 0.3, i], [o, o], color=color, lw=1.4, zorder=4)
@@ -112,6 +144,25 @@ def _draw_bars_classic(ax, sub, bands=None):
         ax.plot(x, sub[bbm], color="#78909c", lw=0.9, ls="-.", zorder=2, label="BB mid")
         ax.plot(x, sub[bbu], color="#e53935", lw=1.0, ls="--", zorder=2, label="BB up")
         ax.legend(loc="upper left", fontsize=7, ncol=3, frameon=False)
+
+
+def _draw_ma_cloud(ax, sub, fast_col, slow_col):
+    """Ценовой график с облаком SMA fast/slow (заливка между ними)."""
+    _draw_bars_classic(ax, sub)
+    x = range(len(sub))
+    ax.plot(x, sub[fast_col], color="#3949ab", lw=1.3, zorder=2, label="SMA fast")
+    ax.plot(x, sub[slow_col], color="#8e24aa", lw=1.3, zorder=2, label="SMA slow")
+    ax.fill_between(
+        x,
+        sub[fast_col],
+        sub[slow_col],
+        color="#c5cae9",
+        alpha=0.5,
+        lw=0,
+        zorder=1,
+        label="Облако",
+    )
+    ax.legend(loc="upper left", fontsize=7, ncol=3, frameon=False)
 
 
 def _draw_macd(ax, sub, cols):
@@ -132,8 +183,26 @@ def _draw_rsi(ax, sub, col):
     ax.axhline(50, color="#bbbbbb", lw=0.8)
     ax.axhline(30, color="#7cb342", lw=0.8, ls="--")
     ax.axhline(70, color="#e53935", lw=0.8, ls="--")
-    ax.text(0.99, 0.965, "перекупленность >70", transform=ax.transAxes, ha="right", va="top", fontsize=6.5, color="#b71c1c")
-    ax.text(0.99, 0.02, "перепроданность <30", transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5, color="#33691e")
+    ax.text(
+        0.99,
+        0.965,
+        "перекупленность >70",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=6.5,
+        color="#b71c1c",
+    )
+    ax.text(
+        0.99,
+        0.02,
+        "перепроданность <30",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=6.5,
+        color="#33691e",
+    )
     ax.plot(x, sub[col], color="#7b1fa2", lw=1.2)
     ax.set_ylabel("RSI", rotation=0, labelpad=25)
     ax.set_yticks([0, 30, 50, 70, 100])
@@ -147,8 +216,26 @@ def _draw_stoch(ax, sub, cols):
     ax.axhline(20, color="#7cb342", lw=0.8, ls="--")
     ax.axhline(80, color="#e53935", lw=0.8, ls="--")
     ax.axhline(50, color="#bbbbbb", lw=0.8)
-    ax.text(0.99, 0.965, "перекупленность >80", transform=ax.transAxes, ha="right", va="top", fontsize=6.5, color="#b71c1c")
-    ax.text(0.99, 0.02, "перепроданность <20", transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5, color="#33691e")
+    ax.text(
+        0.99,
+        0.965,
+        "перекупленность >80",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=6.5,
+        color="#b71c1c",
+    )
+    ax.text(
+        0.99,
+        0.02,
+        "перепроданность <20",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=6.5,
+        color="#33691e",
+    )
     ax.plot(x, sub[k_col], color="#00897b", lw=1.2, label="%K")
     ax.plot(x, sub[d_col], color="#e53935", lw=1.2, label="%D")
     ax.set_ylabel("Stoch", rotation=0, labelpad=25)
@@ -163,25 +250,45 @@ def _mark_stoch_entry(ax, sub, cols, ei):
     k, d = float(sub[k_col].iloc[ei]), float(sub[d_col].iloc[ei])
     lo, hi = ax.get_ylim()
     for val, color, name in ((k, "#00897b", "%K"), (d, "#e53935", "%D")):
-        ax.scatter([ei], [val], s=42, color=color, edgecolors="white", linewidths=0.7,
-                   zorder=7)
+        ax.scatter(
+            [ei], [val], s=42, color=color, edgecolors="white", linewidths=0.7, zorder=7
+        )
         near_top = val > hi - 0.05 * (hi - lo)
         near_bottom = val < lo + 0.05 * (hi - lo)
         va = "bottom" if near_top else ("top" if near_bottom else "bottom")
-        ax.text(ei + 0.35, val, f"{name} {val:.1f}", fontsize=7.5, color=color, va=va, zorder=7)
+        ax.text(
+            ei + 0.35,
+            val,
+            f"{name} {val:.1f}",
+            fontsize=7.5,
+            color=color,
+            va=va,
+            zorder=7,
+        )
 
 
 # ── описания панелей ─────────────────────────────────────────────
 
 
-def _desc_events_by_signal(kind, sig_col, window, sub, entry_i, value_line):
-    """События индикатора за окно стратегии + текущее значение."""
-    w = sub.iloc[entry_i - window + 1 : entry_i + 1]
-    events = []
-    if sig_col in SIGNAL_TEXT:
-        unique_events = {int(e) for e in w[sig_col].unique() if e != 0}
-        events = [SIGNAL_TEXT[sig_col][e] for e in sorted(unique_events)]
-    text_lines = [f"{kind}: {ev}" for ev in events] if events else [f"{kind}: без сигналов за окно"]
+def _desc_events_by_signal(kind, sig_col, window, sub, entry_i, value_line, only=None):
+    """События индикатора за окно анализа + текущее значение.
+
+    `only=1` — только бычьи (положительные) сигналы, `only=-1` — только медвежьи
+    (отрицательные), `None` — все непустые.
+    """
+    if sig_col not in SIGNAL_TEXT:
+        values = set()
+    else:
+        w = sub.iloc[entry_i - window + 1 : entry_i + 1]
+        values = {int(e) for e in w[sig_col].unique() if e != 0}
+        if only is not None:
+            values = {e for e in values if (e > 0) == (only > 0)}
+    events = [SIGNAL_TEXT[sig_col][e] for e in sorted(values)]
+    text_lines = (
+        [f"{kind}: {ev}" for ev in events]
+        if events
+        else [f"{kind}: без сигналов за окно"]
+    )
     text_lines.append(value_line(sub.iloc[entry_i]))
     return "\n".join(text_lines)
 
@@ -205,30 +312,55 @@ def _build_panel_config_macd(cfg):
                 "kind": "price",
                 "draw": lambda ax, sub: _draw_bars_classic(ax, sub),
                 "describe": lambda sub, ei, direction: _desc_events_by_signal(
-                    "Цена", None, cfg.strategy_window, sub, ei,
-                    lambda r: f"close {r['close']:.2f}"
+                    "Цена",
+                    None,
+                    cfg.strategy_window,
+                    sub,
+                    ei,
+                    lambda r: f"close {r['close']:.2f}",
                 ),
             },
             {
-                "kind": "macd", "label": "MACD", "signal_col": "macd_signal",
+                "kind": "macd",
+                "label": "MACD",
+                "signal_col": "macd_signal",
                 "draw": lambda ax, sub: _draw_macd(ax, sub, macd_cols),
                 "describe": lambda sub, ei, direction: _desc_events_by_signal(
-                    "MACD", "macd_signal", cfg.strategy_window, sub, ei, value_lines["macd"]
+                    "MACD",
+                    "macd_signal",
+                    cfg.strategy_window,
+                    sub,
+                    ei,
+                    value_lines["macd"],
                 ),
             },
             {
-                "kind": "rsi", "label": "RSI", "signal_col": "rsi_signal",
+                "kind": "rsi",
+                "label": "RSI",
+                "signal_col": "rsi_signal",
                 "draw": lambda ax, sub: _draw_rsi(ax, sub, "rsi"),
                 "describe": lambda sub, ei, direction: _desc_events_by_signal(
-                    "RSI", "rsi_signal", cfg.strategy_window, sub, ei, value_lines["rsi"]
+                    "RSI",
+                    "rsi_signal",
+                    cfg.strategy_window,
+                    sub,
+                    ei,
+                    value_lines["rsi"],
                 ),
             },
             {
-                "kind": "stoch", "label": "Stoch", "signal_col": "stoch_signal",
+                "kind": "stoch",
+                "label": "Stoch",
+                "signal_col": "stoch_signal",
                 "stoch_cols": stoch_cols,
                 "draw": lambda ax, sub: _draw_stoch(ax, sub, stoch_cols),
                 "describe": lambda sub, ei, direction: _desc_events_by_signal(
-                    "Stoch", "stoch_signal", cfg.strategy_window, sub, ei, value_lines["stoch"]
+                    "Stoch",
+                    "stoch_signal",
+                    cfg.strategy_window,
+                    sub,
+                    ei,
+                    value_lines["stoch"],
                 ),
             },
         ],
@@ -254,24 +386,46 @@ def _build_panel_config_flat(cfg):
                 f"Цена {close:.2f} — находится за нижней полосой\n"
                 f"BB {lower:.2f}: перепроданность, возможен отскок"
             )
-        return "\n".join([relation, f"Полосы BB: {lower:.2f} … {mid:.2f} … {upper:.2f}"])
+        return "\n".join(
+            [relation, f"Полосы BB: {lower:.2f} … {mid:.2f} … {upper:.2f}"]
+        )
 
     def describe_rsi(sub, ei, direction):
         row = sub.iloc[ei]
         v = row["rsi"]
-        zone = "находится в зоне перепроданности (<30)" if v < 30 else (
-            "находится в зоне перекупленности (>70)" if v > 70 else "в нейтральной зоне"
+        zone = (
+            "находится в зоне перепроданности (<30)"
+            if v < 30
+            else (
+                "находится в зоне перекупленности (>70)"
+                if v > 70
+                else "в нейтральной зоне"
+            )
         )
         return f"RSI {v:.1f} — {zone}"
 
     def describe_stoch(sub, ei, direction):
         row = sub.iloc[ei]
         k, d = row[stoch_cols[0]], row[stoch_cols[1]]
-        k_prev, d_prev = sub[stoch_cols[0]].iloc[ei - 1], sub[stoch_cols[1]].iloc[ei - 1]
-        cross = "пересечение: %K пересекла %D снизу вверх" if k_prev <= d_prev and k > d else \
-                "пересечение: %K пересекла %D сверху вниз" if k_prev >= d_prev and k < d else ""
-        zone = "находится в зоне перепроданности (<20)" if k < 20 else (
-            "находится в зоне перекупленности (>80)" if k > 80 else "в нейтральной зоне"
+        k_prev, d_prev = (
+            sub[stoch_cols[0]].iloc[ei - 1],
+            sub[stoch_cols[1]].iloc[ei - 1],
+        )
+        cross = (
+            "пересечение: %K пересекла %D снизу вверх"
+            if k_prev <= d_prev and k > d
+            else "пересечение: %K пересекла %D сверху вниз"
+            if k_prev >= d_prev and k < d
+            else ""
+        )
+        zone = (
+            "находится в зоне перепроданности (<20)"
+            if k < 20
+            else (
+                "находится в зоне перекупленности (>80)"
+                if k > 80
+                else "в нейтральной зоне"
+            )
         )
         return "\n".join([f"%K {k:.1f} {cross}", f"%D {d:.1f} — {zone}"]).strip()
 
@@ -280,16 +434,21 @@ def _build_panel_config_flat(cfg):
         "panels": [
             {
                 "kind": "price",
-                "draw": lambda ax, sub: _draw_bars_classic(ax, sub, bands=(bbl, bbm, bbu)),
+                "draw": lambda ax, sub: _draw_bars_classic(
+                    ax, sub, bands=(bbl, bbm, bbu)
+                ),
                 "describe": describe_price,
             },
             {
-                "kind": "rsi", "label": "RSI",
+                "kind": "rsi",
+                "label": "RSI",
                 "draw": lambda ax, sub: _draw_rsi(ax, sub, "rsi"),
                 "describe": describe_rsi,
             },
             {
-                "kind": "stoch", "label": "Stoch", "stoch_cols": stoch_cols,
+                "kind": "stoch",
+                "label": "Stoch",
+                "stoch_cols": stoch_cols,
                 "draw": lambda ax, sub: _draw_stoch(ax, sub, stoch_cols),
                 "describe": describe_stoch,
             },
@@ -305,6 +464,86 @@ def _build_panel_config_harmonic(cfg):
     }
 
 
+def _ma_cloud_panel_window(sig_windows, col, fallback, ei):
+    """Окно панели: от ближайшего сигнала индикатора (перед входом) до входа."""
+    w = sig_windows.get(col, fallback)
+    if w is None:
+        w = fallback
+    return min(w, ei + 1)
+
+
+def _build_panel_config_ma_cloud(cfg):
+    ma_cloud, rsi, macd = cfg.indicators
+    macd_cols = _macd_columns(macd)
+    sig_windows = {}
+    value_lines = {
+        "ma": lambda r: (
+            f"close {r['close']:.2f} / SMA10 {r['sma_fast']:.2f} / SMA40 {r['sma_slow']:.2f}"
+        ),
+        "rsi": lambda r: f"RSI {r['rsi']:.1f}",
+        "macd": lambda r: f"MACD {r[macd_cols[0]]:.2f} / Signal {r[macd_cols[1]]:.2f}",
+    }
+    return {
+        "window": cfg.strategy_window,
+        # Окно анализа = до ближайших подтверждающих сигналов индикаторов,
+        # а не STRATEGY_WINDOW=1 (иначе на панелях не видно подтверждений входа).
+        "adaptive_window": True,
+        "sig_windows": sig_windows,
+        "panels": [
+            {
+                "kind": "price",
+                "signal_col": "ma_cloud_signal",
+                "draw": lambda ax, sub: _draw_ma_cloud(ax, sub, "sma_fast", "sma_slow"),
+                "describe": lambda sub, ei, direction: _desc_events_by_signal(
+                    "MA Cloud",
+                    "ma_cloud_signal",
+                    _ma_cloud_panel_window(
+                        sig_windows, "ma_cloud_signal", cfg.strategy_window, ei
+                    ),
+                    sub,
+                    ei,
+                    lambda r: value_lines["ma"](r),
+                    only=1 if direction == "BUY" else -1,
+                ),
+            },
+            {
+                "kind": "macd",
+                "label": "MACD",
+                "signal_col": "macd_zero_signal",
+                "draw": lambda ax, sub: _draw_macd(ax, sub, macd_cols),
+                "describe": lambda sub, ei, direction: _desc_events_by_signal(
+                    "MACD",
+                    "macd_zero_signal",
+                    _ma_cloud_panel_window(
+                        sig_windows, "macd_zero_signal", cfg.strategy_window, ei
+                    ),
+                    sub,
+                    ei,
+                    value_lines["macd"],
+                    only=1 if direction == "BUY" else -1,
+                ),
+            },
+            {
+                "kind": "rsi",
+                "label": "RSI",
+                "signal_col": "rsi_signal",
+                "draw": lambda ax, sub: _draw_rsi(ax, sub, "rsi"),
+                "describe": lambda sub, ei, direction: _desc_events_by_signal(
+                    "RSI",
+                    "rsi_signal",
+                    _ma_cloud_panel_window(
+                        sig_windows, "rsi_signal", cfg.strategy_window, ei
+                    ),
+                    sub,
+                    ei,
+                    value_lines["rsi"],
+                    only=1 if direction == "BUY" else -1,
+                ),
+            },
+        ],
+    }
+
+
 def build_panel_config(strategy_name):
     cfg = STRATEGY_CONFIGS[strategy_name]
     if strategy_name == "macd_rsi_stoch":
@@ -313,6 +552,8 @@ def build_panel_config(strategy_name):
         return _build_panel_config_flat(cfg)
     if strategy_name == "harmonic_abcd":
         return _build_panel_config_harmonic(cfg)
+    if strategy_name == "ma_cloud_rsi_macd":
+        return _build_panel_config_ma_cloud(cfg)
     raise ValueError(
         f"Для стратегии '{strategy_name}' нет конфигурации панелей. "
         f"Доступны: {sorted(STRATEGY_CONFIGS)}"
@@ -322,7 +563,8 @@ def build_panel_config(strategy_name):
 PANEL_CONFIG = {
     strategy_name: build_panel_config(strategy_name)
     for strategy_name in STRATEGY_CONFIGS
-    if strategy_name in ("macd_rsi_stoch", "flat_triangle", "harmonic_abcd")
+    if strategy_name
+    in ("macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd")
 }
 
 
@@ -333,9 +575,7 @@ def _find_harmonic_pattern(df, entry_i):
     """Паттерн AB=CD, чей вход совпадает с баром `entry_i`."""
     detector = HarmonicPatternDetector()
     patterns = detector.analyze(df)
-    candidates = [
-        p for p in patterns if p.c.index + detector.right == entry_i
-    ]
+    candidates = [p for p in patterns if p.c.index + detector.right == entry_i]
     if not candidates:
         return None
     # при конфликте лонг/шорт приоритет у лонга (как в стратегии)
@@ -354,39 +594,94 @@ def _draw_harmonic(ax, sub, pattern, offset, swings, d_hit_loc=None):
     levels = [retracement_level(a_price, x_price, r) for r in fib_levels]
     band_alphas = (0.08, 0.16, 0.22, 0.16, 0.08)
     for (lo_r, hi_r), alpha in zip(zip(fib_levels, fib_levels[1:]), band_alphas):
-        lo_y, hi_y = sorted((retracement_level(a_price, x_price, lo_r),
-                             retracement_level(a_price, x_price, hi_r)))
+        lo_y, hi_y = sorted(
+            (
+                retracement_level(a_price, x_price, lo_r),
+                retracement_level(a_price, x_price, hi_r),
+            )
+        )
         ax.axhspan(lo_y, hi_y, color="#f9a825", alpha=alpha, zorder=2, lw=0)
     for r, lvl in zip(fib_levels[1:-1], levels[1:-1]):
         ax.axhline(lvl, color="#f9a825", lw=0.9, ls=":", alpha=0.95, zorder=3)
-        ax.text(0.004, lvl, f"{r:.1%}", transform=ax.get_yaxis_transform(),
-                ha="left", va="top", fontsize=6.5, color="#5d4037", zorder=6)
+        ax.text(
+            0.004,
+            lvl,
+            f"{r:.1%}",
+            transform=ax.get_yaxis_transform(),
+            ha="left",
+            va="top",
+            fontsize=6.5,
+            color="#5d4037",
+            zorder=6,
+        )
     ax.axhline(levels[0], color="#bdbdbd", lw=0.8, alpha=0.8, zorder=3)
     ax.axhline(levels[-1], color="#bdbdbd", lw=0.8, alpha=0.8, zorder=3)
-    ax.text(0.004, levels[0], "0.0%", transform=ax.get_yaxis_transform(),
-            ha="left", va="top", fontsize=6.5, color="#5d4037", zorder=6)
-    ax.text(0.004, levels[-1], "100%", transform=ax.get_yaxis_transform(),
-            ha="left", va="top", fontsize=6.5, color="#5d4037", zorder=6)
+    ax.text(
+        0.004,
+        levels[0],
+        "0.0%",
+        transform=ax.get_yaxis_transform(),
+        ha="left",
+        va="top",
+        fontsize=6.5,
+        color="#5d4037",
+        zorder=6,
+    )
+    ax.text(
+        0.004,
+        levels[-1],
+        "100%",
+        transform=ax.get_yaxis_transform(),
+        ha="left",
+        va="top",
+        fontsize=6.5,
+        color="#5d4037",
+        zorder=6,
+    )
 
     # цель D (161.8%)
     d_target = pattern.d_target
     ax.axhline(d_target, color="#9e9e9e", lw=1.4, ls="--", alpha=0.95, zorder=4)
-    ax.text(0.004, d_target, "161.8% цель D", transform=ax.get_yaxis_transform(),
-            ha="left", va="bottom", fontsize=7, color="#424242", zorder=6,
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#9e9e9e", lw=0.7))
+    ax.text(
+        0.004,
+        d_target,
+        "161.8% цель D",
+        transform=ax.get_yaxis_transform(),
+        ha="left",
+        va="bottom",
+        fontsize=7,
+        color="#424242",
+        zorder=6,
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#9e9e9e", lw=0.7),
+    )
 
     # бар достижения цели D (вход → цель)
     if d_hit_loc is not None and 0 <= d_hit_loc < len(sub):
-        reach_price = sub["high"].iloc[d_hit_loc] if pattern.direction is Direction.LONG \
+        reach_price = (
+            sub["high"].iloc[d_hit_loc]
+            if pattern.direction is Direction.LONG
             else sub["low"].iloc[d_hit_loc]
-        ax.plot([d_hit_loc], [d_target], marker="o", ms=8, color="#43a047",
-                mfc="white", mew=1.8, zorder=9)
+        )
+        ax.plot(
+            [d_hit_loc],
+            [d_target],
+            marker="o",
+            ms=8,
+            color="#43a047",
+            mfc="white",
+            mew=1.8,
+            zorder=9,
+        )
         ax.annotate(
             f"Цель D достигнута: {reach_price:.2f}",
             xy=(d_hit_loc, d_target),
             xytext=(d_hit_loc, d_target + (d_target - a_price) * 0.06),
-            fontsize=8, color="#2e7d32", fontweight="bold", va="bottom",
-            ha="center", zorder=9,
+            fontsize=8,
+            color="#2e7d32",
+            fontweight="bold",
+            va="bottom",
+            ha="center",
+            zorder=9,
         )
 
     # свинги в окне (контекст колебаний)
@@ -395,30 +690,62 @@ def _draw_harmonic(ax, sub, pattern, offset, swings, d_hit_loc=None):
         if not (0 <= yi < len(sub)):
             continue
         marker = "^" if s.kind is SwingKind.HIGH else "v"
-        ax.plot([yi], [s.price], marker=marker, ms=6, color="#424242", mfc="#ffe082",
-                mew=0.9, zorder=6)
+        ax.plot(
+            [yi],
+            [s.price],
+            marker=marker,
+            ms=6,
+            color="#424242",
+            mfc="#ffe082",
+            mew=0.9,
+            zorder=6,
+        )
 
     # ключевые точки и волны X→A→B→C
     xs = [pt.index - offset for pt in (pattern.x, pattern.a, pattern.b, pattern.c)]
     ys = [pt.price for pt in (pattern.x, pattern.a, pattern.b, pattern.c)]
     if all(0 <= x < len(sub) for x in xs):
         ax.plot(xs, ys, color=col, lw=2.0, ls="-", zorder=7, alpha=0.9)
-        ax.annotate("", xy=(xs[1], ys[1]), xytext=(xs[0], ys[0]),
-                    arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0,
-                                    mutation_scale=14), zorder=8)
-        ax.annotate("", xy=(xs[2], ys[2]), xytext=(xs[1], ys[1]),
-                    arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0,
-                                    mutation_scale=14), zorder=8)
-        ax.annotate("", xy=(xs[3], ys[3]), xytext=(xs[2], ys[2]),
-                    arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0,
-                                    mutation_scale=14), zorder=8)
+        ax.annotate(
+            "",
+            xy=(xs[1], ys[1]),
+            xytext=(xs[0], ys[0]),
+            arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0, mutation_scale=14),
+            zorder=8,
+        )
+        ax.annotate(
+            "",
+            xy=(xs[2], ys[2]),
+            xytext=(xs[1], ys[1]),
+            arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0, mutation_scale=14),
+            zorder=8,
+        )
+        ax.annotate(
+            "",
+            xy=(xs[3], ys[3]),
+            xytext=(xs[2], ys[2]),
+            arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0, mutation_scale=14),
+            zorder=8,
+        )
 
-    for pt, name in ((pattern.x, "X"), (pattern.a, "A"),
-                     (pattern.b, "B"), (pattern.c, "C")):
+    for pt, name in (
+        (pattern.x, "X"),
+        (pattern.a, "A"),
+        (pattern.b, "B"),
+        (pattern.c, "C"),
+    ):
         yi = pt.index - offset
         if 0 <= yi < len(sub):
-            ax.plot([yi], [pt.price], marker="o", ms=7, color=col, mfc="white",
-                    mew=1.8, zorder=9)
+            ax.plot(
+                [yi],
+                [pt.price],
+                marker="o",
+                ms=7,
+                color=col,
+                mfc="white",
+                mew=1.8,
+                zorder=9,
+            )
             span = sub["high"].max() - sub["low"].min()
             if pt.kind is SwingKind.HIGH:
                 label_y = pt.price + span * 0.006
@@ -441,10 +768,15 @@ def _draw_harmonic(ax, sub, pattern, offset, swings, d_hit_loc=None):
                 f"{name} {pt.price:.2f}",
                 xy=(yi, pt.price),
                 xytext=(x_loc, label_y),
-                fontsize=8, color=col, fontweight="bold", va=va, ha=ha,
+                fontsize=8,
+                color=col,
+                fontweight="bold",
+                va=va,
+                ha=ha,
                 zorder=9,
-                bbox=dict(boxstyle="round,pad=0.18", fc="#ffffff", ec="none",
-                          lw=0, alpha=0.9),
+                bbox=dict(
+                    boxstyle="round,pad=0.18", fc="#ffffff", ec="none", lw=0, alpha=0.9
+                ),
             )
 
 
@@ -458,7 +790,8 @@ def _describe_harmonic(pattern, d_hit_loc=None):
     kind = "бычья (лонг)" if pattern.direction is Direction.LONG else "медвежья (шорт)"
     lines = [
         f"Формация AB=CD ({kind}):",
-        f"X {x:.2f} → A {a:.2f} — нисходящая волна" if pattern.direction is Direction.LONG
+        f"X {x:.2f} → A {a:.2f} — нисходящая волна"
+        if pattern.direction is Direction.LONG
         else f"X {x:.2f} → A {a:.2f} — восходящая волна",
         f"B {b:.2f} — откат волны XA на {b_retr:.1f}% (38.2–61.8)",
         f"C {c:.2f} — откат волны AB на {c_retr:.1f}% (38.2–78.6)",
@@ -517,13 +850,48 @@ def render(strategy_name, case, direction, out):
 
     expected = _load_expected(case, strategy_name)
     events = expected[expected["signal"] == direction]
+    if "action" in events.columns:
+        events = events[events["action"] == "entry"]
     if events.empty:
         raise ValueError(
             f"В кейсе '{case}' нет событий '{direction}' для стратегии '{strategy_name}'."
         )
     entry = events.iloc[0]
+    if config.get("adaptive_window"):
+        # ищем первый вход, где все три индикатора дали сигнал в сторону входа
+        # (иначе на панелях нечего показывать — например, до первого MA-кросса)
+        sign = 1 if direction == "BUY" else -1
+        sig_cols = [
+            p["signal_col"]
+            for p in config["panels"]
+            if p.get("signal_col") and p["signal_col"] in ta.columns
+        ]
+        clean_positions = []
+        for pos in range(len(events)):
+            candidate_date = events["datetime"].iloc[pos]
+            candidate_i = int((ta["datetime"] == candidate_date).idxmax())
+            if all((ta[sc].iloc[: candidate_i + 1] == sign).any() for sc in sig_cols):
+                clean_positions.append(pos)
+        if clean_positions:
+            entry = events.iloc[clean_positions[0]]
     entry_date = entry["datetime"]
     entry_i = int((ta["datetime"] == entry_date).idxmax())
+
+    if config.get("adaptive_window"):
+        # окно каждой панели — от ближайшего сигнала её индикатора в
+        # направлении входа (BUY/SELL) до входа
+        sign = 1 if direction == "BUY" else -1
+        wins = {}
+        seen = set()
+        for panel in config["panels"]:
+            sc = panel.get("signal_col")
+            if sc and sc in ta.columns and sc not in seen:
+                seen.add(sc)
+                series = ta[sc].iloc[: entry_i + 1]
+                matching = series.index[series == sign]
+                wins[sc] = int(entry_i - matching[-1] + 1) if len(matching) else None
+        config["sig_windows"].clear()
+        config["sig_windows"].update(wins)
 
     if config.get("harmonic"):
         pattern = _find_harmonic_pattern(df, entry_i)
@@ -539,16 +907,24 @@ def render(strategy_name, case, direction, out):
         if lo < 0:
             lo = 0
         d_hit = _find_d_target_hit(ta, entry_i, pattern)
-        hi = max(entry_i, d_hit + FORWARD if d_hit is not None else entry_i + FORWARD,
-                 pattern.b.index, pattern.c.index)
+        hi = max(
+            entry_i,
+            d_hit + FORWARD if d_hit is not None else entry_i + FORWARD,
+            pattern.b.index,
+            pattern.c.index,
+        )
         sub = ta.iloc[lo:hi].reset_index(drop=True)
         ei = entry_i - lo
         hi_loc = d_hit - lo if d_hit is not None else None
         panels = [
             {
                 "kind": "price",
-                "draw": lambda ax, sub: _draw_harmonic(ax, sub, pattern, lo, swings, hi_loc),
-                "describe": lambda sub, ei, direction: _describe_harmonic(pattern, hi_loc),
+                "draw": lambda ax, sub: _draw_harmonic(
+                    ax, sub, pattern, lo, swings, hi_loc
+                ),
+                "describe": lambda sub, ei, direction: _describe_harmonic(
+                    pattern, hi_loc
+                ),
             }
         ]
     else:
@@ -559,7 +935,10 @@ def render(strategy_name, case, direction, out):
         ei = entry_i - lo
         panels = config["panels"][:]
     fig, axs = plt.subplots(
-        len(panels), 1, figsize=(15, 2.7 + 1.4 * len(panels)), sharex=True,
+        len(panels),
+        1,
+        figsize=(15, 2.7 + 1.4 * len(panels)),
+        sharex=True,
         gridspec_kw={"hspace": 0.10},
     )
     axs = list(axs) if len(panels) > 1 else [axs]
@@ -571,18 +950,29 @@ def render(strategy_name, case, direction, out):
             ax.set_ylabel("Цена", rotation=0, labelpad=40)
 
     # пунктиры: жирный на входе, тонкий на границе окна анализа (если окно > 1)
-    if config["window"] > 1:
+    win = config["window"]
+    if config.get("adaptive_window"):
+        cand = [w for w in config["sig_windows"].values() if w]
+        if cand:
+            win = max(cand)
+    if win > 1:
         for ax in axs:
-            ax.axvline(ei - config["window"] + 1, color="#c8c8c8", lw=0.7, ls="--", zorder=0)
+            ax.axvline(ei - win + 1, color="#c8c8c8", lw=0.7, ls="--", zorder=0)
     for ax in axs:
         ax.axvline(ei, color="#888888", lw=1.6, ls="--", zorder=0)
 
     axs[0].annotate(
         f"{direction} ВХОД",
         xy=(ei, sub["high"].iloc[ei]),
-        xytext=(ei + 6, sub["high"].iloc[ei] + (sub["high"].max() - sub["low"].min()) * 0.12),
+        xytext=(
+            ei + 6,
+            sub["high"].iloc[ei] + (sub["high"].max() - sub["low"].min()) * 0.12,
+        ),
         arrowprops=dict(arrowstyle="->", color="#d32f2f", lw=2.4, shrinkA=0, shrinkB=4),
-        ha="left", color="#d32f2f", fontsize=10, fontweight="bold",
+        ha="left",
+        color="#d32f2f",
+        fontsize=10,
+        fontweight="bold",
     )
 
     for ax, panel in zip(axs, panels):
@@ -590,19 +980,29 @@ def render(strategy_name, case, direction, out):
         if panel["kind"] == "stoch":
             _mark_stoch_entry(ax, sub, panel["stoch_cols"], ei)
         ax.text(
-            1.015, 0.5, text, transform=ax.transAxes, rotation=0,
-            va="center", ha="left", fontsize=8.5, color="#303030", linespacing=1.5,
+            1.015,
+            0.5,
+            text,
+            transform=ax.transAxes,
+            rotation=0,
+            va="center",
+            ha="left",
+            fontsize=8.5,
+            color="#303030",
+            linespacing=1.5,
             bbox=dict(boxstyle="round,pad=0.4", fc="#fff8f8", ec="#d32f2f", lw=0.9),
         )
 
     xs = list(range(0, len(sub), 6))
     axs[-1].set_xticks(xs)
     axs[-1].set_xticklabels(
-        [pd.Timestamp(sub["datetime"].iloc[i]).strftime("%d %b\n%H:%M") for i in xs], fontsize=8
+        [pd.Timestamp(sub["datetime"].iloc[i]).strftime("%d %b\n%H:%M") for i in xs],
+        fontsize=8,
     )
     fig.suptitle(
         f"{strategy_name} · {case} · {direction} · вход {ta['datetime'].iloc[entry_i]}",
-        fontsize=12, y=0.995,
+        fontsize=12,
+        y=0.995,
     )
     fig.subplots_adjust(right=0.72)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -611,11 +1011,26 @@ def render(strategy_name, case, direction, out):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Генерация SVG-картинок сигналов стратегий.")
-    parser.add_argument("--strategy", required=True, choices=sorted(STRATEGY_CONFIGS), help="Имя стратегии из реестра")
-    parser.add_argument("--case", required=True, help="Имя snapshot-кейса (папка в tests/snapshot/data)")
-    parser.add_argument("--direction", choices=["BUY", "SELL"], default=None, help="Направление события")
-    parser.add_argument("--out", default=None, help="Папка вывода (по умолчанию openspec/assets/signals)")
+    parser = argparse.ArgumentParser(
+        description="Генерация SVG-картинок сигналов стратегий."
+    )
+    parser.add_argument(
+        "--strategy",
+        required=True,
+        choices=sorted(STRATEGY_CONFIGS),
+        help="Имя стратегии из реестра",
+    )
+    parser.add_argument(
+        "--case", required=True, help="Имя snapshot-кейса (папка в tests/snapshot/data)"
+    )
+    parser.add_argument(
+        "--direction", choices=["BUY", "SELL"], default=None, help="Направление события"
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Папка вывода (по умолчанию openspec/assets/signals)",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out) if args.out else ASSETS_DIR

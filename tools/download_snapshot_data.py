@@ -26,22 +26,22 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.config import TIMEFRAMES, TINKOFF_TOKEN
 from src.data.loader import load_candles
 from src.strategies import get_strategy
-from src.strategies.indicators.macd import MacdIndicator
+from src.strategies.indicators.macd import MacdIndicator, MacdMode
 from src.strategies.indicators.rsi import RsiIndicator
 from src.strategies.indicators.stochastic import StochasticIndicator
 from src.strategies.base_strategy import StrategyConfig
 from t_tech.invest.utils import now
 
-HARD_LIMIT = 300     # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
+HARD_LIMIT = 300  # неприкосновенный потолок объёма скачивания на кейс и дефолтная глубина запроса
 
 TIMEFRAME_DURATIONS = {
-    '1m': timedelta(minutes=1),
-    '5m': timedelta(minutes=5),
-    '15m': timedelta(minutes=15),
-    '1h': timedelta(hours=1),
-    '1d': timedelta(days=1),
-    '1w': timedelta(weeks=1),
-    '1M': timedelta(days=30),  # приближение календарного месяца
+    "1m": timedelta(minutes=1),
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "1d": timedelta(days=1),
+    "1w": timedelta(weeks=1),
+    "1M": timedelta(days=30),  # приближение календарного месяца
 }
 
 STRATEGY_CONFIGS = {
@@ -49,7 +49,7 @@ STRATEGY_CONFIGS = {
         name="macd_rsi_stoch",
         strategy_window=5,
         indicators=(
-            MacdIndicator(fast=12, slow=26, signal=9),
+            MacdIndicator(fast=12, slow=26, signal=9, mode=MacdMode.SIGNAL_LINE_CROSS),
             RsiIndicator(period=14),
             StochasticIndicator(k=14, d=3, smooth_k=3),
         ),
@@ -100,37 +100,58 @@ def save_case(ticker, instrument_type, timeframe, strategy_name, case_name):
     data_ta = strategy.compute(df)
     expected = strategy.expected_events(data_ta)
 
-    case_dir = PROJECT_ROOT / 'tests' / 'snapshot' / 'data' / case_name
+    case_dir = PROJECT_ROOT / "tests" / "snapshot" / "data" / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    candles_path = case_dir / 'candles.csv'
-    expected_path = case_dir / f'{strategy_name}_expected_signals.csv'
+    candles_path = case_dir / "candles.csv"
+    expected_path = case_dir / f"{strategy_name}_expected_signals.csv"
 
     df.to_csv(candles_path, index=False)
     expected.to_csv(expected_path, index=False)
 
     print(f"Инструмент: {instrument_id}")
     print(f"Глубина запроса: {depth} свечей, получено: {len(df)}")
-    print(f"Консенсусных событий в эталоне: {len(expected)} (BUY={int((expected['signal'] == 'BUY').sum())}, SELL={int((expected['signal'] == 'SELL').sum())})")
+    print(
+        f"Консенсусных событий в эталоне: {len(expected)} (BUY={int((expected['signal'] == 'BUY').sum())}, SELL={int((expected['signal'] == 'SELL').sum())})"
+    )
     print(f"Фикстура: {candles_path}")
     print(f"Эталон:   {expected_path}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Скачивание фикстур для snapshot-тестов.")
-    parser.add_argument('--ticker', required=True, help='Тикер инструмента (например NGU6)')
-    parser.add_argument('--instrument-type', default='future', choices=['share', 'future', 'etf', 'currency'], help='Тип инструмента')
-    parser.add_argument('--timeframe', default='1h', help='Таймфрейм из src.config.TIMEFRAMES')
-    parser.add_argument('--strategy', default='macd_rsi_stoch', help='Имя стратегии из реестра src.strategies')
-    parser.add_argument('--case', default=None, help='Имя кейса (по умолчанию TICKER_timeframe)')
+    parser = argparse.ArgumentParser(
+        description="Скачивание фикстур для snapshot-тестов."
+    )
+    parser.add_argument(
+        "--ticker", required=True, help="Тикер инструмента (например NGU6)"
+    )
+    parser.add_argument(
+        "--instrument-type",
+        default="future",
+        choices=["share", "future", "etf", "currency"],
+        help="Тип инструмента",
+    )
+    parser.add_argument(
+        "--timeframe", default="1h", help="Таймфрейм из src.config.TIMEFRAMES"
+    )
+    parser.add_argument(
+        "--strategy",
+        default="macd_rsi_stoch",
+        help="Имя стратегии из реестра src.strategies",
+    )
+    parser.add_argument(
+        "--case", default=None, help="Имя кейса (по умолчанию TICKER_timeframe)"
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     case_name = args.case or f"{args.ticker}_{args.timeframe}"
-    save_case(args.ticker, args.instrument_type, args.timeframe, args.strategy, case_name)
+    save_case(
+        args.ticker, args.instrument_type, args.timeframe, args.strategy, case_name
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
