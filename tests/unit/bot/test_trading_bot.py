@@ -397,7 +397,42 @@ class TestTradingBot:
 
         bot.run()
 
-        assert any("Ошибка робота" in m for m in bot._notifier.messages)
+        assert any("bot_debug.log" in m for m in bot._notifier.messages)
+
+    def test_error_message_does_not_leak_technical_details(self):
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=FakeCache(frames={"SBER": _df()}, refresh_error=RuntimeError("boom")),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(),
+            share={"SBER": _assign("macd_rsi_stoch")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        notified = [m for m in bot._notifier.messages if "Сбой" in m]
+        assert len(notified) == 1
+        assert "boom" not in notified[0]
+        assert "обновление свечей таймфрейма 1h" in notified[0]
+        assert "bot_debug.log" in notified[0]
+
+    def test_rate_limit_error_is_not_notified(self):
+        bot = _make_bot(
+            timeline=FakeTimeline(ticks=1),
+            cache=FakeCache(frames={"SBER": _df()}, refresh_error=RuntimeError("RESOURCE_EXHAUSTED 8")),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(),
+            share={"SBER": _assign("macd_rsi_stoch")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert not any("Сбой" in m for m in bot._notifier.messages)
+        assert bot._errors_in_period == 1
 
     def test_heartbeat_every_n_ticks(self):
         bot = _make_bot(
@@ -464,8 +499,10 @@ class TestTradingBot:
         bot.run()
 
         heartbeats = [m for m in bot._notifier.messages if "Сердцебиение" in m]
-        assert len(heartbeats) == 1
-        assert "ошибок за период — 1" in heartbeats[-1]
+        # ошибка не роняет тик: tick 1 выполнился со счётчиком ошибок, tick 2 — сброс
+        assert len(heartbeats) == 2
+        assert "ошибок за период — 1" in heartbeats[0]
+        assert "ошибок за период — 0" in heartbeats[-1]
 
     def test_tick_held_until_fresh_bar_published(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
@@ -616,7 +653,7 @@ class TestTradingBot:
         bot.run()
 
         assert len(execution.decisions) == 2
-        assert any("Ошибка робота" in m for m in bot._notifier.messages)
+        assert any("bot_debug.log" in m for m in bot._notifier.messages)
         assert timeline.wait_boundaries == [False, False, True, True]
 
     def test_empty_tick_skips_process_and_heartbeat(self):
@@ -713,7 +750,9 @@ class TestTradingBot:
         bot.run()
 
         # фатальная ошибка не скрывается локально — всплывает и обрабатывается как ошибка робота
-        assert any("Ошибка робота" in m for m in notifier.messages)
+        assert any("bot_debug.log" in m for m in notifier.messages)
+        # в тексте уведомления названы инструмент, таймфрейм и стратегия
+        assert any("анализ" in m and "macd_rsi_stoch" in m for m in notifier.messages)
         # _analyze прерван на первой стратегии — вторая в том же тике не выполнилась
         assert working.compute.called is False
 
@@ -740,7 +779,7 @@ class TestTradingBot:
         bot.run()
 
         risk.apply.assert_called_once()
-        assert any("Ошибка робота" in m for m in notifier.messages)
+        assert any("bot_debug.log" in m for m in notifier.messages)
         assert len(execution.decisions) == 0
 
     def test_duplicate_strategy_with_distinct_profiles_runs_both(self):
