@@ -6,10 +6,24 @@ from uuid import uuid4
 
 from src.instruments import Instrument, normalize_instrument
 from src.logging_setup import correlation_id_var, get_logger
+from src.notifier.errors import user_error_message
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 
 log = get_logger(__name__)
+
+
+class _OperationError(Exception):
+    """Несёт человекочитаемое имя операции, на которой случился сбой.
+
+    Исходное исключение доступно как ``cause`` — его текст уходит в журнал,
+    а имя операции — в уведомление пользователя.
+    """
+
+    def __init__(self, operation: str, cause: Exception) -> None:
+        super().__init__(operation)
+        self.operation = operation
+        self.cause = cause
 
 
 class TradingBot:
@@ -87,7 +101,7 @@ class TradingBot:
                 log.info("Бот остановлен.")
                 return
             except Exception as exc:
-                self._report_error(exc)
+                self._report_error(exc, "обработка тика")
                 time.sleep(self._timeline.fallback_secs())
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
@@ -115,13 +129,24 @@ class TradingBot:
         try:
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
-                    self._data_cache.frame_for(instrument, tf)
+                    try:
+                        self._data_cache.frame_for(instrument, tf)
+                    except Exception as exc:
+                        self._report_error(exc, f"обновление данных {instrument.label} ({tf})")
             for tf in ready_tfs:
-                self._data_cache.refresh_if_new_candle(tf)
+                try:
+                    self._data_cache.refresh_if_new_candle(tf)
+                except Exception as exc:
+                    self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             if not ready_tfs:
                 return
             for instrument in self._instruments:
-                self._process(instrument, ready_tfs)
+                try:
+                    self._process(instrument, ready_tfs)
+                except _OperationError as err:
+                    self._report_error(err.cause, err.operation)
+                except Exception as exc:
+                    self._report_error(exc, f"анализ {instrument.label}")
             self._maybe_heartbeat()
         finally:
             correlation_id_var.set(None)
@@ -186,6 +211,10 @@ class TradingBot:
                 log.warning(
                     "Проблема со стратегией '%s' на %s: %s", name, instrument.label, exc
                 )
+            except Exception as exc:
+                raise _OperationError(
+                    f"анализ {instrument.label} ({tf}, {name})", exc
+                ) from exc
 
     # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
     def _emit(self, instrument: Instrument, name: str, decision, *, filter_profile: str = "", filtered_out: bool = False, timeframe: str = "") -> None:
@@ -273,10 +302,13 @@ class TradingBot:
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
 
-    def _report_error(self, exc: Exception) -> None:
+    def _report_error(self, exc: Exception, operation: str = "обработка тика") -> None:
         self._errors_in_period += 1
-        log.exception("Ошибка тика: %s", exc)
+        log.exception("Ошибка тика (%s): %s", operation, exc)
+        message = user_error_message(exc, operation)
+        if message is None:
+            return
         try:
-            self._notifier.notify(f"❗ Ошибка робота: {exc}")
+            self._notifier.notify(message)
         except Exception:
             log.exception("Не удалось уведомить об ошибке робота.")
