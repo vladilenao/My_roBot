@@ -4,6 +4,16 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## 2.1.1 — 13.09.2026
+
+### Исправлено
+- Логгер падал при обращении к реальному API: записи сторонних библиотек
+  (`t_tech` и др.) не содержат `service_uid`/`correlation_id`, и форматтер
+  `RotatingFileHandler` бросал `ValueError: Formatting field not found in
+  record: 'service_uid'`. Теперь контекстные поля встраивает фильтр на
+  хэндлере — работает для любых источников записей, включая сигналы
+  выборки свечей (`GetCandles`).
+
 ## 2.1.0 — 12.09.2026
 
 ### Добавлено

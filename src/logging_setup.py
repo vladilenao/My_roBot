@@ -40,6 +40,23 @@ class ContextLoggerAdapter(logging.LoggerAdapter):
         return msg, kwargs
 
 
+# ── Handler filter ─────────────────────────────────────────────
+class _ContextFilter(logging.Filter):
+    """Встраивает ``service_uid`` и ``correlation_id`` в каждую запись.
+
+    Записи, пришедшие от логгеров без адаптера (третьи библиотеки: t_tech,
+    sentry_sdk и т.п.), не содержат этих полей, и массовый форматтер падает.
+    Фильтр на хэндлере заполняет недостающие поля для любых источников.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "service_uid"):
+            record.service_uid = service_uid_var.get("")
+        if not hasattr(record, "correlation_id"):
+            record.correlation_id = correlation_id_var.get() or ""
+        return True
+
+
 # ── Formatter ──────────────────────────────────────────────────
 class _MicrosecondFormatter(logging.Formatter):
     """Форматтер с реальными микросекундами в timestamp.
@@ -94,6 +111,7 @@ def setup_logging(
         delay=True,
     )
     handler.setFormatter(_MicrosecondFormatter(fmt, datefmt=datefmt))
+    handler.addFilter(_ContextFilter())
     root.addHandler(handler)
 
 

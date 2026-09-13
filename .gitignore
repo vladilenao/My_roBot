@@ -10,4 +10,4 @@ dist/
 .venv/
 .pytest_cache/
 .ruff_cache/
-robot.toml
+robot.tomlbot_debug.log

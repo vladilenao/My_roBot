@@ -281,3 +281,23 @@ class TestRetryLogging:
             pytest.skip("Нет доступа к исходнику retry.py")
         source = loader.get_source("src.api.retry")
         assert "print(" not in source, "В retry.py не должно остаться print()"
+
+    def test_third_party_record_gets_context_fields(self, tmp_path: Path) -> None:
+        """Запись логгера без адаптера (t_tech и др.) не должна падать в форматтере.
+
+        Регрессия: форматтер требует %(service_uid)s, но сторонние логгеры
+        эмитят чистые LogRecord без этих полей — хэндлер-фильтр обязан их
+        встроить, иначе RotatingFileHandler.emit падает с ValueError.
+        """
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc-456", log_file=str(log_file))
+
+        foreign = logging.getLogger("t_tech.invest.logging")  # без ContextLoggerAdapter
+        foreign.setLevel(logging.INFO)
+        foreign.info("%s %s", "588f", "GetCandles")
+
+        for h in logging.getLogger().handlers:
+            h.flush()
+        content = log_file.read_text(encoding="utf-8")
+        assert "[svc-456]" in content
+        assert "GetCandles" in content
