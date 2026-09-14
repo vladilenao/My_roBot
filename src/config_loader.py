@@ -16,7 +16,9 @@ import os
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 
 CONFIG_FILENAME = "robot.toml"
 BUNDLED_FILENAME = "default.toml"
@@ -43,6 +45,9 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "share": "share_strategies",
         "future": "future_strategies",
     },
+    "strategies.filter": {
+        "triple_screen": "triple_screen_params",
+    },
     "logging": {
         "service_uid": "logging_service_uid",
         "file": "logging_file",
@@ -63,6 +68,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "notifier": str,
     "share_strategies": dict,
     "future_strategies": dict,
+    "triple_screen_params": dict,
     "logging_service_uid": str,
     "logging_file": str,
     "logging_level": str,
@@ -196,10 +202,64 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [notifier] channel должен быть одним из "
                 f"{sorted(_ALLOWED_NOTIFIER_VALUES)}, получено {value!r}"
             )
+        if key == "triple_screen_params":
+            cleaned[key] = _validate_triple_screen_params(value, path)
+            continue
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
     return cleaned
+
+
+def _validate_triple_screen_params(value: Any, path: Path) -> dict[str, Any]:
+    """Проверка секции `[strategies.filter.triple_screen]`: строгие ключи и типы."""
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"{path}: [strategies.filter.triple_screen] должна быть таблицей"
+        )
+    non_int = {
+        key: val
+        for key, val in value.items()
+        if isinstance(val, bool) or not isinstance(val, int)
+    }
+    if non_int:
+        raise ConfigError(
+            f"{path}: [strategies.filter.triple_screen] ключи "
+            f"{sorted(non_int)} должны быть целыми числами"
+        )
+    try:
+        TripleScreenParams.from_config(dict(value))
+    except ValueError as exc:
+        raise ConfigError(
+            f"{path}: [strategies.filter.triple_screen] {exc}"
+        ) from exc
+    return dict(value)
+
+
+def validate_triple_screen_hierarchy(
+    bindings: Mapping[str, list[Any]],
+    multiplier: int,
+    ladder: Sequence[str],
+    path: Path,
+) -> None:
+    """Проверка иерархии ТФ привязок с профилем `triple_screen` (дефолты Элдера).
+
+    Для каждой привязки ``filter = "triple_screen"`` вычисляется ``tf_hierarchy``;
+    при выходе шага множителя за пределы лестницы ``TIMEFRAMES`` — ``ConfigError``
+    с указанием привязки.
+    """
+    for ticker, items in bindings.items():
+        for item in items:
+            if getattr(item, "filter_profile", None) != "triple_screen":
+                continue
+            try:
+                tf_hierarchy(item.timeframe, multiplier, ladder)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"{path}: привязка {ticker!r} (стратегия {item.strategy}, "
+                    f"таймфрейм {item.timeframe!r}) несовместима с профилем "
+                    f"triple_screen: {exc}"
+                ) from exc
 
 
 def _parse(path: Path) -> dict[str, Any]:
@@ -221,6 +281,9 @@ def _parse(path: Path) -> dict[str, Any]:
             raise ConfigError(f"{path}: секция [{section}] должна быть таблицей")
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
+            if key == "filter" and section == "strategies":
+                flat["triple_screen_params"] = _parse_triple_screen_section(value, path)
+                continue
             target = allowed_keys.get(key)
             if target is None:
                 raise ConfigError(
@@ -229,6 +292,28 @@ def _parse(path: Path) -> dict[str, Any]:
                 )
             flat[target] = value
     return _validate(flat, path)
+
+
+def _parse_triple_screen_section(value: Any, path: Path) -> dict[str, Any]:
+    """Извлечение таблицы `[strategies.filter.triple_screen]` из вложенной секции."""
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"{path}: [strategies.filter] должна быть таблицей с секцией triple_screen"
+        )
+    unknown = set(value) - {"triple_screen"}
+    if unknown:
+        raise ConfigError(
+            f"{path}: [strategies.filter] незнакомые секции {sorted(unknown)}; "
+            f"допустимые: ['triple_screen']"
+        )
+    params = value.get("triple_screen")
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise ConfigError(
+            f"{path}: [strategies.filter.triple_screen] должна быть таблицей"
+        )
+    return dict(params)
 
 
 def _candidate_files(

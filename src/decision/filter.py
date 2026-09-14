@@ -28,6 +28,8 @@ class SignalFilter:
         decision: Decision,
         ctx: MarketContext,
         profile_name: str = DEFAULT_FILTER_PROFILE,
+        instrument: str = "",
+        timeframe: str = "",
     ) -> Decision:
         profile = self._PROFILES.get(profile_name)
         if profile is None:
@@ -36,4 +38,4 @@ class SignalFilter:
                 f"Неизвестный профиль фильтрации {profile_name!r}. "
                 f"Доступны: {available}"
             )
-        return profile.apply(decision, ctx)
+        return profile.apply(decision, ctx, instrument=instrument, timeframe=timeframe)

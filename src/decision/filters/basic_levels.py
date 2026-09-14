@@ -16,7 +16,13 @@ class BasicLevelsFilter:
     обогащает Decision полями `trend_direction` и `trend_confidence`.
     """
 
-    def apply(self, decision: Decision, ctx: MarketContext) -> Decision:
+    def apply(
+        self,
+        decision: Decision,
+        ctx: MarketContext,
+        instrument: str = "",
+        timeframe: str = "",
+    ) -> Decision:
         direction = ctx.trend.direction
         direction_str = direction.value
 

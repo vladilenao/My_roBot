@@ -14,11 +14,36 @@ _PERIODS = {
     "1m": ("minute", 1),
     "5m": ("minute", 5),
     "15m": ("minute", 15),
+    "30m": ("minute", 30),
     "1h": ("hour", 1),
+    "4h": ("hour", 4),
     "1d": ("day", 1),
     "1w": ("week", 1),
     "1M": ("month", 1),
 }
+
+_TF_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+    "1w": 10080,
+    "1M": 43200,
+}
+
+
+def tf_period_minutes(timeframe: str) -> int:
+    """Длительность таймфрейма в минутах (для 1M — ≈ 30 дней)."""
+    try:
+        return _TF_MINUTES[timeframe]
+    except KeyError:
+        raise ValueError(
+            f"Неподдерживаемый таймфрейм '{timeframe}'. "
+            f"Доступны: {', '.join(sorted(_TF_MINUTES))}"
+        ) from None
 
 
 def _month_span(t: datetime) -> timedelta:
@@ -205,6 +230,7 @@ class MultiTimeframeScheduler:
             tf: CandleScheduler(tf, sleep_secs=sleep_secs, clock=self._clock)
             for tf in unique
         }
+        self._lazy_grids: dict[str, CandleScheduler] = {}
         self._fallback = sleep_secs
         self._last_tick: datetime | None = None
 
@@ -217,8 +243,19 @@ class MultiTimeframeScheduler:
         return tuple(self._grids)
 
     def grid(self, timeframe: str) -> CandleScheduler:
-        """Сетка конкретного таймфрейма (математика границ, bar_close)."""
-        return self._grids[timeframe]
+        """Сетка конкретного таймфрейма (математика границ, bar_close).
+
+        Сетки неактивных (вне ритма) ТФ создаются по запросу потребителей данных
+        (``HtfFrameProvider``) и не влияют на ``next_boundary``/``fallback_secs``.
+        """
+        grid = self._grids.get(timeframe)
+        if grid is not None:
+            return grid
+        grid = self._lazy_grids.get(timeframe)
+        if grid is None:
+            grid = CandleScheduler(timeframe, sleep_secs=self._fallback, clock=self._clock)
+            self._lazy_grids[timeframe] = grid
+        return grid
 
     def next_boundary(self, t: datetime | None = None) -> datetime:
         """Ближайшая граница закрытия свечи среди активных ТФ."""

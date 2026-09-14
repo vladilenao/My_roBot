@@ -66,6 +66,28 @@ class MarketDataCache:
             return pd.DataFrame()
         return self._closed_only(frame, timeframe)
 
+    def ensure_loaded(self, instrument, timeframe: str) -> None:
+        """Гарантирует актуальность кадра пары (инструмент, ТФ) по требованию.
+
+        Используется для таймфреймов вне активного ритма (старшие ТФ фильтров):
+        отсутствующий кадр загружается целиком, существующий — инкрементально
+        дозагружается новыми закрытыми барами поверх кэша.
+        """
+        key = self._key(instrument, timeframe)
+        if key not in self._frames:
+            self._initial_load(instrument, timeframe, key)
+            return
+        frame = self._frames[key]
+        if frame is None or frame.empty:
+            return
+        last_dt = self._last_loaded.get(key)
+        new_df = self._load(self._instruments[key], timeframe, start_date=last_dt)
+        merged = self._merge_new_bars(frame, new_df, last_dt)
+        self._frames[key] = merged
+        closed = self._closed_only(merged, timeframe)
+        if not closed.empty:
+            self._last_loaded[key] = _naive(closed["datetime"].max())
+
     def refresh_if_new_candle(self, timeframe: str, now=None, force: bool = False) -> None:
         """Инкрементально дозагружает новые закрытые бары таймфрейма, если граница сместилась.
 

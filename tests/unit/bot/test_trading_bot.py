@@ -822,7 +822,7 @@ class TestTradingBot:
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         execution = RecordingExecution()
         signal_filter = MagicMock()
-        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels": replace(
+        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels", instrument="", timeframe="": replace(
             decision, signal_type=SignalType.HOLD
         )
         context_cache = MagicMock()
@@ -841,8 +841,10 @@ class TestTradingBot:
 
         bot.run()
 
-        # фильтр получил профиль привязки, порт — профиль и признак отклонения
+        # фильтр получил профиль привязки и объект инструмента с ТФ, порт — профиль и признак отклонения
         assert signal_filter.apply.call_args.kwargs["profile_name"] == "basic_levels"
+        assert signal_filter.apply.call_args.kwargs["instrument"] is bot._instruments[0]
+        assert signal_filter.apply.call_args.kwargs["timeframe"] == "1h"
         assert execution.calls[0]["filtered_out"] is True
         assert execution.calls[0]["filter_profile"] == "basic_levels"
 
@@ -850,7 +852,7 @@ class TestTradingBot:
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         execution = RecordingExecution()
         signal_filter = MagicMock()
-        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels": decision
+        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels", instrument="", timeframe="": decision
         context_cache = MagicMock()
         context_cache.get_context.return_value = object()
         bot = _make_bot(

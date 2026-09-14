@@ -17,6 +17,7 @@ from src.config import (
     TICK_POLL_SECS,
     TICK_TIMEOUT_SECS,
     TINKOFF_TOKEN,
+    TRIPLE_SCREEN_PARAMS,
     INSTRUMENT_TYPE,
     LOGGING_SERVICE_UID,
     LOGGING_FILE,
@@ -25,7 +26,10 @@ from src.config import (
     LOGGING_BACKUP_COUNT,
 )
 from src.data.cache import MarketDataCache
+from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
+from src.decision.filters import PROFILES
+from src.decision.filters.triple_screen import TripleScreenFilter
 from src.execution import NotifyOnlyExecutionPort
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
@@ -51,6 +55,11 @@ def main():
     )
     data_cache = MarketDataCache(
         loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
+    )
+
+    htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
+    PROFILES["triple_screen"] = TripleScreenFilter(
+        provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
     )
 
     TradingBot(
