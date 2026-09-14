@@ -303,3 +303,85 @@ class TestMultiTimeframeCache:
 
         assert cache.has_fresh_closed_bar("15m") is True
         assert cache.has_fresh_closed_bar("1h") is False
+
+
+class FakeLoaderWithStart:
+    """Лоадер по паре (тикер, таймфрейм) с записью start_date дозагрузок."""
+
+    def __init__(self, data):
+        self.data = data
+        self.calls = []
+
+    def __call__(
+        self, ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None, instrument_id=None
+    ):
+        self.calls.append((ticker, timeframe, start_date))
+        rows = [
+            b
+            for b in self.data.get((ticker, timeframe), [])
+            if start_date is None or b > pd.Timestamp(start_date)
+        ]
+        return _bars_from_rows(rows), instrument_id or "uid-2"
+
+
+class TestEnsureLoaded:
+    def _make(self, data, clock_at):
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock_at[0])
+        cache = MarketDataCache(loader=FakeLoaderWithStart(data), timeline=sched)
+        return cache, sched
+
+    def test_loads_inactive_timeframe_on_demand(self):
+        clock = [datetime(2024, 1, 1, 8, 15)]
+        data = {
+            ("SBER", "4h"): [pd.Timestamp("2024-01-01 00:00"),
+                             pd.Timestamp("2024-01-01 04:00"),
+                             pd.Timestamp("2024-01-01 08:00")],
+        }
+        cache, sched = self._make(data, clock)
+        inst = Instrument("SBER", "SBER", "share")
+
+        cache.ensure_loaded(inst, "4h")
+
+        # 4h вне активного ритма, но запрошен — загружен целиком
+        assert ("SBER", "4h", None) in cache._loader.calls
+        assert len(cache._frames[("SBER", "share", "4h")]) == 3
+        assert sched.timeframes == ("1h",)  # ленивая 4h-сетка не входит в ритм
+
+    def test_incremental_reload_on_existing_frame(self):
+        clock = [datetime(2024, 1, 1, 8, 15)]
+        data = {
+            ("SBER", "4h"): [pd.Timestamp("2024-01-01 00:00"),
+                             pd.Timestamp("2024-01-01 04:00")],
+        }
+        cache, _ = self._make(data, clock)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.ensure_loaded(inst, "4h")
+        calls_before = list(cache._loader.calls)
+
+        # появился новый закрытый 4h-бар
+        data[("SBER", "4h")].append(pd.Timestamp("2024-01-01 08:00"))
+        cache.ensure_loaded(inst, "4h")
+
+        # дозагрузка идёт с последнего известного бара 04:00
+        assert cache._loader.calls == calls_before + [("SBER", "4h", pd.Timestamp("2024-01-01 04:00"))]
+        raw = cache._frames[("SBER", "share", "4h")]
+        assert raw["datetime"].max() == pd.Timestamp("2024-01-01 08:00")
+
+    def test_frame_for_returns_closed_only(self):
+        clock = [datetime(2024, 1, 1, 8, 15)]
+        data = {
+            ("SBER", "4h"): [pd.Timestamp("2024-01-01 00:00"),
+                             pd.Timestamp("2024-01-01 04:00"),
+                             pd.Timestamp("2024-01-01 08:00")],
+        }
+        cache, _ = self._make(data, clock)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.ensure_loaded(inst, "4h")
+
+        frame = cache.frame_for(inst, "4h")
+
+        # бар 08:00 закрывается в 12:00 — ещё живой, наружу не выдаётся
+        assert frame["datetime"].tolist() == [
+            pd.Timestamp("2024-01-01 00:00"),
+            pd.Timestamp("2024-01-01 04:00"),
+        ]

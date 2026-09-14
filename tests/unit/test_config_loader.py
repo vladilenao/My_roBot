@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from src.config_loader import ConfigError, app_dir, load_config
+from src.config_loader import ConfigError, app_dir, load_config, validate_triple_screen_hierarchy
 from src.strategies.contracts import Assignment
 
 
@@ -264,3 +264,134 @@ class TestToAssignments:
 
         with pytest.raises(ConfigError, match="2h"):
             _to_assignments({"SBER": self._table(["flat_triangle"], timeframe="2h")})
+
+
+class TestTripleScreenSection:
+    def _load(self, tmp_path, text):
+        path = tmp_path / "robot.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_config(_defaults(), config_file=path)
+
+    def test_section_parsed(self, tmp_path):
+        cfg = self._load(
+            tmp_path,
+            '[strategies.filter.triple_screen]\n'
+            'multiplier = 3\n'
+            'oversold = 25\n'
+            'macd_fast = 5\n',
+        )
+
+        assert cfg["triple_screen_params"] == {
+            "multiplier": 3,
+            "oversold": 25,
+            "macd_fast": 5,
+        }
+
+    def test_empty_section_means_defaults(self, tmp_path):
+        cfg = self._load(tmp_path, "[strategies.filter.triple_screen]\n")
+
+        assert cfg.get("triple_screen_params") == {}
+
+    def test_unknown_key_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="window"):
+            self._load(tmp_path, "[strategies.filter.triple_screen]\nwindow = 5\n")
+
+    def test_float_value_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="целыми числами"):
+            self._load(tmp_path, '[strategies.filter.triple_screen]\nmultiplier = 5.0\n')
+
+    def test_bool_value_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="целыми числами"):
+            self._load(tmp_path, "[strategies.filter.triple_screen]\nmultiplier = true\n")
+
+    def test_invalid_zones_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="oversold"):
+            self._load(
+                tmp_path,
+                "[strategies.filter.triple_screen]\noversold = 90\noverbought = 20\n",
+            )
+
+    def test_multiplier_one_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="множитель"):
+            self._load(tmp_path, "[strategies.filter.triple_screen]\nmultiplier = 1\n")
+
+    def test_unknown_filter_subsection_rejected(self, tmp_path):
+        with pytest.raises(ConfigError, match="triple_screen"):
+            self._load(tmp_path, "[strategies.filter]\nbogus = { x = 1 }\n")
+
+
+class TestTripleScreenHierarchyValidation:
+    def test_compatible_tf_passes(self):
+        bindings = {
+            "SBER": [
+                Assignment(
+                    strategy="macd_rsi_stoch",
+                    filter_profile="triple_screen",
+                    timeframe="5m",
+                )
+            ]
+        }
+        validate_triple_screen_hierarchy(
+            bindings, multiplier=5, ladder=("1m", "5m", "15m", "30m", "1h", "4h"), path=object()
+        )
+
+    def test_incompatible_tf_raises_config_error(self):
+        from pathlib import Path
+
+        bindings = {
+            "SBER": [
+                Assignment(
+                    strategy="macd_rsi_stoch",
+                    filter_profile="triple_screen",
+                    timeframe="1M",
+                )
+            ]
+        }
+        with pytest.raises(ConfigError, match="несовместима с профилем triple_screen"):
+            validate_triple_screen_hierarchy(
+                bindings,
+                multiplier=5,
+                ladder=("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"),
+                path=Path("robot.toml"),
+            )
+
+    def test_config_flow_binding_compatible(self, tmp_path):
+        """Интеграция: привязка {filter = triple_screen, tf = 5m} проходит весь путь конфига."""
+        from src.config import _to_assignments, TIMEFRAMES, TRIPLE_SCREEN_PARAMS
+
+        path = tmp_path / "robot.toml"
+        path.write_text(
+            "[strategies.share.SBER]\n"
+            'strategies = [{ name = "macd_rsi_stoch", filter = "triple_screen", tf = "5m" }]\n',
+            encoding="utf-8",
+        )
+        cfg = load_config(_defaults(), config_file=path)
+        bindings = _to_assignments(cfg["share_strategies"])
+
+        result = bindings["SBER"][0]
+        assert (result.strategy, result.filter_profile, result.timeframe) == (
+            "macd_rsi_stoch",
+            "triple_screen",
+            "5m",
+        )
+        validate_triple_screen_hierarchy(
+            bindings, TRIPLE_SCREEN_PARAMS.multiplier, tuple(TIMEFRAMES), path
+        )
+
+    def test_config_flow_binding_incompatible_rejected(self, tmp_path):
+        """Интеграция: привязка с tf = 1M отсекается fail-fast на этапе конфига."""
+        from src.config import _to_assignments, TIMEFRAMES, TRIPLE_SCREEN_PARAMS
+
+        path = tmp_path / "robot.toml"
+        path.write_text(
+            "[strategies.share.SBER]\n"
+            'strategies = [{ name = "macd_rsi_stoch", filter = "triple_screen", tf = "1M" }]\n',
+            encoding="utf-8",
+        )
+        cfg = load_config(_defaults(), config_file=path)
+        bindings = _to_assignments(cfg["share_strategies"])
+
+        with pytest.raises(ConfigError, match="несовместима с профилем triple_screen"):
+            validate_triple_screen_hierarchy(
+                bindings, TRIPLE_SCREEN_PARAMS.multiplier, tuple(TIMEFRAMES), path
+            )

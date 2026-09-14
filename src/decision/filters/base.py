@@ -9,6 +9,17 @@ from src.strategies.contracts import Decision
 
 
 class ProfileFilter(Protocol):
-    """Конкретный фильтр профиля: чистый трансформер Decision."""
+    """Конкретный фильтр профиля: чистый трансформер Decision.
 
-    def apply(self, decision: Decision, ctx: MarketContext) -> Decision: ...
+    `instrument`/`timeframe` — контекст привязки для данных-зависимых профилей
+    (``triple_screen``: выбор старших ТФ). Профили без потребности в данных
+    (``raw``, ``basic_levels``) игнорируют эти параметры.
+    """
+
+    def apply(
+        self,
+        decision: Decision,
+        ctx: MarketContext,
+        instrument: str = "",
+        timeframe: str = "",
+    ) -> Decision: ...

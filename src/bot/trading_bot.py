@@ -193,7 +193,11 @@ class TradingBot:
                     if self._signal_filter is not None:
                         raw = decision
                         decision = self._signal_filter.apply(
-                            decision, context, profile_name=assignment.filter_profile
+                            decision,
+                            context,
+                            profile_name=assignment.filter_profile,
+                            instrument=instrument,
+                            timeframe=tf,
                         )
                         filtered_out = (
                             raw.signal_type is not SignalType.HOLD

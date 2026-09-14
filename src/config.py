@@ -3,7 +3,13 @@ from typing import cast
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
 
-from src.config_loader import ConfigError, load_config
+from src.config_loader import (
+    ConfigError,
+    app_dir,
+    load_config,
+    validate_triple_screen_hierarchy,
+)
+from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
 
@@ -19,7 +25,9 @@ TIMEFRAMES = {
     "1m": CandleInterval.CANDLE_INTERVAL_1_MIN,
     "5m": CandleInterval.CANDLE_INTERVAL_5_MIN,
     "15m": CandleInterval.CANDLE_INTERVAL_15_MIN,
+    "30m": CandleInterval.CANDLE_INTERVAL_30_MIN,
     "1h": CandleInterval.CANDLE_INTERVAL_HOUR,
+    "4h": CandleInterval.CANDLE_INTERVAL_4_HOUR,
     "1d": CandleInterval.CANDLE_INTERVAL_DAY,
     "1w": CandleInterval.CANDLE_INTERVAL_WEEK,
     "1M": CandleInterval.CANDLE_INTERVAL_MONTH,
@@ -132,6 +140,20 @@ SHARE_STRATEGIES: dict[str, list[Assignment]] = _to_assignments(_CONFIG["share_s
 # Запись не привязана к конкретному контракту и действует на любой контракт актива
 # (например "NG" покрывает NGU6, NGZ7 и любые последующие контракты природного газа).
 FUTURE_STRATEGIES: dict[str, list[Assignment]] = _to_assignments(_CONFIG["future_strategies"])
+
+# Параметры профиля triple_screen (методика Элдера) из [strategies.filter.triple_screen];
+# при отсутствии секции — дефолты (множитель 5, MACD 12/26/9, Stochastic 14/3/3, 20/80).
+TRIPLE_SCREEN_PARAMS: TripleScreenParams = TripleScreenParams.from_config(
+    _CONFIG.get("triple_screen_params") or {}
+)
+
+# Fail-fast на недопустимую иерархию ТФ: шаг множителя не должен выходить за лестницу TIMEFRAMES.
+validate_triple_screen_hierarchy(
+    {**SHARE_STRATEGIES, **FUTURE_STRATEGIES},
+    TRIPLE_SCREEN_PARAMS.multiplier,
+    tuple(TIMEFRAMES),
+    app_dir() / "robot.toml",
+)
 
 # Множество таймфреймов, задействованных привязками (ритм планировщика).
 ACTIVE_TIMEFRAMES: frozenset[str] = frozenset(

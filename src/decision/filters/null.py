@@ -9,5 +9,11 @@ from src.strategies.contracts import Decision
 class NullFilter:
     """Отсутствие фильтрации: сигнал и поля тренда не трогаются."""
 
-    def apply(self, decision: Decision, ctx: MarketContext) -> Decision:
+    def apply(
+        self,
+        decision: Decision,
+        ctx: MarketContext,
+        instrument: str = "",
+        timeframe: str = "",
+    ) -> Decision:
         return decision

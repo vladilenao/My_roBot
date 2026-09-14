@@ -1,5 +1,4 @@
 """Unit-тесты отображения ошибок для пользователя."""
-import pytest
 
 from src.notifier.errors import user_error_message
 
