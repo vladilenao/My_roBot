@@ -74,7 +74,7 @@ class _MicrosecondFormatter(logging.Formatter):
 
 
 _DEFAULT_FORMAT = (
-    "%(asctime)s [%(levelname)s] [%(service_uid)s] [ID:%(correlation_id)s] "
+    "%(asctime)s [%(levelname)s] [%(service_uid)s] [tick:%(correlation_id)s] "
     "%(name)s (%(filename)s:%(lineno)d): %(message)s"
 )
 _DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S.%f"

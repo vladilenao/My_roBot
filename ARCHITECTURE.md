@@ -23,8 +23,10 @@
   точечные профиль фильтрации и таймфрейм; каскад ТФ: `tf` → `timeframe` тикера →
   `[robot].timeframe`) и подхватывается через
   `SHARE_STRATEGIES`/`FUTURE_STRATEGIES` из `src/config.py` (списки `Assignment`).
-- **Исполнение отделено от принятия решений.** Сейчас стоит безопасный
-  `NotifyOnlyExecutionPort`; замена на реальный торговый порт не затрагивает оркестратор.
+- **Исполнение отделено от принятия решений.** Порт исполнения выбирается в `run.py` по
+  признаку «торговый режим активен» (секция `[trading]` в конфиге): с конфигом — имитация
+  через `BrokerExecutionPort` (журнал сделок `trade_journal.csv`), без конфига — безопасный
+  `NotifyOnlyExecutionPort`. Замена на реальный API не затрагивает оркестратор.
 
 ## Модули и их ответственность
 
@@ -37,8 +39,11 @@
 | `market_structure` | `swings.py`, `harmonic.py`, `fibonacci.py` | Структура рынка: свинг-детектор, формация AB=CD, уровни Фибо. |
 | `strategies` | `*_strategy.py`, `base_strategy.py`, `registry.py`, `signals.py`, `contracts.py`, `indicators/` | Сигнальные стратегии, их построение и реестр. |
 | `decision` | `filter.py`, `filters/`, `risk.py` | Пост-фильтр сигналов по профилям (`raw`, `basic_levels`; фабричный выбор по имени в фасаде `SignalFilter`) и риск-менеджмент. |
-| `execution` | `port.py` | Исполнение решений (сейчас — `NotifyOnlyExecutionPort`). |
-| `notifier` | `base.py`, `console.py`, `telegram.py` | Доставка уведомлений (консоль / Telegram). |
+| `execution` | `port.py` | Исполнение решений: `NotifyOnlyExecutionPort` (без конфига `[trading]`), `BrokerExecutionPort` — обёртка брокерского адаптера, `NotifyOnlyExecutionPort` fallback. |
+| `trade_journal` | `journal.py` | **Дневник сделок**: append-only CSV (`trade_journal.csv`, UTF-8-SIG), события `NEW/FILLED/CANCELLED/EXPIRED/CLEARING`, `position_id = {тикер}-{uuid}`, звуковые/когерентные снимки; `replay_events()` восстанавливает баланс, позиции и заявки при рестарте. |
+| `portfolio` | `models.py` | **Портфель и риск**: `Account` (баланс = депозит + реализованный P/L + плавающий P/L mark-to-market, equity), `PositionManager` (открытие/закрытие, частичный выход, перекос `over_risk`, лимит агрегированного риска и ГО-ёмкость). |
+| `broker` | `port.py`, `journal_broker.py`, `exec_adapter.py` | **Имитация исполнения**: `JournalBroker` (порт границ `BrokerPort`) — жизненный цикл заявок, стоп/тейк-протекшн, TTL, клиринг FORTS, FIFO-отмена при перекосе; `BrokerExecutionAdapter` — мост Сигнал→Сигнал→сайзинг→заявка. |
+| `notifier` | `base.py`, `console.py`, `telegram.py` | Доставка уведомлений (консоль / Telegram), включая события имитации (`DealEventFormatter`, `AbstractNotifier.notify_event`). |
 | `scheduler` | `timing.py` | `MultiTimeframeScheduler` — координатор сеток активных ТФ (тик = ближайшая граница любого ТФ); `CandleScheduler` — математика одной сетки. |
 | `config.py` | — | Параметры из `robot.toml` (внешнего или вшитого `default.toml`) и токены из `.env`; импортируется всеми модулями. |
 | `config_loader.py` | — | Загрузка и валидация TOML-конфигурации; приоритет: внешний `robot.toml` → вшитый `default.toml` → дефолты кода; незнакомые ключи/типы → `ConfigError`. |
@@ -61,15 +66,38 @@ run.py  (композиция зависимостей)
           ├─ market_context        тренд + SR-уровни (контекст сделки)
           ├─ strategies.registry   стратегия по паре «инструмент × стратегия»
           │        └─ market_structure  (свинги / Фибо / формация)
-          ├─ decision.signal_filter пост-фильтр сигнала
-          ├─ decision.risk_manager  оценка риска
-          ├─ execution.port         исполнение решения (сейчас NotifyOnly)
-          └─ notifier               уведомление пользователя
+├─ decision.signal_filter пост-фильтр сигнала
+           ├─ decision.risk_manager  оценка риска
+           ├─ execution.port         исполнение (NotifyOnly | BrokerExecutionPort)
+           │        └─ broker.exec_adapter → journal_broker → portfolio → trade_journal
+           └─ notifier               уведомление пользователя (вкл. события сделок)
 ```
 
 Шаги в `TradingBot` — отдельные методы-этапы сценария: новый тик → запросить
 закэшированные свечи → построить контекст → прогнать стратегию → отфильтровать →
 оценить риск → исполнить → уведомить → heartbeat.
+
+## Торговая имитация (`[trading]`)
+
+Включается наличием секции `[trading]` в конфиге (`initial_deposit`, `max_risk_pct`,
+`journal_file`, `clearing_times`). Поток в `run.py`:
+
+1. `_build_execution()`: при активном режиме собирает `TradeJournal` + `PortfolioManager` +
+   `JournalBroker` и возвращает `(BrokerExecutionPort, on_bar)`; иначе —
+   `(NotifyOnlyExecutionPort, None)`. Метаданные контрактов фьючерсов подгружаются из
+   реального Tinkoff API (`load_futures_contracts`); при отсутствии — входы по таким
+   инструментам отклоняются (`no-contract-meta`).
+2. Решение → `BrokerExecutionPort`: сначала дублируется в notifier прежней строкой
+   сигнала (`notify_decision`), затем сайзинг (риск `max_risk_pct × equity`, количество
+   `floor(risk_rub / (|вход−стоп| × step_cost / price_step))`, мин. 1) → `place_order`.
+3. `on_bar` на каждом тике вызывает `run_clearing_if_due()` и `track_bar()`:
+   - клиринг (заявки закрываются, защитные переставляются, снимок в журнал);
+   - перекос „over_risk" (стоимость позиции > 3 × `INITIAL_DEPOSIT`): FIFO-отмена
+     неисполненных заявок других позиций и контр-сделка;
+   - защитные стоп/тейк + TTL (до 30m → 1h; до 1h → 4h; ≥4h → ближайший клиринг).
+4. Все события журналируются append-only в `trade_journal.csv` и дублируются в notifier
+   (`notify_event`). Рестарт восстанавливает состояние через `TradeJournal.replay(initial_deposit)`
+   (в т.ч. отменённые/истёкшие заявки отрезают «призрачные» NEW-строки).
 
 ## Стратегии
 

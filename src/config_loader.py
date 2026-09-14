@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -55,6 +56,12 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "max_bytes": "logging_max_bytes",
         "backup_count": "logging_backup_count",
     },
+    "trading": {
+        "initial_deposit": "initial_deposit",
+        "max_risk_pct": "max_risk_pct",
+        "journal_file": "journal_file",
+        "clearing_times": "clearing_times",
+    },
 }
 
 _EXPECTED_TYPES: dict[str, type] = {
@@ -74,6 +81,10 @@ _EXPECTED_TYPES: dict[str, type] = {
     "logging_level": str,
     "logging_max_bytes": int,
     "logging_backup_count": int,
+    "initial_deposit": int,
+    "max_risk_pct": float,
+    "journal_file": str,
+    "clearing_times": list,
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
@@ -205,10 +216,46 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
             continue
+        if key == "initial_deposit":
+            if isinstance(value, bool):
+                raise ConfigError(
+                    f"{path}: [trading] initial_deposit ожидается целое число > 0, "
+                    f"получено {value!r}"
+                )
+            if value <= 0:
+                raise ConfigError(
+                    f"{path}: [trading] initial_deposit должен быть > 0, "
+                    f"получено {value!r}"
+                )
+        if key == "max_risk_pct":
+            if isinstance(value, bool) or not (0 < value <= 100):
+                raise ConfigError(
+                    f"{path}: [trading] max_risk_pct должен быть дробным в (0, 100], "
+                    f"получено {value!r}"
+                )
+        if key == "clearing_times":
+            _validate_clearing_times(value, path)
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
     return cleaned
+
+
+_CLEARING_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _validate_clearing_times(value: Any, path: Path) -> None:
+    """Проверка `clearing_times`: список строк `HH:MM` (непустой)."""
+    if not value:
+        raise ConfigError(
+            f"{path}: [trading] clearing_times должен быть непустым списком"
+        )
+    for item in value:
+        if not isinstance(item, str) or not _CLEARING_TIME_RE.match(item):
+            raise ConfigError(
+                f"{path}: [trading] clearing_times: элемент {item!r} должен быть "
+                f"времени в формате HH:MM"
+            )
 
 
 def _validate_triple_screen_params(value: Any, path: Path) -> dict[str, Any]:
