@@ -1,0 +1,55 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: robot ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macOs
+            suffix: ''
+          - os: windows-latest
+            platform: win
+            suffix: '.exe'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Resolve version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        shell: bash
+        env:
+          PYINSTALLER_NAME: robot-${{ env.VERSION }}_${{ matrix.platform }}
+        run: pyinstaller run.spec --noconfirm
+
+      - name: Inspect dist directory
+        shell: bash
+        run: ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-${{ env.VERSION }}_${{ matrix.platform }}${{ matrix.suffix }}
+          path: dist/robot-${{ env.VERSION }}_${{ matrix.platform }}${{ matrix.suffix }}
