@@ -27,10 +27,6 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Resolve version
-        shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-
       - name: Install build dependencies
         shell: bash
         run: |
@@ -41,7 +37,7 @@ jobs:
       - name: Build executable
         shell: bash
         env:
-          PYINSTALLER_NAME: robot-${{ env.VERSION }}_${{ matrix.platform }}
+          PYINSTALLER_NAME: robot-${{ github.ref_name }}_${{ matrix.platform }}
         run: pyinstaller run.spec --noconfirm
 
       - name: Inspect dist directory
@@ -51,5 +47,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: robot-${{ env.VERSION }}_${{ matrix.platform }}${{ matrix.suffix }}
-          path: dist/robot-${{ env.VERSION }}_${{ matrix.platform }}${{ matrix.suffix }}
+          name: robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}
+          path: dist/robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}
