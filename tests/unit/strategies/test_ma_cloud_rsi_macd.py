@@ -6,6 +6,7 @@ from src.strategies.contracts import SignalType
 from src.strategies.ma_cloud_rsi_macd_strategy import (
     DEFAULT_CONFIG,
     MaCloudRsiMacdStrategy,
+    MaCloudState,
 )
 from src.strategies.registry import strategy_names
 
@@ -46,6 +47,15 @@ def _decide_through(strategy: MaCloudRsiMacdStrategy, close: np.ndarray):
         ta = strategy.compute(df)
         decisions.append(strategy.decide(ta))
     return decisions
+
+
+def _final_state(
+    strategy: MaCloudRsiMacdStrategy, close: np.ndarray
+) -> MaCloudState:
+    """Состояние стратегии после реплея всей истории (через публичный decide)."""
+    df = _df_from_close(close)
+    ta = strategy.compute(df)
+    return strategy._replay_state(ta)
 
 
 def _ta_scenario(
@@ -141,7 +151,7 @@ class TestMaCloudRsiMacdStrategy:
     def test_long_entry_sets_one_contract(self):
         strat = MaCloudRsiMacdStrategy()
         _decide_through(strat, LONG_ENTRY_SERIES)
-        assert strat._long_contracts == 1
+        assert _final_state(strat, LONG_ENTRY_SERIES).long_contracts == 1
 
     # ── Окно сигнала (6 свечей) ──────────────────────────────────
     def test_no_entry_when_signals_span_more_than_window(self):
@@ -151,19 +161,19 @@ class TestMaCloudRsiMacdStrategy:
         strat.compute(_df_from_close(close))  # прогрев
         decisions = _decide_through(strat, close)
         assert all(d.action != "entry" for d in decisions)
-        assert strat._long_contracts == 0
+        assert _final_state(strat, close).long_contracts == 0
 
     def test_pending_indicators_cleared_on_expiry(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._pending_long = {"rsi": -30, "macd_zero": -10}
+        state = MaCloudState(pending_long=(("rsi", -30), ("macd_zero", -10)))
         ta = _ta_scenario(100.0)
-        strat.decide(ta)
-        assert strat._pending_long == {}
+        state, _ = strat._step(state, len(ta) - 1, ta.iloc[-1])
+        assert state.pending_long == ()
 
     def test_repeat_signal_of_same_indicator_is_not_second(self):
         """Повторный сигнал того же индикатора не считается вторым подтверждением."""
         strat = MaCloudRsiMacdStrategy()
-        strat._pending_long = {"rsi": 2, "macd_zero": 3}  # 2 разных в окне
+        state = MaCloudState(pending_long=(("rsi", 2), ("macd_zero", 3)))
         ta = _ta_scenario(
             close=118.0,
             ma_signal=0,
@@ -171,43 +181,45 @@ class TestMaCloudRsiMacdStrategy:
             macd_signal=0,
             rsi=55.0,  # RSI бычий, но макд/ма не менялись
         )
-        decision = strat.decide(ta)
+        decision = strat._decide_from_state(ta, state)
         assert decision.signal_type == SignalType.HOLD
-        assert strat._pending_long == {"rsi": 2, "macd_zero": 3}
+        assert state.pending_long == (("rsi", 2), ("macd_zero", 3))
 
     def test_third_different_indicator_enters_and_clears(self):
         """Третий РАЗНЫЙ индикатор в окне даёт BUY, состояние очищается."""
         strat = MaCloudRsiMacdStrategy()
-        strat.decide  # noqa: B018
-        strat._pending_long = {"rsi": 2, "macd_zero": 3}
+        state = MaCloudState(pending_long=(("rsi", 2), ("macd_zero", 3)))
         ta = _ta_scenario(
             close=118.0,
             ma_signal=1,  # облако бычье — третий индикатор
             rsi_signal=0,
             macd_signal=0,
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.BUY
         assert decision.action == "entry"
-        assert strat._pending_long == {}
+        assert state.pending_long == ()
+        assert state.long_contracts == 1
 
     def test_third_different_indicator_short_enters_and_clears(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._pending_short = {"rsi": 200, "macd_zero": 201}
+        state = MaCloudState(pending_short=(("rsi", 200), ("macd_zero", 201)))
         ta = _ta_scenario(
             close=82.0,
             ma_signal=-1,  # облако медвежье — третий индикатор
             rsi_signal=0,
             macd_signal=0,
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.SELL
-        assert strat._pending_short == {}
+        assert decision.action == "entry"
+        assert state.pending_short == ()
+        assert state.short_contracts == 1
 
     def test_indicator_refires_after_window_expiry(self):
         """Сигнал того же индикатора может сработать заново после истечения окна."""
         strat = MaCloudRsiMacdStrategy()
-        strat._pending_long = {"rsi": -20}  # bar за пределами окна
+        state = MaCloudState(pending_long=(("rsi", -20),))  # bar за пределами окна
         ta = _ta_scenario(
             close=118.0,
             ma_signal=0,
@@ -215,9 +227,45 @@ class TestMaCloudRsiMacdStrategy:
             macd_signal=0,
             rsi=60.0,
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.HOLD
-        assert list(strat._pending_long) == ["rsi"]
+        assert state.pending_long == (("rsi", len(ta) - 1),)
+
+    def test_decide_is_stateless_and_idempotent(self):
+        """Повторные вызовы на одном инстансе дают один результат (реплей)."""
+        strat = MaCloudRsiMacdStrategy()
+        close = LONG_ENTRY_SERIES
+        df = _df_from_close(close)
+        ta = strat.compute(df)
+        d1 = strat.decide(ta)
+        d2 = strat.decide(ta)
+        assert d1.signal_type == d2.signal_type
+        assert d1.price == d2.price
+        assert d1.action == d2.action
+        assert d1.exit_reason == d2.exit_reason
+        # Тот же результат на «свежем» инстансе — никакой памяти между вызовами.
+        assert d1.signal_type == MaCloudRsiMacdStrategy().decide(ta).signal_type
+        # expected_events на инстансе с предысторией вызовов даёт тот же результат.
+        e_before = strat.expected_events(ta)
+        strat.decide(ta)
+        e_after = strat.expected_events(ta)
+        pd.testing.assert_frame_equal(e_before, e_after)
+
+    def test_shared_instance_two_bindings_do_not_collide(self):
+        """Инстанс, разделяемый привязками одного ТФ, детерминирован префиксом."""
+        strat = MaCloudRsiMacdStrategy()
+        close = LONG_ENTRY_SERIES
+        df = _df_from_close(close)
+        ta = strat.compute(df)
+        # Решение по накопительному префиксу не меняется от того, что раньше
+        # на этом же инстансе считали другой (полный) префикс.
+        d_before = strat.decide(ta)
+        strat.decide(ta)
+        d_after = strat.decide(ta)
+        assert (d_before.signal_type, d_before.price) == (
+            d_after.signal_type,
+            d_after.price,
+        )
 
     def test_expected_events_cumulative_replay_is_consistent(self):
         """expected_events() накопительным реплеем идентичен полной истории."""
@@ -257,7 +305,7 @@ class TestMaCloudRsiMacdStrategy:
     # ── Добор (scale-in) ──────────────────────────────────────────
     def test_scale_in_long_on_cloud_retest(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 1
+        state = MaCloudState(long_contracts=1)
         ta = _ta_scenario(
             close=118.0,
             low=115.0,  # Low внутри облака [115, 120]
@@ -268,14 +316,14 @@ class TestMaCloudRsiMacdStrategy:
             rsi_signal=0,
             macd_signal=0,
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.BUY
         assert decision.action == "scale_in"
-        assert strat._long_contracts == 2
+        assert state.long_contracts == 2
 
     def test_scale_in_short_on_cloud_retest(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._short_contracts = 1
+        state = MaCloudState(short_contracts=1)
         ta = _ta_scenario(
             close=122.0,
             high=125.0,  # High внутри облака [120, 125]
@@ -285,10 +333,10 @@ class TestMaCloudRsiMacdStrategy:
             rsi_signal=0,
             macd_signal=0,
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.SELL
         assert decision.action == "scale_in"
-        assert strat._short_contracts == 2
+        assert state.short_contracts == 2
 
     def test_no_scale_in_when_no_position(self):
         strat = MaCloudRsiMacdStrategy()
@@ -298,28 +346,28 @@ class TestMaCloudRsiMacdStrategy:
             sma_fast=120.0,
             sma_slow=115.0,
         )
-        decision = strat.decide(ta)
+        decision = strat._decide_from_state(ta, MaCloudState())
         assert decision.action is None
 
     # ── Выход (exit) ──────────────────────────────────────────────
     def test_exit_one_contract_below_ma40(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 1
+        state = MaCloudState(long_contracts=1)
         ta = _ta_scenario(
             close=108.0,
             sma_fast=114.0,
             sma_slow=110.0,  # close < MA40 → полный выход
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.SELL
         assert decision.exit_reason == "close_below_ma40"
         assert decision.exit_contracts is None
-        assert strat._long_contracts == 0
+        assert state.long_contracts == 0
 
     def test_one_contract_ignores_ma10_exit(self):
         """Правило: 1 контракт — выход только под MA40, MA10 игнорируется."""
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 1
+        state = MaCloudState(long_contracts=1)
         ta = _ta_scenario(
             close=112.0,
             low=115.0,  # low выше облака → нет scale-in
@@ -327,116 +375,114 @@ class TestMaCloudRsiMacdStrategy:
             sma_fast=114.0,  # close < MA10, но
             sma_slow=110.0,  # close > MA40
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason is None
         assert decision.signal_type == SignalType.HOLD
-        assert strat._long_contracts == 1
+        assert state.long_contracts == 1
 
     def test_partial_exit_below_ma10_when_two_contracts(self):
         """below_ma10 partial only reachable when close < min(MA10, MA40) — downtrend order."""
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 2
+        state = MaCloudState(long_contracts=2)
         ta = _ta_scenario(
             close=108.0,  # below MA10=110 and below cloud_low=110
             sma_fast=110.0,  # MA10 (lower in downtrend)
             sma_slow=115.0,  # MA40 (higher): cloud=[110, 115]
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason == "close_below_ma10"
         assert decision.exit_contracts == 1
-        assert strat._long_contracts == 1
+        assert state.long_contracts == 1
 
     def test_full_exit_below_ma40_when_two_contracts(self):
         """Full exit fires for >1 contracts only when partial tier doesn't match.
         With downtrend order (MA10<MA40): close < MA10 triggers partial first.
         Test that partial fires on first encounter, full on second bar."""
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 2
+        state = MaCloudState(long_contracts=2)
         ta1 = _ta_scenario(
             close=108.0,
             sma_fast=110.0,  # MA10 < MA40
             sma_slow=115.0,  # MA40
         )
-        d1 = strat.decide(ta1)
+        state, d1 = strat._step(state, len(ta1) - 1, ta1.iloc[-1])
         assert d1.exit_reason == "close_below_ma10"
-        assert strat._long_contracts == 1
+        assert state.long_contracts == 1
         # Второй бар: 1 контракт → ниже MA40 → full exit
         ta2 = _ta_scenario(
             close=108.0,
             sma_fast=110.0,
             sma_slow=115.0,
         )
-        d2 = strat.decide(ta2)
+        state, d2 = strat._step(state, len(ta2), ta2.iloc[-1])
         assert d2.exit_reason == "close_below_ma40"
-        assert strat._long_contracts == 0
+        assert state.long_contracts == 0
 
     def test_full_exit_direct_when_one_contract(self):
         """1 контракт — только below MA40 exit."""
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 1
+        state = MaCloudState(long_contracts=1)
         ta = _ta_scenario(
             close=108.0,
             sma_fast=110.0,
             sma_slow=115.0,  # close < MA40
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason == "close_below_ma40"
         assert decision.exit_contracts is None
-        assert strat._long_contracts == 0
+        assert state.long_contracts == 0
 
     def test_partial_exit_inside_cloud_when_two_contracts(self):
         """Выход внутри облака: downtrend order MA10 < MA40, close в облаке."""
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 2
+        state = MaCloudState(long_contracts=2)
         ta = _ta_scenario(
             close=112.0,
             low=111.0,
             sma_fast=110.0,  # MA10 < MA40 (downtrend)
             sma_slow=115.0,  # MA40: облако [110, 115]
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason == "close_inside_cloud"
         assert decision.exit_contracts == 1
-        assert strat._long_contracts == 1
+        assert state.long_contracts == 1
 
     def test_short_exit_one_contract_above_ma40(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._short_contracts = 1
+        state = MaCloudState(short_contracts=1)
         ta = _ta_scenario(
             close=112.0,
             sma_fast=106.0,
             sma_slow=110.0,  # close > MA40 → полный выход Short
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.signal_type == SignalType.BUY
         assert decision.exit_reason == "close_above_ma40"
-        assert strat._short_contracts == 0
+        assert state.short_contracts == 0
 
     # ── Двусторонность ────────────────────────────────────────────
     def test_long_exit_does_not_touch_short(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 2
-        strat._short_contracts = 1
+        state = MaCloudState(long_contracts=2, short_contracts=1)
         ta = _ta_scenario(
             close=112.0,
             sma_fast=110.0,  # MA10 < MA40 (downtrend)
             sma_slow=115.0,  # MA40: облако [110, 115]
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason == "close_inside_cloud"
-        assert strat._long_contracts == 1  # Long уменьшился
-        assert strat._short_contracts == 1  # Short не тронут
+        assert state.long_contracts == 1  # Long уменьшился
+        assert state.short_contracts == 1  # Short не тронут
 
     def test_short_exit_does_not_touch_long(self):
         strat = MaCloudRsiMacdStrategy()
-        strat._long_contracts = 1
-        strat._short_contracts = 1
+        state = MaCloudState(long_contracts=1, short_contracts=1)
         ta = _ta_scenario(
             close=112.0,
             sma_fast=106.0,
             sma_slow=110.0,  # Short: полный выход (close > MA40)
         )
-        decision = strat.decide(ta)
+        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
         assert decision.exit_reason == "close_above_ma40"
-        assert strat._short_contracts == 0
-        assert strat._long_contracts == 1  # Long не тронут
+        assert state.short_contracts == 0
+        assert state.long_contracts == 1  # Long не тронут

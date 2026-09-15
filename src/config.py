@@ -173,3 +173,22 @@ LOGGING_FILE = _CONFIG["logging_file"]
 LOGGING_LEVEL = _CONFIG["logging_level"]
 LOGGING_MAX_BYTES = _CONFIG["logging_max_bytes"]
 LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
+
+# Торговая секция [trading]: имитированное исполнение через дневник сделок.
+# При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.
+INITIAL_DEPOSIT = int(_CONFIG.get("initial_deposit", 100_000))
+MAX_RISK_PCT = float(_CONFIG.get("max_risk_pct", 2.0))
+JOURNAL_FILE = _CONFIG.get("journal_file", "trade_journal.csv")
+CLEARING_TIMES = list(_CONFIG.get("clearing_times", ["14:05", "19:00"]))
+
+
+def trading_enabled() -> bool:
+    """Признак активного торгового режима (наличие секции `[trading]` после слияния конфигов).
+
+    В дефолтной сборке секция всегда есть → торговый режим активен. Отсутствие
+    всех ключей (старый robot.toml без дефолтов) оставляет `NotifyOnlyExecutionPort`.
+    """
+    return any(
+        key in _CONFIG
+        for key in ("initial_deposit", "max_risk_pct", "journal_file", "clearing_times")
+    )

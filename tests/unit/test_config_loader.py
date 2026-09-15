@@ -67,6 +67,23 @@ def test_missing_files_fall_back_to_defaults(tmp_path):
     assert cfg == _defaults()
 
 
+def test_bundled_default_si_two_ma_cloud_bindings_on_5m():
+    """Бандл default.toml: сценарий сравнения на SI — две привязки
+    ma_cloud_rsi_macd на 5m с профилями raw и triple_screen."""
+    bundled = app_dir() / "default.toml"
+    cfg = load_config(
+        _defaults(),
+        config_file=bundled.parent / "no_such_robot.toml",
+        bundled_file=bundled,
+    )
+
+    si = cfg["future_strategies"]["SI"]["strategies"]
+    assert si == [
+        {"name": "ma_cloud_rsi_macd", "filter": "raw", "tf": "5m"},
+        {"name": "ma_cloud_rsi_macd", "filter": "triple_screen", "tf": "5m"},
+    ]
+
+
 def test_unknown_key_raises_config_error(tmp_path):
     bad = tmp_path / "robot.toml"
     bad.write_text("[robot]\nbogus = 1\n", encoding="utf-8")

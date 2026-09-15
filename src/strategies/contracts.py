@@ -49,6 +49,9 @@ class Decision:
     action: str | None = None
     exit_reason: str | None = None
     exit_contracts: int | None = None
+    risk_pct: float | None = None
+    risk_rub: float | None = None
+    quantity: int | None = None
 
 
 class Strategy(Protocol):

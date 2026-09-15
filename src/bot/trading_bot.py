@@ -52,6 +52,7 @@ class TradingBot:
         context_cache=None,
         signal_filter=None,
         risk_manager=None,
+        post_tick=None,
     ) -> None:
         self._notifier = notifier
         self._strategy_map = strategy_map
@@ -67,6 +68,7 @@ class TradingBot:
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._risk_manager = risk_manager
+        self._post_tick = post_tick
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
@@ -125,7 +127,7 @@ class TradingBot:
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self, ready_tfs: set[str]) -> None:
-        correlation_id_var.set(f"tick-{uuid4().hex[:8]}")
+        correlation_id_var.set(uuid4().hex[:8])
         try:
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
@@ -147,6 +149,8 @@ class TradingBot:
                     self._report_error(err.cause, err.operation)
                 except Exception as exc:
                     self._report_error(exc, f"анализ {instrument.label}")
+            if self._post_tick is not None:
+                self._post_tick(ready_tfs)
             self._maybe_heartbeat()
         finally:
             correlation_id_var.set(None)
@@ -162,19 +166,28 @@ class TradingBot:
     def _process(self, instrument: Instrument, ready_tfs: set[str]) -> None:
         assignments = self._strategies_for(instrument)
         if not assignments:
-            log.info("Для %s не назначено стратегий — пропускаем.", instrument.label)
+            log.info("Для %s не назначено стратегий — пропускаем.", self._display_name(instrument))
             return
         for tf in sorted({a.timeframe for a in assignments} & ready_tfs):
             frame = self._data_cache.frame_for(instrument, tf)
             if frame.empty:
-                log.info("Нет готовых свечей для %s (%s) — пропускаем.", instrument.label, tf)
+                log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
             context = self._context_cache.get_context(instrument, tf) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
+            log.debug(
+                "%s %s | получено свечей=%d, последний бар O=%.4f H=%.4f L=%.4f C=%.4f",
+                self._display_name(instrument), tf, len(frame),
+                frame["open"].iloc[-1], frame["high"].iloc[-1],
+                frame["low"].iloc[-1], frame["close"].iloc[-1],
+            )
+            if context is not None:
+                log.debug("%s %s | контекст: %s", self._display_name(instrument), tf, context)
             self._analyze(instrument, tf_assignments, frame, context, tf)
 
     # ── ПУНКТ 4.2: анализ по каждой привязке «стратегия × профиль» одного ТФ ──
     def _analyze(self, instrument: Instrument, assignments: list[Assignment], frame, context=None, tf: str = "") -> None:
+        summaries = []
         for assignment in assignments:
             name = assignment.strategy
             try:
@@ -182,11 +195,17 @@ class TradingBot:
                 if strategy is None:
                     log.warning(
                         "Стратегия '%s' не построена для %s (%s) — пропускаем.",
-                        name, instrument.label, tf,
+                        name, self._display_name(instrument), tf,
                     )
                     continue
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=tf)
+                log.debug(
+                    "%s %s | %s → %s %s",
+                    self._display_name(instrument), tf, name,
+                    decision.signal_type.name,
+                    self._ta_digest(ta),
+                )
                 decision = replace(decision, bar_time=self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
                 filtered_out = False
                 if context is not None:
@@ -203,22 +222,63 @@ class TradingBot:
                             raw.signal_type is not SignalType.HOLD
                             and decision.signal_type is SignalType.HOLD
                         )
+                        if filtered_out:
+                            log.debug(
+                                "%s %s | %s [%s]: сигнал %s отклонён фильтром",
+                                self._display_name(instrument), tf, name,
+                                assignment.filter_profile, raw.signal_type.name,
+                            )
                     if self._risk_manager is not None:
                         decision = self._risk_manager.apply(decision, context)
+                        log.debug(
+                            "%s %s | %s риск-менеджер → %s",
+                            self._display_name(instrument), tf, name,
+                            decision.signal_type.name,
+                        )
                 self._emit(
                     instrument, name, decision,
                     filter_profile=assignment.filter_profile,
                     filtered_out=filtered_out,
                     timeframe=tf,
                 )
+                summaries.append(f"{name}={decision.signal_type.name}")
             except (ValueError, TypeError, KeyError) as exc:
                 log.warning(
-                    "Проблема со стратегией '%s' на %s: %s", name, instrument.label, exc
+                    "Проблема со стратегией '%s' на %s: %s", name, self._display_name(instrument), exc
                 )
             except Exception as exc:
                 raise _OperationError(
-                    f"анализ {instrument.label} ({tf}, {name})", exc
+                    f"анализ {self._display_name(instrument)} ({tf}, {name})", exc
                 ) from exc
+        if summaries:
+            log.info(
+                "%s %s | итог: %s",
+                self._display_name(instrument), tf, ", ".join(summaries),
+            )
+
+    # ── компактная сводка индикаторов по итоговому бару (для отладки) ──
+    @staticmethod
+    def _ta_digest(ta) -> str:
+        if ta is None or len(ta) == 0:
+            return ""
+        last = ta.iloc[-1]
+        interesting = [
+            c for c in ta.columns
+            if any(k in str(c).lower() for k in ("rsi", "stoch", "macd", "ema", "sma", "signal", "slope"))
+        ]
+        parts = []
+        for c in interesting:
+            v = last[c]
+            try:
+                parts.append(f"{c}={v:.3f}")
+            except (TypeError, ValueError):
+                parts.append(f"{c}={v}")
+        return " | ".join(parts) if parts else ""
+
+    # ── читаемое имя инструмента для логов (короткое «NG-10.26», не тикер и не label) ──
+    @staticmethod
+    def _display_name(instrument: Instrument) -> str:
+        return instrument.short_name or instrument.ticker
 
     # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
     def _emit(self, instrument: Instrument, name: str, decision, *, filter_profile: str = "", filtered_out: bool = False, timeframe: str = "") -> None:
