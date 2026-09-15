@@ -32,9 +32,9 @@ strategies = [
 [strategies.future.NG]
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
-    "macd_rsi_stoch",
+
     { name = "flat_triangle", filter = "raw" },
-    { name = "harmonic_abcd", filter = "basic_levels" },
+    { name = "macd_rsi_stoch", tf = "15m",filter = "basic_levels" },
     { name = "ma_cloud_rsi_macd", tf = "1h", filter = "triple_screen" },  # Элдер на часовике
 ]
 
@@ -46,12 +46,17 @@ strategies = [
     { name = "ma_cloud_rsi_macd", tf = "15m" },
 ]
 
+# Сценарий сравнения привязок: SI — один инструмент, один ТФ (5m), две
+# привязки ma_cloud_rsi_macd с разными профилями фильтрации (raw / triple_screen).
+# Сценарий пришёл на смену дубликату имени стратегии на 1h (перекрёстный ТФ
+# с дефолтным профилем) и стратегиям macd_rsi_stoch/flat_triangle на 1h.
+# Обе привязки делят один инстанс стратегии и выдают одинаковое решение;
+# расхождение возможно только после фильтра. Повторный вход того же бара
+# отсекает брокер: в журнале причина `duplicate`.
 [strategies.future.SI]
 strategies = [
-    "macd_rsi_stoch",
-    "flat_triangle",
     { name = "ma_cloud_rsi_macd", filter = "raw", tf = "5m" },
-    { name = "ma_cloud_rsi_macd" },                         # дубликат: 1h + дефолтный профиль
+    { name = "ma_cloud_rsi_macd", filter = "triple_screen", tf = "5m" },
 ]
 
 [strategies.future.ED]

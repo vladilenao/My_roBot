@@ -49,6 +49,23 @@ class DecisionFormatter:
         return " ".join(parts) + f" ➜ {signal}"
 
 
+class DealEventFormatter:
+    """Форматирование событий исполнения (order / fill / cancel / clear / over_risk / protective / balance)."""
+
+    @staticmethod
+    def format_event(event_type: str, position_id: str, message: str) -> str:
+        prefix = {
+            "order": "📝 Ордер",
+            "fill": "💰 Сделка",
+            "cancel": "❌ Отмена",
+            "clear": "🏛 Клиринг",
+            "over_risk": "⚠️ Over-risk",
+            "protective": "🛡 Защита",
+            "balance": "💼 Баланс",
+        }.get(event_type, "📌 Событие")
+        return f"{prefix}: {message}"
+
+
 class AbstractNotifier(ABC):
     """Доставляет уведомления: форматтер внедряется через конструктор."""
 
@@ -71,6 +88,9 @@ class AbstractNotifier(ABC):
                 timeframe=timeframe,
             )
         )
+
+    def notify_event(self, event_type: str, position_id: str, message: str) -> None:
+        self.notify(DealEventFormatter.format_event(event_type, position_id, message))
 
     @abstractmethod
     def notify(self, message: str) -> None: ...

@@ -2,6 +2,8 @@ from unittest.mock import MagicMock
 from dataclasses import replace
 from datetime import timedelta
 
+import logging
+
 import pandas as pd
 import pytest
 
@@ -927,3 +929,108 @@ class TestTradingBot:
         assert inst_15m.decide.call_args.kwargs["timeframe"] == "15m"
         assert inst_1h.decide.call_args.kwargs["timeframe"] == "1h"
         assert len(execution.decisions) == 2
+
+
+def _ta_frame():
+    return pd.DataFrame({
+        "datetime": pd.date_range("2024-01-01", periods=3, freq="1h"),
+        "open": [100.0] * 3,
+        "high": [101.0] * 3,
+        "low": [99.0] * 3,
+        "close": [100.5] * 3,
+        "volume": [1000] * 3,
+        "rsi14": [54.5, 54.5, 54.5],
+        "stochk14": [37.1, 37.1, 37.1],
+        "macdh": [-0.00236, -0.00236, -0.00236],
+        "macd_rsi_stoch_signal": [0, 0, 0],
+    })
+
+
+class TestAnalysisLogging:
+    """Проверка диагностических логов анализа: данные, стратегии, сводка, tick-id."""
+
+    @staticmethod
+    def _future_bot(strategy=None, *, share=None, future=None):
+        strategy = strategy or _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"NGV6": _df()}),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            share=share,
+            future=future or {"NG": _assign("macd_rsi_stoch")},
+        )
+        bot._instruments = [
+            Instrument(
+                label="NG (Природный газ) — NG-10.26",
+                ticker="NGV6",
+                instrument_type="future",
+                short_name="NG-10.26",
+            )
+        ]
+        return bot
+
+    def test_debug_bar_line_and_summary(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="src.bot")
+        self._future_bot().run()
+
+        text = caplog.text
+        assert "NG-10.26 1h | получено свечей=10" in text
+        assert "итог: macd_rsi_stoch=HOLD" in text
+
+    def test_debug_decision_line_includes_indicator_digest(self, caplog):
+        strategy = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
+        strategy.compute.return_value = _ta_frame()
+        caplog.set_level(logging.DEBUG, logger="src.bot")
+        self._future_bot(strategy=strategy).run()
+
+        assert "macd_rsi_stoch → HOLD" in caplog.text
+        assert "rsi14=54.500" in caplog.text
+        assert "macdh=-0.002" in caplog.text
+
+    def test_all_lines_of_tick_share_same_tick_id(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="src.bot")
+        self._future_bot().run()
+
+        ids = {
+            rec.correlation_id
+            for rec in caplog.records
+            if rec.message.startswith("NG-10.26 1h")
+        }
+        assert ids and len(ids) == 1
+        import re
+        assert re.fullmatch(r"[0-9a-f]{8}", next(iter(ids)))
+        assert all(rec.correlation_id == next(iter(ids)) for rec in caplog.records if rec.message.startswith("NG-10.26 1h"))
+
+    def test_filtered_out_is_logged(self, caplog):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        signal_filter = MagicMock()
+        signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels", instrument="", timeframe="": replace(
+            decision, signal_type=SignalType.HOLD
+        )
+        context_cache = MagicMock()
+        context_cache.get_context.return_value = object()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"NGV6": _df()}),
+            execution=RecordingExecution(),
+            notifier=RecordingNotifier(),
+            strategy=strategy,
+            future={"NG": _assign("macd_rsi_stoch")},
+            context_cache=context_cache,
+            signal_filter=signal_filter,
+        )
+        bot._instruments = [
+            Instrument(
+                label="NG (Природный газ) — NG-10.26",
+                ticker="NGV6",
+                instrument_type="future",
+                short_name="NG-10.26",
+            )
+        ]
+        caplog.set_level(logging.DEBUG, logger="src.bot")
+        bot.run()
+
+        assert "отклонён фильтром" in caplog.text
+        assert "итог: macd_rsi_stoch=HOLD" in caplog.text

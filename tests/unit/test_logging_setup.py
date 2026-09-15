@@ -106,14 +106,14 @@ class TestGetLogger:
     def test_adapter_injects_correlation_id(self, tmp_path: Path) -> None:
         log_file = tmp_path / "test.log"
         setup_logging(service_uid="test-uid", log_file=str(log_file))
-        correlation_id_var.set("tick-abcd1234")
+        correlation_id_var.set("abcd1234")
         try:
             logger = get_logger("test_corr")
             logger.info("проверка correlation_id")
             for h in logging.getLogger().handlers:
                 h.flush()
             content = log_file.read_text(encoding="utf-8")
-            assert "[ID:tick-abcd1234]" in content
+            assert "[tick:abcd1234]" in content
         finally:
             correlation_id_var.set(None)
 
@@ -126,7 +126,7 @@ class TestGetLogger:
         for h in logging.getLogger().handlers:
             h.flush()
         content = log_file.read_text(encoding="utf-8")
-        assert "[ID:]" in content
+        assert "[tick:]" in content
 
 
 class TestCorrelationIdVar:
@@ -136,8 +136,8 @@ class TestCorrelationIdVar:
         assert correlation_id_var.get() is None
 
     def test_set_and_reset(self) -> None:
-        correlation_id_var.set("tick-12345678")
-        assert correlation_id_var.get() == "tick-12345678"
+        correlation_id_var.set("12345678")
+        assert correlation_id_var.get() == "12345678"
         correlation_id_var.set(None)
         assert correlation_id_var.get() is None
 
