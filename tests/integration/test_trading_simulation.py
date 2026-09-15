@@ -6,7 +6,7 @@ from src.broker import JournalBroker
 from src.broker.exec_adapter import BrokerExecutionAdapter
 from src.portfolio import ContractMeta, OrderStatus, PositionManager
 from src.strategies.contracts import Decision, SignalType
-from src.trade_journal import TradeJournal
+from src.trade_journal import OpType, TradeJournal
 
 NG = ContractMeta(ticker="NG", price_step=1.0, step_cost=100.0, go_buy=100.0, go_sell=100.0)
 NOW = datetime(2026, 9, 14, 10, 0, 0, tzinfo=UTC)
@@ -54,7 +54,7 @@ def test_signal_to_clearing_to_restart(tmp_path):
     # клиринг
     broker.run_clearing(NOW + timedelta(hours=5))
     events = journal.events()
-    assert {e.status for e in events} == {"NEW", "FILLED", "CLEARING"}
+    assert {e.op for e in events} == {OpType.ORDER.value, OpType.ENTRY.value, OpType.EXIT.value, OpType.SNAPSHOT.value}
 
     # рестарт восстанавливает баланс
     restored = TradeJournal.created_on_init(journal_path).replay(100000)

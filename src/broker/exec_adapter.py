@@ -32,10 +32,11 @@ class BrokerExecutionAdapter:
         self._contracts: dict[str, ContractMeta] = {}
         self._last_entry_bar: dict[tuple[str, str], object] = {}
 
-    def set_contracts(self, contracts: dict[str, ContractMeta]) -> None:
+    def set_contracts(self, contracts: dict[str, ContractMeta], names: dict[str, str] | None = None) -> None:
         self._contracts.update(contracts)
         if isinstance(self.broker, JournalBroker):
             self.broker.set_contracts(contracts)
+            self.broker.set_names(names)
 
     def execute(
         self,

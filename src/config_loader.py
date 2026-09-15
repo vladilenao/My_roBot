@@ -60,6 +60,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "initial_deposit": "initial_deposit",
         "max_risk_pct": "max_risk_pct",
         "journal_file": "journal_file",
+        "positions_file": "positions_file",
         "clearing_times": "clearing_times",
     },
 }
@@ -84,6 +85,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "initial_deposit": int,
     "max_risk_pct": float,
     "journal_file": str,
+    "positions_file": str,
     "clearing_times": list,
 }
 
@@ -119,6 +121,12 @@ def _type_name(expected: type) -> str:
     return {str: "строка", int: "целое число", dict: "таблица"}.get(
         expected, expected.__name__
     )
+
+
+def derived_positions_file(journal_file: str) -> str:
+    """Имя файла карточек по умолчанию: суффикс `_positions` перед расширением."""
+    path = Path(journal_file)
+    return f"{path.stem}_positions{path.suffix}"
 
 
 def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
@@ -235,6 +243,11 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 )
         if key == "clearing_times":
             _validate_clearing_times(value, path)
+        if key == "positions_file" and not value:
+            raise ConfigError(
+                f"{path}: [trading] positions_file должен быть непустой строкой, "
+                f"получено {value!r}"
+            )
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value

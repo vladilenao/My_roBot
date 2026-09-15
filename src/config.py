@@ -6,6 +6,7 @@ from t_tech.invest import CandleInterval
 from src.config_loader import (
     ConfigError,
     app_dir,
+    derived_positions_file,
     load_config,
     validate_triple_screen_hierarchy,
 )
@@ -179,6 +180,7 @@ LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
 INITIAL_DEPOSIT = int(_CONFIG.get("initial_deposit", 100_000))
 MAX_RISK_PCT = float(_CONFIG.get("max_risk_pct", 2.0))
 JOURNAL_FILE = _CONFIG.get("journal_file", "trade_journal.csv")
+POSITIONS_FILE = _CONFIG.get("positions_file") or derived_positions_file(JOURNAL_FILE)
 CLEARING_TIMES = list(_CONFIG.get("clearing_times", ["14:05", "19:00"]))
 
 
@@ -190,5 +192,11 @@ def trading_enabled() -> bool:
     """
     return any(
         key in _CONFIG
-        for key in ("initial_deposit", "max_risk_pct", "journal_file", "clearing_times")
+        for key in (
+            "initial_deposit",
+            "max_risk_pct",
+            "journal_file",
+            "positions_file",
+            "clearing_times",
+        )
     )

@@ -28,6 +28,7 @@ from src.config import (
     INITIAL_DEPOSIT,
     JOURNAL_FILE,
     MAX_RISK_PCT,
+    POSITIONS_FILE,
     trading_enabled,
 )
 from src.data.cache import MarketDataCache
@@ -111,7 +112,12 @@ def _build_execution(instruments, notifier, data_cache):
 
     try:
         broker = create_journal_broker(
-            JOURNAL_FILE, INITIAL_DEPOSIT, MAX_RISK_PCT, CLEARING_TIMES
+            JOURNAL_FILE,
+            INITIAL_DEPOSIT,
+            MAX_RISK_PCT,
+            CLEARING_TIMES,
+            positions_file=POSITIONS_FILE,
+            contract_names=_instrument_names(instruments),
         )
     except Exception as exc:
         log.warning("Не удалось поднять журнал сделок (%s) — NotifyOnly.", exc)
@@ -121,7 +127,7 @@ def _build_execution(instruments, notifier, data_cache):
 
     adapter = BrokerExecutionAdapter(broker, broker.manager)
     contracts = _load_contracts_metadata(instruments)
-    adapter.set_contracts(contracts)
+    adapter.set_contracts(contracts, names=_instrument_names(instruments))
     print_contract_metadata(contracts)
 
     def on_bar(ready_tfs: set[str]) -> None:
@@ -157,6 +163,21 @@ def _instrument_ticker(instrument) -> str | None:
     if isinstance(instrument, (tuple, list)):
         return str(instrument[1]) if len(instrument) > 1 else str(instrument[0])
     return getattr(instrument, "ticker", None)
+
+
+def _instrument_names(instruments) -> dict[str, str]:
+    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов."""
+    names: dict[str, str] = {}
+    for instrument in instruments:
+        ticker = _instrument_ticker(instrument)
+        if not ticker:
+            continue
+        if isinstance(instrument, (tuple, list)):
+            short = instrument[3] if len(instrument) > 3 else None
+        else:
+            short = getattr(instrument, "short_name", None) or getattr(instrument, "label", None)
+        names[ticker] = short or ticker
+    return names
 
 
 def _load_contracts_metadata(instruments):

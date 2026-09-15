@@ -1,9 +1,13 @@
+import csv
+import shutil
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Mapping, Optional
 
 from src.broker.port import BrokerPort
+from src.logging_setup import get_logger
 from src.portfolio import (
     BrokerEvent,
     ContractMeta,
@@ -15,7 +19,9 @@ from src.portfolio import (
     Signal,
 )
 from src.trade_journal import (
+    COLUMNS_RU,
     JournalEvent,
+    OpType,
     TradeJournal,
     format_dt,
     parse_hhmm,
@@ -23,6 +29,8 @@ from src.trade_journal import (
 
 UTC = timezone.utc
 _MSK = timezone(timedelta(hours=3))
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -106,6 +114,7 @@ class JournalBroker(BrokerPort):
         journal: TradeJournal,
         manager: PositionManager,
         clearing_times_msk: list[str],
+        contract_names: Optional[Mapping[str, str]] = None,
     ):
         self.journal = journal
         self.manager = manager
@@ -114,9 +123,19 @@ class JournalBroker(BrokerPort):
         self._events: deque[BrokerEvent] = deque()
         self._last_clearing_check: Optional[datetime] = None
         self._contracts: dict[str, ContractMeta] = {}
+        self._names: dict[str, str] = dict(contract_names or {})
         self.load_state()
 
     # ——— Порт ———
+
+    def set_names(self, names: Optional[Mapping[str, str]]) -> None:
+        """Отображение тикер -> короткое имя (NG-10.26) для пользовательских файлов/сообщений."""
+        if names:
+            self._names.update(names)
+
+    def _display(self, ticker: str) -> str:
+        """Короткое имя контракта для пользовательского вывода; тикер — только фолбэк."""
+        return self._names.get(ticker) or ticker
 
     def load_state(self) -> None:
         self._orders = {}
@@ -196,16 +215,17 @@ class JournalBroker(BrokerPort):
             risk_rub=signal.risk_rub,
             source=signal.source,
         )
-        row = self._entry_row(order, contract, now)
+        row = self._order_row(order, contract, now)
         self.journal.append(row)
         self._orders[order_id] = order
         restored = self._restored(order)
         self.manager.register_order(order_id, restored)
+        display = self._display(ticker)
         self._emit(
             "order",
             now,
             signal.position_id,
-            f"Заявка {signal.side} {signal.qty} {ticker} по {signal.entry_price} принята (id={order_id})",
+            f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} принята (id={order_id})",
         )
         return OrderResult(
             order_id=order_id,
@@ -217,7 +237,7 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason="",
-            message=f"Заявка {signal.side} {signal.qty} {ticker} по {signal.entry_price} размещена (id={order_id})",
+            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена (id={order_id})",
             ts_order=now,
         )
 
@@ -365,33 +385,29 @@ class JournalBroker(BrokerPort):
         )
 
     def _reject(self, signal: Signal, reason: str, now: datetime) -> OrderResult:
+        display = self._display(signal.ticker)
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.CANCEL.value,
+            ts=format_dt(now),
+            order_id="",
             position_id=signal.position_id,
-            status="CANCELLED",
-            ts_order=format_dt(now),
-            date="",
+            contract=display,
             side=signal.side,
-            ts_entry="",
+            qty=str(signal.qty or 0),
+            price=_fmt(signal.entry_price),
+            stop=_fmt(signal.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(signal.risk_pct),
             risk_rub=_fmt(signal.risk_rub),
-            entry_price=_fmt(signal.entry_price),
-            stop_price=_fmt(signal.stop_price),
-            qty=str(signal.qty or 0),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract=signal.ticker,
+            go="",
             reason=reason,
             notes=_notes(signal.timeframe, source=signal.source),
         )
         self.journal.append(event)
-        self._emit("order", now, signal.position_id, f"Сделка {signal.side} {signal.ticker} отклонена ({reason})")
+        self._emit("order", now, signal.position_id, f"Сделка {signal.side} {display} отклонена ({reason})")
         return OrderResult(
             order_id=event.id,
             status=OrderStatus.CANCELLED,
@@ -402,62 +418,84 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason=reason,
-            message=f"Сделка {signal.side} {signal.ticker} отклонена ({reason})",
+            message=f"Сделка {signal.side} {display} отклонена ({reason})",
             ts_order=now,
         )
 
-    def _entry_row(self, order: Order, contract: ContractMeta, now: datetime) -> JournalEvent:
+    def _order_row(self, order: Order, contract: ContractMeta, now: datetime) -> JournalEvent:
+        """ЗАЯВКА: принятая, но не исполненная заявка (связь с ВХОД по order_id)."""
         return JournalEvent(
             id=order.order_id,
+            op=OpType.ORDER.value,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
             position_id=order.position_id,
-            status="NEW",
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(order.ticker),
             side=order.side,
-            ts_entry="",
+            qty=str(order.qty),
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(order.risk_pct),
             risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
-            qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step=_fmt(contract.price_step),
-            step_cost=_fmt(contract.step_cost),
-            go_buy=_fmt(contract.go_buy),
-            go_sell=_fmt(contract.go_sell),
-            contract=order.contract,
-            reason=order.source,
+            go=_fmt(self.manager.get_go(order.qty, contract, order.side)),
+            reason="",
             notes=_notes(order.timeframe, source=order.source),
         )
 
-    def _write_terminal(self, order: Order, reason: str, now: datetime, status: str = "CANCELLED") -> None:
-        event = JournalEvent(
+    def _fill_row(
+        self,
+        order: Order,
+        contract: ContractMeta,
+        now: datetime,
+        over_risk: bool = False,
+        op: str = OpType.ENTRY.value,
+    ) -> JournalEvent:
+        """Исполнение заявки: ВХОД для новой позиции, ДОБОР — для добора."""
+        return JournalEvent(
             id=self.journal.next_id,
+            op=op,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
             position_id=order.position_id,
-            status=status,
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(order.ticker),
             side=order.side,
-            ts_entry="",
+            qty=str(order.qty),
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(order.risk_pct),
             risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
+            go=_fmt(self.manager.get_go(order.qty, contract, order.side)),
+            reason="",
+            notes=_notes(order.timeframe, over_risk=over_risk, source=order.source),
+        )
+
+    def _write_terminal(self, order: Order, reason: str, now: datetime) -> None:
+        notes = _notes(order.timeframe, extra="expired" if reason == "ttl" else "", source=order.source)
+        event = JournalEvent(
+            id=self.journal.next_id,
+            op=OpType.CANCEL.value,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
+            position_id=order.position_id,
+            contract=self._display(order.ticker),
+            side=order.side,
             qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract=order.contract,
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
+            deposit="",
+            risk_pct=_fmt(order.risk_pct),
+            risk_rub=_fmt(order.risk_rub),
+            go="",
             reason=reason,
-            notes=_notes(order.timeframe, extra="expired" if status == "EXPIRED" else "", source=order.source),
+            notes=notes,
         )
         self.journal.append(event)
 
@@ -466,7 +504,7 @@ class JournalBroker(BrokerPort):
         if order is None:
             return self._noop_result("")
         order.status = OrderStatus.EXPIRED
-        self._write_terminal(order, "ttl", now, status="EXPIRED")
+        self._write_terminal(order, "ttl", now)
         self._orders.pop(order_id, None)
         self.manager.drop_order(order_id)
         self._emit("cancel", now, order.position_id, f"Заявка {order_id} истекла по TTL")
@@ -487,10 +525,11 @@ class JournalBroker(BrokerPort):
     def _execute_entry(self, order: Order, now: datetime) -> list[OrderResult]:
         contract = self._contracts.get(order.ticker)
         if contract is None:
-            return [self._noop_result(f"Нет метаданных контракта для {order.ticker}")]
+            return [self._noop_result(f"Нет метаданных контракта для {self._display(order.ticker)}")]
         order.status = OrderStatus.FILLED
         over_risk = self._position_over_limit(order.position_id, order.qty, order.limit_price, contract)
         pos = self.manager.positions.get(order.position_id)
+        is_add = pos is not None and pos.qty > 0
         if pos is None:
             pos = Position(
                 position_id=order.position_id,
@@ -509,35 +548,21 @@ class JournalBroker(BrokerPort):
             pos.mark_over_risk()
         pos.protective = self._protective_for(pos, now)
 
-        event = JournalEvent(
-            id=self.journal.next_id,
-            position_id=order.position_id,
-            status="FILLED",
-            ts_order=format_dt(now),
-            date="",
-            side=order.side,
-            ts_entry=format_dt(now),
-            deposit="",
-            risk_pct=_fmt(order.risk_pct),
-            risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
-            qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step=_fmt(contract.price_step),
-            step_cost=_fmt(contract.step_cost),
-            go_buy=_fmt(contract.go_buy),
-            go_sell=_fmt(contract.go_sell),
-            contract=order.contract,
-            reason=order.source,
-            notes=_notes(order.timeframe, over_risk=over_risk, source=order.source),
+        event = self._fill_row(
+            order,
+            contract,
+            now,
+            over_risk=over_risk,
+            op=OpType.ADD.value if is_add else OpType.ENTRY.value,
         )
         self.journal.append(event)
+        if is_add:
+            self._emit("add", now, order.position_id, f"Добор {order.side} {order.qty} {self._display(order.ticker)} по {order.limit_price}")
         self._orders.pop(order.order_id, None)
         self.manager.drop_order(order.order_id)
-        self._emit("fill", now, order.position_id, f"Вход {order.side} {order.qty} {order.ticker} по {order.limit_price}")
+        display = self._display(order.ticker)
+        if not is_add:
+            self._emit("fill", now, order.position_id, f"Вход {order.side} {order.qty} {display} по {order.limit_price}")
         if pos.protective is not None:
             self._emit("protective", now, order.position_id, f"Защитный стоп {order.stop_price} / ТП {order.take_profit} установлен")
         if over_risk:
@@ -553,7 +578,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason="over_risk" if over_risk else "",
-            message=f"Вход {order.side} {order.qty} {order.ticker} по {order.limit_price}",
+            message=f"Вход {order.side} {order.qty} {self._display(order.ticker)} по {order.limit_price}",
             ts_order=now,
         )
         results = [result]
@@ -575,42 +600,39 @@ class JournalBroker(BrokerPort):
         self.manager.account.realize(pnl)
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.EXIT.value if closed_qty >= pos.qty else OpType.TAKE.value,
+            ts=format_dt(now),
+            order_id="",
             position_id=pos.position_id,
-            status="FILLED",
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(pos.ticker),
             side="SELL" if pos.side == "BUY" else "BUY",
-            ts_entry="",
+            qty=str(closed_qty),
+            price=_fmt(exit_price),
+            stop="",
+            pnl_part=_fmt(pnl),
+            fee=_fmt(fee),
             deposit="",
             risk_pct="",
             risk_rub="",
-            entry_price="",
-            stop_price="",
-            qty=str(closed_qty),
-            exit_price=_fmt(exit_price),
-            pnl_rub=_fmt(pnl),
-            fee_rub=_fmt(fee),
-            price_step=_fmt(contract.price_step) if contract else "",
-            step_cost=_fmt(contract.step_cost) if contract else "",
-            go_buy=_fmt(contract.go_buy) if contract else "",
-            go_sell=_fmt(contract.go_sell) if contract else "",
-            contract=pos.ticker,
+            go="",
             reason=reason,
             notes=_notes(pos.timeframe),
         )
         self.journal.append(event)
-        self._emit("fill", now, pos.position_id, f"Закрытие {closed_qty} {pos.ticker} по {exit_price} (PnL {pnl:g})")
+        display = self._display(pos.ticker)
+        self._emit("fill", now, pos.position_id, f"Закрытие {closed_qty} {display} по {exit_price} (PnL {pnl:g})")
         if reason in ("protective", "over_risk", "signal", "reverse"):
             self._emit(
                 reason,
                 now,
                 pos.position_id,
-                f"Закрытие позиции {pos.ticker} {closed_qty} шт: PnL {pnl:g} руб",
+                f"Закрытие позиции {display} {closed_qty} шт: PnL {pnl:g} руб",
             )
         side = pos.side
-        pos.qty = 0
-        self.manager.positions.pop(pos.position_id, None)
-        self.manager.drop_order_stale(pos.position_id)
+        pos.reduce(closed_qty)
+        if pos.qty == 0:
+            self.manager.positions.pop(pos.position_id, None)
+            self.manager.drop_order_stale(pos.position_id)
         return OrderResult(
             order_id=event.id,
             status=OrderStatus.FILLED,
@@ -621,7 +643,7 @@ class JournalBroker(BrokerPort):
             stop_price=pos.stop_price,
             take_profit=pos.take_profit,
             reason=reason,
-            message=f"Закрытие {pos.ticker} по {exit_price}, PnL {pnl:g} руб",
+            message=f"Закрытие {display} по {exit_price}, PnL {pnl:g} руб",
             ts_order=now,
         )
 
@@ -635,26 +657,21 @@ class JournalBroker(BrokerPort):
     ) -> None:
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.SNAPSHOT.value,
+            ts=format_dt(now),
+            order_id="",
             position_id="",
-            status="CLEARING",
-            ts_order=format_dt(now),
-            date="",
+            contract="",
             side="",
-            ts_entry="",
+            qty=str(positions),
+            price="",
+            stop="",
+            pnl_part=_fmt(realized),
+            fee="",
             deposit=_fmt(balance),
             risk_pct=_fmt(max_risk_pct),
             risk_rub="",
-            entry_price="",
-            stop_price="",
-            qty=str(positions),
-            exit_price="",
-            pnl_rub=_fmt(realized),
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract="",
+            go="",
             reason="clearing",
             notes=f"Клиринговый снимок: {positions} позиций",
         )
@@ -703,28 +720,61 @@ def _fmt(value: Optional[float]) -> str:
     return "" if value is None else repr(round(value, 6))
 
 
+_OP_BY_LEGACY_STATUS: dict[str, tuple[str, ...]] = {
+    "NEW": (OpType.ORDER.value,),
+    "FILLED": (OpType.ENTRY.value, OpType.ADD.value, OpType.TAKE.value, OpType.EXIT.value),
+    "CLEARING": (OpType.SNAPSHOT.value,),
+    "CANCELLED": (OpType.CANCEL.value,),
+}
+
+
+def filter_rows(journal: TradeJournal, op_or_status: str) -> list[JournalEvent]:
+    """Выборка строк журнала по операции («ВХОД», «ОТМЕНА»…) или легаси-статусу (NEW/FILLED/…)."""
+    ops = _OP_BY_LEGACY_STATUS.get(op_or_status, (op_or_status,))
+    return [e for e in journal.events() if e.op in ops]
+
+
+def count_status_rows(journal: TradeJournal, op_or_status: str) -> int:
+    return len(filter_rows(journal, op_or_status))
+
+
+def _migrate_legacy_journal(path: Path) -> None:
+    """При наличии легаси-журнала (ограниченная схема) — резервная копия .bak.
+
+    Старые строки не переносятся: журнал начинается с чистого файла, а состояние
+    восстанавливается из резервной копии вручную при необходимости.
+    """
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            header = next(csv.reader(fh), [])
+    except Exception:  # битый файл — не мешаем старту
+        log.warning("Легаси-журнал %s не читается, пропускаю миграцию", path)
+        return
+    if header == COLUMNS_RU:
+        return
+    backup = path.with_name(path.name + ".bak")
+    shutil.copy2(path, backup)
+    log.warning("Легаси-журнал %s сохранён как %s", path, backup)
+
+
 def create_journal_broker(
     journal_file: str,
     initial_deposit: float,
     max_risk_pct: float,
     clearing_times_msk: list[str],
+    positions_file: Optional[str] = None,
+    contract_names: Optional[Mapping[str, str]] = None,
 ) -> JournalBroker:
     """Сборка симулятора из конфига: журнал + восстановление состояния портфеля."""
-    from pathlib import Path
-
     from src.config_loader import app_dir
     from src.portfolio import PositionManager
 
     path = Path(app_dir()) / journal_file
-    journal = TradeJournal.created_on_init(path)
+    _migrate_legacy_journal(path)
+    positions_path = Path(app_dir()) / positions_file if positions_file else None
+    journal = TradeJournal.created_on_init(path, positions_path=positions_path)
     state = journal.replay(initial_deposit=initial_deposit)
     manager = PositionManager(state, initial_deposit, max_risk_pct)
-    return JournalBroker(journal, manager, clearing_times_msk)
-
-
-def filter_rows(journal: TradeJournal, status: str) -> list[JournalEvent]:
-    return [e for e in journal.events() if e.status == status]
-
-
-def count_status_rows(journal: TradeJournal, status: str) -> int:
-    return len(filter_rows(journal, status))
+    return JournalBroker(journal, manager, clearing_times_msk, contract_names=contract_names)

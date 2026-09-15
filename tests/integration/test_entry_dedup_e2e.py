@@ -20,7 +20,7 @@ from src.strategies.ma_cloud_rsi_macd_strategy import (
     DEFAULT_CONFIG,
     MaCloudRsiMacdStrategy,
 )
-from src.trade_journal import TradeJournal
+from src.trade_journal import OpType, TradeJournal
 
 SI_META = ContractMeta(ticker="SIU6", price_step=1.0, step_cost=100.0, go_buy=5000.0, go_sell=5000.0)
 
@@ -136,7 +136,7 @@ def test_si_5m_two_profiles_yield_one_entry_one_duplicate(tmp_path):
     manager = PositionManager(None, initial_deposit=100000, max_risk_pct=2.0)
     broker = JournalBroker(journal, manager, ["14:05", "19:00"])
     adapter = BrokerExecutionAdapter(broker, manager)
-    adapter.set_contracts({"SIU6": SI_META})
+    adapter.set_contracts({"SIU6": SI_META}, names={"SIU6": "SI-12.26"})
     port = BrokerExecutionPort(adapter)
 
     bot = _make_bot(frame, port, FakeNotifier())
@@ -144,11 +144,12 @@ def test_si_5m_two_profiles_yield_one_entry_one_duplicate(tmp_path):
     bot.run()
 
     events = journal.events()
-    entries = [e for e in events if e.status == "NEW"]
+    entries = [e for e in events if e.op == OpType.ORDER.value]
     duplicates = [
-        e for e in events if e.status == "CANCELLED" and e.reason == "duplicate"
+        e for e in events if e.op == OpType.CANCEL.value and e.reason == "duplicate"
     ]
     assert len(entries) == 1, "должен быть ровно один входящий ордер"
     assert len(duplicates) == 1, "второй вход должен фиксироваться причиной duplicate"
-    assert "raw" in entries[0].reason
+    assert "raw" in entries[0].notes
+    assert entries[0].contract == "SI-12.26", "пользовательские файлы используют короткое имя"
     assert len(manager.pending) == 1

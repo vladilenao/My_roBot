@@ -87,7 +87,8 @@ class TestBrokerEntryDedup:
         assert len(manager.pending) == 1
         reasons = [e.reason for e in journal.events()]
         assert reasons.count("duplicate") == 1
-        assert "ma_cloud_rsi_macd" in reasons
+        notes = " ".join(e.notes for e in journal.events())
+        assert "ma_cloud_rsi_macd" in notes
 
     def test_next_bar_creates_new_entry(self, tmp_path):
         """Разные бары — новые ордера: карта помнит только последний бар."""
