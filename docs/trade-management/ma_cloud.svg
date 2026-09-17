@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="930" height="455" viewBox="0 0 930 455" role="img" aria-labelledby="title desc">
+<title id="title">ma_cloud — ценовая защита отдельно от сигнальных выходов</title><desc id="desc">Вход104 стоп99; MA40 подтягивает защиту до103. На закрытииt3 частичный сигнал, исполнениеt4; на закрытииt5 полный сигнал, исполнениеt6. Защитный стоп не задет.</desc>
+<rect width="930" height="455" fill="white"/>
+<g font-family="sans-serif" font-size="13" fill="#172033">
+<text x="55" y="25" font-size="19">ma_cloud · синтетический LONG · NG-10.26</text>
+<path d="M80 60V350H735" stroke="#64748b" fill="none"/>
+<path d="M80 80H735 M80 200H735 M80 260H735 M80 320H735" stroke="#e2e8f0" fill="none"/>
+<text x="35" y="84">108</text><text x="35" y="204">104</text><text x="35" y="264">102</text><text x="42" y="324">100</text><text x="20" y="52">Цена</text>
+<polygon points="80,230 180,200 280,140 380,110 480,140 580,170 580,200 480,200 380,230 280,260 180,290 80,320" fill="#e0e7ff"/>
+<polyline points="80,230 180,200 280,140 380,110 480,140 580,170" stroke="#7c3aed" stroke-width="2" fill="none"/>
+<polyline points="80,320 180,290 280,260 380,230 480,200 580,200" stroke="#0891b2" stroke-width="2" fill="none"/>
+<path d="M80 350H280V320H380V290H480V260H580V230H680" stroke="#dc2626" stroke-width="3" fill="none"/>
+<polyline points="80,200 180,140 280,80 380,170 480,170 580,215 680,215" stroke="#2563eb" stroke-width="3" fill="none"/>
+<g fill="#ea580c"><circle cx="380" cy="170" r="5"/><circle cx="580" cy="215" r="5"/></g>
+<g fill="#15803d"><circle cx="480" cy="170" r="5"/><circle cx="680" cy="215" r="5"/></g>
+<text x="86" y="191">Вход 2</text><text x="315" y="150">Сигнал −1</text><text x="465" y="120">Fill −1</text><text x="544" y="190">Сигнал выхода</text><text x="659" y="250">Fill остатка</text>
+<g text-anchor="middle"><text x="80" y="374">0</text><text x="180" y="374">1</text><text x="280" y="374">2</text><text x="380" y="374">3</text><text x="480" y="374">4</text><text x="580" y="374">5</text><text x="680" y="374">6</text></g>
+<text x="770" y="80" fill="#2563eb">━ Цена</text><text x="770" y="106" fill="#7c3aed">━ MA10</text><text x="770" y="132" fill="#0891b2">━ MA40</text><text x="770" y="158" fill="#dc2626">━ Стоп</text><text x="770" y="184" fill="#ea580c">● Сигнал close</text><text x="770" y="210" fill="#15803d">● Fill next open</text>
+<text x="55" y="413">Заданные значения MA после прогрева · MA40-выход приоритетнее частичного MA10</text><text x="55" y="438">Красный стоп не задет: выходы в этом примере сигнальные, а не стоп-исполнения.</text>
+</g></svg>

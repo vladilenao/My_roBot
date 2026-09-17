@@ -95,6 +95,16 @@ class TestJournalBasics:
         assert lines[0].split(",") == POSITIONS_COLUMNS_RU
         assert len(lines) == 2
 
+    def test_card_keeps_actual_risk_not_budget(self, tmp_path):
+        j = _journal(tmp_path)
+        pid = make_position_id("NG")
+        j.append(_ev(j, id=j.next_id, op="ВХОД", position_id=pid, qty="2",
+                     risk_pct="2.0", risk_rub="2000.0"))
+        card = j.cards()[0]
+        assert card.risk_rub == "2000.0"
+        row = j.positions_path.read_text(encoding="utf-8-sig").splitlines()[1].split(",")
+        assert row[POSITIONS_COLUMNS_RU.index("риск_руб")] == "2000.0"
+
 
 class TestTimesMsk:
     def test_format_dt_writes_msk(self):

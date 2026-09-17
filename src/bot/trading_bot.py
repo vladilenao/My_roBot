@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from src.instruments import Instrument, normalize_instrument
@@ -9,6 +10,7 @@ from src.logging_setup import correlation_id_var, get_logger
 from src.notifier.errors import user_error_message
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
+from src.trade_management.actions import AddToTrade, TradeAction
 
 log = get_logger(__name__)
 
@@ -24,6 +26,24 @@ class _OperationError(Exception):
         super().__init__(operation)
         self.operation = operation
         self.cause = cause
+
+
+@dataclass(frozen=True)
+class _EntryCandidate:
+    assignment: Assignment
+    decision: object
+    instrument: Instrument
+    frame: object
+    context: object
+    timeframe: str
+
+    def sort_key(self) -> tuple[int, str, str, str]:
+        return (
+            -self.assignment.priority,
+            self.assignment.id,
+            self.instrument.ticker,
+            self.decision.event_id or "",
+        )
 
 
 class TradingBot:
@@ -53,6 +73,9 @@ class TradingBot:
         signal_filter=None,
         risk_manager=None,
         post_tick=None,
+        trade_manager=None,
+        action_executor=None,
+        protection_timeframe: str = "1m",
     ) -> None:
         self._notifier = notifier
         self._strategy_map = strategy_map
@@ -69,6 +92,9 @@ class TradingBot:
         self._signal_filter = signal_filter
         self._risk_manager = risk_manager
         self._post_tick = post_tick
+        self._trade_manager = trade_manager
+        self._action_executor = action_executor
+        self._protection_timeframe = protection_timeframe
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
@@ -142,15 +168,25 @@ class TradingBot:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             if not ready_tfs:
                 return
+            # Protection is simulated from closed base bars before any strategy
+            # may calculate a new entry from a slower timeframe.
+            if self._protection_timeframe in ready_tfs and self._post_tick is not None:
+                self._post_tick({self._protection_timeframe})
+            entry_candidates: list[_EntryCandidate] = []
             for instrument in self._instruments:
                 try:
-                    self._process(instrument, ready_tfs)
+                    self._process(instrument, ready_tfs, entry_candidates)
                 except _OperationError as err:
                     self._report_error(err.cause, err.operation)
                 except Exception as exc:
                     self._report_error(exc, f"анализ {instrument.label}")
-            if self._post_tick is not None:
-                self._post_tick(ready_tfs)
+            for candidate in sorted(entry_candidates, key=_EntryCandidate.sort_key):
+                try:
+                    self._admit_candidate(candidate)
+                except _OperationError as err:
+                    self._report_error(err.cause, err.operation)
+                except Exception as exc:
+                    self._report_error(exc, f"портфельный допуск {candidate.instrument.label}")
             self._maybe_heartbeat()
         finally:
             correlation_id_var.set(None)
@@ -163,12 +199,19 @@ class TradingBot:
         return self._data_cache.has_fresh_closed_bar(timeframe)
 
     # ── ПУНКТ 4: по инструменту — только привязки ТФ с закрывшейся свечой ──
-    def _process(self, instrument: Instrument, ready_tfs: set[str]) -> None:
+    def _process(
+        self,
+        instrument: Instrument,
+        ready_tfs: set[str],
+        entry_candidates: list[_EntryCandidate] | None = None,
+    ) -> None:
         assignments = self._strategies_for(instrument)
-        if not assignments:
-            log.info("Для %s не назначено стратегий — пропускаем.", self._display_name(instrument))
-            return
-        for tf in sorted({a.timeframe for a in assignments} & ready_tfs):
+        assigned_tfs = {assignment.timeframe for assignment in assignments}
+        management_tfs = {self._protection_timeframe} if self._trade_manager is not None else set()
+        for tf in sorted(
+            (assigned_tfs | management_tfs) & ready_tfs,
+            key=lambda timeframe: (timeframe != self._protection_timeframe, timeframe),
+        ):
             frame = self._data_cache.frame_for(instrument, tf)
             if frame.empty:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
@@ -183,10 +226,20 @@ class TradingBot:
             )
             if context is not None:
                 log.debug("%s %s | контекст: %s", self._display_name(instrument), tf, context)
-            self._analyze(instrument, tf_assignments, frame, context, tf)
+            self._manage(instrument, tf_assignments, frame, context, tf)
+            if tf_assignments:
+                self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
 
     # ── ПУНКТ 4.2: анализ по каждой привязке «стратегия × профиль» одного ТФ ──
-    def _analyze(self, instrument: Instrument, assignments: list[Assignment], frame, context=None, tf: str = "") -> None:
+    def _analyze(
+        self,
+        instrument: Instrument,
+        assignments: list[Assignment],
+        frame,
+        context=None,
+        tf: str = "",
+        entry_candidates: list[_EntryCandidate] | None = None,
+    ) -> None:
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -206,7 +259,25 @@ class TradingBot:
                     decision.signal_type.name,
                     self._ta_digest(ta),
                 )
-                decision = replace(decision, bar_time=self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
+                bar_time = self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1])
+                decision = replace(
+                    decision,
+                    bar_time=bar_time,
+                    available_at=decision.available_at or bar_time,
+                    event_id=decision.event_id or f"{assignment.id}:{instrument.ticker}:{tf}:{bar_time.isoformat()}:{decision.signal_type.value}",
+                )
+                if self._trade_manager is not None:
+                    actions_for_signal = getattr(self._trade_manager, "actions_for_signal", None)
+                    if actions_for_signal is not None:
+                        candidate = _EntryCandidate(
+                            assignment, decision, instrument, frame, context, tf,
+                        )
+                        if entry_candidates is None:
+                            self._admit_candidate(candidate)
+                        else:
+                            entry_candidates.append(candidate)
+                        summaries.append(f"{name}={decision.signal_type.name}")
+                        continue
                 filtered_out = False
                 if context is not None:
                     if self._signal_filter is not None:
@@ -228,13 +299,6 @@ class TradingBot:
                                 self._display_name(instrument), tf, name,
                                 assignment.filter_profile, raw.signal_type.name,
                             )
-                    if self._risk_manager is not None:
-                        decision = self._risk_manager.apply(decision, context)
-                        log.debug(
-                            "%s %s | %s риск-менеджер → %s",
-                            self._display_name(instrument), tf, name,
-                            decision.signal_type.name,
-                        )
                 self._emit(
                     instrument, name, decision,
                     filter_profile=assignment.filter_profile,
@@ -255,6 +319,70 @@ class TradingBot:
                 "%s %s | итог: %s",
                 self._display_name(instrument), tf, ", ".join(summaries),
             )
+
+    def _admit_candidate(self, candidate: _EntryCandidate) -> None:
+        """Apply trade-manager admission after every tick candidate is known."""
+        actions_for_signal = getattr(self._trade_manager, "actions_for_signal", None)
+        if actions_for_signal is None:
+            return
+        self._dispatch_management_actions(
+            actions_for_signal(
+                candidate.assignment,
+                candidate.decision,
+                candidate.instrument,
+                candidate.frame,
+                candidate.context,
+                timeframe=candidate.timeframe,
+            ),
+            candidate.decision,
+            candidate.context,
+            candidate.assignment,
+            candidate.instrument,
+            candidate.timeframe,
+        )
+
+    def _manage(self, instrument: Instrument, assignments: list[Assignment], frame, context, tf: str) -> None:
+        """Dispatch ongoing trade actions before evaluating new entry signals."""
+        if self._trade_manager is None:
+            return
+        manage = getattr(self._trade_manager, "manage", None)
+        if manage is None:
+            return
+        self._dispatch_management_actions(
+            manage(instrument, assignments, frame, context, timeframe=tf),
+            None,
+            context,
+            None,
+            instrument,
+            tf,
+        )
+
+    def _dispatch_management_actions(
+        self, actions, entry_candidate, context, assignment: Assignment | None,
+        instrument: Instrument, timeframe: str,
+    ) -> None:
+        """Send management actions directly; only adds need entry admission."""
+        for action in actions or ():
+            if not isinstance(action, TradeAction):
+                raise TypeError("trade manager must return TradeAction instances")
+            if isinstance(action, AddToTrade):
+                if entry_candidate is None or assignment is None or self._signal_filter is None:
+                    log.warning("Добор %s отклонён: нет входного кандидата или фильтра", action.trade_id)
+                    continue
+                candidate = self._signal_filter.apply(
+                    entry_candidate,
+                    context,
+                    profile_name=assignment.filter_profile,
+                    instrument=instrument,
+                    timeframe=timeframe,
+                )
+                if candidate.signal_type is SignalType.HOLD:
+                    continue
+            executor = self._action_executor or self._execution
+            submit = getattr(executor, "submit", None)
+            if submit is None:
+                raise TypeError("action executor must support submit(action, now)")
+            submit(action, datetime.now(timezone.utc).replace(microsecond=0))
 
     # ── компактная сводка индикаторов по итоговому бару (для отладки) ──
     @staticmethod
@@ -296,10 +424,9 @@ class TradingBot:
 
     # ── ТФ, задействованные привязками инструмента ──
     def _assigned_timeframes(self, instrument: Instrument) -> set[str]:
-        return {a.timeframe for a in self._strategies_for(instrument)}
-        if instrument.instrument_type == "future":
-            return self._future_strategies.get(instrument.ticker[:2].upper(), [])
-        return self._share_strategies.get(instrument.ticker, [])
+        timeframes = {assignment.timeframe for assignment in self._strategies_for(instrument)}
+        timeframes.add(self._protection_timeframe)
+        return timeframes
 
     # ── валидация привязок и построение стратегий до цикла (fail-fast) ──
     def _validate(self) -> None:

@@ -1,7 +1,11 @@
 import pandas as pd
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from src.notifier import DecisionFormatter
+from src.notifier.base import TradePlanFormatter
 from src.strategies.contracts import Decision, SignalType
+from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
 
 
 def _decision(
@@ -201,3 +205,24 @@ class TestFilterProfileBlock:
         )
         assert result == "● ED-9.26 (1h) 22:00 | flat_triangle [basic_levels] ➜ ❌ Отклонено фильтром."
         assert "Цена" not in result
+
+
+class TestTradePlanFormatter:
+    def test_formats_profile_levels_as_plan_not_fill(self):
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("96"),
+            targets=(
+                TargetPlan("tp1", Decimal("104"), Decimal("0.5")),
+                TargetPlan("tp2", Decimal("108"), Decimal("0.5")),
+            ),
+            profile=ProfileSnapshot("levels_rr", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        result = TradePlanFormatter.format(plan, "NG-10.26", timeframe="1h")
+
+        assert result == "● NG-10.26 (1h) | levels_rr ➜ ПЛАН BUY — Вход: 100, Стоп: 96, Цели: 104, 108"
+        assert "Сделка" not in result
+        assert "исполн" not in result.lower()

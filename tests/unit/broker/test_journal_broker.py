@@ -32,7 +32,7 @@ def _signal(**kw):
 
 def _broker(tmp_path, initial=100000, max_risk=2.0):
     journal = TradeJournal.created_on_init(tmp_path / "j.csv")
-    mgr = PositionManager(None, initial_deposit=initial, max_risk_pct=max_risk)
+    mgr = PositionManager(initial_deposit=initial, max_risk_pct=max_risk)
     return JournalBroker(journal, mgr, ["14:05", "19:00"])
 
 
@@ -54,7 +54,7 @@ class TestPlaceOrder:
         events = broker.journal.events()
         assert events[0].op == OpType.ORDER.value
         assert events[0].price == "100.0"
-        assert events[0].contract == "NG"
+        assert events[0].contract == "контракт не указан"
         assert "tf=1h" in events[0].notes
         assert "source=ma [basic_levels]" in events[0].notes
 
@@ -289,7 +289,7 @@ class TestDisplayNames:
 
     def _broker_with_names(self, tmp_path):
         journal = TradeJournal.created_on_init(tmp_path / "j.csv")
-        mgr = PositionManager(None, initial_deposit=100000, max_risk_pct=2.0)
+        mgr = PositionManager(initial_deposit=100000, max_risk_pct=2.0)
         return JournalBroker(journal, mgr, ["14:05", "19:00"], contract_names=self.NAMES)
 
     def test_rows_use_short_names(self, tmp_path):
@@ -308,8 +308,8 @@ class TestDisplayNames:
         assert "NG " not in messages.replace("NG-10.26", "")
 
     def test_name_replacement_after_contract_missing(self, tmp_path):
-        """Без карты имён строки и сообщения остаются с тикером (фолбэк)."""
+        """A raw exchange ticker is never shown when no short name is known."""
         broker = _broker(tmp_path)
         broker.place_order(_signal(), NG_META, NOW)
         row = broker.journal.events()[0]
-        assert row.contract == "NG"
+        assert row.contract == "контракт не указан"

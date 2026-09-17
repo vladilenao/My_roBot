@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="460" viewBox="0 0 920 460" role="img" aria-labelledby="title desc">
+<title id="title">pattern_targets — формация AB=CD и стоп за C</title><desc id="desc">A100 B110 C104 D114. После подтвержденияC вход106, стоп103, цели110 и114. После первой цели стоп106.</desc>
+<rect width="920" height="460" fill="white"/>
+<g font-family="sans-serif" font-size="13" fill="#172033">
+<text x="55" y="25" font-size="19">pattern_targets · синтетическая геометрия AB=CD</text>
+<path d="M80 40V365H735" stroke="#64748b" fill="none"/>
+<path d="M80 40H735 M80 120H735 M80 200H735 M80 260H735 M80 320H735" stroke="#e2e8f0" fill="none"/>
+<text x="35" y="44">114</text><text x="35" y="124">110</text><text x="35" y="204">106</text><text x="35" y="264">103</text><text x="35" y="324">100</text>
+<path d="M480 40H680 M480 120H580" stroke="#15803d" stroke-dasharray="7 5" stroke-width="2" fill="none"/>
+<path d="M480 260H680V200H710" stroke="#dc2626" stroke-width="3" fill="none"/>
+<polyline points="80,320 180,120 280,240 380,200 480,200 580,120 680,40" stroke="#2563eb" stroke-width="3" fill="none"/>
+<path d="M280 240L680 40" stroke="#94a3b8" stroke-dasharray="4 5" fill="none"/>
+<g fill="#2563eb"><circle cx="80" cy="320" r="5"/><circle cx="180" cy="120" r="5"/><circle cx="280" cy="240" r="5"/><circle cx="480" cy="200" r="5"/></g>
+<text x="88" y="343">A=100</text><text x="188" y="109">B=110</text><text x="235" y="262">C=104</text><text x="308" y="180">Подтверждение</text><text x="454" y="224">Вход 106</text><text x="548" y="104">TP1=110</text><text x="690" y="61">D=114</text><text x="490" y="282" fill="#dc2626">S=C−1=103</text>
+<g text-anchor="middle"><text x="80" y="386">0</text><text x="180" y="386">1</text><text x="280" y="386">2</text><text x="380" y="386">3</text><text x="480" y="386">4</text><text x="580" y="386">5</text><text x="680" y="386">6</text></g>
+<text x="755" y="105" fill="#2563eb">━ Цена / форма</text><text x="755" y="133" fill="#dc2626">━ Активный стоп</text><text x="755" y="161" fill="#15803d">┄ Цели</text><text x="55" y="420">AB=10 · D=C+AB=114 · TP1=(106+114)/2=110 · S=106 после TP1</text><text x="55" y="445">До подтверждения C нет торгового плана; вход не переносится задним числом в точку C.</text>
+</g></svg>

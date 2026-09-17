@@ -71,6 +71,7 @@ class FlatTriangleStrategy:
         stoch_d_prev = float(ta[stoch_d_col].iloc[-2])
 
         price = float(row["close"])
+        bar_time = pd.Timestamp(row["datetime"]) if "datetime" in row else None
 
         indicators = {
             "bb_lower": bb_lower,
@@ -100,6 +101,9 @@ class FlatTriangleStrategy:
             return Decision(
                 SignalType.BUY,
                 price,
+                bar_time=bar_time,
+                event_id=f"{self.NAME}:{timeframe or ''}:{bar_time.isoformat() if bar_time is not None else len(ta)}:BUY",
+                available_at=bar_time,
                 timeframe=timeframe,
                 strategy_name=self.NAME,
                 indicator_values=indicators,
@@ -108,11 +112,14 @@ class FlatTriangleStrategy:
             return Decision(
                 SignalType.SELL,
                 price,
+                bar_time=bar_time,
+                event_id=f"{self.NAME}:{timeframe or ''}:{bar_time.isoformat() if bar_time is not None else len(ta)}:SELL",
+                available_at=bar_time,
                 timeframe=timeframe,
                 strategy_name=self.NAME,
                 indicator_values=indicators,
             )
-        return Decision(SignalType.HOLD, price, timeframe=timeframe, strategy_name=self.NAME)
+        return Decision(SignalType.HOLD, price, bar_time=bar_time, timeframe=timeframe, strategy_name=self.NAME)
 
     def required_history(self) -> int:
         return self._config.required_history

@@ -6,14 +6,14 @@ from dataclasses import replace
 
 from src.market_context.models import MarketContext, TrendDirection
 from src.strategies.contracts import Decision, SignalType
+from src.trade_management.audit import CalculationTrace, MeasuredValue, TraceLinks, TraceOutcome, calculation_trace
 
 
 class BasicLevelsFilter:
     """Жёсткий фильтр сигналов по направлению тренда.
 
     Блокирует BUY при нисходящем тренде и SELL при восходящем, превращая их в
-    HOLD. Боковой тренд и совпадающие сигналы проходят без изменений. Всегда
-    обогащает Decision полями `trend_direction` и `trend_confidence`.
+    HOLD. Боковой тренд и совпадающие сигналы проходят без изменений.
     """
 
     def apply(
@@ -24,7 +24,6 @@ class BasicLevelsFilter:
         timeframe: str = "",
     ) -> Decision:
         direction = ctx.trend.direction
-        direction_str = direction.value
 
         blocked = False
         if decision.signal_type is SignalType.BUY and direction is TrendDirection.DOWN:
@@ -32,13 +31,25 @@ class BasicLevelsFilter:
         elif decision.signal_type is SignalType.SELL and direction is TrendDirection.UP:
             blocked = True
 
-        confidence = 0.0 if blocked or decision.signal_type is SignalType.HOLD else ctx.trend.strength
-
         if blocked:
-            decision = replace(decision, signal_type=SignalType.HOLD)
+            return replace(decision, signal_type=SignalType.HOLD)
+        return decision
 
-        return replace(
-            decision,
-            trend_direction=direction_str,
-            trend_confidence=confidence,
+    def apply_with_trace(
+        self, decision: Decision, ctx: MarketContext, instrument: str = "", timeframe: str = ""
+    ) -> tuple[Decision, CalculationTrace]:
+        """Apply the entry filter and retain its entirely local decision inputs."""
+        result = self.apply(decision, ctx, instrument, timeframe)
+        blocked = result.signal_type is SignalType.HOLD and decision.signal_type is not SignalType.HOLD
+        return result, calculation_trace(
+            "filter.basic_levels", inputs={
+                "signal": MeasuredValue(decision.signal_type.value, "signal"),
+                "trend": MeasuredValue(ctx.trend.direction.value, "trend-direction"),
+                "instrument": MeasuredValue(instrument, "instrument-id"),
+                "timeframe": MeasuredValue(timeframe, "timeframe"),
+            }, result=MeasuredValue(result.signal_type.value, "signal"),
+            reason="trend-opposes-entry" if blocked else "entry-allowed",
+            formula="BUY blocked on DOWN; SELL blocked on UP; otherwise pass",
+            links=TraceLinks(signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED if blocked else TraceOutcome.ACCEPTED,
         )

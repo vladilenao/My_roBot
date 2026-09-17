@@ -79,9 +79,74 @@ def test_bundled_default_si_two_ma_cloud_bindings_on_5m():
 
     si = cfg["future_strategies"]["SI"]["strategies"]
     assert si == [
-        {"name": "ma_cloud_rsi_macd", "filter": "raw", "tf": "5m"},
-        {"name": "ma_cloud_rsi_macd", "filter": "triple_screen", "tf": "5m"},
+        {"id": "future-si-ma-raw", "name": "ma_cloud_rsi_macd", "management": "ma_cloud", "filter": "raw", "tf": "5m", "priority": 10},
+        {"id": "future-si-ma-triple", "name": "ma_cloud_rsi_macd", "management": "ma_cloud", "filter": "triple_screen", "tf": "5m", "priority": 10},
     ]
+
+
+class TestTradeManagementConfiguration:
+    def test_unknown_profile_key_is_rejected(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            '[trade_management.profiles.levels_rr]\n'
+            'type = "levels_rr"\n'
+            'target_R = [1.0, 2.0]\n'
+            'shares = [0.5, 0.5]\n'
+            'unexpected = 1\n',
+        )
+        with pytest.raises(ConfigError, match="unexpected"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_duplicate_ids_are_rejected_before_config_import(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            '[strategies.share.SBER]\n'
+            'strategies = [{ id = "duplicate", name = "flat_triangle", management = "levels_rr" }]\n'
+            '[strategies.future.NG]\n'
+            'strategies = [{ id = "duplicate", name = "macd_rsi_stoch", management = "levels_rr" }]\n',
+        )
+        with pytest.raises(ConfigError, match="повторяющийся id"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_nonfinite_profile_and_risk_values_are_rejected(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            '[trade_management.profiles.atr_trend]\n'
+            'type = "atr_trend"\natr_period = 14\ninitial_k = nan\n'
+            'trail_k = 2.0\ntp1_R = 1.0\ntp1_share = 0.5\n'
+            '[trading.risk_limits]\ntrade_pct = nan\n',
+        )
+        with pytest.raises(ConfigError, match="initial_k"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_target_shares_and_warmup_are_validated(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            '[trade_management.profiles.levels_rr]\n'
+            'type = "levels_rr"\ntarget_R = [1.0, 2.0]\nshares = [0.75, 0.75]\n',
+        )
+        with pytest.raises(ConfigError, match="shares"):
+            load_config(_defaults(), config_file=cfg)
+
+        cfg = _write(
+            tmp_path,
+            '[trade_management.profiles.ma_cloud]\n'
+            'type = "ma_cloud"\nma_fast_period = 40\nma_slow_period = 10\n',
+        )
+        with pytest.raises(ConfigError, match="прогрева"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_pattern_profile_requires_compatible_strategy(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            '[strategies.share.SBER]\n'
+            'strategies = [{ id = "sber-pattern", name = "flat_triangle", management = "pattern_targets" }]\n'
+            '[trade_management.profiles.pattern_targets]\n'
+            'type = "pattern_targets"\nbuffer_ticks = 1\n'
+            'fractions_to_D = [0.5, 1.0]\nshares = [0.5, 0.5]\n',
+        )
+        with pytest.raises(ConfigError, match="несовместим"):
+            load_config(_defaults(), config_file=cfg)
 
 
 def test_unknown_key_raises_config_error(tmp_path):
@@ -123,26 +188,23 @@ def _write(tmp_path, body: str):
 
 
 class TestHybridStrategyAssignments:
-    def test_string_entry_passes_through(self, tmp_path):
+    def test_string_entry_is_rejected(self, tmp_path):
         cfg = _write(tmp_path, '[strategies.share.SBER]\nstrategies = ["flat_triangle"]\n')
 
-        result = load_config(_defaults(), config_file=cfg)
-
-        assert result["share_strategies"] == {
-            "SBER": {"strategies": ["flat_triangle"], "timeframe": None}
-        }
+        with pytest.raises(ConfigError, match="id и management"):
+            load_config(_defaults(), config_file=cfg)
 
     def test_inline_table_with_filter_passes_through(self, tmp_path):
         cfg = _write(
             tmp_path,
             '[strategies.future.ED]\n'
-            'strategies = [{ name = "flat_triangle", filter = "raw" }]\n',
+            'strategies = [{ id = "ed-flat", name = "flat_triangle", management = "levels_rr", filter = "raw" }]\n',
         )
 
         result = load_config(_defaults(), config_file=cfg)
 
         assert result["future_strategies"] == {
-            "ED": {"strategies": [{"name": "flat_triangle", "filter": "raw"}], "timeframe": None}
+            "ED": {"strategies": [{"id": "ed-flat", "name": "flat_triangle", "management": "levels_rr", "filter": "raw"}], "timeframe": None}
         }
 
     def test_inline_table_without_name_raises(self, tmp_path):
@@ -157,19 +219,19 @@ class TestHybridStrategyAssignments:
         cfg = _write(
             tmp_path,
             '[strategies.share.SBER]\n'
-            'strategies = [{ name = "macd_rsi_stoch", tf = "15m" }]\n',
+            'strategies = [{ id = "sber-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m" }]\n',
         )
 
         result = load_config(_defaults(), config_file=cfg)
 
         assert result["share_strategies"]["SBER"]["strategies"] == [
-            {"name": "macd_rsi_stoch", "tf": "15m"}
+            {"id": "sber-macd", "name": "macd_rsi_stoch", "management": "levels_rr", "tf": "15m"}
         ]
 
     def test_ticker_timeframe_key_is_accepted(self, tmp_path):
         cfg = _write(
             tmp_path,
-            '[strategies.share.SBER]\ntimeframe = "15m"\nstrategies = ["flat_triangle"]\n',
+            '[strategies.share.SBER]\ntimeframe = "15m"\nstrategies = [{ id = "sber-flat", name = "flat_triangle", management = "levels_rr" }]\n',
         )
 
         result = load_config(_defaults(), config_file=cfg)
@@ -212,26 +274,26 @@ class TestToAssignments:
     def _table(strategies, timeframe=None):
         return {"strategies": strategies, "timeframe": timeframe}
 
-    def test_string_entry_gets_default_profile_and_global_tf(self):
+    def test_explicit_entry_preserves_identity_and_default_priority(self):
         from src.config import _to_assignments
 
-        assert _to_assignments({"SBER": self._table(["flat_triangle"])}) == {
-            "SBER": [Assignment("flat_triangle", "basic_levels", timeframe="1h")]
+        assert _to_assignments({"SBER": self._table([{"id": "share-flat", "name": "flat_triangle", "management": "levels_rr"}])}) == {
+            "SBER": [Assignment(id="share-flat", strategy="flat_triangle", management="levels_rr", filter_profile="basic_levels", timeframe="1h")]
         }
 
     def test_inline_table_overrides_profile(self):
         from src.config import _to_assignments
 
         result = _to_assignments(
-            {"ED": self._table([{"name": "flat_triangle", "filter": "raw"}])}
+            {"ED": self._table([{"id": "ed-flat", "name": "flat_triangle", "management": "levels_rr", "filter": "raw"}])}
         )
 
-        assert result["ED"] == [Assignment("flat_triangle", "raw", timeframe="1h")]
+        assert result["ED"] == [Assignment(id="ed-flat", strategy="flat_triangle", management="levels_rr", filter_profile="raw", timeframe="1h")]
 
     def test_inline_table_without_filter_gets_default_profile(self):
         from src.config import _to_assignments
 
-        result = _to_assignments({"ED": self._table([{"name": "flat_triangle"}])})
+        result = _to_assignments({"ED": self._table([{"id": "ed-flat", "name": "flat_triangle", "management": "levels_rr"}])})
 
         assert result["ED"][0].filter_profile == "basic_levels"
 
@@ -239,17 +301,35 @@ class TestToAssignments:
         from src.config import _to_assignments
 
         result = _to_assignments(
-            {"SBER": self._table([{"name": "macd_rsi_stoch", "filter": "raw"}, "macd_rsi_stoch"])}
+            {"SBER": self._table([{"id": "sber-macd-raw", "name": "macd_rsi_stoch", "management": "levels_rr", "filter": "raw"}, {"id": "sber-macd-basic", "name": "macd_rsi_stoch", "management": "levels_rr"}])}
         )
 
         assert [a.strategy for a in result["SBER"]] == ["macd_rsi_stoch", "macd_rsi_stoch"]
         assert [a.filter_profile for a in result["SBER"]] == ["raw", "basic_levels"]
 
+    def test_duplicate_assignment_id_is_rejected_across_instruments(self):
+        from src.config import _to_assignments
+
+        with pytest.raises(ConfigError, match="повторяющийся id"):
+            _to_assignments({
+                "SBER": self._table([{"id": "shared", "name": "macd_rsi_stoch", "management": "levels_rr"}]),
+                "ED": self._table([{"id": "shared", "name": "flat_triangle", "management": "levels_rr"}]),
+            })
+
+    def test_duplicate_assignment_id_across_sources_is_rejected(self):
+        from src.config import _to_assignments, _validate_global_assignment_ids
+
+        share = _to_assignments({"SBER": self._table([{"id": "shared", "name": "macd_rsi_stoch", "management": "levels_rr"}])})
+        future = _to_assignments({"ED": self._table([{"id": "shared", "name": "flat_triangle", "management": "levels_rr"}])})
+
+        with pytest.raises(ConfigError, match="глобально уникальным"):
+            _validate_global_assignment_ids(share, future)
+
     def test_inline_tf_beats_ticker_timeframe(self):
         from src.config import _to_assignments
 
         result = _to_assignments(
-            {"SBER": self._table([{"name": "macd_rsi_stoch", "tf": "15m"}], timeframe="1h")}
+            {"SBER": self._table([{"id": "sber-macd", "name": "macd_rsi_stoch", "management": "levels_rr", "tf": "15m"}], timeframe="1h")}
         )
 
         assert result["SBER"][0].timeframe == "15m"
@@ -257,7 +337,7 @@ class TestToAssignments:
     def test_ticker_timeframe_beats_global(self):
         from src.config import _to_assignments
 
-        result = _to_assignments({"SBER": self._table(["flat_triangle"], timeframe="15m")})
+        result = _to_assignments({"SBER": self._table([{"id": "sber-flat", "name": "flat_triangle", "management": "levels_rr"}], timeframe="15m")})
 
         assert result["SBER"][0].timeframe == "15m"
 
@@ -265,7 +345,7 @@ class TestToAssignments:
         from src.config import _to_assignments
 
         result = _to_assignments(
-            {"SBER": self._table([{"name": "macd_rsi_stoch", "filter": "raw"}], timeframe="5m")}
+            {"SBER": self._table([{"id": "sber-macd", "name": "macd_rsi_stoch", "management": "levels_rr", "filter": "raw"}], timeframe="5m")}
         )
 
         assert result["SBER"][0].timeframe == "5m"
@@ -274,13 +354,13 @@ class TestToAssignments:
         from src.config import _to_assignments
 
         with pytest.raises(ConfigError, match="2h"):
-            _to_assignments({"SBER": self._table([{"name": "macd_rsi_stoch", "tf": "2h"}])})
+            _to_assignments({"SBER": self._table([{"id": "sber-macd", "name": "macd_rsi_stoch", "management": "levels_rr", "tf": "2h"}])})
 
     def test_invalid_ticker_timeframe_raises(self):
         from src.config import _to_assignments
 
         with pytest.raises(ConfigError, match="2h"):
-            _to_assignments({"SBER": self._table(["flat_triangle"], timeframe="2h")})
+            _to_assignments({"SBER": self._table([{"id": "sber-flat", "name": "flat_triangle", "management": "levels_rr"}], timeframe="2h")})
 
 
 class TestTripleScreenSection:
@@ -342,7 +422,9 @@ class TestTripleScreenHierarchyValidation:
         bindings = {
             "SBER": [
                 Assignment(
+                    id="sber-macd",
                     strategy="macd_rsi_stoch",
+                    management="levels_rr",
                     filter_profile="triple_screen",
                     timeframe="5m",
                 )
@@ -358,7 +440,9 @@ class TestTripleScreenHierarchyValidation:
         bindings = {
             "SBER": [
                 Assignment(
+                    id="sber-macd",
                     strategy="macd_rsi_stoch",
+                    management="levels_rr",
                     filter_profile="triple_screen",
                     timeframe="1M",
                 )
@@ -379,7 +463,7 @@ class TestTripleScreenHierarchyValidation:
         path = tmp_path / "robot.toml"
         path.write_text(
             "[strategies.share.SBER]\n"
-            'strategies = [{ name = "macd_rsi_stoch", filter = "triple_screen", tf = "5m" }]\n',
+            'strategies = [{ id = "sber-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "5m" }]\n',
             encoding="utf-8",
         )
         cfg = load_config(_defaults(), config_file=path)
@@ -402,7 +486,7 @@ class TestTripleScreenHierarchyValidation:
         path = tmp_path / "robot.toml"
         path.write_text(
             "[strategies.share.SBER]\n"
-            'strategies = [{ name = "macd_rsi_stoch", filter = "triple_screen", tf = "1M" }]\n',
+            'strategies = [{ id = "sber-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "1M" }]\n',
             encoding="utf-8",
         )
         cfg = load_config(_defaults(), config_file=path)

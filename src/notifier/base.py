@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import timedelta
 
 from src.strategies.contracts import Decision, SignalType
+from src.trade_management.models import TradePlan
 
 
 class DecisionFormatter:
@@ -49,6 +50,26 @@ class DecisionFormatter:
         return " ".join(parts) + f" ➜ {signal}"
 
 
+class TradePlanFormatter:
+    """Formats a proposed trade without presenting it as an execution."""
+
+    @staticmethod
+    def format(plan: TradePlan, contract_name: str, *, timeframe: str = "") -> str:
+        label = f"● {contract_name}"
+        if timeframe:
+            label += f" ({timeframe})"
+        targets = ", ".join(_format_price(target.price) for target in plan.targets) or "нет"
+        return (
+            f"{label} | {plan.profile.name} ➜ ПЛАН {plan.side} — "
+            f"Вход: {_format_price(plan.reference_entry)}, "
+            f"Стоп: {_format_price(plan.stop_price)}, Цели: {targets}"
+        )
+
+
+def _format_price(value) -> str:
+    return format(value, "f").rstrip("0").rstrip(".") if "." in format(value, "f") else format(value, "f")
+
+
 class DealEventFormatter:
     """Форматирование событий исполнения (order / fill / cancel / clear / over_risk / protective / balance)."""
 
@@ -88,6 +109,9 @@ class AbstractNotifier(ABC):
                 timeframe=timeframe,
             )
         )
+
+    def notify_plan(self, plan: TradePlan, contract_name: str, *, timeframe: str = "") -> None:
+        self.notify(TradePlanFormatter.format(plan, contract_name, timeframe=timeframe))
 
     def notify_event(self, event_type: str, position_id: str, message: str) -> None:
         self.notify(DealEventFormatter.format_event(event_type, position_id, message))

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from src.market_context.models import MarketContext, SRLevel, SRType
-from src.strategies.contracts import Decision, SignalType
+from src.strategies.contracts import Decision
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -29,15 +29,8 @@ class RiskManager:
             raise ValueError("default_sl_pct должен быть > 0")
 
     def apply(self, decision: Decision, ctx: MarketContext) -> Decision:
-        if decision.signal_type is SignalType.HOLD:
-            return decision
-
-        price = decision.price
-        levels = ctx.sr_levels
-
-        if decision.signal_type is SignalType.BUY:
-            return self._apply_buy(decision, price, levels)
-        return self._apply_sell(decision, price, levels)
+        """Leave entry events unchanged until profile planning replaces this legacy API."""
+        return decision
 
     def _apply_buy(self, decision: Decision, price: float, levels: list[SRLevel]) -> Decision:
         support = self._nearest_below(levels, SRType.SUPPORT, price)

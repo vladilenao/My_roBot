@@ -151,6 +151,18 @@ class TestPositionsFileParsing:
         with pytest.raises(ConfigError, match="positions_file"):
             load_config(_defaults(), config_file=cfg_ref(tmp_path))
 
+    @pytest.mark.parametrize("export_key", ("journal_file", "positions_file"))
+    def test_database_path_matching_export_after_normalization_is_rejected(self, tmp_path, export_key):
+        _write(
+            tmp_path,
+            "[trading]\n"
+            'database_file = "state/../trades.sqlite3"\n'
+            f'{export_key} = "trades.sqlite3"\n',
+        )
+
+        with pytest.raises(ConfigError, match="database_file"):
+            load_config(_defaults(), config_file=cfg_ref(tmp_path))
+
 
 class TestDerivedPositionsFile:
     def test_suffix_before_extension(self):
@@ -171,7 +183,7 @@ class TestTradingEnabled:
         from src.config import _CONFIG
 
         saved = dict(_CONFIG)
-        for key in ("initial_deposit", "max_risk_pct", "journal_file", "clearing_times"):
+        for key in ("initial_deposit", "max_risk_pct", "journal_file", "positions_file", "database_file", "clearing_times"):
             _CONFIG.pop(key, None)
         try:
             assert trading_enabled() is False

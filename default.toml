@@ -18,32 +18,31 @@ fallback_ticker = "NGU6"
 [notifier]
 channel = "console"
 
-# Покрытие всех форм привязки: строка (дефолты), инлайн-таблица с raw /
-# basic_levels, дубликаты стратегий; каскад ТФ: глобальный 1h, timeframe
+# Явные привязки с глобальными ID и профилями управления; каскад ТФ: глобальный 1h, timeframe
 # тикера (NG → 15m), точечный tf в инлайне, дубли на разных ТФ.
 [strategies.share.SBER]
 strategies = [
-    { name = "macd_rsi_stoch", filter = "raw", tf = "15m" },  # скальпер без фильтров на 15m
-    { name = "macd_rsi_stoch", filter = "basic_levels" },     # та же стратегия на 1h с фильтром
-    "flat_triangle",                                          # строка → дефолты (1h, basic_levels)
-    { name = "ma_cloud_rsi_macd", filter = "raw" },
+    { id = "share-sber-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-sber-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-sber-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-sber-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.future.NG]
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { name = "flat_triangle", filter = "raw" },
-    { name = "macd_rsi_stoch", tf = "15m",filter = "basic_levels" },
-    { name = "ma_cloud_rsi_macd", tf = "1h", filter = "triple_screen" },  # Элдер на часовике
+    { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
 
 [strategies.future.BR]
 strategies = [
-    { name = "macd_rsi_stoch", filter = "raw", tf = "5m" },
-    "flat_triangle",
-    { name = "harmonic_abcd", filter = "raw" },
-    { name = "ma_cloud_rsi_macd", tf = "15m" },
+    { id = "future-br-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "5m", priority = 10 },
+    { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "future-br-harmonic", name = "harmonic_abcd", management = "pattern_targets", filter = "raw", priority = 10 },
+    { id = "future-br-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "15m", priority = 10 },
 ]
 
 # Сценарий сравнения привязок: SI — один инструмент, один ТФ (5m), две
@@ -55,16 +54,16 @@ strategies = [
 # отсекает брокер: в журнале причина `duplicate`.
 [strategies.future.SI]
 strategies = [
-    { name = "ma_cloud_rsi_macd", filter = "raw", tf = "5m" },
-    { name = "ma_cloud_rsi_macd", filter = "triple_screen", tf = "5m" },
+    { id = "future-si-ma-raw", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", tf = "5m", priority = 10 },
+    { id = "future-si-ma-triple", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "triple_screen", tf = "5m", priority = 10 },
 ]
 
 [strategies.future.ED]
 strategies = [
-    { name = "flat_triangle", filter = "raw", tf = "15m" },
-    { name = "macd_rsi_stoch", filter = "basic_levels" },
-    "harmonic_abcd",
-    "ma_cloud_rsi_macd",
+    { id = "future-ed-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", tf = "15m", priority = 5 },
+    { id = "future-ed-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "future-ed-harmonic", name = "harmonic_abcd", management = "pattern_targets", priority = 10 },
+    { id = "future-ed-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", priority = 10 },
 ]
 
 # Профиль фильтрации triple_screen (методика Элдера):
@@ -87,3 +86,56 @@ file = "bot_debug.log"
 level = "DEBUG"
 max_bytes = 10485760
 backup_count = 5
+audit_file = "trade_audit.log"
+audit_max_bytes = 10485760
+audit_backup_count = 5
+
+[trading]
+initial_deposit = 100000
+max_risk_pct = 2.0
+database_file = "trades.sqlite3"
+journal_file = "trade_journal.csv"
+positions_file = "trade_journal_positions.csv"
+clearing_times = ["14:05", "19:00"]
+
+[trading.risk_limits]
+trade_pct = 2.0
+instrument_pct = 4.0
+portfolio_pct = 6.0
+max_qty = 10
+commission = 0.0
+slippage = 0.0
+groups = { energy = 4.0, currency = 4.0 }
+
+[trade_management.profiles.levels_rr]
+type = "levels_rr"
+buffer_ticks = 1
+target_R = [1.0, 2.0]
+shares = [0.5, 0.5]
+max_adds = 0
+
+[trade_management.profiles.atr_trend]
+type = "atr_trend"
+atr_period = 14
+initial_k = 2.0
+trail_k = 2.0
+tp1_R = 1.0
+tp1_share = 0.5
+max_adds = 2
+add_fraction = 0.5
+advance_R = 0.5
+
+[trade_management.profiles.ma_cloud]
+type = "ma_cloud"
+ma_fast_period = 10
+ma_slow_period = 40
+buffer_ticks = 1
+max_adds = 2
+add_fraction = 0.5
+
+[trade_management.profiles.pattern_targets]
+type = "pattern_targets"
+buffer_ticks = 1
+fractions_to_D = [0.5, 1.0]
+shares = [0.5, 0.5]
+max_adds = 0

@@ -1,6 +1,5 @@
 from src.config import BAR_TIME_TZ_OFFSET_HOURS, NOTIFIER
-from src.notifier.base import AbstractNotifier as AbstractNotifier
-from src.notifier.base import DecisionFormatter
+from src.notifier.base import AbstractNotifier as AbstractNotifier, DecisionFormatter
 from src.notifier.console import ConsoleNotifier
 from src.notifier.telegram import TelegramNotifier
 

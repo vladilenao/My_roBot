@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from src.logging_setup import get_logger
+from src.trade_management.models import TradePlan
 
 log = get_logger(__name__)
 
@@ -47,7 +48,10 @@ class NotifyOnlyExecutionPort(ExecutionPort):
         filtered_out: bool = False,
         timeframe: str = "",
     ) -> None:
-        label = getattr(instrument, "short_name", None) or getattr(instrument, "label", "")
+        label = _short_contract_name(instrument)
+        if isinstance(decision, TradePlan):
+            self._notifier.notify_plan(decision, label, timeframe=timeframe)
+            return
         self._notifier.notify_decision(
             decision, label,
             filter_profile=filter_profile, filtered_out=filtered_out,
@@ -79,7 +83,7 @@ class BrokerExecutionPort(ExecutionPort):
         timeframe: str = "",
     ) -> object | None:
         if self._notifier is not None:
-            label = getattr(instrument, "short_name", None) or getattr(instrument, "label", "")
+            label = _short_contract_name(instrument)
             self._notifier.notify_decision(
                 decision, label,
                 filter_profile=filter_profile, filtered_out=filtered_out,
@@ -92,3 +96,8 @@ class BrokerExecutionPort(ExecutionPort):
             filtered_out=filtered_out,
             timeframe=timeframe,
         )
+
+
+def _short_contract_name(instrument) -> str:
+    """Never expose a raw exchange ticker or verbose selector label to users."""
+    return getattr(instrument, "short_name", None) or "контракт не указан"

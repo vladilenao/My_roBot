@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
 
 import logging
 
@@ -10,10 +11,14 @@ import pytest
 from src.bot import TradingBot
 from src.instruments import Instrument
 from src.strategies.contracts import Assignment, Decision, SignalType
+from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, MoveStop, ReduceTrade
 
 
 def _assign(*names: str, profile: str = "basic_levels", timeframe: str = "1h") -> list[Assignment]:
-    return [Assignment(strategy=name, filter_profile=profile, timeframe=timeframe) for name in names]
+    return [
+        Assignment(id=f"test-{profile}-{timeframe}-{index}-{name}", strategy=name, management="levels_rr", filter_profile=profile, timeframe=timeframe)
+        for index, name in enumerate(names)
+    ]
 
 
 def _inst(*args):
@@ -190,7 +195,7 @@ class RecordingNotifier:
         self.messages.append(message)
 
 
-def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None, strategy_map=None):
+def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None, strategy_map=None, trade_manager=None, action_executor=None):
     return TradingBot(
         instruments=[],  # replace below
         notifier=notifier,
@@ -205,10 +210,204 @@ def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future
         context_cache=context_cache,
         signal_filter=signal_filter,
         risk_manager=risk_manager,
+        trade_manager=trade_manager,
+        action_executor=action_executor,
     )
 
 
 class TestTradingBot:
+    def test_portfolio_admission_uses_stable_tick_candidate_order(self):
+        trade_manager = MagicMock()
+        admitted = []
+        trade_manager.manage.return_value = ()
+        trade_manager.actions_for_signal.side_effect = (
+            lambda assignment, decision, instrument, *_args, **_kwargs:
+            admitted.append((assignment.id, instrument.ticker, decision.event_id)) or ()
+        )
+        assignments = {
+            "AAA": [Assignment("assignment-b", "macd_rsi_stoch", "levels_rr", priority=1, timeframe="1h")],
+            "ZZZ": [Assignment("assignment-a", "macd_rsi_stoch", "levels_rr", priority=1, timeframe="1h")],
+        }
+
+        def admitted_for(instruments):
+            bot = _make_bot(
+                timeline=FakeTimeline(),
+                cache=FakeCache(frames={"AAA": _df(), "ZZZ": _df()}),
+                execution=RecordingExecution(),
+                notifier=RecordingNotifier(),
+                strategy=_make_strategy(),
+                share=assignments,
+                trade_manager=trade_manager,
+            )
+            bot._instruments = instruments
+            bot.run()
+            return admitted[:]
+
+        forward = admitted_for([_inst("AAA", "AAA", "share"), _inst("ZZZ", "ZZZ", "share")])
+        admitted.clear()
+        reversed_order = admitted_for([_inst("ZZZ", "ZZZ", "share"), _inst("AAA", "AAA", "share")])
+
+        assert forward == reversed_order
+        assert [(assignment_id, instrument_id) for assignment_id, instrument_id, _ in forward] == [
+            ("assignment-a", "ZZZ"),
+            ("assignment-b", "AAA"),
+        ]
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            CloseTrade("close", "trade-1", 0, "exit"),
+            ReduceTrade("reduce", "trade-1", 0, "reduce", 1),
+            MoveStop("move", "trade-1", 0, "move-stop", Decimal("99")),
+            CancelEntry("cancel", "trade-1", 0, "cancel"),
+        ],
+    )
+    def test_management_actions_bypass_entry_filter(self, action):
+        signal_filter = MagicMock()
+        action_executor = MagicMock()
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(), execution=RecordingExecution(),
+            notifier=RecordingNotifier(), strategy=_make_strategy(), signal_filter=signal_filter,
+        )
+        bot._action_executor = action_executor
+
+        bot._dispatch_management_actions(
+            (action,), Decision(SignalType.BUY, 100.5), object(), _assign("macd_rsi_stoch")[0], _inst("SBER", "share"), "1h",
+        )
+
+        signal_filter.apply.assert_not_called()
+        action_executor.submit.assert_called_once()
+
+    def test_add_action_always_passes_entry_filter(self):
+        signal_filter = MagicMock()
+        signal_filter.apply.return_value = Decision(SignalType.BUY, 100.5)
+        action_executor = MagicMock()
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(), execution=RecordingExecution(),
+            notifier=RecordingNotifier(), strategy=_make_strategy(), signal_filter=signal_filter,
+        )
+        bot._action_executor = action_executor
+
+        bot._dispatch_management_actions(
+            (AddToTrade("add", "trade-1", 0, "add", 1),),
+            Decision(SignalType.BUY, 100.5), object(), _assign("macd_rsi_stoch")[0], _inst("SBER", "share"), "1h",
+        )
+
+        signal_filter.apply.assert_called_once()
+        action_executor.submit.assert_called_once()
+
+    def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
+        signal_filter = MagicMock()
+        action_executor = MagicMock()
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        trade_manager.actions_for_signal.return_value = (
+            CloseTrade("close", "trade-1", 0, "raw-opposite-signal"),
+        )
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(frames={"SBER": _df()}),
+            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            share={"SBER": _assign("macd_rsi_stoch")}, context_cache=MagicMock(),
+            signal_filter=signal_filter, trade_manager=trade_manager,
+            action_executor=action_executor,
+        )
+        bot._context_cache.get_context.return_value = object()
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        signal_filter.apply.assert_not_called()
+        action_executor.submit.assert_called_once()
+
+    def test_protection_runs_on_1m_before_a_hold_strategy(self):
+        events = []
+        trade_manager = MagicMock()
+        trade_manager.manage.side_effect = lambda *args, **kwargs: events.append("manage") or ()
+        post_tick = MagicMock(side_effect=lambda timeframes: events.append(f"protect:{next(iter(timeframes))}"))
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m", "1h")),
+            cache=FakeCache(frames={
+                ("SBER", "1m"): _df(),
+                ("SBER", "1h"): _df(),
+            }),
+            execution=RecordingExecution(), notifier=RecordingNotifier(),
+            strategy=_make_strategy(decision=Decision(SignalType.HOLD, 100.5)),
+            share={"SBER": _assign("macd_rsi_stoch")}, trade_manager=trade_manager,
+        )
+        bot._post_tick = post_tick
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert events[0] == "protect:1m"
+        assert trade_manager.manage.call_count == 2
+        assert trade_manager.manage.call_args_list[0].kwargs["timeframe"] == "1m"
+
+    def test_deleted_assignment_keeps_1m_management_subscription(self):
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m",)),
+            cache=FakeCache(frames={("SBER", "1m"): _df()}),
+            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            share={}, trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        trade_manager.manage.assert_called_once()
+        assert trade_manager.manage.call_args.args[1] == []
+        assert trade_manager.manage.call_args.kwargs["timeframe"] == "1m"
+
+    def test_strategy_error_does_not_block_prior_1m_management(self):
+        strategy = _make_strategy()
+        strategy.compute.side_effect = RuntimeError("boom")
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m", "1h")),
+            cache=FakeCache(frames={
+                ("SBER", "1m"): _df(),
+                ("SBER", "1h"): _df(),
+            }),
+            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch")}, trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert trade_manager.manage.call_args_list[0].kwargs["timeframe"] == "1m"
+
+    def test_empty_1m_bar_does_not_run_management_or_strategy(self):
+        trade_manager = MagicMock()
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m",)),
+            cache=FakeCache(frames={("SBER", "1m"): pd.DataFrame()}),
+            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            share={}, trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        trade_manager.manage.assert_not_called()
+
+    def test_1m_protection_does_not_analyze_a_1h_strategy(self):
+        strategy = _make_strategy()
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m",)),
+            cache=FakeCache(frames={("SBER", "1m"): _df()}),
+            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch", timeframe="1h")}, trade_manager=MagicMock(),
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        strategy.compute.assert_not_called()
+
     def test_fail_fast_on_unknown_strategy(self):
         bot = _make_bot(
             timeline=FakeTimeline(),
@@ -758,7 +957,7 @@ class TestTradingBot:
         # _analyze прерван на первой стратегии — вторая в том же тике не выполнилась
         assert working.compute.called is False
 
-    def test_risk_manager_fatal_error_reports_globally(self):
+    def test_legacy_risk_manager_is_not_applied_to_entry_events(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         execution = RecordingExecution()
         risk = MagicMock()
@@ -780,9 +979,9 @@ class TestTradingBot:
 
         bot.run()
 
-        risk.apply.assert_called_once()
-        assert any("bot_debug.log" in m for m in notifier.messages)
-        assert len(execution.decisions) == 0
+        risk.apply.assert_not_called()
+        assert not notifier.messages
+        assert len(execution.decisions) == 1
 
     def test_duplicate_strategy_with_distinct_profiles_runs_both(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))

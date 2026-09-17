@@ -9,6 +9,7 @@ import pandas_ta_classic as ta
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
 from src.strategies.indicators.ma.signalEnum import MaCloudSignalEnum
 from src.logging_setup import get_logger
+from src.trade_management.audit import CalculationTrace, MeasuredValue, calculation_trace
 
 log = get_logger(__name__)
 
@@ -49,6 +50,8 @@ class MaCloudIndicator(Indicator):
         data = df.copy()
         data["sma_fast"] = ta.sma(data["close"], length=self.fast_period)
         data["sma_slow"] = ta.sma(data["close"], length=self.slow_period)
+        data["sma_fast_available"] = data["sma_fast"].notna()
+        data["sma_slow_available"] = data["sma_slow"].notna()
 
         data[self.signal_column] = np.where(
             (data["sma_fast"] > data["sma_slow"])
@@ -62,3 +65,19 @@ class MaCloudIndicator(Indicator):
             ),
         )
         return data
+
+    def compute_with_trace(self, df: pd.DataFrame) -> tuple[pd.DataFrame, CalculationTrace]:
+        """Compute SMA cloud with the complete local close windows used by it."""
+        data = self.compute(df)
+        close = data["close"].tail(self.slow_period).tolist()
+        fast, slow = data["sma_fast"].iloc[-1], data["sma_slow"].iloc[-1]
+        return data, calculation_trace(
+            "indicator.ma_cloud", inputs={
+                "fast_period": MeasuredValue(self.fast_period, "bars"),
+                "slow_period": MeasuredValue(self.slow_period, "bars"),
+                "closed_closes": MeasuredValue(close, "price"),
+            }, result=MeasuredValue({"sma_fast": None if pd.isna(fast) else float(fast),
+                                      "sma_slow": None if pd.isna(slow) else float(slow)}, "moving-averages"),
+            reason="moving-averages-available" if not pd.isna(slow) else "insufficient-history",
+            formula="SMA_n=sum(last n closed prices)/n; cloud uses SMA fast and slow",
+        )

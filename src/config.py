@@ -51,18 +51,18 @@ _DEFAULTS = {
     "share_strategies": {
         "SBER": {
             "strategies": [
-                "macd_rsi_stoch",
-                "flat_triangle",
-                "harmonic_abcd",
-                "ma_cloud_rsi_macd",
+                {"id": "share-sber-macd", "name": "macd_rsi_stoch", "management": "levels_rr"},
+                {"id": "share-sber-flat", "name": "flat_triangle", "management": "levels_rr"},
+                {"id": "share-sber-harmonic", "name": "harmonic_abcd", "management": "pattern_targets"},
+                {"id": "share-sber-ma", "name": "ma_cloud_rsi_macd", "management": "ma_cloud"},
             ],
         },
     },
     "future_strategies": {
-        "NG": {"strategies": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]},
-        "BR": {"strategies": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]},
-        "SI": {"strategies": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]},
-        "ED": {"strategies": ["macd_rsi_stoch", "flat_triangle", "harmonic_abcd", "ma_cloud_rsi_macd"]},
+        "NG": {"strategies": [{"id": "future-ng-macd", "name": "macd_rsi_stoch", "management": "levels_rr"}]},
+        "BR": {"strategies": [{"id": "future-br-macd", "name": "macd_rsi_stoch", "management": "levels_rr"}]},
+        "SI": {"strategies": [{"id": "future-si-macd", "name": "macd_rsi_stoch", "management": "levels_rr"}]},
+        "ED": {"strategies": [{"id": "future-ed-macd", "name": "macd_rsi_stoch", "management": "levels_rr"}]},
     },
     # Логирование (секция [logging] в robot.toml)
     "logging_service_uid": "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a",
@@ -70,6 +70,9 @@ _DEFAULTS = {
     "logging_level": "DEBUG",
     "logging_max_bytes": 10_485_760,
     "logging_backup_count": 5,
+    "audit_file": "trade_audit.log",
+    "audit_max_bytes": 10_485_760,
+    "audit_backup_count": 5,
 }
 
 _CONFIG = load_config(_DEFAULTS)
@@ -104,12 +107,13 @@ def _checked_timeframe(value: str, where: str) -> str:
 
 
 def _to_assignments(raw: dict[str, dict]) -> dict[str, list[Assignment]]:
-    """Раскрытие гибридной записи привязок (строка | таблица) в Assignment.
+    """Раскрытие явной записи привязок в Assignment.
 
     Каскад таймфрейма: `tf` инлайн-записи → `timeframe` таблицы тикера →
     глобальный TIMEFRAME раздела робота.
     """
     result: dict[str, list[Assignment]] = {}
+    assignment_ids: set[str] = set()
     for ticker, table in raw.items():
         ticker_tf = table.get("timeframe")
         if ticker_tf is not None:
@@ -117,22 +121,41 @@ def _to_assignments(raw: dict[str, dict]) -> dict[str, list[Assignment]]:
         assignments: list[Assignment] = []
         for item in table["strategies"]:
             if isinstance(item, str):
-                tf = ticker_tf or TIMEFRAME
-                assignments.append(
-                    Assignment(strategy=cast(StrategyName, item), timeframe=tf)
+                raise ConfigError(f"robot.toml: привязка для {ticker!r} должна содержать id и management")
+            assignment_id = item.get("id")
+            management = item.get("management")
+            if not isinstance(assignment_id, str) or not assignment_id:
+                raise ConfigError(f"robot.toml: у привязки {item.get('name')!r} для {ticker!r} отсутствует непустой id")
+            if assignment_id in assignment_ids:
+                raise ConfigError(f"robot.toml: повторяющийся id привязки {assignment_id!r}")
+            if not isinstance(management, str) or not management:
+                raise ConfigError(f"robot.toml: у привязки {assignment_id!r} отсутствует management")
+            assignment_ids.add(assignment_id)
+            tf = item.get("tf") or ticker_tf or TIMEFRAME
+            _checked_timeframe(tf, f"tf привязки {item['name']!r} для {ticker!r}")
+            assignments.append(
+                Assignment(
+                    id=assignment_id,
+                    strategy=cast(StrategyName, item["name"]),
+                    management=management,
+                    filter_profile=item.get("filter", DEFAULT_FILTER_PROFILE),
+                    priority=item.get("priority", 0),
+                    timeframe=tf,
                 )
-            else:
-                tf = item.get("tf") or ticker_tf or TIMEFRAME
-                _checked_timeframe(tf, f"tf привязки {item['name']!r} для {ticker!r}")
-                assignments.append(
-                    Assignment(
-                        strategy=cast(StrategyName, item["name"]),
-                        filter_profile=item.get("filter", DEFAULT_FILTER_PROFILE),
-                        timeframe=tf,
-                    )
-                )
+            )
         result[ticker] = assignments
     return result
+
+
+def _validate_global_assignment_ids(*sources: dict[str, list[Assignment]]) -> None:
+    assignment_ids = [
+        assignment.id
+        for source in sources
+        for assignments in source.values()
+        for assignment in assignments
+    ]
+    if len(assignment_ids) != len(set(assignment_ids)):
+        raise ConfigError("robot.toml: id привязки должен быть глобально уникальным")
 
 
 SHARE_STRATEGIES: dict[str, list[Assignment]] = _to_assignments(_CONFIG["share_strategies"])
@@ -141,6 +164,8 @@ SHARE_STRATEGIES: dict[str, list[Assignment]] = _to_assignments(_CONFIG["share_s
 # Запись не привязана к конкретному контракту и действует на любой контракт актива
 # (например "NG" покрывает NGU6, NGZ7 и любые последующие контракты природного газа).
 FUTURE_STRATEGIES: dict[str, list[Assignment]] = _to_assignments(_CONFIG["future_strategies"])
+
+_validate_global_assignment_ids(SHARE_STRATEGIES, FUTURE_STRATEGIES)
 
 # Параметры профиля triple_screen (методика Элдера) из [strategies.filter.triple_screen];
 # при отсутствии секции — дефолты (множитель 5, MACD 12/26/9, Stochastic 14/3/3, 20/80).
@@ -175,13 +200,19 @@ LOGGING_LEVEL = _CONFIG["logging_level"]
 LOGGING_MAX_BYTES = _CONFIG["logging_max_bytes"]
 LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
 
-# Торговая секция [trading]: имитированное исполнение через дневник сделок.
+# Торговая секция [trading]: SQLite-backed candle simulation.
 # При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.
 INITIAL_DEPOSIT = int(_CONFIG.get("initial_deposit", 100_000))
 MAX_RISK_PCT = float(_CONFIG.get("max_risk_pct", 2.0))
 JOURNAL_FILE = _CONFIG.get("journal_file", "trade_journal.csv")
 POSITIONS_FILE = _CONFIG.get("positions_file") or derived_positions_file(JOURNAL_FILE)
 CLEARING_TIMES = list(_CONFIG.get("clearing_times", ["14:05", "19:00"]))
+DATABASE_FILE = _CONFIG.get("database_file", "trades.sqlite3")
+AUDIT_FILE = _CONFIG.get("audit_file", "trade_audit.log")
+AUDIT_MAX_BYTES = _CONFIG.get("audit_max_bytes", 10_485_760)
+AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
+RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
+TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
 
 
 def trading_enabled() -> bool:
@@ -194,9 +225,6 @@ def trading_enabled() -> bool:
         key in _CONFIG
         for key in (
             "initial_deposit",
-            "max_risk_pct",
-            "journal_file",
-            "positions_file",
-            "clearing_times",
+            "database_file",
         )
     )
