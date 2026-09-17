@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
+import pytest
 
+from src.strategies.indicators.atr import AtrWilderIndicator
 from src.strategies.indicators.ma import MaCloudIndicator
 from src.strategies.indicators.ma.signalEnum import MaCloudSignalEnum
 from src.strategies.indicators.macd import MacdIndicator, MacdMode
@@ -78,6 +80,47 @@ class TestMaCloudIndicator:
         assert "sma_fast" in ta.columns
         assert "sma_slow" in ta.columns
         assert "ma_cloud_signal" in ta.columns
+
+    def test_sma_values_become_available_at_their_periods(self):
+        ta = MaCloudIndicator(fast_period=10, slow_period=40).compute(_make_ohlcv(40))
+
+        assert not ta["sma_fast_available"].iloc[8]
+        assert ta["sma_fast_available"].iloc[9]
+        assert not ta["sma_slow_available"].iloc[38]
+        assert ta["sma_slow_available"].iloc[39]
+
+
+class TestAtrWilderIndicator:
+    def test_warmup_and_seed_from_first_true_ranges(self):
+        ta = AtrWilderIndicator(period=3).compute(
+            pd.DataFrame(
+                {
+                    "high": [12.0, 14.0, 15.0],
+                    "low": [10.0, 11.0, 12.0],
+                    "close": [11.0, 12.0, 14.0],
+                }
+            )
+        )
+
+        assert AtrWilderIndicator(period=3).warmup == 3
+        assert ta["true_range"].tolist() == [2.0, 3.0, 3.0]
+        assert ta["atr_wilder"].iloc[:2].isna().all()
+        assert ta["atr_wilder"].iloc[2] == 8 / 3
+        assert ta["atr_available"].tolist() == [False, False, True]
+
+    def test_recurrence_uses_previous_atr(self):
+        ta = AtrWilderIndicator(period=3).compute(
+            pd.DataFrame(
+                {
+                    "high": [12.0, 14.0, 15.0, 20.0],
+                    "low": [10.0, 11.0, 12.0, 16.0],
+                    "close": [11.0, 12.0, 14.0, 17.0],
+                }
+            )
+        )
+
+        assert ta["true_range"].iloc[3] == 6.0
+        assert ta["atr_wilder"].iloc[3] == pytest.approx(34 / 9)
 
 
 class TestMacdZeroCrossIndicator:

@@ -1,11 +1,2 @@
-datetime,signal,price,action,exit_reason
-2023-09-21,SELL,250.16,entry,
-2023-09-26,SELL,255.87,scale_in,
-2023-09-27,BUY,256.1,,close_above_ma10
-2023-09-28,SELL,257.67,scale_in,
-2023-09-29,BUY,260.72,,close_above_ma10
-2023-10-02,SELL,258.98,scale_in,
-2023-10-03,BUY,259.65,,close_above_ma10
-2023-10-04,SELL,259.53,scale_in,
-2023-10-05,BUY,259.38,,close_above_ma10
-2023-10-06,BUY,262.93,,close_above_ma40
+datetime,signal,price
+2023-09-21,SELL,249.81

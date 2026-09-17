@@ -11,16 +11,13 @@ DEFAULT_FILTER_PROFILE = "basic_levels"
 
 @dataclass(frozen=True)
 class Assignment:
-    """Привязка стратегии к инструменту: имя стратегии + профиль фильтрации + таймфрейм.
+    """Глобально идентифицируемая привязка входной стратегии к профилю управления."""
 
-    Идентичность привязки — кортеж (инструмент, стратегия, профиль, таймфрейм):
-    дубли имени стратегии на одном инструменте допустимы при разных профилях
-    или разных таймфреймах. Таймфрейм обязателен и разворачивается каскадом
-    конфигурации (tf инлайна → timeframe тикера → глобальный TIMEFRAME).
-    """
-
+    id: str
     strategy: StrategyName
+    management: str
     filter_profile: str = DEFAULT_FILTER_PROFILE
+    priority: int = 0
     timeframe: str = field(kw_only=True)
 
 
@@ -32,26 +29,17 @@ class SignalType(Enum):
 
 @dataclass(frozen=True)
 class Decision:
+    """Неизменяемое входное событие стратегии, не план и не торговая команда."""
+
     signal_type: SignalType
     price: float
+    bar_time: pd.Timestamp | None = None
+    event_id: str | None = None
+    available_at: pd.Timestamp | None = None
     timeframe: str | None = None
     strategy_name: str | None = None
     indicator_values: dict[str, float] | None = None
-    bar_time: pd.Timestamp | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-    sl_distance_pct: float | None = None
-    tp_distance_pct: float | None = None
-    sl_level_label: str | None = None
-    tp_level_label: str | None = None
-    trend_direction: str | None = None
-    trend_confidence: float | None = None
-    action: str | None = None
-    exit_reason: str | None = None
-    exit_contracts: int | None = None
-    risk_pct: float | None = None
-    risk_rub: float | None = None
-    quantity: int | None = None
+    idea_references: dict[str, float | str] | None = None
 
 
 class Strategy(Protocol):

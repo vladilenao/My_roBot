@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="440" viewBox="0 0 860 440" role="img" aria-labelledby="title desc">
+<title id="title">levels_rr — стоп за уровнем и две цели</title><desc id="desc">Синтетический LONG: вход 100, support 97, стоп 96; тейки 104 и108; после первого тейка стоп 100 действует со следующего бара.</desc>
+<rect width="860" height="440" fill="white"/>
+<g font-family="sans-serif" font-size="13" fill="#172033">
+<text x="55" y="25" font-size="19">levels_rr · синтетический LONG · NG-10.26</text>
+<path d="M80 50V360H650" fill="none" stroke="#64748b"/>
+<g fill="#64748b"><text x="35" y="84">108</text><text x="35" y="164">104</text><text x="35" y="244">100</text><text x="42" y="324">96</text><text x="590" y="390">Бар t →</text><text x="20" y="48">Цена</text></g>
+<path d="M80 80H650 M80 160H650 M80 240H650 M80 320H650" stroke="#e2e8f0" fill="none"/>
+<path d="M80 80H580 M80 160H280" stroke="#15803d" stroke-width="2" stroke-dasharray="7 5" fill="none"/>
+<path d="M80 300H260" stroke="#a16207" stroke-dasharray="3 4" fill="none"/>
+<text x="88" y="292" fill="#a16207">support 97; отступ 1</text>
+<path d="M80 320H380V240H580" stroke="#dc2626" stroke-width="3" fill="none"/>
+<polyline points="80,240 180,200 280,160 380,120 480,180 580,80" stroke="#2563eb" stroke-width="3" fill="none"/>
+<g fill="#2563eb"><circle cx="80" cy="240" r="5"/><circle cx="280" cy="160" r="5"/><circle cx="580" cy="80" r="5"/></g>
+<text x="87" y="227">Вход 2 @100</text><text x="236" y="144">TP1: 1 @104</text><text x="518" y="66">TP2: остаток @108</text><text x="391" y="263" fill="#dc2626">S=100 с t3</text><text x="87" y="343" fill="#dc2626">S0=96</text>
+<g text-anchor="middle"><text x="80" y="380">0</text><text x="180" y="380">1</text><text x="280" y="380">2</text><text x="380" y="380">3</text><text x="480" y="380">4</text><text x="580" y="380">5</text></g>
+<text x="680" y="100" fill="#2563eb">━ Цена</text><text x="680" y="128" fill="#dc2626">━ Активный стоп</text><text x="680" y="156" fill="#15803d">┄ Цели</text><text x="55" y="421">E=100 · R=4 · затраты=0 для иллюстрации · параметры не оптимизированы</text>
+</g></svg>

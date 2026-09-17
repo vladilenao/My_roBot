@@ -155,7 +155,7 @@ def test_strategy_names_returns_sorted_keys():
 
 
 def _a(name: str, profile: str = "basic_levels") -> Assignment:
-    return Assignment(strategy=name, filter_profile=profile, timeframe="1h")
+    return Assignment(id=f"test-{name}-{profile}", strategy=name, management="levels_rr", filter_profile=profile, timeframe="1h")
 
 
 def test_validate_assignments_accepts_known_names():

@@ -1,28 +1,48 @@
+import csv
+import shutil
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Mapping, Optional
 
-from src.broker.port import BrokerPort
+from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.logging_setup import get_logger
 from src.portfolio import (
     BrokerEvent,
     ContractMeta,
     OrderResult,
     OrderStatus,
+    PendingOrder,
     Position,
     PositionManager,
     ProtectiveOrder,
     Signal,
 )
 from src.trade_journal import (
+    COLUMNS_RU,
     JournalEvent,
+    OpType,
     TradeJournal,
     format_dt,
     parse_hhmm,
 )
+from src.trade_management.actions import (
+    AddToTrade,
+    CancelEntry,
+    CloseTrade,
+    MoveStop,
+    OpenTrade,
+    ReduceTrade,
+    TradeAction,
+)
+from src.trade_management.models import TradePlan
 
 UTC = timezone.utc
 _MSK = timezone(timedelta(hours=3))
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -45,6 +65,30 @@ class Order:
     risk_rub: Optional[float] = None
     source: str = ""
     status: OrderStatus = OrderStatus.NEW
+
+
+@dataclass
+class AddressedTrade:
+    """Simulator state keyed by trade ID rather than by an instrument ticker."""
+
+    plan: TradePlan
+    revision: int = 0
+    confirmed_stop: Decimal | None = None
+    pending_stop: Decimal | None = None
+    target_filled: dict[str, int] = field(default_factory=dict)
+    entry_quantity: int = 0
+    opened_bar: datetime | None = None
+    last_stop_fill: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.target_filled:
+            self.target_filled = {target.target_id: 0 for target in self.plan.targets}
+
+
+@dataclass(frozen=True)
+class ScheduledAction:
+    action: TradeAction
+    submitted_at: datetime
 
 
 def _next_clearing_utc(now: datetime, clearing_times_msk: list[str]) -> datetime:
@@ -103,9 +147,10 @@ class JournalBroker(BrokerPort):
 
     def __init__(
         self,
-        journal: TradeJournal,
+        journal: TradeJournal | None,
         manager: PositionManager,
         clearing_times_msk: list[str],
+        contract_names: Optional[Mapping[str, str]] = None,
     ):
         self.journal = journal
         self.manager = manager
@@ -114,9 +159,162 @@ class JournalBroker(BrokerPort):
         self._events: deque[BrokerEvent] = deque()
         self._last_clearing_check: Optional[datetime] = None
         self._contracts: dict[str, ContractMeta] = {}
-        self.load_state()
+        self._names: dict[str, str] = dict(contract_names or {})
+        self._command_events: dict[str, ExecutionEvent] = {}
+        self._addressed_trades: dict[str, AddressedTrade] = {}
+        self._scheduled_actions: list[ScheduledAction] = []
+        self._processed_addressed_bars: set[tuple[str, datetime]] = set()
+        # Addressed SQLite runtime starts with no CSV-derived state. Legacy CSV
+        # callers retain their explicit replay path below.
+        if journal is not None:
+            self.load_state()
 
     # ——— Порт ———
+
+    def register_trade(self, plan: TradePlan) -> None:
+        """Register the immutable details required to execute a trade command."""
+        existing = self._addressed_trades.get(plan.trade_id)
+        if existing is not None and existing.plan != plan:
+            raise ValueError(f"trade {plan.trade_id!r} is already registered with another plan")
+        self._addressed_trades.setdefault(plan.trade_id, AddressedTrade(plan))
+
+    def trade_state(self, trade_id: str) -> AddressedTrade | None:
+        """Return simulator state for tests and the orchestration boundary."""
+        return self._addressed_trades.get(trade_id)
+
+    def submit(self, action: TradeAction, now: datetime) -> ExecutionEvent:
+        """Execute an addressed command against its owning trade only.
+
+        Entries, stop changes, and signal exits activate on the next processed
+        bar. Target reductions remain immediate commands because their price is
+        supplied by the target plan rather than a closing-bar signal.
+        """
+        previous = self._command_events.get(action.command_id)
+        if previous is not None:
+            return previous
+        trade = self._addressed_trades.get(action.trade_id)
+        if trade is None:
+            event = self._command_outcome(action, now, ExecutionStatus.REJECT, "unknown-trade")
+        elif action.state_revision != trade.revision:
+            event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
+        elif isinstance(action, (OpenTrade, AddToTrade, MoveStop, CloseTrade)) or (
+            isinstance(action, ReduceTrade) and action.target_id is None
+        ):
+            self._scheduled_actions.append(ScheduledAction(action, now))
+            event = self._command_outcome(action, now, ExecutionStatus.ACK, "next-bar")
+        else:
+            event = self._execute_action(trade, action, now)
+        self._command_events[action.command_id] = event
+        return event
+
+    def _execute_action(
+        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
+    ) -> ExecutionEvent:
+        plan = trade.plan
+        position = self.manager.positions.get(action.trade_id)
+        if isinstance(action, CancelEntry):
+            if position is not None and position.qty:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-already-open")
+            trade.revision += 1
+            return self._command_outcome(action, now, ExecutionStatus.CANCEL, action.reason)
+        if isinstance(action, MoveStop):
+            if position is None or position.qty == 0:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
+            trade.pending_stop = action.stop_price
+            # ACK is the simulated broker confirmation; never claim a pending stop is active.
+            position.stop_price = float(action.stop_price)
+            trade.confirmed_stop = action.stop_price
+            trade.pending_stop = None
+            trade.revision += 1
+            return self._command_outcome(action, now, ExecutionStatus.ACK, action.reason)
+        if isinstance(action, (OpenTrade, AddToTrade)):
+            quantity = action.quantity
+            if quantity <= 0:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "quantity-non-positive")
+            if isinstance(action, OpenTrade) and position is not None and position.qty:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-already-open")
+            if isinstance(action, AddToTrade) and (position is None or position.qty == 0):
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
+            if position is None:
+                price = fill_price or plan.reference_entry
+                position = Position(
+                    position_id=plan.trade_id, ticker=plan.instrument_id, side=plan.side,
+                    qty=quantity, avg_price=float(price),
+                    stop_price=float(plan.stop_price), take_profit=None, ts_entry=now,
+                )
+                self.manager.positions[plan.trade_id] = position
+            else:
+                price = fill_price or plan.reference_entry
+                position.apply_fill(float(price), quantity)
+            trade.entry_quantity += quantity
+            # The initial stop is active only after the entry fill is confirmed.
+            trade.confirmed_stop = plan.stop_price
+            trade.revision += 1
+            return self._command_fill(action, now, quantity, price)
+        if isinstance(action, (ReduceTrade, CloseTrade)):
+            if position is None or position.qty == 0:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
+            quantity = position.qty if isinstance(action, CloseTrade) else action.quantity
+            if quantity <= 0 or quantity > position.qty:
+                return self._command_outcome(action, now, ExecutionStatus.REJECT, "quantity-exceeds-trade-remainder")
+            target_id = action.target_id if isinstance(action, ReduceTrade) else None
+            if target_id is not None:
+                if target_id not in trade.target_filled:
+                    return self._command_outcome(action, now, ExecutionStatus.REJECT, "unknown-target")
+                if quantity > self._target_remaining(trade, target_id):
+                    return self._command_outcome(action, now, ExecutionStatus.REJECT, "quantity-exceeds-target-remainder")
+                trade.target_filled[target_id] += quantity
+            position.reduce(quantity)
+            if position.qty == 0:
+                self.manager.positions.pop(plan.trade_id, None)
+                trade.confirmed_stop = None
+            trade.revision += 1
+            price = fill_price or next(
+                (target.price for target in plan.targets if target.target_id == target_id), plan.reference_entry
+            )
+            return self._command_fill(action, now, quantity, price)
+        return self._command_outcome(action, now, ExecutionStatus.REJECT, "unsupported-command")
+
+    @staticmethod
+    def _target_remaining(trade: AddressedTrade, target_id: str) -> int:
+        """Allocate target shares from confirmed entries; the last target gets rounding remainder."""
+        targets = trade.plan.targets
+        allocated = 0
+        for index, target in enumerate(targets):
+            planned = (
+                trade.entry_quantity - allocated
+                if index == len(targets) - 1
+                else int(trade.entry_quantity * target.share)
+            )
+            allocated += planned
+            if target.target_id == target_id:
+                return planned - trade.target_filled[target_id]
+        return 0
+
+    @staticmethod
+    def _command_outcome(action: TradeAction, now: datetime, status: ExecutionStatus, reason: str) -> ExecutionEvent:
+        return ExecutionEvent(
+            execution_id=f"{action.command_id}:{status.value}", order_id=action.command_id,
+            command_id=action.command_id, trade_id=action.trade_id, status=status,
+            filled_quantity=0, price=None, fee=Decimal("0"), timestamp=now, reason=reason,
+        )
+
+    @staticmethod
+    def _command_fill(action: TradeAction, now: datetime, quantity: int, price: Decimal) -> ExecutionEvent:
+        return ExecutionEvent(
+            execution_id=f"{action.command_id}:fill", order_id=action.command_id,
+            command_id=action.command_id, trade_id=action.trade_id, status=ExecutionStatus.FILL,
+            filled_quantity=quantity, price=price, fee=Decimal("0"), timestamp=now, reason=action.reason,
+        )
+
+    def set_names(self, names: Optional[Mapping[str, str]]) -> None:
+        """Отображение тикер -> короткое имя (NG-10.26) для пользовательских файлов/сообщений."""
+        if names:
+            self._names.update(names)
+
+    def _display(self, ticker: str) -> str:
+        """Short contract name for user-visible rows and messages."""
+        return self._names.get(ticker) or "контракт не указан"
 
     def load_state(self) -> None:
         self._orders = {}
@@ -196,16 +394,16 @@ class JournalBroker(BrokerPort):
             risk_rub=signal.risk_rub,
             source=signal.source,
         )
-        row = self._entry_row(order, contract, now)
+        row = self._order_row(order, contract, now)
         self.journal.append(row)
         self._orders[order_id] = order
-        restored = self._restored(order)
-        self.manager.register_order(order_id, restored)
+        self.manager.register_order(self._pending(order))
+        display = self._display(ticker)
         self._emit(
             "order",
             now,
             signal.position_id,
-            f"Заявка {signal.side} {signal.qty} {ticker} по {signal.entry_price} принята (id={order_id})",
+            f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} принята (id={order_id})",
         )
         return OrderResult(
             order_id=order_id,
@@ -217,7 +415,7 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason="",
-            message=f"Заявка {signal.side} {signal.qty} {ticker} по {signal.entry_price} размещена (id={order_id})",
+            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена (id={order_id})",
             ts_order=now,
         )
 
@@ -247,14 +445,17 @@ class JournalBroker(BrokerPort):
     def track_bar(
         self,
         now: datetime,
-        prices: Mapping[str, tuple[float, float, float]],
+        prices: Mapping[str, tuple[float, ...]],
         contracts: Mapping[str, ContractMeta],
     ) -> list[OrderResult]:
         self.set_contracts(contracts)
         results: list[OrderResult] = []
-        lows = {t: p[0] for t, p in prices.items()}
-        highs = {t: p[1] for t, p in prices.items()}
-        closes = {t: p[2] for t, p in prices.items()}
+        ohlc = {ticker: self._ohlc(values) for ticker, values in prices.items()}
+        lows = {ticker: values[1] for ticker, values in ohlc.items()}
+        highs = {ticker: values[2] for ticker, values in ohlc.items()}
+        closes = {ticker: values[3] for ticker, values in ohlc.items()}
+
+        self._track_addressed_bars(now, ohlc)
 
         cancel_pids = self.manager.track_bar(closes, dict(self._contracts))
         for pid in cancel_pids:
@@ -263,10 +464,14 @@ class JournalBroker(BrokerPort):
                 results.append(self.cancel_order(order.order_id, "risk_cap"))
 
         for pos in list(self.manager.positions.values()):
+            if pos.position_id in self._addressed_trades:
+                continue
             if pos.qty > 0 and pos.over_risk and pos.ticker in closes:
                 results.append(self.close_position(pos, closes[pos.ticker], now, "over_risk"))
 
         for pos in list(self.manager.positions.values()):
+            if pos.position_id in self._addressed_trades:
+                continue
             if pos.qty <= 0 or pos.ticker not in closes:
                 continue
             low, high = lows.get(pos.ticker, closes[pos.ticker]), highs.get(pos.ticker, closes[pos.ticker])
@@ -293,6 +498,120 @@ class JournalBroker(BrokerPort):
 
         self._update_floating(closes)
         return results
+
+    @staticmethod
+    def _ohlc(values: tuple[float, ...]) -> tuple[float, float, float, float]:
+        """Accept legacy (low, high, close) bars and explicit (open, low, high, close) bars."""
+        if len(values) == 3:
+            low, high, close = values
+            return close, low, high, close
+        if len(values) == 4:
+            return values  # type: ignore[return-value]
+        raise ValueError("bar must contain low/high/close or open/low/high/close")
+
+    def _track_addressed_bars(
+        self, now: datetime, ohlc: Mapping[str, tuple[float, float, float, float]]
+    ) -> None:
+        """Process each addressed trade at most once for a closed OHLC bar."""
+        active_tickers = {
+            ticker for ticker in ohlc
+            if (ticker, now) not in self._processed_addressed_bars
+        }
+        if not active_tickers:
+            return
+        self._processed_addressed_bars.update((ticker, now) for ticker in active_tickers)
+
+        due, pending = [], []
+        for scheduled in self._scheduled_actions:
+            trade = self._addressed_trades.get(scheduled.action.trade_id)
+            if trade is not None and trade.plan.instrument_id in active_tickers and scheduled.submitted_at < now:
+                due.append(scheduled)
+            else:
+                pending.append(scheduled)
+        self._scheduled_actions = pending
+
+        # A confirmed stop amendment is active at this bar's open, before its range.
+        for scheduled in due:
+            if isinstance(scheduled.action, MoveStop):
+                trade = self._addressed_trades[scheduled.action.trade_id]
+                self._execute_scheduled(trade, scheduled.action, now)
+
+        # Existing protection takes priority over targets and over a signal exit.
+        for trade in self._addressed_trades.values():
+            if trade.plan.instrument_id in active_tickers:
+                self._process_addressed_protection(trade, now, ohlc[trade.plan.instrument_id])
+
+        for scheduled in due:
+            action = scheduled.action
+            if isinstance(action, MoveStop):
+                continue
+            trade = self._addressed_trades.get(action.trade_id)
+            if trade is None or trade.plan.instrument_id not in active_tickers:
+                continue
+            open_price = Decimal(str(ohlc[trade.plan.instrument_id][0]))
+            if isinstance(action, (OpenTrade, AddToTrade)):
+                event = self._execute_scheduled(trade, action, now, open_price)
+                if event.status not in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
+                    continue
+                trade.opened_bar = now
+                # A newly filled entry may be stopped during its own bar, but its
+                # targets cannot use high/low that occurred before that fill.
+                self._process_addressed_stop(trade, now, ohlc[trade.plan.instrument_id])
+            elif isinstance(action, (CloseTrade, ReduceTrade)):
+                self._execute_scheduled(trade, action, now, open_price)
+
+    def _execute_scheduled(
+        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
+    ) -> ExecutionEvent:
+        if action.state_revision != trade.revision:
+            return self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
+        return self._execute_action(trade, action, now, fill_price)
+
+    def _process_addressed_protection(
+        self, trade: AddressedTrade, now: datetime, bar: tuple[float, float, float, float]) -> None:
+        position = self.manager.positions.get(trade.plan.trade_id)
+        if position is None or position.qty == 0 or trade.opened_bar == now:
+            return
+        if self._process_addressed_stop(trade, now, bar):
+            return
+        _, low, high, _ = bar
+        targets = sorted(
+            trade.plan.targets,
+            key=lambda target: target.price,
+            reverse=trade.plan.side == "SELL",
+        )
+        for target in targets:
+            if position.qty == 0:
+                return
+            reached = high >= float(target.price) if trade.plan.side == "BUY" else low <= float(target.price)
+            remaining = self._target_remaining(trade, target.target_id)
+            if reached and remaining > 0:
+                filled = min(remaining, position.qty)
+                position.reduce(filled)
+                trade.target_filled[target.target_id] += filled
+                trade.revision += 1
+                if position.qty == 0:
+                    self.manager.positions.pop(trade.plan.trade_id, None)
+                    trade.confirmed_stop = None
+
+    def _process_addressed_stop(self, trade: AddressedTrade, now: datetime, bar: tuple[float, float, float, float]) -> bool:
+        position = self.manager.positions.get(trade.plan.trade_id)
+        if position is None or position.qty == 0 or trade.confirmed_stop is None:
+            return False
+        open_price, low, high, _ = bar
+        stop = float(trade.confirmed_stop)
+        triggered = low <= stop if trade.plan.side == "BUY" else high >= stop
+        if not triggered:
+            return False
+        gap = open_price < stop if trade.plan.side == "BUY" else open_price > stop
+        price = Decimal(str(open_price if gap else stop))
+        quantity = position.qty
+        position.reduce(quantity)
+        self.manager.positions.pop(trade.plan.trade_id, None)
+        trade.confirmed_stop = None
+        trade.last_stop_fill = price
+        trade.revision += 1
+        return True
 
     def _update_floating(self, closes: Mapping[str, float]) -> None:
         floating = 0.0
@@ -365,33 +684,29 @@ class JournalBroker(BrokerPort):
         )
 
     def _reject(self, signal: Signal, reason: str, now: datetime) -> OrderResult:
+        display = self._display(signal.ticker)
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.CANCEL.value,
+            ts=format_dt(now),
+            order_id="",
             position_id=signal.position_id,
-            status="CANCELLED",
-            ts_order=format_dt(now),
-            date="",
+            contract=display,
             side=signal.side,
-            ts_entry="",
+            qty=str(signal.qty or 0),
+            price=_fmt(signal.entry_price),
+            stop=_fmt(signal.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(signal.risk_pct),
             risk_rub=_fmt(signal.risk_rub),
-            entry_price=_fmt(signal.entry_price),
-            stop_price=_fmt(signal.stop_price),
-            qty=str(signal.qty or 0),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract=signal.ticker,
+            go="",
             reason=reason,
             notes=_notes(signal.timeframe, source=signal.source),
         )
         self.journal.append(event)
-        self._emit("order", now, signal.position_id, f"Сделка {signal.side} {signal.ticker} отклонена ({reason})")
+        self._emit("order", now, signal.position_id, f"Сделка {signal.side} {display} отклонена ({reason})")
         return OrderResult(
             order_id=event.id,
             status=OrderStatus.CANCELLED,
@@ -402,62 +717,84 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason=reason,
-            message=f"Сделка {signal.side} {signal.ticker} отклонена ({reason})",
+            message=f"Сделка {signal.side} {display} отклонена ({reason})",
             ts_order=now,
         )
 
-    def _entry_row(self, order: Order, contract: ContractMeta, now: datetime) -> JournalEvent:
+    def _order_row(self, order: Order, contract: ContractMeta, now: datetime) -> JournalEvent:
+        """ЗАЯВКА: принятая, но не исполненная заявка (связь с ВХОД по order_id)."""
         return JournalEvent(
             id=order.order_id,
+            op=OpType.ORDER.value,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
             position_id=order.position_id,
-            status="NEW",
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(order.ticker),
             side=order.side,
-            ts_entry="",
+            qty=str(order.qty),
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(order.risk_pct),
             risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
-            qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step=_fmt(contract.price_step),
-            step_cost=_fmt(contract.step_cost),
-            go_buy=_fmt(contract.go_buy),
-            go_sell=_fmt(contract.go_sell),
-            contract=order.contract,
-            reason=order.source,
+            go=_fmt(self.manager.get_go(order.qty, contract, order.side)),
+            reason="",
             notes=_notes(order.timeframe, source=order.source),
         )
 
-    def _write_terminal(self, order: Order, reason: str, now: datetime, status: str = "CANCELLED") -> None:
-        event = JournalEvent(
+    def _fill_row(
+        self,
+        order: Order,
+        contract: ContractMeta,
+        now: datetime,
+        over_risk: bool = False,
+        op: str = OpType.ENTRY.value,
+    ) -> JournalEvent:
+        """Исполнение заявки: ВХОД для новой позиции, ДОБОР — для добора."""
+        return JournalEvent(
             id=self.journal.next_id,
+            op=op,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
             position_id=order.position_id,
-            status=status,
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(order.ticker),
             side=order.side,
-            ts_entry="",
+            qty=str(order.qty),
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
             deposit="",
             risk_pct=_fmt(order.risk_pct),
             risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
+            go=_fmt(self.manager.get_go(order.qty, contract, order.side)),
+            reason="",
+            notes=_notes(order.timeframe, over_risk=over_risk, source=order.source),
+        )
+
+    def _write_terminal(self, order: Order, reason: str, now: datetime) -> None:
+        notes = _notes(order.timeframe, extra="expired" if reason == "ttl" else "", source=order.source)
+        event = JournalEvent(
+            id=self.journal.next_id,
+            op=OpType.CANCEL.value,
+            ts=format_dt(now),
+            order_id=str(order.order_id),
+            position_id=order.position_id,
+            contract=self._display(order.ticker),
+            side=order.side,
             qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract=order.contract,
+            price=_fmt(order.limit_price),
+            stop=_fmt(order.stop_price),
+            pnl_part="",
+            fee="",
+            deposit="",
+            risk_pct=_fmt(order.risk_pct),
+            risk_rub=_fmt(order.risk_rub),
+            go="",
             reason=reason,
-            notes=_notes(order.timeframe, extra="expired" if status == "EXPIRED" else "", source=order.source),
+            notes=notes,
         )
         self.journal.append(event)
 
@@ -466,7 +803,7 @@ class JournalBroker(BrokerPort):
         if order is None:
             return self._noop_result("")
         order.status = OrderStatus.EXPIRED
-        self._write_terminal(order, "ttl", now, status="EXPIRED")
+        self._write_terminal(order, "ttl", now)
         self._orders.pop(order_id, None)
         self.manager.drop_order(order_id)
         self._emit("cancel", now, order.position_id, f"Заявка {order_id} истекла по TTL")
@@ -487,16 +824,17 @@ class JournalBroker(BrokerPort):
     def _execute_entry(self, order: Order, now: datetime) -> list[OrderResult]:
         contract = self._contracts.get(order.ticker)
         if contract is None:
-            return [self._noop_result(f"Нет метаданных контракта для {order.ticker}")]
+            return [self._noop_result(f"Нет метаданных контракта для {self._display(order.ticker)}")]
         order.status = OrderStatus.FILLED
         over_risk = self._position_over_limit(order.position_id, order.qty, order.limit_price, contract)
         pos = self.manager.positions.get(order.position_id)
+        is_add = pos is not None and pos.qty > 0
         if pos is None:
             pos = Position(
                 position_id=order.position_id,
                 ticker=order.ticker,
                 side=order.side,
-                qty=0,
+                qty=order.qty,
                 avg_price=order.limit_price,
                 stop_price=order.stop_price,
                 take_profit=order.take_profit,
@@ -504,40 +842,27 @@ class JournalBroker(BrokerPort):
                 timeframe=order.timeframe,
             )
             self.manager.positions[order.position_id] = pos
-        pos.average(order.limit_price, order.qty)
+        else:
+            pos.apply_fill(order.limit_price, order.qty)
         if over_risk:
             pos.mark_over_risk()
         pos.protective = self._protective_for(pos, now)
 
-        event = JournalEvent(
-            id=self.journal.next_id,
-            position_id=order.position_id,
-            status="FILLED",
-            ts_order=format_dt(now),
-            date="",
-            side=order.side,
-            ts_entry=format_dt(now),
-            deposit="",
-            risk_pct=_fmt(order.risk_pct),
-            risk_rub=_fmt(order.risk_rub),
-            entry_price=_fmt(order.limit_price),
-            stop_price=_fmt(order.stop_price),
-            qty=str(order.qty),
-            exit_price="",
-            pnl_rub="",
-            fee_rub="",
-            price_step=_fmt(contract.price_step),
-            step_cost=_fmt(contract.step_cost),
-            go_buy=_fmt(contract.go_buy),
-            go_sell=_fmt(contract.go_sell),
-            contract=order.contract,
-            reason=order.source,
-            notes=_notes(order.timeframe, over_risk=over_risk, source=order.source),
+        event = self._fill_row(
+            order,
+            contract,
+            now,
+            over_risk=over_risk,
+            op=OpType.ADD.value if is_add else OpType.ENTRY.value,
         )
         self.journal.append(event)
+        if is_add:
+            self._emit("add", now, order.position_id, f"Добор {order.side} {order.qty} {self._display(order.ticker)} по {order.limit_price}")
         self._orders.pop(order.order_id, None)
         self.manager.drop_order(order.order_id)
-        self._emit("fill", now, order.position_id, f"Вход {order.side} {order.qty} {order.ticker} по {order.limit_price}")
+        display = self._display(order.ticker)
+        if not is_add:
+            self._emit("fill", now, order.position_id, f"Вход {order.side} {order.qty} {display} по {order.limit_price}")
         if pos.protective is not None:
             self._emit("protective", now, order.position_id, f"Защитный стоп {order.stop_price} / ТП {order.take_profit} установлен")
         if over_risk:
@@ -553,7 +878,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason="over_risk" if over_risk else "",
-            message=f"Вход {order.side} {order.qty} {order.ticker} по {order.limit_price}",
+            message=f"Вход {order.side} {order.qty} {self._display(order.ticker)} по {order.limit_price}",
             ts_order=now,
         )
         results = [result]
@@ -575,42 +900,39 @@ class JournalBroker(BrokerPort):
         self.manager.account.realize(pnl)
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.EXIT.value if closed_qty >= pos.qty else OpType.TAKE.value,
+            ts=format_dt(now),
+            order_id="",
             position_id=pos.position_id,
-            status="FILLED",
-            ts_order=format_dt(now),
-            date="",
+            contract=self._display(pos.ticker),
             side="SELL" if pos.side == "BUY" else "BUY",
-            ts_entry="",
+            qty=str(closed_qty),
+            price=_fmt(exit_price),
+            stop="",
+            pnl_part=_fmt(pnl),
+            fee=_fmt(fee),
             deposit="",
             risk_pct="",
             risk_rub="",
-            entry_price="",
-            stop_price="",
-            qty=str(closed_qty),
-            exit_price=_fmt(exit_price),
-            pnl_rub=_fmt(pnl),
-            fee_rub=_fmt(fee),
-            price_step=_fmt(contract.price_step) if contract else "",
-            step_cost=_fmt(contract.step_cost) if contract else "",
-            go_buy=_fmt(contract.go_buy) if contract else "",
-            go_sell=_fmt(contract.go_sell) if contract else "",
-            contract=pos.ticker,
+            go="",
             reason=reason,
             notes=_notes(pos.timeframe),
         )
         self.journal.append(event)
-        self._emit("fill", now, pos.position_id, f"Закрытие {closed_qty} {pos.ticker} по {exit_price} (PnL {pnl:g})")
+        display = self._display(pos.ticker)
+        self._emit("fill", now, pos.position_id, f"Закрытие {closed_qty} {display} по {exit_price} (PnL {pnl:g})")
         if reason in ("protective", "over_risk", "signal", "reverse"):
             self._emit(
                 reason,
                 now,
                 pos.position_id,
-                f"Закрытие позиции {pos.ticker} {closed_qty} шт: PnL {pnl:g} руб",
+                f"Закрытие позиции {display} {closed_qty} шт: PnL {pnl:g} руб",
             )
         side = pos.side
-        pos.qty = 0
-        self.manager.positions.pop(pos.position_id, None)
-        self.manager.drop_order_stale(pos.position_id)
+        pos.reduce(closed_qty)
+        if pos.qty == 0:
+            self.manager.positions.pop(pos.position_id, None)
+            self.manager.drop_order_stale(pos.position_id)
         return OrderResult(
             order_id=event.id,
             status=OrderStatus.FILLED,
@@ -621,7 +943,7 @@ class JournalBroker(BrokerPort):
             stop_price=pos.stop_price,
             take_profit=pos.take_profit,
             reason=reason,
-            message=f"Закрытие {pos.ticker} по {exit_price}, PnL {pnl:g} руб",
+            message=f"Закрытие {display} по {exit_price}, PnL {pnl:g} руб",
             ts_order=now,
         )
 
@@ -635,42 +957,35 @@ class JournalBroker(BrokerPort):
     ) -> None:
         event = JournalEvent(
             id=self.journal.next_id,
+            op=OpType.SNAPSHOT.value,
+            ts=format_dt(now),
+            order_id="",
             position_id="",
-            status="CLEARING",
-            ts_order=format_dt(now),
-            date="",
+            contract="",
             side="",
-            ts_entry="",
+            qty=str(positions),
+            price="",
+            stop="",
+            pnl_part=_fmt(realized),
+            fee="",
             deposit=_fmt(balance),
             risk_pct=_fmt(max_risk_pct),
             risk_rub="",
-            entry_price="",
-            stop_price="",
-            qty=str(positions),
-            exit_price="",
-            pnl_rub=_fmt(realized),
-            fee_rub="",
-            price_step="",
-            step_cost="",
-            go_buy="",
-            go_sell="",
-            contract="",
+            go="",
             reason="clearing",
             notes=f"Клиринговый снимок: {positions} позиций",
         )
         self.journal.append(event)
 
-    def _restored(self, order: Order):
-        from src.trade_journal import RestoredOrder
-
-        return RestoredOrder(
+    def _pending(self, order: Order) -> PendingOrder:
+        return PendingOrder(
             order_id=order.order_id,
             position_id=order.position_id,
             ticker=order.ticker,
             side=order.side,
             qty=order.qty,
             limit_price=order.limit_price,
-            stop_price=order.stop_price or 0.0,
+            stop_price=order.stop_price,
             take_profit=order.take_profit,
             timeframe=order.timeframe,
             ts_order=order.ts_order,
@@ -703,28 +1018,110 @@ def _fmt(value: Optional[float]) -> str:
     return "" if value is None else repr(round(value, 6))
 
 
+_OP_BY_LEGACY_STATUS: dict[str, tuple[str, ...]] = {
+    "NEW": (OpType.ORDER.value,),
+    "FILLED": (OpType.ENTRY.value, OpType.ADD.value, OpType.TAKE.value, OpType.EXIT.value),
+    "CLEARING": (OpType.SNAPSHOT.value,),
+    "CANCELLED": (OpType.CANCEL.value,),
+}
+
+
+def filter_rows(journal: TradeJournal, op_or_status: str) -> list[JournalEvent]:
+    """Выборка строк журнала по операции («ВХОД», «ОТМЕНА»…) или легаси-статусу (NEW/FILLED/…)."""
+    ops = _OP_BY_LEGACY_STATUS.get(op_or_status, (op_or_status,))
+    return [e for e in journal.events() if e.op in ops]
+
+
+def count_status_rows(journal: TradeJournal, op_or_status: str) -> int:
+    return len(filter_rows(journal, op_or_status))
+
+
+def _migrate_legacy_journal(path: Path) -> None:
+    """При наличии легаси-журнала (ограниченная схема) — резервная копия .bak.
+
+    Старые строки не переносятся: журнал начинается с чистого файла, а состояние
+    восстанавливается из резервной копии вручную при необходимости.
+    """
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            header = next(csv.reader(fh), [])
+    except Exception:  # битый файл — не мешаем старту
+        log.warning("Легаси-журнал %s не читается, пропускаю миграцию", path)
+        return
+    if header == COLUMNS_RU:
+        return
+    backup = path.with_name(path.name + ".bak")
+    shutil.copy2(path, backup)
+    log.warning("Легаси-журнал %s сохранён как %s", path, backup)
+
+
 def create_journal_broker(
     journal_file: str,
     initial_deposit: float,
     max_risk_pct: float,
     clearing_times_msk: list[str],
+    positions_file: Optional[str] = None,
+    contract_names: Optional[Mapping[str, str]] = None,
 ) -> JournalBroker:
     """Сборка симулятора из конфига: журнал + восстановление состояния портфеля."""
-    from pathlib import Path
-
     from src.config_loader import app_dir
     from src.portfolio import PositionManager
 
     path = Path(app_dir()) / journal_file
-    journal = TradeJournal.created_on_init(path)
+    _migrate_legacy_journal(path)
+    positions_path = Path(app_dir()) / positions_file if positions_file else None
+    journal = TradeJournal.created_on_init(path, positions_path=positions_path)
     state = journal.replay(initial_deposit=initial_deposit)
-    manager = PositionManager(state, initial_deposit, max_risk_pct)
-    return JournalBroker(journal, manager, clearing_times_msk)
+    positions = [
+        Position(
+            position_id=pos.position_id,
+            ticker=pos.ticker,
+            side=pos.side,
+            qty=pos.qty,
+            avg_price=pos.avg_price,
+            stop_price=pos.stop_price,
+            take_profit=pos.take_profit,
+            ts_entry=pos.ts_entry,
+            over_risk=pos.over_risk,
+            timeframe=pos.timeframe,
+        )
+        for pos in state.positions.values()
+    ]
+    pending = [
+        PendingOrder(
+            order_id=order.order_id,
+            position_id=order.position_id,
+            ticker=order.ticker,
+            side=order.side,
+            qty=order.qty,
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+            take_profit=order.take_profit,
+            timeframe=order.timeframe,
+            ts_order=order.ts_order,
+            risk_pct=order.risk_pct,
+            risk_rub=order.risk_rub,
+            ttl=order.ttl,
+        )
+        for order in state.orders.values()
+    ]
+    manager = PositionManager(initial_deposit, max_risk_pct, realized=state.realized, positions=positions, pending=pending)
+    return JournalBroker(journal, manager, clearing_times_msk, contract_names=contract_names)
 
 
-def filter_rows(journal: TradeJournal, status: str) -> list[JournalEvent]:
-    return [e for e in journal.events() if e.status == status]
+def create_addressable_journal_broker(
+    initial_deposit: float,
+    clearing_times_msk: list[str],
+    contract_names: Optional[Mapping[str, str]] = None,
+) -> JournalBroker:
+    """Create the addressed simulator without reading or creating legacy CSV state."""
+    from src.portfolio import PositionManager
 
-
-def count_status_rows(journal: TradeJournal, status: str) -> int:
-    return len(filter_rows(journal, status))
+    return JournalBroker(
+        None,
+        PositionManager(initial_deposit, 0),
+        clearing_times_msk,
+        contract_names=contract_names,
+    )

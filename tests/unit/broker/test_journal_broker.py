@@ -4,7 +4,7 @@ import pytest
 
 from src.broker import JournalBroker
 from src.portfolio import ContractMeta, OrderStatus, PositionManager, Signal
-from src.trade_journal import TradeJournal
+from src.trade_journal import OpType, TradeJournal
 
 UTC = timezone.utc
 
@@ -32,7 +32,7 @@ def _signal(**kw):
 
 def _broker(tmp_path, initial=100000, max_risk=2.0):
     journal = TradeJournal.created_on_init(tmp_path / "j.csv")
-    mgr = PositionManager(None, initial_deposit=initial, max_risk_pct=max_risk)
+    mgr = PositionManager(initial_deposit=initial, max_risk_pct=max_risk)
     return JournalBroker(journal, mgr, ["14:05", "19:00"])
 
 
@@ -52,16 +52,19 @@ class TestPlaceOrder:
         assert res.position_id == "NG-123"
         assert len(broker.manager.pending) == 1
         events = broker.journal.events()
-        assert events[0].status == "NEW"
-        assert events[0].entry_price == "100.0"
-        assert events[0].reason == "ma [basic_levels]"
+        assert events[0].op == OpType.ORDER.value
+        assert events[0].price == "100.0"
+        assert events[0].contract == "контракт не указан"
         assert "tf=1h" in events[0].notes
+        assert "source=ma [basic_levels]" in events[0].notes
 
     def test_rejects_without_quantity(self, tmp_path):
         broker = _broker(tmp_path)
         res = broker.place_order(_signal(qty=0), NG_META, NOW)
         assert res.status is OrderStatus.CANCELLED
         assert res.reason == "qty-negative"
+        rows = broker.journal.events()
+        assert rows and rows[-1].op == OpType.CANCEL.value and rows[-1].reason == "qty-negative"
 
     def test_rejects_when_position_open(self, tmp_path):
         broker = _broker(tmp_path)
@@ -89,9 +92,9 @@ class TestEntryFill:
         assert pos.avg_price == 100.0
         assert pos.protective is not None
         assert any(r.status is OrderStatus.FILLED for r in results)
-        filled = broker.journal.events()
-        statuses = [e.status for e in filled]
-        assert statuses == ["NEW", "FILLED"]
+        rows = broker.journal.events()
+        ops = [e.op for e in rows]
+        assert ops == [OpType.ORDER.value, OpType.ENTRY.value]
 
     def test_buy_does_not_fill_when_not_reached(self, tmp_path):
         broker = _broker(tmp_path)
@@ -118,11 +121,14 @@ class TestProtective:
         closes = [r for r in results if r.status is OrderStatus.FILLED]
         assert closes and closes[0].reason == "protective"
         rows = broker.journal.events()
-        close_row = [e for e in rows if e.status == "FILLED" and e.side == "SELL"]
+        close_row = [e for e in rows if e.op == OpType.EXIT.value and e.side == "SELL"]
         assert close_row and close_row[0].reason == "protective"
-        assert close_row[0].exit_price == "98.0"
+        assert close_row[0].price == "98.0"
         # qty=10, pnl = (98-100)/1*100*10 = -2000, fee = 2.0, total = -2002
         assert broker.manager.account.realized_total == pytest.approx(-2002.0)
+        # закрытие несёт чистый PnL и комиссию
+        assert float(close_row[0].pnl_part) == pytest.approx(-2002.0)
+        assert float(close_row[0].fee) == pytest.approx(2.0)
 
     def test_take_profit_triggers_close(self, tmp_path):
         broker = _broker(tmp_path)
@@ -140,7 +146,7 @@ class TestProtective:
         broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": NG_META})
         # теперь bar: low=97 (стоп), high=106 (тейк) → стоп должен отработать
         broker.track_bar(NOW + timedelta(minutes=2), _bars({"NG": (97.0, 106.0, 98.0)}), {"NG": NG_META})
-        closes = [e for e in broker.journal.events() if e.status == "FILLED" and e.side == "SELL"]
+        closes = [e for e in broker.journal.events() if e.op == OpType.EXIT.value and e.side == "SELL"]
         assert closes[0].reason == "protective"
 
 
@@ -152,7 +158,7 @@ class TestTtl:
         assert any(r.status is OrderStatus.EXPIRED for r in results)
         assert len(broker.manager.pending) == 0
         rows = broker.journal.events()
-        assert rows[-1].status == "EXPIRED"
+        assert rows[-1].op == OpType.CANCEL.value
         assert rows[-1].reason == "ttl"
 
     def test_long_timeframe_lives_to_next_clearing(self, tmp_path):
@@ -175,7 +181,7 @@ class TestClearing:
         cancelled = [r for r in res if r.status is OrderStatus.CANCELLED]
         assert cancelled and cancelled[0].reason == "clearing"
         rows = broker.journal.events()
-        snapshot = [e for e in rows if e.status == "CLEARING"]
+        snapshot = [e for e in rows if e.op == OpType.SNAPSHOT.value]
         assert snapshot and snapshot[0].deposit == "100000.0"
         assert snapshot[0].reason == "clearing"
         assert broker.manager.pending == {}
@@ -188,7 +194,7 @@ class TestClearing:
         pos = next(iter(broker.manager.positions.values()))
         assert pos.qty == 10
         assert pos.protective is not None
-        snapshot = [e for e in broker.journal.events() if e.status == "CLEARING"]
+        snapshot = [e for e in broker.journal.events() if e.op == OpType.SNAPSHOT.value]
         assert snapshot and snapshot[0].qty == "1"
 
     def test_clearing_if_due(self, tmp_path):
@@ -207,9 +213,9 @@ class TestOverRiskAndFifo:
         results = broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": self.LOW_GO_META})
         assert broker.manager.positions == {}  # контр-сделка закрыла позицию
         rows = broker.journal.events()
-        entry = [e for e in rows if e.status == "FILLED" and e.side == "BUY"][0]
+        entry = [e for e in rows if e.op == OpType.ENTRY.value and e.side == "BUY"][0]
         assert "over_risk=true" in entry.notes
-        close = [e for e in rows if e.status == "FILLED" and e.side == "SELL"][0]
+        close = [e for e in rows if e.op == OpType.EXIT.value and e.side == "SELL"][0]
         assert close.reason == "over_risk"
         types = {e.type for e in broker.drain_events()}
         assert "over_risk" in types
@@ -234,9 +240,7 @@ class TestOverRiskAndFifo:
         assert cancelled and cancelled[0].reason == "risk_cap"
         assert broker.manager.positions == {}  # NG закрыт контр-сделкой
         rows = broker.journal.events()
-        assert any(e.status == "CANCELLED" and e.reason == "risk_cap" for e in rows)
-        rows = broker.journal.events()
-        assert any(e.status == "CANCELLED" and e.reason == "risk_cap" for e in rows)
+        assert any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
 
 
 class TestCancelOrder:
@@ -247,4 +251,65 @@ class TestCancelOrder:
         assert cancelled.status is OrderStatus.CANCELLED
         assert broker.manager.pending == {}
         rows = broker.journal.events()
-        assert any(e.status == "CANCELLED" and e.reason == "risk_cap" for e in rows)
+        assert any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+
+
+class TestMigration:
+    def test_legacy_journal_backed_up_and_fresh_files_created(self, tmp_path, monkeypatch):
+        """Легаси-журнал (ограниченная схема) → .bak, стартуем с чистых journal/positions."""
+        legacy = tmp_path / "trade_journal.csv"
+        legacy.write_text("id,date,status,ts_order,entry_price\n1,NEW,X,\n", encoding="utf-8")
+        monkeypatch.setattr("src.config_loader.app_dir", lambda: tmp_path)
+
+        from src.broker import create_journal_broker
+
+        broker = create_journal_broker("trade_journal.csv", 100000, 2.0, ["14:05", "19:00"])
+        assert (tmp_path / "trade_journal.csv.bak").exists()
+        assert broker.journal.events() == []
+        assert broker.journal.positions_path == tmp_path / "trade_journal_positions.csv"
+        assert broker.journal.positions_path.exists()
+
+    def test_new_schema_journal_not_backed_up(self, tmp_path, monkeypatch):
+        """Если журнал уже новой схемы — резервная копия не создаётся."""
+        from src.trade_journal import COLUMNS_RU
+
+        fresh = tmp_path / "j.csv"
+        fresh.write_text(",".join(COLUMNS_RU) + "\n", encoding="utf-8")
+        monkeypatch.setattr("src.config_loader.app_dir", lambda: tmp_path)
+
+        from src.broker import create_journal_broker
+
+        broker = create_journal_broker("j.csv", 100000, 2.0, ["14:05", "19:00"])
+        assert not (tmp_path / "j.csv.bak").exists()
+        assert broker.journal.events() == []
+
+
+class TestDisplayNames:
+    NAMES = {"NG": "NG-10.26", "BR": "BR-7.12"}
+
+    def _broker_with_names(self, tmp_path):
+        journal = TradeJournal.created_on_init(tmp_path / "j.csv")
+        mgr = PositionManager(initial_deposit=100000, max_risk_pct=2.0)
+        return JournalBroker(journal, mgr, ["14:05", "19:00"], contract_names=self.NAMES)
+
+    def test_rows_use_short_names(self, tmp_path):
+        broker = self._broker_with_names(tmp_path)
+        broker.place_order(_signal(), NG_META, NOW)
+        broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": NG_META})
+        row = broker.journal.events()[0]
+        assert row.contract == "NG-10.26" and row.op == OpType.ORDER.value
+
+    def test_messages_use_short_names(self, tmp_path):
+        broker = self._broker_with_names(tmp_path)
+        broker.place_order(_signal(), NG_META, NOW)
+        broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": NG_META})
+        messages = " | ".join(e.message for e in broker.drain_events())
+        assert "NG-10.26" in messages
+        assert "NG " not in messages.replace("NG-10.26", "")
+
+    def test_name_replacement_after_contract_missing(self, tmp_path):
+        """A raw exchange ticker is never shown when no short name is known."""
+        broker = _broker(tmp_path)
+        broker.place_order(_signal(), NG_META, NOW)
+        row = broker.journal.events()[0]
+        assert row.contract == "контракт не указан"

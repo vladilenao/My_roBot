@@ -56,11 +56,15 @@ class MacdRsiStochStrategy:
     def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision:
         sums = get_last_signals(ta, self.STRATEGY_WINDOW, self._config.signal_columns)
         current_price = float(ta["close"].iloc[-1])
+        bar_time = pd.Timestamp(ta["datetime"].iloc[-1]) if "datetime" in ta else None
 
         if all(s > 0 for s in sums):
             return Decision(
                 SignalType.BUY,
                 current_price,
+                bar_time=bar_time,
+                event_id=f"{self.NAME}:{timeframe or ''}:{bar_time.isoformat() if bar_time is not None else len(ta)}:BUY",
+                available_at=bar_time,
                 timeframe=timeframe,
                 strategy_name=self.NAME,
             )
@@ -68,11 +72,14 @@ class MacdRsiStochStrategy:
             return Decision(
                 SignalType.SELL,
                 current_price,
+                bar_time=bar_time,
+                event_id=f"{self.NAME}:{timeframe or ''}:{bar_time.isoformat() if bar_time is not None else len(ta)}:SELL",
+                available_at=bar_time,
                 timeframe=timeframe,
                 strategy_name=self.NAME,
             )
         return Decision(
-            SignalType.HOLD, current_price, timeframe=timeframe, strategy_name=self.NAME
+            SignalType.HOLD, current_price, bar_time=bar_time, timeframe=timeframe, strategy_name=self.NAME
         )
 
     def required_history(self) -> int:

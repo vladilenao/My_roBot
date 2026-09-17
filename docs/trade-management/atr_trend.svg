@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="460" viewBox="0 0 860 460" role="img" aria-labelledby="title desc">
+<title id="title">atr_trend — активный ATR-stop по времени</title><desc id="desc">Вход100 стоп96; после цели104 активны стопы99.5,101.25,103.125. На пятом баре остаток закрывается по103.125. ПериодATR2 выбран для короткого численного примера.</desc>
+<rect width="860" height="460" fill="white"/>
+<g font-family="sans-serif" font-size="13" fill="#172033">
+<text x="55" y="25" font-size="19">atr_trend · синтетический LONG · NG-10.26</text>
+<path d="M80 60V380H650" stroke="#64748b" fill="none"/>
+<path d="M80 100H650 M80 180H650 M80 260H650 M80 340H650" stroke="#e2e8f0" fill="none"/>
+<text x="35" y="104">108</text><text x="35" y="184">104</text><text x="35" y="264">100</text><text x="42" y="344">96</text><text x="20" y="53">Цена</text>
+<path d="M80 180H280" stroke="#15803d" stroke-width="2" stroke-dasharray="7 5" fill="none"/>
+<path d="M80 340H380V270H480V235H580V197.5H615" stroke="#dc2626" stroke-width="3" fill="none"/>
+<polyline points="80,260 180,220 280,180 380,140 480,100 580,200" stroke="#2563eb" stroke-width="3" fill="none"/>
+<path d="M180 200V260 M280 160V220 M380 120V180 M480 80V140 M580 100V220" stroke="#2563eb" opacity="0.4" stroke-width="6"/>
+<circle cx="80" cy="260" r="5" fill="#2563eb"/><circle cx="280" cy="180" r="5" fill="#15803d"/><circle cx="580" cy="197.5" r="6" fill="#dc2626"/>
+<text x="88" y="284">Вход 2 @100</text><text x="237" y="163">TP1 @104</text><text x="387" y="295" fill="#dc2626">99.5</text><text x="483" y="257" fill="#dc2626">101.25</text><text x="595" y="222" fill="#dc2626">Стоп @103.125</text>
+<g text-anchor="middle"><text x="80" y="400">0</text><text x="180" y="400">1</text><text x="280" y="400">2</text><text x="380" y="400">3</text><text x="480" y="400">4</text><text x="580" y="400">5</text></g>
+<text x="590" y="420">Бар t →</text><text x="680" y="85" fill="#2563eb">━ Close / high-low</text><text x="680" y="110" fill="#dc2626">━ Активный стоп</text><text x="680" y="135" fill="#15803d">┄ Первая цель</text><text x="55" y="445">ATR(n=2), seed=2, k=2 · новый стоп действует со следующего бара · остаток без TP2</text>
+</g></svg>

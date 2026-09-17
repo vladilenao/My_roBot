@@ -5,7 +5,9 @@ from src.market_context import (
 )
 
 from src import __version__
-from src.decision import RiskManager, SignalFilter
+from decimal import Decimal
+
+from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
     ACTIVE_TIMEFRAMES,
@@ -26,9 +28,15 @@ from src.config import (
     LOGGING_BACKUP_COUNT,
     CLEARING_TIMES,
     INITIAL_DEPOSIT,
+    DATABASE_FILE,
     JOURNAL_FILE,
-    MAX_RISK_PCT,
+    POSITIONS_FILE,
+    RISK_LIMITS,
+    AUDIT_FILE,
+    AUDIT_MAX_BYTES,
+    AUDIT_BACKUP_COUNT,
     trading_enabled,
+    app_dir,
 )
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
@@ -56,7 +64,7 @@ def main():
     instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
     notifier = get_notifier()
     timeline = MultiTimeframeScheduler(
-        timeframes=sorted(ACTIVE_TIMEFRAMES), sleep_secs=SLEEP_SECONDS
+        timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS
     )
     data_cache = MarketDataCache(
         loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
@@ -67,7 +75,7 @@ def main():
         provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
     )
 
-    execution, post_tick = _build_execution(instruments, notifier, data_cache)
+    runtime = _build_runtime(instruments, notifier, data_cache)
 
     TradingBot(
         instruments=instruments,
@@ -75,7 +83,7 @@ def main():
         strategy_map=_strategy_map(),
         data_cache=data_cache,
         timeline=timeline,
-        execution=execution,
+        execution=runtime.execution,
         share_strategies=SHARE_STRATEGIES,
         future_strategies=FUTURE_STRATEGIES,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
@@ -87,69 +95,115 @@ def main():
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        risk_manager=RiskManager(),
-        post_tick=post_tick,
+        risk_manager=runtime.risk_manager,
+        post_tick=runtime.post_tick,
+        trade_manager=runtime.trade_manager,
     ).run()
 
 
-def _build_execution(instruments, notifier, data_cache):
-    """Выбор порта исполнения: имитация через журнал сделок или NotifyOnly.
+class _Runtime:
+    def __init__(self, execution, post_tick=None, trade_manager=None, risk_manager=None) -> None:
+        self.execution = execution
+        self.post_tick = post_tick
+        self.trade_manager = trade_manager
+        self.risk_manager = risk_manager
 
-    Торговый режим активен при наличии секции `[trading]` в конфиге; метаданные
-    контрактов для расчёта маржи/объёма подгружаются из API Тильды (если есть
-    токен), иначе — пустой кэш, и исполнение планово отклоняет входы с причиной
-    `no-contract-meta`.
+
+def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
+    """Compose notification-only or SQLite-backed simulated runtime services.
+
+    Neither mode constructs an exchange adapter. The only broker selected here is
+    the addressed candle simulator, and durable trade state is restored from
+    SQLite rather than either legacy CSV projection.
     """
     if not trading_enabled():
         log.info("Торговый режим выключен — NotifyOnly.")
-        return NotifyOnlyExecutionPort(notifier), None
+        return _Runtime(NotifyOnlyExecutionPort(notifier))
 
-    from datetime import UTC, datetime
-
-    from src.broker import create_journal_broker
-    from src.broker.exec_adapter import BrokerExecutionAdapter
+    from src.broker import create_addressable_journal_broker
+    from src.portfolio import PortfolioRiskManager
+    from src.trade_journal.storage import Storage
+    from src.trade_management.manager import TradeManager
 
     try:
-        broker = create_journal_broker(
-            JOURNAL_FILE, INITIAL_DEPOSIT, MAX_RISK_PCT, CLEARING_TIMES
+        storage = Storage(
+            app_dir() / DATABASE_FILE,
+            journal_path=app_dir() / JOURNAL_FILE,
+            positions_path=app_dir() / POSITIONS_FILE,
+            audit_path=app_dir() / AUDIT_FILE,
+            audit_max_bytes=AUDIT_MAX_BYTES,
+            audit_backup_count=AUDIT_BACKUP_COUNT,
+        )
+        broker = create_addressable_journal_broker(
+            INITIAL_DEPOSIT,
+            CLEARING_TIMES,
+            contract_names=_instrument_names(instruments),
         )
     except Exception as exc:
-        log.warning("Не удалось поднять журнал сделок (%s) — NotifyOnly.", exc)
-        return NotifyOnlyExecutionPort(notifier), None
+        log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
+        return _Runtime(NotifyOnlyExecutionPort(notifier))
 
-    from src.execution import BrokerExecutionPort
-
-    adapter = BrokerExecutionAdapter(broker, broker.manager)
+    trade_manager = TradeManager(
+        storage,
+        broker,
+        initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+    )
+    trade_manager.restore()
+    risk_manager = PortfolioRiskManager()
+    # Validate the configured limits while building the runtime. Their pure
+    # calculations are consumed by the admission layer as it creates plans.
+    _risk_limits()
     contracts = _load_contracts_metadata(instruments)
-    adapter.set_contracts(contracts)
+    broker.set_contracts(contracts)
+    broker.set_names(_instrument_names(instruments))
     print_contract_metadata(contracts)
 
     def on_bar(ready_tfs: set[str]) -> None:
         try:
-            now = datetime.now(UTC).replace(microsecond=0)
-            broker.run_clearing_if_due(now)
             prices = {}
+            bar_times = []
             for instrument in instruments:
-                for tf in ready_tfs:
-                    try:
-                        frame = data_cache.frame_for(instrument, tf)
-                    except Exception:
-                        continue
-                    if frame.empty:
-                        continue
-                    prices[instrument.ticker] = (
-                        float(frame["low"].iloc[-1]),
-                        float(frame["high"].iloc[-1]),
-                        float(frame["close"].iloc[-1]),
-                    )
+                try:
+                    frame = data_cache.frame_for(instrument, "1m")
+                except Exception:
+                    continue
+                if frame.empty:
+                    continue
+                bar_time = frame["datetime"].iloc[-1]
+                if hasattr(bar_time, "to_pydatetime"):
+                    bar_time = bar_time.to_pydatetime()
+                bar_times.append(bar_time)
+                prices[instrument.ticker] = (
+                    float(frame["open"].iloc[-1]),
+                    float(frame["low"].iloc[-1]),
+                    float(frame["high"].iloc[-1]),
+                    float(frame["close"].iloc[-1]),
+                )
             if prices:
-                broker.track_bar(now, prices, adapter._contracts)
+                broker.track_bar(max(bar_times), prices, contracts)
             for event in broker.drain_events():
                 notifier.notify_event(event.type, event.position_id, event.message)
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 
-    return BrokerExecutionPort(adapter, notifier), on_bar
+    return _Runtime(
+        NotifyOnlyExecutionPort(notifier),
+        post_tick=on_bar,
+        trade_manager=trade_manager,
+        risk_manager=risk_manager,
+    )
+
+
+def _risk_limits():
+    """Build typed portfolio limits from the validated configuration values."""
+    from src.portfolio import RiskLimits
+
+    return RiskLimits(
+        per_trade=Decimal(str(RISK_LIMITS["trade_pct"])),
+        per_instrument=Decimal(str(RISK_LIMITS["instrument_pct"])),
+        per_group={key: Decimal(str(value)) for key, value in RISK_LIMITS.get("groups", {}).items()},
+        portfolio=Decimal(str(RISK_LIMITS["portfolio_pct"])),
+    )
 
 
 def _instrument_ticker(instrument) -> str | None:
@@ -157,6 +211,21 @@ def _instrument_ticker(instrument) -> str | None:
     if isinstance(instrument, (tuple, list)):
         return str(instrument[1]) if len(instrument) > 1 else str(instrument[0])
     return getattr(instrument, "ticker", None)
+
+
+def _instrument_names(instruments) -> dict[str, str]:
+    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов."""
+    names: dict[str, str] = {}
+    for instrument in instruments:
+        ticker = _instrument_ticker(instrument)
+        if not ticker:
+            continue
+        if isinstance(instrument, (tuple, list)):
+            short = instrument[3] if len(instrument) > 3 else None
+        else:
+            short = getattr(instrument, "short_name", None) or getattr(instrument, "label", None)
+        names[ticker] = short or ticker
+    return names
 
 
 def _load_contracts_metadata(instruments):

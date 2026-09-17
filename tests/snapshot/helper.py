@@ -42,7 +42,7 @@ STRATEGY_COLUMNS = {
         "float": ["price"],
     },
     "ma_cloud_rsi_macd": {
-        "event": ["datetime", "signal", "price", "action", "exit_reason"],
+        "event": ["datetime", "signal", "price"],
         "float": ["price"],
     },
 }
@@ -144,8 +144,8 @@ def _ma_cloud_rsi_macd_expected_events(
 ) -> pd.DataFrame:
     """События стратегии MA Cloud RSI MACD (эталон snapshot-тестов).
 
-    Стратегия держит внутреннее состояние (pending-сигналы, контракты),
-    поэтому события считает сам боевой метод `expected_events()` методом
+    Стратегия держит pending-подтверждения, поэтому события считает сам
+    боевой метод `expected_events()` методом
     накопительного реплея `decide()` (та же семантика, что в боевом цикле).
     """
     from src.strategies import get_strategy

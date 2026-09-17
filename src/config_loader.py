@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tomllib
+from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -55,12 +56,21 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "level": "logging_level",
         "max_bytes": "logging_max_bytes",
         "backup_count": "logging_backup_count",
+        "audit_file": "audit_file",
+        "audit_max_bytes": "audit_max_bytes",
+        "audit_backup_count": "audit_backup_count",
     },
     "trading": {
         "initial_deposit": "initial_deposit",
         "max_risk_pct": "max_risk_pct",
         "journal_file": "journal_file",
+        "positions_file": "positions_file",
         "clearing_times": "clearing_times",
+        "database_file": "database_file",
+        "risk_limits": "risk_limits",
+    },
+    "trade_management": {
+        "profiles": "trade_management_profiles",
     },
 }
 
@@ -84,15 +94,29 @@ _EXPECTED_TYPES: dict[str, type] = {
     "initial_deposit": int,
     "max_risk_pct": float,
     "journal_file": str,
+    "positions_file": str,
     "clearing_times": list,
+    "database_file": str,
+    "audit_file": str,
+    "audit_max_bytes": int,
+    "audit_backup_count": int,
+    "risk_limits": dict,
+    "trade_management_profiles": dict,
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 
-# Таблица тикера в [strategies.*]: гибридный массив `strategies` (строка с именем
-# стратегии | инлайн-таблица {name, filter, tf}) + опциональный базовый `timeframe`.
+# Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
-_STRATEGY_ENTRY_KEYS = {"name", "filter", "tf"}
+_STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority"}
+_PROFILE_KEYS = {
+    "levels_rr": {"type", "buffer_ticks", "target_R", "shares", "max_adds", "add_fraction"},
+    "atr_trend": {"type", "atr_period", "initial_k", "trail_k", "tp1_R", "tp1_share", "max_adds", "add_fraction", "advance_R"},
+    "ma_cloud": {"type", "ma_fast_period", "ma_slow_period", "buffer_ticks", "max_adds", "add_fraction"},
+    "pattern_targets": {"type", "buffer_ticks", "fractions_to_D", "shares", "max_adds", "add_fraction"},
+}
+_RISK_LIMIT_KEYS = {"trade_pct", "instrument_pct", "portfolio_pct", "groups", "max_qty", "commission", "slippage"}
+_PATTERN_STRATEGIES = {"harmonic_abcd"}
 
 
 class ConfigError(RuntimeError):
@@ -121,18 +145,19 @@ def _type_name(expected: type) -> str:
     )
 
 
+def derived_positions_file(journal_file: str) -> str:
+    """Имя файла карточек по умолчанию: суффикс `_positions` перед расширением."""
+    path = Path(journal_file)
+    return f"{path.stem}_positions{path.suffix}"
+
+
 def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
-    """Проверка одного элемента гибридного массива `strategies` таблицы тикера."""
+    """Проверка одной явной привязки стратегии."""
     if isinstance(item, str):
-        if not item:
-            raise ConfigError(
-                f"{path}: пустое имя стратегии в привязке для {ticker!r}"
-            )
-        return
+        raise ConfigError(f"{path}: привязка стратегии для {ticker!r} должна быть инлайн-таблицей с id и management")
     if not isinstance(item, dict):
         raise ConfigError(
-            f"{path}: элемент strategies для {ticker!r} должен быть строкой "
-            f"или инлайн-таблицей {{name, filter}}, получено {type(item).__name__}"
+            f"{path}: элемент strategies для {ticker!r} должен быть инлайн-таблицей, получено {type(item).__name__}"
         )
     unknown = set(item) - _STRATEGY_ENTRY_KEYS
     if unknown:
@@ -140,11 +165,14 @@ def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
             f"{path}: привязка стратегии для {ticker!r}: незнакомые ключи "
             f"{sorted(unknown)}; допустимые: {sorted(_STRATEGY_ENTRY_KEYS)}"
         )
-    name = item.get("name")
-    if not isinstance(name, str) or not name:
+    for required in ("id", "name", "management"):
+        if not isinstance(item.get(required), str) or not item[required]:
+            raise ConfigError(
+                f"{path}: привязка стратегии для {ticker!r} требует непустой строковый ключ {required!r}"
+            )
+    if "priority" in item and (not isinstance(item["priority"], int) or isinstance(item["priority"], bool)):
         raise ConfigError(
-            f"{path}: привязка стратегии для {ticker!r} требует непустой "
-            f"строковый ключ 'name'"
+            f"{path}: привязка стратегии для {ticker!r}: ключ 'priority' должен быть целым числом"
         )
     if "filter" in item and not isinstance(item["filter"], str):
         raise ConfigError(
@@ -198,6 +226,101 @@ def _validate_strategies(value: dict, key: str, path: Path) -> dict[str, dict]:
     return unwrapped
 
 
+def _finite_number(value: Any, key: str, path: Path, *, positive: bool = False, non_negative: bool = False) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        raise ConfigError(f"{path}: {key} должен быть конечным числом")
+    if positive and value <= 0:
+        raise ConfigError(f"{path}: {key} должен быть > 0")
+    if non_negative and value < 0:
+        raise ConfigError(f"{path}: {key} должен быть >= 0")
+
+
+def _validate_shares(value: Any, key: str, path: Path, count: int | None = None) -> None:
+    if not isinstance(value, list) or not value or (count is not None and len(value) != count):
+        raise ConfigError(f"{path}: {key} должен быть непустым списком корректной длины")
+    for share in value:
+        _finite_number(share, key, path, positive=True)
+        if share > 1:
+            raise ConfigError(f"{path}: {key} должен содержать доли в (0, 1]")
+    if sum(value) > 1:
+        raise ConfigError(f"{path}: {key} не должен давать сумму больше 1")
+
+
+def _validate_profile_parameters(name: str, value: dict[str, Any], path: Path) -> None:
+    allowed = _PROFILE_KEYS.get(name)
+    if allowed is None:
+        raise ConfigError(f"{path}: неизвестный профиль управления {name!r}")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ConfigError(f"{path}: [trade_management.profiles.{name}] незнакомые ключи {sorted(unknown)}")
+    if value.get("type") != name:
+        raise ConfigError(f"{path}: [trade_management.profiles.{name}] ключ 'type' должен быть {name!r}")
+    for key in ("buffer_ticks", "max_adds", "atr_period", "ma_fast_period", "ma_slow_period"):
+        if key in value and (isinstance(value[key], bool) or not isinstance(value[key], int) or value[key] < (1 if key.endswith("period") else 0)):
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] {key} должен быть корректным целым числом")
+    for key in ("initial_k", "trail_k", "tp1_R", "add_fraction", "advance_R", "tp1_share"):
+        if key in value:
+            _finite_number(value[key], f"[trade_management.profiles.{name}] {key}", path, positive=True)
+            if key.endswith("share") or key == "add_fraction":
+                if value[key] > 1:
+                    raise ConfigError(f"{path}: [trade_management.profiles.{name}] {key} должен быть в (0, 1]")
+    if name == "levels_rr":
+        targets = value.get("target_R")
+        if not isinstance(targets, list) or not targets:
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] target_R должен быть непустым списком")
+        for target in targets:
+            _finite_number(target, f"[trade_management.profiles.{name}] target_R", path, positive=True)
+        if any(right <= left for left, right in zip(targets, targets[1:])):
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] target_R должен возрастать")
+        _validate_shares(value.get("shares"), f"[trade_management.profiles.{name}] shares", path, len(targets))
+    if name == "pattern_targets":
+        fractions = value.get("fractions_to_D")
+        if not isinstance(fractions, list) or len(fractions) != 2:
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] fractions_to_D должен содержать две доли")
+        for fraction in fractions:
+            _finite_number(fraction, f"[trade_management.profiles.{name}] fractions_to_D", path, positive=True)
+            if fraction > 1:
+                raise ConfigError(f"{path}: [trade_management.profiles.{name}] fractions_to_D должен быть в (0, 1]")
+        if fractions[0] >= fractions[1]:
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] fractions_to_D должен возрастать")
+        _validate_shares(value.get("shares"), f"[trade_management.profiles.{name}] shares", path, 2)
+    if name == "atr_trend" and "atr_period" not in value:
+        raise ConfigError(f"{path}: [trade_management.profiles.{name}] atr_period задаёт необходимый прогрев")
+    if name == "ma_cloud":
+        fast, slow = value.get("ma_fast_period"), value.get("ma_slow_period")
+        if fast is None or slow is None or fast >= slow:
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] требует ma_fast_period < ma_slow_period для прогрева")
+
+
+def _validate_trade_management_profiles(value: dict, path: Path) -> dict[str, dict]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path}: [trade_management.profiles] должна быть таблицей")
+    for name, parameters in value.items():
+        if not isinstance(parameters, dict):
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] должна быть таблицей")
+        _validate_profile_parameters(name, parameters, path)
+    return value
+
+
+def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
+    unknown = set(value) - _RISK_LIMIT_KEYS
+    if unknown:
+        raise ConfigError(f"{path}: [trading.risk_limits] незнакомые ключи {sorted(unknown)}")
+    for key in ("trade_pct", "instrument_pct", "portfolio_pct", "commission", "slippage"):
+        if key in value:
+            _finite_number(value[key], f"[trading.risk_limits] {key}", path, positive=key.endswith("_pct"), non_negative=not key.endswith("_pct"))
+    if "max_qty" in value and (isinstance(value["max_qty"], bool) or not isinstance(value["max_qty"], int) or value["max_qty"] <= 0):
+        raise ConfigError(f"{path}: [trading.risk_limits] max_qty должен быть целым числом > 0")
+    groups = value.get("groups", {})
+    if not isinstance(groups, dict):
+        raise ConfigError(f"{path}: [trading.risk_limits] groups должна быть таблицей")
+    for group, limit in groups.items():
+        if not isinstance(group, str) or not group:
+            raise ConfigError(f"{path}: [trading.risk_limits] groups содержит пустое имя")
+        _finite_number(limit, f"[trading.risk_limits.groups] {group}", path, positive=True)
+    return value
+
+
 def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
     """Проверка типов и допустимых значений ключей конфигурации."""
     cleaned: dict[str, Any] = {}
@@ -215,6 +338,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             )
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
+            continue
+        if key == "trade_management_profiles":
+            cleaned[key] = _validate_trade_management_profiles(value, path)
+            continue
+        if key == "risk_limits":
+            cleaned[key] = _validate_risk_limits(value, path)
             continue
         if key == "initial_deposit":
             if isinstance(value, bool):
@@ -235,6 +364,15 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 )
         if key == "clearing_times":
             _validate_clearing_times(value, path)
+        if key == "positions_file" and not value:
+            raise ConfigError(
+                f"{path}: [trading] positions_file должен быть непустой строкой, "
+                f"получено {value!r}"
+            )
+        if key in {"database_file", "audit_file", "journal_file"} and not value:
+            raise ConfigError(f"{path}: [{key}] должен быть непустой строкой")
+        if key in {"audit_max_bytes", "audit_backup_count"} and value < 0:
+            raise ConfigError(f"{path}: [{key}] должен быть неотрицательным целым числом")
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
@@ -341,6 +479,39 @@ def _parse(path: Path) -> dict[str, Any]:
     return _validate(flat, path)
 
 
+def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
+    """Validate constraints that span TOML sections and configuration files."""
+    assignment_ids: set[str] = set()
+    assignments: list[dict[str, Any]] = []
+    for source in ("share_strategies", "future_strategies"):
+        for table in config.get(source, {}).values():
+            if not isinstance(table, dict) or not isinstance(table.get("strategies"), list):
+                continue
+            for assignment in table["strategies"]:
+                if not isinstance(assignment, dict):
+                    continue
+                assignment_id = assignment["id"]
+                if assignment_id in assignment_ids:
+                    raise ConfigError(f"{path}: повторяющийся id привязки {assignment_id!r}")
+                assignment_ids.add(assignment_id)
+                assignments.append(assignment)
+
+    profiles = config.get("trade_management_profiles")
+    if profiles is not None:
+        for assignment in assignments:
+            management = assignment["management"]
+            if management not in profiles:
+                raise ConfigError(f"{path}: привязка {assignment['id']!r} ссылается на неизвестный management {management!r}")
+            if profiles[management]["type"] == "pattern_targets" and assignment["name"] not in _PATTERN_STRATEGIES:
+                raise ConfigError(f"{path}: привязка {assignment['id']!r}: pattern_targets несовместим со стратегией {assignment['name']!r}")
+
+    database_file = config.get("database_file")
+    if database_file is not None:
+        for key in ("journal_file", "positions_file", "audit_file"):
+            if config.get(key) is not None and Path(config[key]).resolve() == Path(database_file).resolve():
+                raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
+
+
 def _parse_triple_screen_section(value: Any, path: Path) -> dict[str, Any]:
     """Извлечение таблицы `[strategies.filter.triple_screen]` из вложенной секции."""
     if not isinstance(value, dict):
@@ -406,4 +577,5 @@ def load_config(
         if not path.is_file():
             continue
         result.update(_parse(path))
+    _validate_combined_config(result, Path(config_file or CONFIG_FILENAME))
     return result

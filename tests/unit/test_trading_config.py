@@ -5,9 +5,10 @@ from src.config import (
     INITIAL_DEPOSIT,
     JOURNAL_FILE,
     MAX_RISK_PCT,
+    POSITIONS_FILE,
     trading_enabled,
 )
-from src.config_loader import ConfigError, load_config
+from src.config_loader import ConfigError, derived_positions_file, load_config
 
 
 def _defaults():
@@ -127,12 +128,62 @@ class TestTradingSectionValidation:
             load_config(_defaults(), config_file=cfg_ref(tmp_path))
 
 
+class TestPositionsFileParsing:
+    def test_explicit_positions_file_parses(self, tmp_path):
+        cfg = _write(
+            tmp_path,
+            "[trading]\n"
+            'journal_file = "trade_journal.csv"\n'
+            'positions_file = "positions.csv"\n',
+        )
+
+        result = load_config(_defaults(), config_file=cfg)
+
+        assert result["positions_file"] == "positions.csv"
+
+    def test_empty_positions_file_rejected(self, tmp_path):
+        _write(tmp_path, '[trading]\npositions_file = ""\n')
+        with pytest.raises(ConfigError, match="positions_file"):
+            load_config(_defaults(), config_file=cfg_ref(tmp_path))
+
+    def test_non_string_positions_file_rejected(self, tmp_path):
+        _write(tmp_path, "[trading]\npositions_file = 42\n")
+        with pytest.raises(ConfigError, match="positions_file"):
+            load_config(_defaults(), config_file=cfg_ref(tmp_path))
+
+    @pytest.mark.parametrize("export_key", ("journal_file", "positions_file"))
+    def test_database_path_matching_export_after_normalization_is_rejected(self, tmp_path, export_key):
+        _write(
+            tmp_path,
+            "[trading]\n"
+            'database_file = "state/../trades.sqlite3"\n'
+            f'{export_key} = "trades.sqlite3"\n',
+        )
+
+        with pytest.raises(ConfigError, match="database_file"):
+            load_config(_defaults(), config_file=cfg_ref(tmp_path))
+
+
+class TestDerivedPositionsFile:
+    def test_suffix_before_extension(self):
+        assert derived_positions_file("trade_journal.csv") == "trade_journal_positions.csv"
+
+    def test_custom_name(self):
+        assert derived_positions_file("journal.csv") == "journal_positions.csv"
+
+    def test_keeps_extension(self):
+        assert derived_positions_file("ledger.csv") == "ledger_positions.csv"
+
+    def test_without_extension(self):
+        assert derived_positions_file("journal") == "journal_positions"
+
+
 class TestTradingEnabled:
     def test_disabled_without_section(self):
         from src.config import _CONFIG
 
         saved = dict(_CONFIG)
-        for key in ("initial_deposit", "max_risk_pct", "journal_file", "clearing_times"):
+        for key in ("initial_deposit", "max_risk_pct", "journal_file", "positions_file", "database_file", "clearing_times"):
             _CONFIG.pop(key, None)
         try:
             assert trading_enabled() is False
@@ -157,7 +208,11 @@ class TestImportConstants:
         assert isinstance(INITIAL_DEPOSIT, int) and INITIAL_DEPOSIT > 0
         assert 0 < MAX_RISK_PCT <= 100
         assert isinstance(JOURNAL_FILE, str) and JOURNAL_FILE
+        assert isinstance(POSITIONS_FILE, str) and POSITIONS_FILE
         assert isinstance(CLEARING_TIMES, list) and CLEARING_TIMES
+
+    def test_positions_file_derived_from_journal_by_default(self):
+        assert POSITIONS_FILE == derived_positions_file(JOURNAL_FILE)
 
 
 def cfg_ref(tmp_path):

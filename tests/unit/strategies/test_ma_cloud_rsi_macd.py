@@ -1,488 +1,135 @@
 import numpy as np
 import pandas as pd
 
-from src.strategies import get_strategy
+from src.portfolio.models import Position
 from src.strategies.contracts import SignalType
-from src.strategies.ma_cloud_rsi_macd_strategy import (
-    DEFAULT_CONFIG,
-    MaCloudRsiMacdStrategy,
-    MaCloudState,
-)
-from src.strategies.registry import strategy_names
+from src.strategies.ma_cloud_rsi_macd_strategy import DEFAULT_CONFIG, MaCloudRsiMacdStrategy, MaCloudState
 
 
-LONG_ENTRY_SERIES = np.concatenate(
-    [
-        np.linspace(110, 90, 44),
-        [95, 99, 103, 107, 111, 115, 119, 123, 127, 131, 135, 139, 143, 147, 151, 155],
-    ]
-)
-
-SHORT_ENTRY_SERIES = np.concatenate(
-    [
-        np.linspace(90, 110, 44),
-        [105, 101, 97, 93, 89, 85, 81, 77, 73, 69, 65, 61, 57, 53, 49, 45],
-    ]
-)
-
-
-def _df_from_close(close: np.ndarray) -> pd.DataFrame:
+def _frame(close: np.ndarray) -> pd.DataFrame:
     start = pd.Timestamp("2024-01-01")
-    return pd.DataFrame(
-        {
-            "datetime": [start + pd.Timedelta(days=i) for i in range(len(close))],
-            "open": close,
-            "high": close + 2,
-            "low": close - 2,
-            "close": close,
-            "volume": [1000] * len(close),
-        }
-    )
+    return pd.DataFrame({
+        "datetime": [start + pd.Timedelta(days=i) for i in range(len(close))],
+        "open": close,
+        "high": close + 2,
+        "low": close - 2,
+        "close": close,
+        "volume": [1000] * len(close),
+    })
 
 
-def _decide_through(strategy: MaCloudRsiMacdStrategy, close: np.ndarray):
-    decisions = []
-    for i in range(41, len(close)):
-        df = _df_from_close(close[: i + 1])
-        ta = strategy.compute(df)
-        decisions.append(strategy.decide(ta))
-    return decisions
+def _ta(ma_signal=0, rsi_signal=0, macd_signal=0) -> pd.DataFrame:
+    return pd.DataFrame({
+        "datetime": pd.date_range("2024-01-01", periods=5, freq="1h"),
+        "high": [120.0] * 5,
+        "low": [116.0] * 5,
+        "close": [118.0] * 5,
+        "sma_fast": [120.0] * 5,
+        "sma_slow": [115.0] * 5,
+        "ma_cloud_signal": [ma_signal] * 5,
+        "rsi": [55.0] * 5,
+        "rsi_signal": [rsi_signal] * 5,
+        "macd_zero_signal": [macd_signal] * 5,
+    })
 
 
-def _final_state(
-    strategy: MaCloudRsiMacdStrategy, close: np.ndarray
-) -> MaCloudState:
-    """Состояние стратегии после реплея всей истории (через публичный decide)."""
-    df = _df_from_close(close)
-    ta = strategy.compute(df)
-    return strategy._replay_state(ta)
+def _confirmation_history() -> pd.DataFrame:
+    ta = _ta()
+    ta.loc[2, "rsi_signal"] = 1
+    ta.loc[3, "macd_zero_signal"] = 1
+    ta.loc[4, "ma_cloud_signal"] = 1
+    return ta
 
 
-def _ta_scenario(
-    close: float,
-    high: float | None = None,
-    low: float | None = None,
-    sma_fast: float | None = None,
-    sma_slow: float | None = None,
-    ma_signal: int = 0,
-    rsi: float = 50.0,
-    rsi_signal: int = 0,
-    macd_signal: int = 0,
-    rows: int = 5,
-) -> pd.DataFrame:
-    """Детерминированный DataFrame для контроля логики decide()."""
-    high = close + 1 if high is None else high
-    low = close - 1 if low is None else low
-    sma_fast = close if sma_fast is None else sma_fast
-    sma_slow = close if sma_slow is None else sma_slow
-    data = {
-        "close": [close] * rows,
-        "high": [high] * rows,
-        "low": [low] * rows,
-        "sma_fast": [sma_fast] * rows,
-        "sma_slow": [sma_slow] * rows,
-        "ma_cloud_signal": [ma_signal] * rows,
-        "rsi": [rsi] * rows,
-        "rsi_signal": [rsi_signal] * rows,
-        "macd_zero_signal": [macd_signal] * rows,
-    }
-    return pd.DataFrame(data)
+def _warmed_confirmation_history() -> pd.DataFrame:
+    ta = pd.concat([_ta()] * 9, ignore_index=True).iloc[:41].copy()
+    ta["datetime"] = pd.date_range("2024-01-01", periods=len(ta), freq="1h")
+    ta.loc[38, "rsi_signal"] = 1
+    ta.loc[39, "macd_zero_signal"] = 1
+    ta.loc[40, "ma_cloud_signal"] = 1
+    return ta
 
 
 class TestMaCloudRsiMacdStrategy:
-    def test_registered_and_discoverable(self):
-        assert "ma_cloud_rsi_macd" in strategy_names()
-        strategy = get_strategy("ma_cloud_rsi_macd", config=DEFAULT_CONFIG)
-        assert isinstance(strategy, MaCloudRsiMacdStrategy)
-
     def test_required_history(self):
-        strat = MaCloudRsiMacdStrategy(DEFAULT_CONFIG)
-        assert strat.required_history() == 41
+        assert MaCloudRsiMacdStrategy(DEFAULT_CONFIG).required_history() == 41
 
-    def test_compute_adds_columns(self):
-        close = np.linspace(100, 120, 60)
-        df = _df_from_close(close)
-        strat = MaCloudRsiMacdStrategy()
-        ta = strat.compute(df)
-        assert "ma_cloud_signal" in ta.columns
-        assert "rsi_signal" in ta.columns
-        assert "macd_zero_signal" in ta.columns
+    def test_compute_adds_signal_columns(self):
+        ta = MaCloudRsiMacdStrategy().compute(_frame(np.linspace(100, 120, 60)))
+        assert {"ma_cloud_signal", "rsi_signal", "macd_zero_signal"} <= set(ta.columns)
 
-    def test_default_config_name(self):
-        assert DEFAULT_CONFIG.name == "ma_cloud_rsi_macd"
-        assert DEFAULT_CONFIG.strategy_window == 1
-
-    # ── Вход (Entry) ─────────────────────────────────────────────
-    def test_long_entry_on_third_indicator(self):
-        strat = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(strat, LONG_ENTRY_SERIES)
-        entries = [d for d in decisions if d.signal_type == SignalType.BUY]
-        assert entries, "Expected at least one BUY entry"
-        assert entries[0].action == "entry"
-        assert entries[0].exit_reason is None
-        assert entries[0].exit_contracts is None
-
-    def test_short_entry_on_third_indicator(self):
-        strat = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(strat, SHORT_ENTRY_SERIES)
-        entries = [d for d in decisions if d.signal_type == SignalType.SELL]
-        assert entries, "Expected at least one SELL entry"
-        assert entries[0].action == "entry"
-
-    def test_hold_when_only_two_indicators(self):
-        close = np.linspace(100, 110, 60)
-        strat = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(strat, close)
-        assert all(d.action is None and d.exit_reason is None for d in decisions)
-
-    def test_flat_data_gives_hold(self):
-        close = np.full(60, 100.0)
-        strat = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(strat, close)
-        assert all(d.signal_type == SignalType.HOLD for d in decisions)
-
-    def test_no_entry_while_long_open(self):
-        """Пока открыт Long, повторный вход не даётся."""
-        strat = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(strat, LONG_ENTRY_SERIES)
-        entries = [d for d in decisions if d.signal_type == SignalType.BUY]
-        assert len(entries) == 1
-
-    def test_long_entry_sets_one_contract(self):
-        strat = MaCloudRsiMacdStrategy()
-        _decide_through(strat, LONG_ENTRY_SERIES)
-        assert _final_state(strat, LONG_ENTRY_SERIES).long_contracts == 1
-
-    # ── Окно сигнала (6 свечей) ──────────────────────────────────
-    def test_no_entry_when_signals_span_more_than_window(self):
-        """RSI@48, MA@53, MACD@57 — разброс 9 свечей > окна 6: входа нет."""
-        close = np.concatenate([np.linspace(110, 90, 40), np.linspace(90, 130, 60)])
-        strat = MaCloudRsiMacdStrategy()
-        strat.compute(_df_from_close(close))  # прогрев
-        decisions = _decide_through(strat, close)
-        assert all(d.action != "entry" for d in decisions)
-        assert _final_state(strat, close).long_contracts == 0
-
-    def test_pending_indicators_cleared_on_expiry(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(pending_long=(("rsi", -30), ("macd_zero", -10)))
-        ta = _ta_scenario(100.0)
-        state, _ = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert state.pending_long == ()
-
-    def test_repeat_signal_of_same_indicator_is_not_second(self):
-        """Повторный сигнал того же индикатора не считается вторым подтверждением."""
-        strat = MaCloudRsiMacdStrategy()
+    def test_third_distinct_confirmation_emits_entry_event_at_high(self):
+        strategy = MaCloudRsiMacdStrategy()
         state = MaCloudState(pending_long=(("rsi", 2), ("macd_zero", 3)))
-        ta = _ta_scenario(
-            close=118.0,
-            ma_signal=0,
-            rsi_signal=0,
-            macd_signal=0,
-            rsi=55.0,  # RSI бычий, но макд/ма не менялись
-        )
-        decision = strat._decide_from_state(ta, state)
-        assert decision.signal_type == SignalType.HOLD
-        assert state.pending_long == (("rsi", 2), ("macd_zero", 3))
+        state, decision = strategy._step(state, 4, _ta(ma_signal=1).iloc[-1], "1h")
 
-    def test_third_different_indicator_enters_and_clears(self):
-        """Третий РАЗНЫЙ индикатор в окне даёт BUY, состояние очищается."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(pending_long=(("rsi", 2), ("macd_zero", 3)))
-        ta = _ta_scenario(
-            close=118.0,
-            ma_signal=1,  # облако бычье — третий индикатор
-            rsi_signal=0,
-            macd_signal=0,
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.BUY
-        assert decision.action == "entry"
-        assert state.pending_long == ()
-        assert state.long_contracts == 1
+        assert decision.signal_type is SignalType.BUY
+        assert decision.price == 120.0
+        assert decision.idea_references == {"entry_reference": "high"}
+        assert decision.event_id == "ma_cloud_rsi_macd:1h:2024-01-01T04:00:00:BUY"
+        assert decision.available_at == decision.bar_time
+        assert state == MaCloudState()
 
-    def test_third_different_indicator_short_enters_and_clears(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(pending_short=(("rsi", 200), ("macd_zero", 201)))
-        ta = _ta_scenario(
-            close=82.0,
-            ma_signal=-1,  # облако медвежье — третий индикатор
-            rsi_signal=0,
-            macd_signal=0,
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.SELL
-        assert decision.action == "entry"
-        assert state.pending_short == ()
-        assert state.short_contracts == 1
+    def test_third_distinct_confirmation_emits_short_entry_at_low(self):
+        strategy = MaCloudRsiMacdStrategy()
+        state = MaCloudState(pending_short=(("rsi", 2), ("macd_zero", 3)))
+        _, decision = strategy._step(state, 4, _ta(ma_signal=-1).iloc[-1], "1h")
 
-    def test_indicator_refires_after_window_expiry(self):
-        """Сигнал того же индикатора может сработать заново после истечения окна."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(pending_long=(("rsi", -20),))  # bar за пределами окна
-        ta = _ta_scenario(
-            close=118.0,
-            ma_signal=0,
-            rsi_signal=1,  # RSI бычий снова — refire
-            macd_signal=0,
-            rsi=60.0,
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.HOLD
-        assert state.pending_long == (("rsi", len(ta) - 1),)
+        assert decision.signal_type is SignalType.SELL
+        assert decision.price == 116.0
+        assert decision.idea_references == {"entry_reference": "low"}
 
-    def test_decide_is_stateless_and_idempotent(self):
-        """Повторные вызовы на одном инстансе дают один результат (реплей)."""
-        strat = MaCloudRsiMacdStrategy()
-        close = LONG_ENTRY_SERIES
-        df = _df_from_close(close)
-        ta = strat.compute(df)
-        d1 = strat.decide(ta)
-        d2 = strat.decide(ta)
-        assert d1.signal_type == d2.signal_type
-        assert d1.price == d2.price
-        assert d1.action == d2.action
-        assert d1.exit_reason == d2.exit_reason
-        # Тот же результат на «свежем» инстансе — никакой памяти между вызовами.
-        assert d1.signal_type == MaCloudRsiMacdStrategy().decide(ta).signal_type
-        # expected_events на инстансе с предысторией вызовов даёт тот же результат.
-        e_before = strat.expected_events(ta)
-        strat.decide(ta)
-        e_after = strat.expected_events(ta)
-        pd.testing.assert_frame_equal(e_before, e_after)
+    def test_confirmation_requires_three_distinct_indicators_within_six_bars(self):
+        strategy = MaCloudRsiMacdStrategy()
+        state = MaCloudState(pending_long=(("rsi", 0), ("macd_zero", 1)))
 
-    def test_shared_instance_two_bindings_do_not_collide(self):
-        """Инстанс, разделяемый привязками одного ТФ, детерминирован префиксом."""
-        strat = MaCloudRsiMacdStrategy()
-        close = LONG_ENTRY_SERIES
-        df = _df_from_close(close)
-        ta = strat.compute(df)
-        # Решение по накопительному префиксу не меняется от того, что раньше
-        # на этом же инстансе считали другой (полный) префикс.
-        d_before = strat.decide(ta)
-        strat.decide(ta)
-        d_after = strat.decide(ta)
-        assert (d_before.signal_type, d_before.price) == (
-            d_after.signal_type,
-            d_after.price,
-        )
+        state, decision = strategy._step(state, 6, _ta(rsi_signal=1).iloc[-1])
 
-    def test_expected_events_cumulative_replay_is_consistent(self):
-        """expected_events() накопительным реплеем идентичен полной истории."""
-        close = LONG_ENTRY_SERIES
-        df = _df_from_close(close)
-        strat = MaCloudRsiMacdStrategy()
-        ta = strat.compute(df)
-        events = strat.expected_events(ta)
+        assert decision.signal_type is SignalType.HOLD
+        assert state.pending_long == (("macd_zero", 1), ("rsi", 6))
 
-        # Полный прогон через накопительный decide_through
-        full = MaCloudRsiMacdStrategy()
-        decisions = _decide_through(full, close)
-        expected = pd.DataFrame(
-            [
-                {
-                    "signal": d.signal_type.value,
-                    "price": d.price,
-                    "action": d.action or "",
-                    "exit_reason": d.exit_reason or "",
-                }
-                for d in decisions
-                if d.signal_type is not SignalType.HOLD
-            ]
-        )
-        # expected_events() выдаёт текстовые колонки как astype("string") (StringDtype).
-        # Накопительный реплей возвращает те же python-строки — приводим к тому же dtype.
-        expected["signal"] = expected["signal"].astype("string")
-        expected["action"] = expected["action"].astype("string")
-        expected["exit_reason"] = expected["exit_reason"].astype("string")
-        actual = events.drop(columns=["datetime"])
-        pd.testing.assert_frame_equal(
-            actual.reset_index(drop=True),
-            expected.reset_index(drop=True),
-            check_like=True,
-        )
+    def test_repeat_calls_are_deterministic_and_do_not_track_positions(self):
+        strategy = MaCloudRsiMacdStrategy()
+        ta = _confirmation_history()
 
-    # ── Добор (scale-in) ──────────────────────────────────────────
-    def test_scale_in_long_on_cloud_retest(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=1)
-        ta = _ta_scenario(
-            close=118.0,
-            low=115.0,  # Low внутри облака [115, 120]
-            high=119.0,
-            sma_fast=120.0,
-            sma_slow=115.0,  # облако: 115..120
-            ma_signal=0,
-            rsi_signal=0,
-            macd_signal=0,
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.BUY
-        assert decision.action == "scale_in"
-        assert state.long_contracts == 2
+        assert strategy.decide(ta) == strategy.decide(ta)
+        state = strategy._replay_state(ta)
+        assert not hasattr(state, "long_contracts")
+        assert not hasattr(state, "short_contracts")
 
-    def test_scale_in_short_on_cloud_retest(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(short_contracts=1)
-        ta = _ta_scenario(
-            close=122.0,
-            high=125.0,  # High внутри облака [120, 125]
-            low=121.0,
-            sma_fast=120.0,
-            sma_slow=125.0,  # облако: 120..125
-            rsi_signal=0,
-            macd_signal=0,
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.SELL
-        assert decision.action == "scale_in"
-        assert state.short_contracts == 2
+    def test_shared_instance_returns_the_same_event_to_two_profiles(self):
+        strategy = MaCloudRsiMacdStrategy()
+        ta = _confirmation_history()
 
-    def test_no_scale_in_when_no_position(self):
-        strat = MaCloudRsiMacdStrategy()
-        ta = _ta_scenario(
-            close=118.0,
-            low=115.0,
-            sma_fast=120.0,
-            sma_slow=115.0,
-        )
-        decision = strat._decide_from_state(ta, MaCloudState())
-        assert decision.action is None
+        ma_cloud_profile_event = strategy.decide(ta, "1h")
+        levels_rr_profile_event = strategy.decide(ta, "1h")
 
-    # ── Выход (exit) ──────────────────────────────────────────────
-    def test_exit_one_contract_below_ma40(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=1)
-        ta = _ta_scenario(
-            close=108.0,
-            sma_fast=114.0,
-            sma_slow=110.0,  # close < MA40 → полный выход
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.SELL
-        assert decision.exit_reason == "close_below_ma40"
-        assert decision.exit_contracts is None
-        assert state.long_contracts == 0
+        assert ma_cloud_profile_event == levels_rr_profile_event
+        assert ma_cloud_profile_event.signal_type is SignalType.BUY
+        assert ma_cloud_profile_event.price == 120.0
 
-    def test_one_contract_ignores_ma10_exit(self):
-        """Правило: 1 контракт — выход только под MA40, MA10 игнорируется."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=1)
-        ta = _ta_scenario(
-            close=112.0,
-            low=115.0,  # low выше облака → нет scale-in
-            high=116.0,
-            sma_fast=114.0,  # close < MA10, но
-            sma_slow=110.0,  # close > MA40
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason is None
-        assert decision.signal_type == SignalType.HOLD
-        assert state.long_contracts == 1
+    def test_entry_event_is_independent_of_portfolio_position_state(self):
+        strategy = MaCloudRsiMacdStrategy()
+        ta = _confirmation_history()
+        before = strategy.decide(ta, "1h")
+        position = Position("trade-1", "NG", "BUY", 1, 100.0, None, None, None)
+        position.apply_fill(110.0, 2)
+        position.reduce(1)
 
-    def test_partial_exit_below_ma10_when_two_contracts(self):
-        """below_ma10 partial only reachable when close < min(MA10, MA40) — downtrend order."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=2)
-        ta = _ta_scenario(
-            close=108.0,  # below MA10=110 and below cloud_low=110
-            sma_fast=110.0,  # MA10 (lower in downtrend)
-            sma_slow=115.0,  # MA40 (higher): cloud=[110, 115]
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason == "close_below_ma10"
-        assert decision.exit_contracts == 1
-        assert state.long_contracts == 1
+        assert strategy.decide(ta, "1h") == before
 
-    def test_full_exit_below_ma40_when_two_contracts(self):
-        """Full exit fires for >1 contracts only when partial tier doesn't match.
-        With downtrend order (MA10<MA40): close < MA10 triggers partial first.
-        Test that partial fires on first encounter, full on second bar."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=2)
-        ta1 = _ta_scenario(
-            close=108.0,
-            sma_fast=110.0,  # MA10 < MA40
-            sma_slow=115.0,  # MA40
-        )
-        state, d1 = strat._step(state, len(ta1) - 1, ta1.iloc[-1])
-        assert d1.exit_reason == "close_below_ma10"
-        assert state.long_contracts == 1
-        # Второй бар: 1 контракт → ниже MA40 → full exit
-        ta2 = _ta_scenario(
-            close=108.0,
-            sma_fast=110.0,
-            sma_slow=115.0,
-        )
-        state, d2 = strat._step(state, len(ta2), ta2.iloc[-1])
-        assert d2.exit_reason == "close_below_ma40"
-        assert state.long_contracts == 0
+    def test_expected_events_are_entry_only(self):
+        strategy = MaCloudRsiMacdStrategy()
+        ta = _warmed_confirmation_history()
 
-    def test_full_exit_direct_when_one_contract(self):
-        """1 контракт — только below MA40 exit."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=1)
-        ta = _ta_scenario(
-            close=108.0,
-            sma_fast=110.0,
-            sma_slow=115.0,  # close < MA40
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason == "close_below_ma40"
-        assert decision.exit_contracts is None
-        assert state.long_contracts == 0
+        first = strategy.expected_events(ta)
+        strategy.decide(ta)
+        second = strategy.expected_events(ta)
 
-    def test_partial_exit_inside_cloud_when_two_contracts(self):
-        """Выход внутри облака: downtrend order MA10 < MA40, close в облаке."""
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=2)
-        ta = _ta_scenario(
-            close=112.0,
-            low=111.0,
-            sma_fast=110.0,  # MA10 < MA40 (downtrend)
-            sma_slow=115.0,  # MA40: облако [110, 115]
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason == "close_inside_cloud"
-        assert decision.exit_contracts == 1
-        assert state.long_contracts == 1
-
-    def test_short_exit_one_contract_above_ma40(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(short_contracts=1)
-        ta = _ta_scenario(
-            close=112.0,
-            sma_fast=106.0,
-            sma_slow=110.0,  # close > MA40 → полный выход Short
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.signal_type == SignalType.BUY
-        assert decision.exit_reason == "close_above_ma40"
-        assert state.short_contracts == 0
-
-    # ── Двусторонность ────────────────────────────────────────────
-    def test_long_exit_does_not_touch_short(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=2, short_contracts=1)
-        ta = _ta_scenario(
-            close=112.0,
-            sma_fast=110.0,  # MA10 < MA40 (downtrend)
-            sma_slow=115.0,  # MA40: облако [110, 115]
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason == "close_inside_cloud"
-        assert state.long_contracts == 1  # Long уменьшился
-        assert state.short_contracts == 1  # Short не тронут
-
-    def test_short_exit_does_not_touch_long(self):
-        strat = MaCloudRsiMacdStrategy()
-        state = MaCloudState(long_contracts=1, short_contracts=1)
-        ta = _ta_scenario(
-            close=112.0,
-            sma_fast=106.0,
-            sma_slow=110.0,  # Short: полный выход (close > MA40)
-        )
-        state, decision = strat._step(state, len(ta) - 1, ta.iloc[-1])
-        assert decision.exit_reason == "close_above_ma40"
-        assert state.short_contracts == 0
-        assert state.long_contracts == 1  # Long не тронут
+        assert list(first.columns) == ["datetime", "signal", "price"]
+        assert first.iloc[0].to_dict() == {
+            "datetime": pd.Timestamp("2024-01-02 16:00:00"),
+            "signal": "BUY",
+            "price": 120.0,
+        }
+        pd.testing.assert_frame_equal(first, second)

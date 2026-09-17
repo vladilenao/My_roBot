@@ -1,51 +1,51 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping, Optional
+from decimal import Decimal
+from enum import StrEnum
+from src.trade_management.actions import TradeAction
 
-from src.portfolio import BrokerEvent, ContractMeta, OrderResult, Signal
+
+class ExecutionStatus(StrEnum):
+    FILL = "fill"
+    PARTIAL = "partial"
+    ACK = "ack"
+    REJECT = "reject"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True)
+class ExecutionEvent:
+    """A broker outcome for one addressed trade command."""
+
+    execution_id: str
+    order_id: str | None
+    command_id: str
+    trade_id: str
+    status: ExecutionStatus
+    filled_quantity: int
+    price: Decimal | None
+    fee: Decimal
+    timestamp: datetime
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not all((self.execution_id, self.command_id, self.trade_id, self.reason)):
+            raise ValueError("execution, command, trade identifiers and reason are required")
+        if self.filled_quantity < 0:
+            raise ValueError("filled_quantity cannot be negative")
+        if self.fee < 0:
+            raise ValueError("fee cannot be negative")
+        is_fill = self.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}
+        if is_fill and (self.filled_quantity == 0 or self.price is None):
+            raise ValueError("fill and partial events require quantity and price")
+        if not is_fill and self.filled_quantity != 0:
+            raise ValueError("only fill and partial events can carry a filled quantity")
 
 
 class BrokerPort(ABC):
-    """Порт брокерского исполнения.
-
-    Исполнитель получает решения (сигналы на открытие) и котировки, возвращает
-    результаты + события для уведомлений. Реализация — симуляция через
-    дневник сделок (`JournalBroker`); интерфейс инвариантен для бэкенда.
-    """
+    """Broker contract for addressable trade actions and their outcomes."""
 
     @abstractmethod
-    def load_state(self) -> None:
-        """Восстановление состояния (позиции, заявки, счёт) из персистентного хранилища."""
-
-    @abstractmethod
-    def place_order(self, signal: Signal, contract: ContractMeta, now: datetime) -> OrderResult:
-        """Размещение заявки на открытие позиции (entry/scale)."""
-
-    @abstractmethod
-    def track_bar(
-        self,
-        now: datetime,
-        prices: Mapping[str, tuple[float, float, float]],
-        contracts: Mapping[str, ContractMeta],
-    ) -> list[OrderResult]:
-        """Обработка закрытой свечи: защитные стопы, TTL, исполнение заявок, over_risk."""
-
-    @abstractmethod
-    def cancel_order(self, order_id: int, reason: str) -> OrderResult:
-        """Отмена размещённой, но не исполненной заявки."""
-
-    @abstractmethod
-    def run_clearing(self, now: datetime) -> list[OrderResult]:
-        """Клиринг FORTS: снимок, отмена отложенных, переустановка защитных стопов."""
-
-    @abstractmethod
-    def run_clearing_if_due(self, now: datetime) -> bool:
-        """Выполнить клиринг, если момент его наступил (сравнение с графиком)."""
-
-    @abstractmethod
-    def drain_events(self) -> list[BrokerEvent]:
-        """Забрать накопленные события для уведомлений."""
-
-    @abstractmethod
-    def contract_for(self, ticker: str) -> Optional[ContractMeta]:
-        """Доступ к метаданным контракта (шаг цены и т.п.) с внутренним кэшем."""
+    def submit(self, action: TradeAction, now: datetime) -> ExecutionEvent:
+        """Submit one addressable action and return its broker outcome."""

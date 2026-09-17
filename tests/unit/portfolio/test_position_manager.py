@@ -6,6 +6,7 @@ from src.portfolio import (
     ContractMeta,
     Position,
     PositionManager,
+    PendingOrder,
     Signal,
 )
 
@@ -32,7 +33,7 @@ def _signal(**kw):
 
 
 def _manager(initial=100000, max_risk=2.0):
-    return PositionManager(state=None, initial_deposit=initial, max_risk_pct=max_risk)
+    return PositionManager(initial_deposit=initial, max_risk_pct=max_risk)
 
 
 class TestSizingFormula:
@@ -99,6 +100,65 @@ class TestSizingFormula:
         assert out.reason == "otherexisting"
 
 
+class TestGeometricRisk:
+    def test_risk_from_full_take_geometry(self):
+        mgr = _manager()
+        sig = _signal(take_profit=108.0, stop_price=96.0, stop_distance_pct=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META})[0]
+        # (108 − 96)/1 × 100 = 1200 ₽/контракт; бюджет 2000 → qty=1, риск 1200
+        assert out.qty == 1
+        assert out.risk_rub == pytest.approx(1200.0)
+
+    def test_short_distance_is_absolute(self):
+        mgr = _manager()
+        sig = _signal(side="SELL", entry_price=100.0, stop_price=104.0, take_profit=96.0, stop_distance_pct=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META})[0]
+        # |96 − 104|/1 × 100 = 800 ₽/контракт
+        assert out.qty == 2  # floor(2000/800)
+        assert out.risk_rub == pytest.approx(1600.0)
+
+    def test_no_take_profit_falls_back_to_stop_distance(self):
+        mgr = _manager()
+        sig = _signal(take_profit=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META})[0]
+        assert out.risk_rub == pytest.approx(2000.0)  # бюджет, стоп 2% × 100 = 200×10
+
+    def test_cap_cuts_qty_but_keeps_entry(self):
+        mgr = _manager(initial=115000, max_risk=2.0)  # бюджет 2300
+        sig = _signal(take_profit=108.0, stop_price=96.0, stop_distance_pct=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META})[0]
+        # риск 1200/лот → floor(2300/1200)=1; 2 лота дали бы 2400 > 2300 (резка qty)
+        assert out.qty == 1
+        assert out.risk_rub == pytest.approx(1200.0)
+        assert out.reason is None
+
+    def test_aggregate_open_positions_blocks_new_entry(self):
+        mgr = _manager(initial=115000, max_risk=2.0)  # бюджет 2300
+        # NG-позиция с фактическим риском 2000: (106−96)/1×100×2 = 2000
+        mgr.positions["NG-500"] = Position(
+            position_id="NG-500", ticker="NG", side="BUY", qty=2,
+            avg_price=100.0, stop_price=96.0, take_profit=106.0, ts_entry=datetime.now(UTC),
+        )
+        sig = _signal(position_id="SI-1", ticker="SI", take_profit=104.0, stop_price=96.0, stop_distance_pct=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META, "SI": NG_META})[0]
+        assert out.qty == 0
+        assert out.reason == "aggregate-overflow"
+
+    def test_aggregate_keeps_entry_when_within_budget(self):
+        mgr = _manager(initial=115000, max_risk=2.0)  # бюджет 2300
+        # NG-позиция с фактическим риском 200: (98−96)/1×100×1 = 200
+        mgr.positions["NG-500"] = Position(
+            position_id="NG-500", ticker="NG", side="BUY", qty=1,
+            avg_price=97.0, stop_price=96.0, take_profit=98.0, ts_entry=datetime.now(UTC),
+        )
+        # SI: (108−100)/1×100×2 = 1600; итого 200 + 1600 = 1800 ≤ 2300 → вход сохранён
+        sig = _signal(position_id="SI-1", ticker="SI", take_profit=108.0, stop_price=100.0, stop_distance_pct=None)
+        out = mgr.evaluate_signals([sig], {"NG": NG_META, "SI": NG_META})[0]
+        assert out.qty == 2
+        assert out.risk_rub == pytest.approx(1600.0)
+        assert out.reason is None
+
+
 class TestOverRisk:
     def test_marks_and_cancels_oldest_non_over_risk(self):
         mgr = _manager(initial=1000, max_risk=2.0)  # кап перекоса = 3000
@@ -133,7 +193,7 @@ class TestMarginAndGo:
     def test_position_ops(self):
         pos = Position(position_id="P", ticker="NG", side="BUY", qty=1, avg_price=100.0,
                        stop_price=98.0, take_profit=None, ts_entry=datetime.now(UTC))
-        pos.average(102.0, 1)
+        pos.apply_fill(102.0, 1)
         assert pos.qty == 2
         assert pos.avg_price == pytest.approx(101.0)
         pos.reduce(1)
@@ -142,13 +202,30 @@ class TestMarginAndGo:
         pos.mark_over_risk()
         assert pos.over_risk is True
 
+    def test_position_mutation_is_limited_to_validated_methods(self):
+        pos = Position(position_id="P", ticker="NG", side="BUY", qty=2, avg_price=100.0,
+                       stop_price=98.0, take_profit=None, ts_entry=datetime.now(UTC))
+
+        with pytest.raises(AttributeError):
+            pos.qty = 3
+        with pytest.raises(AttributeError):
+            pos.avg_price = 101.0
+        with pytest.raises(ValueError, match="positive integer"):
+            pos.apply_fill(101.0, 0)
+        with pytest.raises(ValueError, match="finite and positive"):
+            pos.apply_fill(float("nan"), 1)
+        with pytest.raises(ValueError, match="exceeds"):
+            pos.reduce(3)
+
+        pos.apply_fill(104.0, 1)
+        pos.reduce(1)
+        assert (pos.qty, pos.avg_price) == (2, pytest.approx(101.333333))
+
 
 def _pending_orders(pids):
-    from src.trade_journal import RestoredOrder
-
     now = datetime(2026, 9, 14, 10, 0, 0, tzinfo=UTC)
     return {
-        i: RestoredOrder(
+        i: PendingOrder(
             order_id=i + 1,
             position_id=pid,
             ticker=pid.split("-", 1)[0],

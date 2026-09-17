@@ -1,12 +1,8 @@
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Optional
-
-from src.trade_journal import JournalState, RestoredOrder
-
-UTC = timezone.utc
 
 
 class OrderStatus(str, Enum):
@@ -38,13 +34,13 @@ class ContractMeta:
 
 @dataclass
 class Position:
-    """Открытая позиция. Мутабельна и обновляется исполнителем (JournalBroker)."""
+    """Фактическая позиция, изменяемая только подтвержденными исполнениями."""
 
     position_id: str
     ticker: str
     side: str
-    qty: int
-    avg_price: float
+    _qty: int
+    _avg_price: float
     stop_price: Optional[float]
     take_profit: Optional[float]
     ts_entry: Optional[datetime]
@@ -52,17 +48,71 @@ class Position:
     timeframe: str = ""
     protective: Optional["ProtectiveOrder"] = field(default=None, repr=False)
 
+    def __init__(
+        self,
+        position_id: str,
+        ticker: str,
+        side: str,
+        qty: int,
+        avg_price: float,
+        stop_price: Optional[float],
+        take_profit: Optional[float],
+        ts_entry: Optional[datetime],
+        over_risk: bool = False,
+        timeframe: str = "",
+        protective: Optional["ProtectiveOrder"] = None,
+    ):
+        self.position_id = position_id
+        self.ticker = ticker
+        self.side = side
+        self._qty = self._validate_qty(qty)
+        self._avg_price = self._validate_price(avg_price)
+        self.stop_price = stop_price
+        self.take_profit = take_profit
+        self.ts_entry = ts_entry
+        self.over_risk = over_risk
+        self.timeframe = timeframe
+        self.protective = protective
+
+    @property
+    def qty(self) -> int:
+        return self._qty
+
+    @property
+    def avg_price(self) -> float:
+        return self._avg_price
+
+    def apply_fill(self, price: float, qty: int) -> None:
+        """Apply a confirmed increasing fill and recompute the weighted average."""
+        fill_qty = self._validate_qty(qty)
+        fill_price = self._validate_price(price)
+        total_qty = self._qty + fill_qty
+        self._avg_price = round((self._qty * self._avg_price + fill_qty * fill_price) / total_qty, 6)
+        self._qty = total_qty
+
+    def reduce(self, qty: int) -> None:
+        """Apply a confirmed reducing fill without changing the entry average."""
+        close_qty = self._validate_qty(qty)
+        if close_qty > self._qty:
+            raise ValueError("close quantity exceeds position quantity")
+        self._qty -= close_qty
+
     def mark_over_risk(self) -> None:
         if not self.over_risk:
             self.over_risk = True
 
-    def average(self, price: float, add_qty: int) -> None:
-        total = self.qty * self.avg_price + add_qty * price
-        self.qty += add_qty
-        self.avg_price = round(total / self.qty, 6)
+    @staticmethod
+    def _validate_qty(qty: int) -> int:
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+            raise ValueError("position quantity must be a positive integer")
+        return qty
 
-    def reduce(self, close_qty: int) -> None:
-        self.qty = max(0, self.qty - close_qty)
+    @staticmethod
+    def _validate_price(price: float) -> float:
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("position price must be finite and positive")
+        return value
 
 
 @dataclass(frozen=True)
@@ -108,11 +158,7 @@ class OrderResult:
 
 @dataclass(frozen=True)
 class Signal:
-    """Входное предложение позиционирования (сделка на открытие/добавление).
-
-    `source` сохраняет происхождение сигнала (стратегия/имя) для журнала и
-    уведомлений; в продакшене строится адаптером исполнения из `Decision`.
-    """
+    """Входное предложение позиционирования (сделка на открытие/добавление)."""
 
     position_id: str
     ticker: str
@@ -136,196 +182,23 @@ class SizingOutcome:
     qty: int
     risk_rub: float
     risk_pct: float
-    reason: Optional[str] = None  # причина отказа/ограничения для события
+    reason: Optional[str] = None
 
 
-class Account:
-    """Счёт трейдера. Баланс = стартовый депозит + реализованная прибыль;
+@dataclass(frozen=True)
+class PendingOrder:
+    """Минимальное доменное представление ожидающего legacy-ордера."""
 
-    плюс плавающий P/L открытых позиций (mark-to-market по последней цене).
-    """
-
-    def __init__(self, initial_deposit: float):
-        self.initial_deposit = float(initial_deposit)
-        self.realized_total = 0.0  # кумулятивная реализованная прибыль
-        self.realized_cycle = 0.0  # с последнего клиринга (сбрасывается)
-        self.floating = 0.0        # плавающий P/L открытых позиций
-
-    @property
-    def balance(self) -> float:
-        return self.initial_deposit + self.realized_total
-
-    @property
-    def equity(self) -> float:
-        """Средства с учётом плавающей прибыли открытых позиций."""
-        return self.balance + self.floating
-
-    def realize(self, pnl: float) -> None:
-        self.realized_cycle += pnl
-        self.realized_total += pnl
-
-    def set_floating_pnl(self, pnl: float) -> None:
-        self.floating = float(pnl)
-
-    def clear(self) -> None:
-        self.realized_cycle = 0.0
-        self.floating = 0.0
-
-    def snapshot(self) -> dict:
-        return {
-            "balance": round(self.balance, 2),
-            "equity": round(self.equity, 2),
-            "realized_cycle": round(self.realized_cycle, 2),
-        }
-
-
-class PositionManager:
-    """Портфельное позиционирование: риск-бюджет, размер позиции, over_risk.
-
-    Не зависит от исполнителя: получает восстановленное состояние журнала и
-    контрактные метаданные, возвращает решения по размерам и события лимита.
-    """
-
-    def __init__(
-        self,
-        state: JournalState | None,
-        initial_deposit: float,
-        max_risk_pct: float,
-    ):
-        self.account = Account(initial_deposit)
-        self.max_risk_pct = float(max_risk_pct)
-        self.positions: dict[str, Position] = {}
-        self.pending: dict[int, RestoredOrder] = {}
-        if state is not None:
-            self.account.realize(state.realized)
-            self.pending = dict(state.orders)
-            for pos in state.positions.values():
-                self.positions[pos.position_id] = Position(
-                    position_id=pos.position_id,
-                    ticker=pos.ticker,
-                    side=pos.side,
-                    qty=pos.qty,
-                    avg_price=pos.avg_price,
-                    stop_price=pos.stop_price or None,
-                    take_profit=pos.take_profit,
-                    ts_entry=pos.ts_entry,
-                    over_risk=pos.over_risk,
-                    timeframe=pos.timeframe,
-                )
-
-    def budget(self) -> float:
-        """Риск-бюджет: equity * max_risk_pct / 100 (учёт плавающего P/L)."""
-        return self.account.equity * self.max_risk_pct / 100.0
-
-    def has_open_for(self, ticker: str) -> bool:
-        return any(p.ticker == ticker and p.qty > 0 for p in self.positions.values())
-
-    def get_go(self, qty: int, contract: ContractMeta, side: str) -> float:
-        """Требуемое гарантийное обеспечение (в руб) для заявки на стороне `side`."""
-        side_go = contract.go_buy if side == "BUY" else contract.go_sell
-        return side_go * qty
-
-    def evaluate_signals(
-        self,
-        signals: list[Signal],
-        contracts: dict[str, ContractMeta] | None = None,
-    ) -> list[SizingOutcome]:
-        """FIFO: по каждому сигналу в порядке поступления сохраняется очередь."""
-        contracts = contracts or {}
-        outcomes: list[SizingOutcome] = []
-        for signal in signals:
-            contract = contracts.get(signal.ticker)
-            outcomes.append(
-                self._size_signal(signal, contract)
-                if contract is not None
-                else SizingOutcome(
-                    signal=signal,
-                    qty=0,
-                    risk_rub=0.0,
-                    risk_pct=signal.risk_pct,
-                    reason="no-contract-meta",
-                )
-            )
-        return outcomes
-
-    def _size_signal(self, signal: Signal, contract: ContractMeta) -> SizingOutcome:
-        if self.has_open_for(signal.ticker):
-            return SizingOutcome(
-                signal=signal, qty=0, risk_rub=0.0,
-                risk_pct=signal.risk_pct, reason="otherexisting",
-            )
-        if signal.stop_distance_pct is None or signal.stop_distance_pct <= 0:
-            return SizingOutcome(
-                signal=signal, qty=0, risk_rub=0.0,
-                risk_pct=signal.risk_pct, reason="stop-missing",
-            )
-        used = min(signal.risk_pct, self.max_risk_pct)
-        if used <= 0:
-            return SizingOutcome(
-                signal=signal, qty=0, risk_rub=0.0,
-                risk_pct=signal.risk_pct, reason="risk-pct-exceeded",
-            )
-        risk_rub = self.account.equity * used / 100.0
-        stop_distance = (signal.stop_distance_pct / 100.0) * signal.entry_price
-        if contract.price_step <= 0 or contract.step_cost <= 0 or stop_distance <= 0:
-            return SizingOutcome(
-                signal=signal, qty=0, risk_rub=risk_rub,
-                risk_pct=used, reason="no-margin-math",
-            )
-        qty = math.floor(risk_rub / (stop_distance / contract.price_step * contract.step_cost))
-        if qty < 1:
-            return SizingOutcome(
-                signal=signal, qty=0, risk_rub=risk_rub,
-                risk_pct=used, reason="qty-negative",
-            )
-        return SizingOutcome(
-            signal=signal, qty=int(qty), risk_rub=risk_rub,
-            risk_pct=used, reason=None,
-        )
-
-    def margin_ok(self, qty: int, contract: ContractMeta, side: str) -> bool:
-        """Соответствие заявки ГО: используемое ГО <= баланс."""
-        return self.account.balance >= self.get_go(qty, contract, side)
-
-    def over_risk_cap(self) -> float:
-        """Порог «перекоса»: номинальная стоимость позиции (3 × стартовый депозит)."""
-        return 3.0 * self.account.initial_deposit
-
-    def apply_over_risk(self, positions: dict[str, Position]) -> list[str]:
-        """Отмечает позиции, чья стоимость превысила порог; возвращает их id."""
-        flagged = []
-        for pos in positions.values():
-            if pos.qty <= 0 or pos.ticker not in self._prices:
-                continue
-            contract = self._contracts.get(pos.ticker)
-            if contract is None:
-                continue
-            value = contract.position_value(pos.qty, self._prices[pos.ticker])
-            if value > self.over_risk_cap():
-                pos.mark_over_risk()
-                flagged.append(pos.position_id)
-        return flagged
-
-    def track_bar(self, prices: dict[str, float], contracts: dict[str, ContractMeta] | None = None) -> list[str]:
-        """Обновление котировок и проверка лимита перекоса: возврат position_id заявок,
-        подлежащих отмене (сначала самая старая из-за FIFO, не принадлежащая ove_risk-позициям)."""
-        self._prices = dict(prices)
-        self._contracts = dict(contracts or {})
-        over_ids = set(self.apply_over_risk(self.positions))
-        if not over_ids:
-            return []
-        cancel_candidates = sorted(
-            (o for o in self.pending.values() if o.position_id not in over_ids),
-            key=lambda o: (o.ts_order, o.order_id),
-        )
-        return [cancel_candidates[0].position_id] if cancel_candidates else []
-
-    def register_order(self, order_id: int, restored: RestoredOrder) -> None:
-        self.pending[order_id] = restored
-
-    def drop_order(self, order_id: int) -> None:
-        self.pending.pop(order_id, None)
-
-    def drop_order_stale(self, position_id: str) -> None:
-        """Убирает отложенные заявки закрывшейся позиции (защитные, entry)."""
-        self.pending = {oid: o for oid, o in self.pending.items() if o.position_id != position_id}
+    order_id: int
+    position_id: str
+    ticker: str
+    side: str
+    qty: int
+    limit_price: float
+    stop_price: Optional[float]
+    take_profit: Optional[float]
+    timeframe: str
+    ts_order: datetime
+    risk_pct: Optional[float]
+    risk_rub: Optional[float]
+    ttl: Optional[int]

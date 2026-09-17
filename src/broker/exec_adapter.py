@@ -7,6 +7,8 @@ from src.logging_setup import get_logger
 from src.portfolio import ContractMeta, PositionManager, Signal
 from src.strategies.contracts import Decision, SignalType
 from src.trade_journal import make_position_id
+from src.trade_management.actions import TradeAction
+from src.trade_management.models import TradePlan
 
 UTC = timezone.utc
 
@@ -32,10 +34,22 @@ class BrokerExecutionAdapter:
         self._contracts: dict[str, ContractMeta] = {}
         self._last_entry_bar: dict[tuple[str, str], object] = {}
 
-    def set_contracts(self, contracts: dict[str, ContractMeta]) -> None:
+    def set_contracts(self, contracts: dict[str, ContractMeta], names: dict[str, str] | None = None) -> None:
         self._contracts.update(contracts)
         if isinstance(self.broker, JournalBroker):
             self.broker.set_contracts(contracts)
+            self.broker.set_names(names)
+
+    def register_trade(self, plan: TradePlan) -> None:
+        """Register immutable trade details before sending its addressed actions."""
+        register = getattr(self.broker, "register_trade", None)
+        if register is None:
+            raise TypeError("broker does not support addressable trade plans")
+        register(plan)
+
+    def submit(self, action: TradeAction, now: datetime) -> object:
+        """Send an addressable command without selecting a position by ticker."""
+        return self.broker.submit(action, now)
 
     def execute(
         self,
@@ -50,8 +64,9 @@ class BrokerExecutionAdapter:
         if not ticker or decision.signal_type is SignalType.HOLD:
             return None
         now = datetime.now(UTC).replace(microsecond=0)
-        if decision.exit_reason is not None:
-            return self._close_existing(ticker, decision.price, now, decision.exit_reason)
+        exit_reason = getattr(decision, "exit_reason", None)
+        if exit_reason is not None:
+            return self._close_existing(ticker, decision.price, now, exit_reason)
 
         contract = self._contracts.get(ticker)
         if contract is None:
@@ -65,17 +80,19 @@ class BrokerExecutionAdapter:
         if not (0 < risk_pct <= 100):
             risk_pct = MAX_RISK_PCT
         stop_distance = None
-        if decision.stop_loss is not None and decision.price:
-            stop_distance = (decision.price - decision.stop_loss) / decision.price * 100
+        stop_loss = getattr(decision, "stop_loss", None)
+        take_profit = getattr(decision, "take_profit", None)
+        if stop_loss is not None and decision.price:
+            stop_distance = (decision.price - stop_loss) / decision.price * 100
         signal = Signal(
             position_id=make_position_id(ticker),
             ticker=ticker,
             side=side,
             entry_price=decision.price,
-            stop_price=decision.stop_loss,
+            stop_price=stop_loss,
             stop_distance_pct=stop_distance,
             risk_pct=risk_pct,
-            take_profit=decision.take_profit,
+            take_profit=take_profit,
             timeframe=timeframe or getattr(decision, "timeframe", "") or "",
             source=_source_label(decision, filter_profile),
         )
