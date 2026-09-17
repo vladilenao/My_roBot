@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -90,10 +90,10 @@ class TestRuntimeComposition:
             runtime = run._build_runtime([], notifier, MagicMock())
 
         storage_cls.assert_called_once_with(
-            run.app_dir() / run.DATABASE_FILE,
-            journal_path=run.app_dir() / run.JOURNAL_FILE,
-            positions_path=run.app_dir() / run.POSITIONS_FILE,
-            audit_path=run.app_dir() / run.AUDIT_FILE,
+            run.runtime_dir() / run.DATABASE_FILE,
+            journal_path=run.runtime_dir() / run.JOURNAL_FILE,
+            positions_path=run.runtime_dir() / run.POSITIONS_FILE,
+            audit_path=run.runtime_dir() / run.AUDIT_FILE,
             audit_max_bytes=run.AUDIT_MAX_BYTES,
             audit_backup_count=run.AUDIT_BACKUP_COUNT,
         )
@@ -101,7 +101,15 @@ class TestRuntimeComposition:
             run.INITIAL_DEPOSIT, run.CLEARING_TIMES, contract_names={}
         )
         manager_cls.assert_called_once_with(
-            storage, broker, initial_balance=run.Decimal(str(run.INITIAL_DEPOSIT))
+            storage,
+            broker,
+            initial_balance=run.Decimal(str(run.INITIAL_DEPOSIT)),
+            profiles_config=run.TRADE_MANAGEMENT_PROFILES,
+            risk_limits=limits.return_value,
+            max_qty=run.RISK_LIMITS.get("max_qty"),
+            commission=run.RISK_LIMITS.get("commission"),
+            slippage=run.RISK_LIMITS.get("slippage"),
+            signal_filter=ANY,
         )
         manager.restore.assert_called_once_with()
         limits.assert_called_once_with()

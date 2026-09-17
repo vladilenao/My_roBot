@@ -31,6 +31,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "timeframe": "timeframe",
         "sleep_seconds": "sleep_seconds",
         "heartbeat_every_ticks": "heartbeat_every_ticks",
+        "data_dir": "data_dir",
     },
     "tick": {
         "poll_secs": "tick_poll_secs",
@@ -82,6 +83,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "tick_timeout_secs": int,
     "instrument_type": str,
     "ticker": str,
+    "data_dir": str,
     "notifier": str,
     "share_strategies": dict,
     "future_strategies": dict,
@@ -369,7 +371,7 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [trading] positions_file должен быть непустой строкой, "
                 f"получено {value!r}"
             )
-        if key in {"database_file", "audit_file", "journal_file"} and not value:
+        if key in {"database_file", "audit_file", "journal_file", "data_dir"} and not value:
             raise ConfigError(f"{path}: [{key}] должен быть непустой строкой")
         if key in {"audit_max_bytes", "audit_backup_count"} and value < 0:
             raise ConfigError(f"{path}: [{key}] должен быть неотрицательным целым числом")

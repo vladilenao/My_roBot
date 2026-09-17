@@ -36,9 +36,9 @@ def _write_snapshot(storage):
         )
 
 
-def _revisions(path):
+def _read_csv(path):
     with path.open(newline="", encoding="utf-8") as handle:
-        return {row["export_revision"] for row in csv.DictReader(handle)}
+        return list(csv.DictReader(handle))
 
 
 def _change_snapshot(storage):
@@ -53,15 +53,14 @@ def test_startup_and_later_export_restore_deleted_csv_from_sqlite(tmp_path):
 
     with Storage(database, journal_path=journal, positions_path=positions) as storage:
         _write_snapshot(storage)
-        expected_revision = storage.connection.execute(
-            "SELECT exported_revision FROM export_state"
-        ).fetchone()[0]
+        expected_journal = journal.read_text(encoding="utf-8")
+        expected_positions = positions.read_text(encoding="utf-8")
         journal.unlink()
         positions.unlink()
         assert storage.export()
 
-    assert _revisions(journal) == {str(expected_revision)}
-    assert _revisions(positions) == {str(expected_revision)}
+    assert journal.read_text(encoding="utf-8") == expected_journal
+    assert positions.read_text(encoding="utf-8") == expected_positions
     with Storage(database, journal_path=journal, positions_path=positions):
         pass
     assert journal.exists()
@@ -98,7 +97,7 @@ def test_transient_csv_failure_keeps_database_and_records_retryable_revision(tmp
         ).fetchone() == (required, required, None, None)
 
 
-def test_csv_revisions_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypatch):
+def test_rows_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypatch):
     database = tmp_path / "trades.sqlite3"
     journal = tmp_path / "journal.csv"
     positions = tmp_path / "positions.csv"
@@ -106,9 +105,6 @@ def test_csv_revisions_expose_lag_until_a_failed_projection_is_retried(tmp_path,
 
     with Storage(database, journal_path=journal, positions_path=positions) as storage:
         _write_snapshot(storage)
-        initial_revision = storage.connection.execute(
-            "SELECT exported_revision FROM export_state"
-        ).fetchone()[0]
 
         def fail_positions_replace(source, destination):
             if destination == positions:
@@ -117,16 +113,17 @@ def test_csv_revisions_expose_lag_until_a_failed_projection_is_retried(tmp_path,
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", fail_positions_replace)
         _change_snapshot(storage)
-        required = storage.connection.execute(
-            "SELECT required_revision FROM export_state"
-        ).fetchone()[0]
-        assert _revisions(journal) == {str(required)}
-        assert _revisions(positions) == {str(initial_revision)}
+
+        stale_rows = _read_csv(positions)
+        assert len(stale_rows) == 1
+        assert stale_rows[0]["Кол-во, контракты"] == "2"
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", original_replace)
         assert storage.export()
-        assert _revisions(journal) == {str(required)}
-        assert _revisions(positions) == {str(required)}
+
+    retried_rows = _read_csv(positions)
+    assert len(retried_rows) == 1
+    assert retried_rows[0]["Кол-во, контракты"] == "1"
 
 
 def test_first_sqlite_export_preserves_legacy_csvs_only_once(tmp_path):

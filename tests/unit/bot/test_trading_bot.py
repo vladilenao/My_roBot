@@ -296,6 +296,29 @@ class TestTradingBot:
         signal_filter.apply.assert_called_once()
         action_executor.submit.assert_called_once()
 
+    def test_decisions_notified_even_in_trading_mode(self):
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        trade_manager.actions_for_signal.return_value = ()
+        execution = RecordingExecution()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(decision=Decision(SignalType.HOLD, 100.5)),
+            share={"SBER": _assign("macd_rsi_stoch")},
+            trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert trade_manager.actions_for_signal.call_count == 1
+        assert len(execution.decisions) == 1
+        assert execution.calls[0]["timeframe"] == "1h"
+        assert execution.calls[0]["filter_profile"] == "basic_levels"
+
     def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
         signal_filter = MagicMock()
         action_executor = MagicMock()

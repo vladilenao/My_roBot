@@ -277,6 +277,12 @@ class TradingBot:
                         else:
                             entry_candidates.append(candidate)
                         summaries.append(f"{name}={decision.signal_type.name}")
+                        self._emit(
+                            instrument, name, decision,
+                            filter_profile=assignment.filter_profile,
+                            filtered_out=False,
+                            timeframe=tf,
+                        )
                         continue
                 filtered_out = False
                 if context is not None:

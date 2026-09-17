@@ -6,19 +6,45 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Callable
+from typing import Callable, Mapping
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.logging_setup import get_logger
+from src.portfolio.risk import PortfolioRiskManager, RiskLimits, RiskTrade
+from src.strategies.contracts import SignalType
 from src.trade_journal.reducer import ExecutionReducer
 from src.trade_journal.storage import RecoveredTrade, ReservationCandidate, Storage
 from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
 )
 from src.trade_management.models import TradePhase, TradePlan
+from src.trade_management.opposite_signals import handle_raw_opposite_signal
+from src.trade_management.pipeline import (
+    PROFILE_CLASSES,
+    build_management_market,
+    build_profile_snapshot,
+)
+from src.trade_management.profiles.base import ManagementContext, PlanningContext, ProfileResult
+
+
+log = get_logger(__name__)
 
 
 _INCREASES = (OpenTrade, AddToTrade)
 _MANAGEABLE = {TradePhase.OPEN, TradePhase.BUILDING, TradePhase.REDUCING}
+_TERMINAL = {TradePhase.CLOSED, TradePhase.CANCELLED}
+_DEFAULT_RISK_LIMITS = RiskLimits(
+    per_trade=Decimal("2"),
+    per_instrument=Decimal("6"),
+    per_group={},
+    portfolio=Decimal("10"),
+)
+
+
+def _is_opposite(side: str, signal_type: SignalType) -> bool:
+    return (side == SignalType.BUY.value and signal_type is SignalType.SELL) or (
+        side == SignalType.SELL.value and signal_type is SignalType.BUY
+    )
 
 
 class TradeManager:
@@ -35,12 +61,25 @@ class TradeManager:
         *,
         initial_balance: Decimal = Decimal("0"),
         post_fill_check: Callable[[ExecutionEvent], tuple[TradeAction, ...]] | None = None,
+        profiles_config: Mapping[str, Mapping[str, object]] | None = None,
+        risk_limits: RiskLimits | None = None,
+        max_qty: int | None = None,
+        commission: Decimal | float | str | None = None,
+        slippage: Decimal | float | str | None = None,
+        signal_filter: object | None = None,
     ) -> None:
         self._storage = storage
         self._broker = broker
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
         self._post_fill_check = post_fill_check
+        self._profiles_config = dict(profiles_config or {})
+        self._risk_limits = risk_limits or _DEFAULT_RISK_LIMITS
+        self._max_qty = max_qty if isinstance(max_qty, int) and max_qty > 0 else 10
+        self._commission = Decimal(str(commission)) if commission is not None else Decimal("0")
+        self._slippage = Decimal(str(slippage)) if slippage is not None else Decimal("0")
+        self._signal_filter = signal_filter
+        self._risk = PortfolioRiskManager()
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -154,6 +193,276 @@ class TradeManager:
             for action in self._post_fill_check(event):
                 self.submit_action(action)
         return True
+
+    def actions_for_signal(
+        self,
+        assignment,
+        decision,
+        instrument,
+        frame,
+        context=None,
+        *,
+        timeframe: str | None = None,
+    ) -> tuple[TradeAction, ...]:
+        """Admit one raw strategy event: manage an owned trade or plan a new entry."""
+        if decision.signal_type is SignalType.HOLD:
+            return ()
+        timeframe = timeframe or assignment.timeframe
+        contract = getattr(self._broker, "contract_for", None)
+        meta = contract(instrument.ticker) if callable(contract) else None
+        if meta is None:
+            log.debug("actions_for_signal %s: нет метаданных контракта", instrument.ticker)
+            return ()
+        try:
+            recovered = self.restore()
+            owned = self._owned_trade(recovered, assignment.id)
+            if owned is not None:
+                return self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
+            return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
+        except Exception as exc:
+            log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
+            return ()
+
+    def manage(
+        self,
+        instrument,
+        assignments,
+        frame,
+        context=None,
+        *,
+        timeframe: str | None = None,
+    ) -> tuple[TradeAction, ...]:
+        """Protect each live trade of the instrument from the provided frame."""
+        contract = getattr(self._broker, "contract_for", None)
+        meta = contract(instrument.ticker) if callable(contract) else None
+        if meta is None:
+            return ()
+        results: list[TradeAction] = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != instrument.ticker or state.phase not in _MANAGEABLE or state.quantity <= 0:
+                continue
+            profile_cls = PROFILE_CLASSES.get(plan.profile.name)
+            if profile_cls is None:
+                continue
+            market = build_management_market(
+                contract=meta,
+                frame=frame,
+                context=context,
+                profile_parameters=dict(plan.profile.parameters),
+                signal=False,
+                commission=self._commission,
+                slippage=self._slippage,
+            )
+            try:
+                result = profile_cls().manage(ManagementContext(plan, state, market))
+            except Exception as exc:
+                log.warning("manage %s: %s", plan.trade_id, exc)
+                continue
+            for action in result.actions:
+                if isinstance(action, AddToTrade):
+                    continue
+                try:
+                    if self.submit_action(action, assignment_id=plan.assignment_id):
+                        results.append(action)
+                except ValueError as exc:
+                    log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
+        return tuple(results)
+
+    def _manage_owned(self, owned, assignment, decision, instrument, frame, context, meta, timeframe) -> tuple[TradeAction, ...]:
+        plan, state = owned.plan, owned.state
+        profile_cls = PROFILE_CLASSES.get(plan.profile.name)
+        if profile_cls is None:
+            return ()
+        market = build_management_market(
+            contract=meta,
+            frame=frame,
+            context=context,
+            profile_parameters=dict(plan.profile.parameters),
+            price=decision.price,
+            signal=True,
+            commission=self._commission,
+            slippage=self._slippage,
+        )
+        if _is_opposite(plan.side, decision.signal_type):
+            result = handle_raw_opposite_signal(plan, state, decision)
+            actions = result.actions
+        else:
+            if self._signal_filter is not None:
+                filtered = self._signal_filter.apply(
+                    decision,
+                    context,
+                    profile_name=assignment.filter_profile,
+                    instrument=instrument,
+                    timeframe=timeframe,
+                )
+                if filtered.signal_type is SignalType.HOLD:
+                    return ()
+            actions = tuple(
+                action for action in profile_cls().manage(ManagementContext(plan, state, market)).actions
+                if isinstance(action, AddToTrade)
+            )
+        submitted: list[TradeAction] = []
+        for action in actions:
+            try:
+                if self.submit_action(action, assignment_id=assignment.id):
+                    submitted.append(action)
+            except (ValueError, KeyError, TypeError) as exc:
+                log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
+        return tuple(submitted)
+
+    def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> tuple[TradeAction, ...]:
+        profile_cls = PROFILE_CLASSES.get(assignment.management)
+        if profile_cls is None:
+            log.warning("Неизвестный профиль управления %r", assignment.management)
+            return ()
+        snapshot = build_profile_snapshot(
+            assignment.management, self._profiles_config.get(assignment.management, {})
+        )
+        market = build_management_market(
+            contract=meta,
+            frame=frame,
+            context=context,
+            profile_parameters=dict(snapshot.parameters),
+            price=decision.price,
+            signal=False,
+            commission=self._commission,
+            slippage=self._slippage,
+        )
+        trade_id = decision.event_id or f"{assignment.id}:{timeframe}:{decision.signal_type.value}"
+        plan = profile_cls().plan(
+            PlanningContext(
+                trade_id=trade_id,
+                assignment_id=assignment.id,
+                instrument_id=instrument.ticker,
+                signal=decision,
+                profile=snapshot,
+                market=market,
+            )
+        )
+        if isinstance(plan, ProfileResult) or plan is None:
+            return ()
+        quantity, risk_amount = self._size_open_quantity(plan, meta)
+        if quantity <= 0:
+            return ()
+        action = OpenTrade(
+            command_id=f"{plan.trade_id}:entry",
+            trade_id=plan.trade_id,
+            state_revision=0,
+            reason="profile-entry",
+            quantity=quantity,
+        )
+        go = Decimal(str(meta.go_buy if plan.side == "BUY" else meta.go_sell))
+        reservation = ReservationCandidate(
+            reservation_id=f"reservation:{plan.trade_id}",
+            trade_id=plan.trade_id,
+            order_id=action.command_id,
+            priority=assignment.priority,
+            assignment_id=assignment.id,
+            instrument_id=plan.instrument_id,
+            signal_id=plan.signal_id,
+            risk_amount=risk_amount,
+            margin_amount=go * quantity,
+        )
+        budget = self._budget_base()
+        accepted = self.submit_plan(
+            plan,
+            action,
+            reservation=reservation,
+            risk_budget=budget * self._risk_limits.per_trade / Decimal("100"),
+            margin_budget=budget,
+        )
+        return (action,) if accepted else ()
+
+    def _size_open_quantity(self, plan: TradePlan, meta) -> tuple[int, Decimal]:
+        """Size a fresh entry within per-trade/instrument/portfolio risk and margin."""
+        value_per_point = Decimal(str(meta.step_cost)) / Decimal(str(meta.price_step))
+        direction = Decimal("1") if plan.side == "BUY" else Decimal("-1")
+        per_unit_risk = direction * (plan.reference_entry - plan.stop_price) * value_per_point
+        if per_unit_risk <= 0:
+            return 0, Decimal("0")
+        budget = self._budget_base()
+        existing = self._risk_trades()
+        go = Decimal(str(meta.go_buy if plan.side == "BUY" else meta.go_sell))
+        limits = self._risk_limits
+
+        def allowed(quantity: int) -> bool:
+            if go > 0 and go * quantity > budget:
+                return False
+            candidate = RiskTrade(
+                trade_id=plan.trade_id,
+                instrument_id=plan.instrument_id,
+                groups=frozenset(),
+                side=plan.side,
+                quantity=quantity,
+                average_price=plan.reference_entry,
+                stop_price=plan.stop_price,
+                price_step=Decimal(str(meta.price_step)),
+                step_cost=Decimal(str(meta.step_cost)),
+            )
+            return self._risk.evaluate(
+                balance=budget, equity=budget, limits=limits,
+                trades=existing + (candidate,),
+            ).allowed
+
+        low, high = 0, self._max_qty
+        while low < high:
+            candidate_qty = (low + high + 1) // 2
+            if allowed(candidate_qty):
+                low = candidate_qty
+            else:
+                high = candidate_qty - 1
+        if low <= 0:
+            return 0, Decimal("0")
+        return low, per_unit_risk * low
+
+    def _budget_base(self) -> Decimal:
+        row = self._storage.connection.execute(
+            "SELECT balance, equity FROM account WHERE account_id = 1"
+        ).fetchone()
+        if row is None:
+            return self._initial_balance
+        return min(Decimal(row[0]), Decimal(row[1]))
+
+    def _risk_trades(self) -> tuple[RiskTrade, ...]:
+        contract_for = getattr(self._broker, "contract_for", None)
+        trades: list[RiskTrade] = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if state.quantity <= 0 or state.average_price is None:
+                continue
+            meta = contract_for(plan.instrument_id) if callable(contract_for) else None
+            if meta is None or meta.price_step <= 0 or meta.step_cost <= 0:
+                continue
+            row = self._storage.connection.execute(
+                "SELECT realized_pnl, fees FROM positions WHERE trade_id = ?", (plan.trade_id,)
+            ).fetchone()
+            realized_pnl = Decimal(row[0]) if row else Decimal("0")
+            paid_fees = Decimal(row[1]) if row else Decimal("0")
+            stop = state.confirmed_stop or plan.stop_price
+            if (plan.side == "BUY") != (stop < state.average_price):
+                stop = plan.stop_price
+            trades.append(RiskTrade(
+                trade_id=plan.trade_id,
+                instrument_id=plan.instrument_id,
+                groups=frozenset(),
+                side=plan.side,
+                quantity=state.quantity,
+                average_price=state.average_price,
+                stop_price=stop,
+                price_step=Decimal(str(meta.price_step)),
+                step_cost=Decimal(str(meta.step_cost)),
+                paid_fees=paid_fees,
+                realized_pnl=realized_pnl,
+            ))
+        return tuple(trades)
+
+    @staticmethod
+    def _owned_trade(recovered, assignment_id: str) -> RecoveredTrade | None:
+        for trade in recovered:
+            if trade.plan.assignment_id == assignment_id and trade.state.phase not in _TERMINAL:
+                return trade
+        return None
 
     @staticmethod
     def _validate_phase(action: TradeAction, phase: TradePhase) -> None:

@@ -165,6 +165,20 @@ class Storage:
         audit_exported = self._audit_exporter.export() if self._audit_exporter is not None else True
         return csv_exported and audit_exported
 
+    def set_contract_metadata(self, contracts: Mapping[str, object]) -> None:
+        """Hand broker contract metadata to the CSV card projection."""
+        if self._exporter is None:
+            return
+        self._exporter.set_contracts(contracts)
+        self.export()
+
+    def set_names(self, names: Mapping[str, str]) -> None:
+        """Hand ticker -> short contract name mapping to the CSV projections."""
+        if self._exporter is None:
+            return
+        self._exporter.set_names(names)
+        self.export()
+
     def _mark_export_required(self) -> None:
         if self._exporter is None and self._audit_exporter is None:
             return

@@ -16,6 +16,7 @@ import contextvars
 import datetime
 import logging
 import logging.handlers
+from pathlib import Path
 
 # ── contextvars ────────────────────────────────────────────────
 service_uid_var: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -102,6 +103,8 @@ def setup_logging(
     # Убираем все существующие хэндлеры (включая консольные)
     for h in list(root.handlers):
         root.removeHandler(h)
+
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
 
     handler = logging.handlers.RotatingFileHandler(
         log_file,

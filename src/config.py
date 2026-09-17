@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import cast
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
@@ -199,6 +200,20 @@ LOGGING_FILE = _CONFIG["logging_file"]
 LOGGING_LEVEL = _CONFIG["logging_level"]
 LOGGING_MAX_BYTES = _CONFIG["logging_max_bytes"]
 LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
+
+# Каталог runtime-агрегатов (БД, CSV-проекции, аудит- и debug-лог).
+DATA_DIR = _CONFIG.get("data_dir", "data")
+
+
+def runtime_dir() -> Path:
+    """Абсолютный каталог состояния робота: ``app_dir()/data_dir``.
+
+    В dev это ``<корень проекта>/data``, в PyInstaller-сборке — ``data`` рядом
+    с исполняемым файлом. Каталог не создаётся здесь: создание выполняет тот,
+    кто открывает первые файлы (``run.main``).
+    """
+    path = Path(DATA_DIR)
+    return path if path.is_absolute() else app_dir() / path
 
 # Торговая секция [trading]: SQLite-backed candle simulation.
 # При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.

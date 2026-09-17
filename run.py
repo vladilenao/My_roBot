@@ -35,8 +35,9 @@ from src.config import (
     AUDIT_FILE,
     AUDIT_MAX_BYTES,
     AUDIT_BACKUP_COUNT,
+    TRADE_MANAGEMENT_PROFILES,
     trading_enabled,
-    app_dir,
+    runtime_dir,
 )
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
@@ -53,9 +54,11 @@ log = get_logger(__name__)
 
 
 def main():
+    state_dir = runtime_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
-        log_file=LOGGING_FILE,
+        log_file=str(state_dir / LOGGING_FILE),
         level=LOGGING_LEVEL,
         max_bytes=LOGGING_MAX_BYTES,
         backup_count=LOGGING_BACKUP_COUNT,
@@ -98,15 +101,18 @@ def main():
         risk_manager=runtime.risk_manager,
         post_tick=runtime.post_tick,
         trade_manager=runtime.trade_manager,
+        action_executor=runtime.action_executor,
     ).run()
 
 
 class _Runtime:
-    def __init__(self, execution, post_tick=None, trade_manager=None, risk_manager=None) -> None:
+    def __init__(self, execution, post_tick=None, trade_manager=None, risk_manager=None,
+                 action_executor=None) -> None:
         self.execution = execution
         self.post_tick = post_tick
         self.trade_manager = trade_manager
         self.risk_manager = risk_manager
+        self.action_executor = action_executor
 
 
 def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
@@ -126,11 +132,13 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
     from src.trade_management.manager import TradeManager
 
     try:
+        state_dir = runtime_dir()
+        state_dir.mkdir(parents=True, exist_ok=True)
         storage = Storage(
-            app_dir() / DATABASE_FILE,
-            journal_path=app_dir() / JOURNAL_FILE,
-            positions_path=app_dir() / POSITIONS_FILE,
-            audit_path=app_dir() / AUDIT_FILE,
+            state_dir / DATABASE_FILE,
+            journal_path=state_dir / JOURNAL_FILE,
+            positions_path=state_dir / POSITIONS_FILE,
+            audit_path=state_dir / AUDIT_FILE,
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
         )
@@ -143,18 +151,24 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime(NotifyOnlyExecutionPort(notifier))
 
+    risk_limits = _risk_limits()
     trade_manager = TradeManager(
         storage,
         broker,
         initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+        profiles_config=TRADE_MANAGEMENT_PROFILES,
+        risk_limits=risk_limits,
+        max_qty=RISK_LIMITS.get("max_qty"),
+        commission=RISK_LIMITS.get("commission"),
+        slippage=RISK_LIMITS.get("slippage"),
+        signal_filter=SignalFilter(),
     )
     trade_manager.restore()
+    action_executor = _OutboxExecutor(trade_manager)
     risk_manager = PortfolioRiskManager()
-    # Validate the configured limits while building the runtime. Their pure
-    # calculations are consumed by the admission layer as it creates plans.
-    _risk_limits()
     contracts = _load_contracts_metadata(instruments)
     broker.set_contracts(contracts)
+    storage.set_contract_metadata(contracts)
     broker.set_names(_instrument_names(instruments))
     print_contract_metadata(contracts)
 
@@ -183,6 +197,13 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
                 broker.track_bar(max(bar_times), prices, contracts)
             for event in broker.drain_events():
                 notifier.notify_event(event.type, event.position_id, event.message)
+            for event in broker.drain_addressed_events():
+                try:
+                    trade_manager.consume(event)
+                except Exception as exc:
+                    log.warning(
+                        "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
+                    )
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 
@@ -191,7 +212,24 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         post_tick=on_bar,
         trade_manager=trade_manager,
         risk_manager=risk_manager,
+        action_executor=action_executor,
     )
+
+
+class _OutboxExecutor:
+    """Flushes the durable trade-management outbox after fresh intent is queued."""
+
+    def __init__(self, trade_manager) -> None:
+        self._trade_manager = trade_manager
+
+    def submit(self, action, now) -> None:
+        dispatch = getattr(self._trade_manager, "dispatch", None)
+        if dispatch is None:
+            return
+        try:
+            dispatch(now)
+        except Exception as exc:
+            log.warning("Сбой доставки команд исполнению: %s", exc)
 
 
 def _risk_limits():
