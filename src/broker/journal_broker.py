@@ -161,6 +161,7 @@ class JournalBroker(BrokerPort):
         self._contracts: dict[str, ContractMeta] = {}
         self._names: dict[str, str] = dict(contract_names or {})
         self._command_events: dict[str, ExecutionEvent] = {}
+        self._addressed_events: list[ExecutionEvent] = []
         self._addressed_trades: dict[str, AddressedTrade] = {}
         self._scheduled_actions: list[ScheduledAction] = []
         self._processed_addressed_bars: set[tuple[str, datetime]] = set()
@@ -564,8 +565,12 @@ class JournalBroker(BrokerPort):
         self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
     ) -> ExecutionEvent:
         if action.state_revision != trade.revision:
-            return self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
-        return self._execute_action(trade, action, now, fill_price)
+            event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
+            self._addressed_events.append(event)
+            return event
+        event = self._execute_action(trade, action, now, fill_price)
+        self._addressed_events.append(event)
+        return event
 
     def _process_addressed_protection(
         self, trade: AddressedTrade, now: datetime, bar: tuple[float, float, float, float]) -> None:
@@ -668,6 +673,12 @@ class JournalBroker(BrokerPort):
     def drain_events(self) -> list[BrokerEvent]:
         events = list(self._events)
         self._events.clear()
+        return events
+
+    def drain_addressed_events(self) -> list[ExecutionEvent]:
+        """Return the bar-time outcomes of scheduled addressed commands."""
+        events = list(self._addressed_events)
+        self._addressed_events.clear()
         return events
 
     # ——— Внутренняя логика ———

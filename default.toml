@@ -6,6 +6,7 @@
 timeframe = "1h"
 sleep_seconds = 3600
 heartbeat_every_ticks = 60
+data_dir = "data"
 
 [tick]
 poll_secs = 1
@@ -69,73 +70,80 @@ strategies = [
 # Профиль фильтрации triple_screen (методика Элдера):
 # множитель иерархии ТФ, параметры MACD/Stochastic, пороги зон %K.
 # Используется привязками с filter = "triple_screen".
+#
+# Три экрана: 1) направление тренда на старшем ТФ — наклон гистограммы MACD;
+# 2) фаза коррекции на среднем ТФ — положение %K Stochastic относительно зон;
+# 3) входящий сигнал базовой стратегии на рабочем ТФ.
 [strategies.filter.triple_screen]
-multiplier = 5
-macd_fast = 12
-macd_slow = 26
-macd_signal = 9
-stoch_k = 14
-stoch_d = 3
-stoch_smooth_k = 3
-oversold = 20
-overbought = 80
+multiplier = 5        # множитель иерархии ТФ Элдера (>= 2): средний ТФ ≈ работа × множитель,
+                      # старший ТФ ≈ средний × множитель (берётся ближайший больший стандартный)
+macd_fast = 12        # быстрая EMA MACD на старшем ТФ (экран 1); должна быть < macd_slow
+macd_slow = 26        # медленная EMA MACD на старшем ТФ
+macd_signal = 9       # сигнальная EMA гистограммы MACD; должна быть < macd_slow
+stoch_k = 14          # период %K Stochastic на среднем ТФ (экран 2); >= stoch_d
+stoch_d = 3           # период сглаживания %D Stochastic (сигнальная линия)
+stoch_smooth_k = 3    # внутреннее сглаживание %K до расчёта %D
+oversold = 20         # порог перепроданности %K (0..100): ниже него коррекция допускает лонг; < overbought
+overbought = 80       # порог перекупленности %K (0..100): выше него коррекция допускает шорт
 
 [logging]
-service_uid = "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a"
-file = "bot_debug.log"
-level = "DEBUG"
-max_bytes = 10485760
-backup_count = 5
-audit_file = "trade_audit.log"
-audit_max_bytes = 10485760
-audit_backup_count = 5
+service_uid = "b7e3a1c4-92f8-4d5e-a016-7f8b2c3d4e5a"  # идентификатор экземпляра робота в строках лога
+file = "bot_debug.log"                                # имя debug-лога внутри runtime-каталога (data/)
+level = "DEBUG"                                       # порог логирования: DEBUG/INFO/WARNING/ERROR
+max_bytes = 10485760                                  # максимальный размер одного файла лога до ротации (10 МБ)
+backup_count = 5                                      # сколько ротационных копий (bot_debug.log.1…N) хранить
+audit_file = "trade_audit.log"                        # лента расчётов менеджмента (трейсы калькуляторов risk/stops)
+audit_max_bytes = 10485760                            # размер audit-файла до ротации
+audit_backup_count = 5                                # число хранимых ротационных копий audit-файла
 
 [trading]
-initial_deposit = 100000
-max_risk_pct = 2.0
-database_file = "trades.sqlite3"
-journal_file = "trade_journal.csv"
-positions_file = "trade_journal_positions.csv"
-clearing_times = ["14:05", "19:00"]
+initial_deposit = 100000                              # стартовый капитал счёта (в валюте счёта), база для risk-лимитов
+max_risk_pct = 2.0                                    # максимальный риск на одну сделку, % от капитала (легаси-лимит)
+database_file = "trades.sqlite3"                      # durable-журнал сделок (SQLite) внутри runtime-каталога
+journal_file = "trade_journal.csv"                    # append-only лента сделок (CSV-проекция журнала)
+positions_file = "trade_journal_positions.csv"        # карточки открытых позиций (производный CSV из журнала)
+clearing_times = ["14:05", "19:00"]                   # времена дневного клиринга (МСК): исполнение сделок приостановлено
 
 [trading.risk_limits]
-trade_pct = 2.0
-instrument_pct = 4.0
-portfolio_pct = 6.0
-max_qty = 10
-commission = 0.0
-slippage = 0.0
-groups = { energy = 4.0, currency = 4.0 }
+trade_pct = 2.0         # макс. риск одной сделки, % от текущего баланса (stop-убыток + комиссии)
+instrument_pct = 4.0    # макс. суммарный риск по всем позициям одного инструмента, %
+portfolio_pct = 6.0     # макс. совокупный риск по всему портфелю, %
+max_qty = 10            # верхняя граница размера входа: не более такого числа контрактов на сделку
+commission = 0.0        # комиссия за сделку в валюте счёта (учитывается в расчёте безубытка)
+slippage = 0.0          # допустимое проскальзывание в валюте счёта (учитывается в расчёте безубытка)
+groups = { energy = 4.0, currency = 4.0 }  # лимиты риска по группам инструментов, % от капитала
 
+# Профили управления открытой позицией. Привязка происходит в [strategies.*] через
+# ключ management; параметры читаются на этапе планирования и каждого mengement-такта.
 [trade_management.profiles.levels_rr]
-type = "levels_rr"
-buffer_ticks = 1
-target_R = [1.0, 2.0]
-shares = [0.5, 0.5]
-max_adds = 0
+type = "levels_rr"  # профиль: риск-доходность от уровней поддержки/сопротивления
+buffer_ticks = 1    # отступ стопа от S/R в шагах цены
+target_R = [1.0, 2.0]     # тейки в долях риска (R): 1.0×R и 2.0×R от точки входа
+shares = [0.5, 0.5]       # доля позиции, закрываемая на каждом тейке (сумма ≤ 1)
+max_adds = 0              # максимум докуток (пирамидинга) на прибыльном движении
 
 [trade_management.profiles.atr_trend]
-type = "atr_trend"
-atr_period = 14
-initial_k = 2.0
-trail_k = 2.0
-tp1_R = 1.0
-tp1_share = 0.5
-max_adds = 2
-add_fraction = 0.5
-advance_R = 0.5
+type = "atr_trend"  # профиль: стоп по ATR, фиксация TP1, далее трейлинг остатка
+atr_period = 14       # период ATR (прогрев индикатором; фрейм должен быть длиннее)
+initial_k = 2.0       # начальный стоп = K × ATR от точки входа
+trail_k = 2.0         # трейлинг-стоп = K × ATR от экстремума движения
+tp1_R = 1.0           # первый тейк в долях риска (R)
+tp1_share = 0.5       # доля позиции, закрываемая на TP1 (остаток уходит в трейлинг)
+max_adds = 2          # максимум докуток в фазе пирамидинга (до срабатывания TP1)
+add_fraction = 0.5    # размер докутки как доля от текущего объёма позиции
+advance_R = 0.5       # минимальное продвижение цены (в R) от последнего входа для докутки
 
 [trade_management.profiles.ma_cloud]
-type = "ma_cloud"
-ma_fast_period = 10
-ma_slow_period = 40
-buffer_ticks = 1
-max_adds = 2
-add_fraction = 0.5
+type = "ma_cloud"      # профиль: стоп по облаку скользящих средних, частичный выход и ретест-докутка
+ma_fast_period = 10    # быстрая MA (верхняя граница облака для BUY)
+ma_slow_period = 40    # медленная MA (нижняя граница облака; пробой — принудительный выход)
+buffer_ticks = 1       # отступ стопа от границы облака в шагах цены
+max_adds = 2           # максимум докуток на возврате цены к облаку
+add_fraction = 0.5     # размер докутки как доля от текущего объёма позиции
 
 [trade_management.profiles.pattern_targets]
-type = "pattern_targets"
-buffer_ticks = 1
-fractions_to_D = [0.5, 1.0]
-shares = [0.5, 0.5]
+type = "pattern_targets"  # профиль: цели AB=CD (паттерн гармоники), стоп за точкой C
+buffer_ticks = 1          # отступ стопа от точки C в шагах цены
+fractions_to_D = [0.5, 1.0]  # доли расстояния до цели D: 0.5 — мидпоинт, 1.0 — сама D
+shares = [0.5, 0.5]          # доля позиции, закрываемая на каждой из двух целей
 max_adds = 0
