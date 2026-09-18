@@ -137,7 +137,7 @@ def test_market_input_is_immutable_and_cannot_be_replaced_for_same_source(tmp_pa
 
 
 def test_trace_exports_structured_values_and_all_identifiers_independent_of_root_level(tmp_path, monkeypatch):
-    audit_path = tmp_path / "trade_audit.log"
+    audit_path = tmp_path / "trade_decision_trace.log"
     monkeypatch.setattr(logging.getLogger(), "level", logging.CRITICAL)
     trace = _trace("calculation-audit", TraceOutcome.ACCEPTED, "risk-within-limit")
     trace = CalculationTrace(

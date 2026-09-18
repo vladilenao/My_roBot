@@ -92,7 +92,7 @@ file = "bot_debug.log"                                # имя debug-лога в
 level = "DEBUG"                                       # порог логирования: DEBUG/INFO/WARNING/ERROR
 max_bytes = 10485760                                  # максимальный размер одного файла лога до ротации (10 МБ)
 backup_count = 5                                      # сколько ротационных копий (bot_debug.log.1…N) хранить
-audit_file = "trade_audit.log"                        # лента расчётов менеджмента (трейсы калькуляторов risk/stops)
+audit_file = "trade_decision_trace.log"               # лента расчётов менеджмента (трейсы калькуляторов risk/stops)
 audit_max_bytes = 10485760                            # размер audit-файла до ротации
 audit_backup_count = 5                                # число хранимых ротационных копий audit-файла
 
@@ -100,8 +100,8 @@ audit_backup_count = 5                                # число храним�
 initial_deposit = 100000                              # стартовый капитал счёта (в валюте счёта), база для risk-лимитов
 max_risk_pct = 2.0                                    # максимальный риск на одну сделку, % от капитала (легаси-лимит)
 database_file = "trades.sqlite3"                      # durable-журнал сделок (SQLite) внутри runtime-каталога
-journal_file = "trade_journal.csv"                    # append-only лента сделок (CSV-проекция журнала)
-positions_file = "trade_journal_positions.csv"        # карточки открытых позиций (производный CSV из журнала)
+journal_file = "trade_event.csv"                      # append-only лента сделок (CSV-проекция журнала)
+positions_file = "trade_summary.csv"                  # карточки открытых позиций (CSV-проекция журнала)
 clearing_times = ["14:05", "19:00"]                   # времена дневного клиринга (МСК): исполнение сделок приостановлено
 
 [trading.risk_limits]

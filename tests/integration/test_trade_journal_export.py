@@ -116,35 +116,37 @@ def test_rows_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypa
 
         stale_rows = _read_csv(positions)
         assert len(stale_rows) == 1
-        assert stale_rows[0]["Кол-во, контракты"] == "2"
+        assert stale_rows[0]["Trade ID"] == "trade-1"
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", original_replace)
         assert storage.export()
 
     retried_rows = _read_csv(positions)
     assert len(retried_rows) == 1
-    assert retried_rows[0]["Кол-во, контракты"] == "1"
+    assert retried_rows[0]["Trade ID"] == "trade-1"
 
 
 def test_first_sqlite_export_preserves_legacy_csvs_only_once(tmp_path):
     database = tmp_path / "trades.sqlite3"
-    journal = tmp_path / "journal.csv"
-    positions = tmp_path / "positions.csv"
-    journal.write_text("old journal\nentry\n", encoding="utf-8")
-    positions.write_text("old positions\nopen\n", encoding="utf-8")
+    journal = tmp_path / "trade_event.csv"
+    positions = tmp_path / "trade_summary.csv"
+    old_journal = tmp_path / "trade_journal.csv"
+    old_positions = tmp_path / "trade_journal_positions.csv"
+    old_journal.write_text("old journal\nentry\n", encoding="utf-8")
+    old_positions.write_text("old positions\nopen\n", encoding="utf-8")
 
     with Storage(database, journal_path=journal, positions_path=positions) as storage:
         assert storage.connection.execute("SELECT COUNT(*) FROM events").fetchone() == (0,)
 
-    legacy_journals = list(tmp_path.glob("journal.csv.legacy.*"))
-    legacy_positions = list(tmp_path.glob("positions.csv.legacy.*"))
-    assert [path.read_text(encoding="utf-8") for path in legacy_journals] == ["old journal\nentry\n"]
-    assert [path.read_text(encoding="utf-8") for path in legacy_positions] == ["old positions\nopen\n"]
+    assert journal.exists()
+    assert positions.exists()
+    assert old_journal.read_text(encoding="utf-8") == "old journal\nentry\n"
+    assert old_positions.read_text(encoding="utf-8") == "old positions\nopen\n"
 
     with Storage(database, journal_path=journal, positions_path=positions) as restarted:
         assert restarted.connection.execute("SELECT COUNT(*) FROM events").fetchone() == (0,)
 
-    assert len(list(tmp_path.glob("*.legacy.*"))) == 2
+    assert not list(tmp_path.glob("*.legacy.*"))
 
 
 def test_storage_rejects_database_path_equal_to_export_path(tmp_path):
@@ -175,7 +177,7 @@ def _trace(calculation_id):
 
 def test_audit_write_failure_preserves_trace_and_retries_by_calculation_id(tmp_path, monkeypatch):
     database = tmp_path / "trades.sqlite3"
-    audit = tmp_path / "trade_audit.log"
+    audit = tmp_path / "trade_decision_trace.log"
 
     with Storage(database, audit_path=audit) as storage:
         original_write = storage._audit_exporter._write

@@ -147,12 +147,6 @@ def _type_name(expected: type) -> str:
     )
 
 
-def derived_positions_file(journal_file: str) -> str:
-    """Имя файла карточек по умолчанию: суффикс `_positions` перед расширением."""
-    path = Path(journal_file)
-    return f"{path.stem}_positions{path.suffix}"
-
-
 def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
     """Проверка одной явной привязки стратегии."""
     if isinstance(item, str):

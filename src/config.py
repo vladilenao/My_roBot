@@ -7,7 +7,6 @@ from t_tech.invest import CandleInterval
 from src.config_loader import (
     ConfigError,
     app_dir,
-    derived_positions_file,
     load_config,
     validate_triple_screen_hierarchy,
 )
@@ -71,7 +70,7 @@ _DEFAULTS = {
     "logging_level": "DEBUG",
     "logging_max_bytes": 10_485_760,
     "logging_backup_count": 5,
-    "audit_file": "trade_audit.log",
+    "audit_file": "trade_decision_trace.log",
     "audit_max_bytes": 10_485_760,
     "audit_backup_count": 5,
 }
@@ -219,11 +218,11 @@ def runtime_dir() -> Path:
 # При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.
 INITIAL_DEPOSIT = int(_CONFIG.get("initial_deposit", 100_000))
 MAX_RISK_PCT = float(_CONFIG.get("max_risk_pct", 2.0))
-JOURNAL_FILE = _CONFIG.get("journal_file", "trade_journal.csv")
-POSITIONS_FILE = _CONFIG.get("positions_file") or derived_positions_file(JOURNAL_FILE)
+JOURNAL_FILE = _CONFIG.get("journal_file", "trade_event.csv")
+POSITIONS_FILE = _CONFIG.get("positions_file", "trade_summary.csv")
 CLEARING_TIMES = list(_CONFIG.get("clearing_times", ["14:05", "19:00"]))
 DATABASE_FILE = _CONFIG.get("database_file", "trades.sqlite3")
-AUDIT_FILE = _CONFIG.get("audit_file", "trade_audit.log")
+AUDIT_FILE = _CONFIG.get("audit_file", "trade_decision_trace.log")
 AUDIT_MAX_BYTES = _CONFIG.get("audit_max_bytes", 10_485_760)
 AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))

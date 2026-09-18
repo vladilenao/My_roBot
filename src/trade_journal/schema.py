@@ -31,7 +31,7 @@ CREATE TABLE trades (
 );
 CREATE UNIQUE INDEX active_trade_per_assignment_instrument
     ON trades (assignment_id, instrument_id)
-    WHERE phase NOT IN ('CLOSED', 'CANCELLED');
+    WHERE phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR');
 
 CREATE TABLE positions (
     trade_id TEXT PRIMARY KEY REFERENCES trades(trade_id) ON DELETE CASCADE,
