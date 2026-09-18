@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from src.broker.port import ExecutionEvent, ExecutionStatus
 from src.trade_journal.storage import Storage
-from src.trade_management.audit import CalculationTrace, MeasuredValue, TraceLinks, calculation_trace
+from src.trade_management.audit import CalculationTrace, CalculationTraceRepository, MeasuredValue, TraceLinks, calculation_trace
 
 
 _INCREASE_ACTIONS = {"OPEN", "ADD"}
@@ -133,6 +133,7 @@ class ExecutionReducer:
 
     def __init__(self, storage: Storage) -> None:
         self._storage = storage
+        self._traces = CalculationTraceRepository(storage)
 
     def apply(self, event: ExecutionEvent) -> bool:
         """Apply an event once; return ``False`` when its execution was already seen."""
@@ -152,7 +153,7 @@ class ExecutionReducer:
 
             if filled:
                 position, account = self._states(connection, event.trade_id)
-                next_position, next_account = apply_fill(
+                next_position, next_account, fill_trace = apply_fill_with_trace(
                     position,
                     account,
                     side=connection.execute(
@@ -163,6 +164,7 @@ class ExecutionReducer:
                     price=event.price,
                     fee=event.fee,
                 )
+                self._traces.record_in_transaction(connection, fill_trace)
                 total_filled = order["filled_quantity"] + event.filled_quantity
                 if total_filled > order["quantity"]:
                     raise ValueError("filled quantity exceeds order quantity")
@@ -189,6 +191,7 @@ class ExecutionReducer:
                 )
                 if event.status in {ExecutionStatus.REJECT, ExecutionStatus.CANCEL}:
                     self._release_reservation(connection, order, now)
+                    self._update_terminal_outcome(connection, event, order, now)
 
             connection.execute(
                 "INSERT INTO events (event_id, trade_id, order_id, command_id, event_type, payload_json, occurred_at) "
@@ -314,8 +317,31 @@ class ExecutionReducer:
         )
 
     @staticmethod
+    def _update_terminal_outcome(connection, event: ExecutionEvent, order: dict[str, object], now: str) -> None:
+        """Keep rejected broker requests distinct from user cancellations."""
+        action = str(order["action_type"]).upper().split(":", 1)[0]
+        if event.status is ExecutionStatus.REJECT and action == "OPEN":
+            phase = "REJECTED"
+        elif action == "OPEN":
+            quantity = connection.execute(
+                "SELECT quantity FROM positions WHERE trade_id = ?", (event.trade_id,)
+            ).fetchone()
+            if quantity and quantity[0] > 0:
+                return
+            phase = "CANCELLED"
+        else:
+            return
+        connection.execute(
+            "UPDATE trades SET phase = ?, state_revision = state_revision + 1, updated_at = ? "
+            "WHERE trade_id = ? AND phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR')",
+            (phase, now, event.trade_id),
+        )
+
+    @staticmethod
     def _payload(event: ExecutionEvent) -> dict[str, str | int | None]:
         return {
             "fee": _text(event.fee), "price": _text(event.price) if event.price is not None else None,
             "reason": event.reason, "status": event.status.value, "quantity": event.filled_quantity,
+            "low": _text(event.market_low) if event.market_low is not None else None,
+            "high": _text(event.market_high) if event.market_high is not None else None,
         }

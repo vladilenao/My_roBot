@@ -8,7 +8,7 @@ from src.config import (
     POSITIONS_FILE,
     trading_enabled,
 )
-from src.config_loader import ConfigError, derived_positions_file, load_config
+from src.config_loader import ConfigError, load_config
 
 
 def _defaults():
@@ -164,20 +164,6 @@ class TestPositionsFileParsing:
             load_config(_defaults(), config_file=cfg_ref(tmp_path))
 
 
-class TestDerivedPositionsFile:
-    def test_suffix_before_extension(self):
-        assert derived_positions_file("trade_journal.csv") == "trade_journal_positions.csv"
-
-    def test_custom_name(self):
-        assert derived_positions_file("journal.csv") == "journal_positions.csv"
-
-    def test_keeps_extension(self):
-        assert derived_positions_file("ledger.csv") == "ledger_positions.csv"
-
-    def test_without_extension(self):
-        assert derived_positions_file("journal") == "journal_positions"
-
-
 class TestTradingEnabled:
     def test_disabled_without_section(self):
         from src.config import _CONFIG
@@ -211,8 +197,9 @@ class TestImportConstants:
         assert isinstance(POSITIONS_FILE, str) and POSITIONS_FILE
         assert isinstance(CLEARING_TIMES, list) and CLEARING_TIMES
 
-    def test_positions_file_derived_from_journal_by_default(self):
-        assert POSITIONS_FILE == derived_positions_file(JOURNAL_FILE)
+    def test_canonical_export_file_defaults(self):
+        assert JOURNAL_FILE == "trade_event.csv"
+        assert POSITIONS_FILE == "trade_summary.csv"
 
 
 def cfg_ref(tmp_path):

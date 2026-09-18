@@ -25,6 +25,9 @@ class TradePhase(StrEnum):
     REDUCING = "REDUCING"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
+    PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
+    REJECTED = "REJECTED"
+    ERROR = "ERROR"
 
 
 @dataclass(frozen=True)

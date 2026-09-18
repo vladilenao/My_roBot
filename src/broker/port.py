@@ -28,6 +28,8 @@ class ExecutionEvent:
     fee: Decimal
     timestamp: datetime
     reason: str
+    market_low: Decimal | None = None
+    market_high: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not all((self.execution_id, self.command_id, self.trade_id, self.reason)):

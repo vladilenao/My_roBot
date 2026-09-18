@@ -144,41 +144,40 @@ class CalculationTraceRepository:
         self._storage = storage
 
     def record(self, trace: CalculationTrace, market_input: MarketInput | None = None) -> bool:
+        with self._storage.transaction() as connection:
+            return self.record_in_transaction(connection, trace, market_input)
+
+    def record_in_transaction(
+        self, connection, trace: CalculationTrace, market_input: MarketInput | None = None
+    ) -> bool:
+        """Record a trace using a transaction owned by the caller."""
         if market_input is not None and trace.source_data_id != market_input.source_data_id:
             raise ValueError("trace source_data_id must match market input")
         if trace.source_data_id is not None and market_input is None:
             raise ValueError("a trace with source_data_id requires its market input")
-        with self._storage.transaction() as connection:
-            if market_input is not None:
-                inserted = connection.execute(
-                    "INSERT INTO market_inputs (source_data_id, kind, data_json, seed_json, available_at, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (source_data_id) DO NOTHING",
-                    (
-                        market_input.source_data_id,
-                        market_input.kind,
-                        _dump(market_input.values),
-                        _dump(market_input.seed),
-                        market_input.available_at.isoformat(),
-                        market_input.created_at.isoformat(),
-                    ),
-                ).rowcount
-                if not inserted:
-                    self._verify_market_input(connection, market_input)
-            return bool(connection.execute(
-                "INSERT INTO calculations (calculation_id, source_data_id, trade_id, command_id, event_id, "
-                "assignment_id, signal_id, service_uid, correlation_id, algorithm, algorithm_version, "
-                "input_json, steps_json, rounding_json, output_json, outcome, reason, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT (calculation_id) DO NOTHING",
-                (
-                    trace.calculation_id, trace.source_data_id, trace.links.trade_id,
-                    trace.links.command_id, trace.links.event_id, trace.links.assignment_id,
-                    trace.links.signal_id, trace.links.service_uid, trace.links.correlation_id,
-                    trace.algorithm, trace.algorithm_version, _dump(trace.inputs), _dump(trace.steps),
-                    _dump(trace.rounding), _dump(trace.result), trace.outcome.value, trace.reason,
-                    trace.created_at.isoformat(),
-                ),
-            ).rowcount)
+        if market_input is not None:
+            inserted = connection.execute(
+                "INSERT INTO market_inputs (source_data_id, kind, data_json, seed_json, available_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (source_data_id) DO NOTHING",
+                (market_input.source_data_id, market_input.kind, _dump(market_input.values),
+                 _dump(market_input.seed), market_input.available_at.isoformat(),
+                 market_input.created_at.isoformat()),
+            ).rowcount
+            if not inserted:
+                self._verify_market_input(connection, market_input)
+        return bool(connection.execute(
+            "INSERT INTO calculations (calculation_id, source_data_id, trade_id, command_id, event_id, "
+            "assignment_id, signal_id, service_uid, correlation_id, algorithm, algorithm_version, "
+            "input_json, steps_json, rounding_json, output_json, outcome, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (calculation_id) DO NOTHING",
+            (trace.calculation_id, trace.source_data_id, trace.links.trade_id,
+             trace.links.command_id, trace.links.event_id, trace.links.assignment_id,
+             trace.links.signal_id, trace.links.service_uid, trace.links.correlation_id,
+             trace.algorithm, trace.algorithm_version, _dump(trace.inputs), _dump(trace.steps),
+             _dump(trace.rounding), _dump(trace.result), trace.outcome.value, trace.reason,
+             trace.created_at.isoformat()),
+        ).rowcount)
 
     @staticmethod
     def _verify_market_input(connection: object, market_input: MarketInput) -> None:

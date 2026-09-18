@@ -6,11 +6,15 @@ from src.trade_management.models import TradePhase, TradeState
 _ALLOWED_TRANSITIONS = {
     TradePhase.PLANNED: {TradePhase.ENTRY_PENDING, TradePhase.CANCELLED},
     TradePhase.ENTRY_PENDING: {TradePhase.OPEN, TradePhase.BUILDING, TradePhase.CANCELLED},
-    TradePhase.OPEN: {TradePhase.BUILDING, TradePhase.REDUCING, TradePhase.CLOSED},
+    TradePhase.OPEN: {TradePhase.BUILDING, TradePhase.REDUCING, TradePhase.PARTIALLY_CLOSED, TradePhase.CLOSED,
+                      TradePhase.ERROR},
     TradePhase.BUILDING: {TradePhase.REDUCING, TradePhase.CLOSED},
-    TradePhase.REDUCING: {TradePhase.CLOSED},
+    TradePhase.REDUCING: {TradePhase.PARTIALLY_CLOSED, TradePhase.CLOSED, TradePhase.ERROR},
     TradePhase.CLOSED: set(),
     TradePhase.CANCELLED: set(),
+    TradePhase.PARTIALLY_CLOSED: {TradePhase.PARTIALLY_CLOSED, TradePhase.CLOSED, TradePhase.ERROR},
+    TradePhase.REJECTED: set(),
+    TradePhase.ERROR: set(),
 }
 
 

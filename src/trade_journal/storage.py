@@ -20,7 +20,14 @@ from src.trade_management.models import (
     TradePlan,
     TradeState,
 )
-from src.trade_management.audit import CalculationTrace, MeasuredValue, TraceLinks, TraceOutcome, calculation_trace
+from src.trade_management.audit import (
+    CalculationTrace,
+    CalculationTraceRepository,
+    MeasuredValue,
+    TraceLinks,
+    TraceOutcome,
+    calculation_trace,
+)
 
 
 BUSY_TIMEOUT_MS = 5_000
@@ -118,6 +125,7 @@ class Storage:
         if audit_path is not None and Path(database).resolve() == Path(audit_path).resolve():
             raise ValueError("database path must not match audit export path")
         self.connection = connect(database)
+        self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
             CsvExporter(self.connection, Path(journal_path), Path(positions_path))
             if journal_path is not None else None
@@ -267,6 +275,9 @@ class Storage:
                              signal_id=decision.candidate.signal_id, command_id=decision.candidate.order_id),
             outcome=TraceOutcome.ACCEPTED if decision.accepted else TraceOutcome.REJECTED,
         ) for decision in decisions)
+        with self.transaction() as connection:
+            for trace in traces:
+                self._trace_repository.record_in_transaction(connection, trace)
         return decisions, traces
 
     def enqueue(
@@ -368,7 +379,7 @@ class Storage:
         """
         query = "SELECT * FROM trades"
         if not include_terminal:
-            query += " WHERE phase NOT IN ('CLOSED', 'CANCELLED')"
+            query += " WHERE phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR')"
         query += " ORDER BY created_at, trade_id"
         cursor = self.connection.execute(query)
         columns = tuple(column[0] for column in cursor.description)

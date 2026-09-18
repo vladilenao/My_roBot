@@ -17,6 +17,12 @@ from src.trade_journal.storage import RecoveredTrade, ReservationCandidate, Stor
 from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
 )
+from src.trade_management.audit import (
+    CalculationTraceRepository,
+    MeasuredValue,
+    TraceLinks,
+    calculation_trace,
+)
 from src.trade_management.models import TradePhase, TradePlan
 from src.trade_management.opposite_signals import handle_raw_opposite_signal
 from src.trade_management.pipeline import (
@@ -80,6 +86,7 @@ class TradeManager:
         self._slippage = Decimal(str(slippage)) if slippage is not None else Decimal("0")
         self._signal_filter = signal_filter
         self._risk = PortfolioRiskManager()
+        self._traces = CalculationTraceRepository(storage)
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -98,6 +105,7 @@ class TradeManager:
         reservation: ReservationCandidate | None = None,
         risk_budget: Decimal | None = None,
         margin_budget: Decimal | None = None,
+        traces: tuple[object, ...] = (),
     ) -> bool:
         """Persist a newly planned entry and its durable broker intent atomically."""
         if action.trade_id != plan.trade_id or action.state_revision != 0:
@@ -141,12 +149,16 @@ class TradeManager:
             self._insert_action(connection, action, now)
             self._ensure_account(connection, now)
             self._reserve(connection, reservation, risk_budget, margin_budget, now)
+            for trace in traces:
+                self._traces.record_in_transaction(connection, trace)
         register = getattr(self._broker, "register_trade", None)
         if callable(register):
             register(plan)
         return True
 
-    def submit_action(self, action: TradeAction, *, assignment_id: str | None = None) -> bool:
+    def submit_action(
+        self, action: TradeAction, *, assignment_id: str | None = None, trace=None
+    ) -> bool:
         """Validate and durably queue one management action before broker delivery."""
         now = datetime.now(timezone.utc).isoformat()
         with self._storage.transaction() as connection:
@@ -169,7 +181,25 @@ class TradeManager:
                     "UPDATE protection SET pending_stop=?, pending_command_id=?, updated_at=? WHERE trade_id=?",
                     (str(action.stop_price), action.command_id, now, action.trade_id),
                 )
+            if trace is not None:
+                self._traces.record_in_transaction(connection, trace)
         return True
+
+    def _record_slippage_stub(self, decision, instrument, timeframe) -> None:
+        trace = calculation_trace(
+            "execution.slippage_guard",
+            inputs={
+                "requested_price": MeasuredValue(decision.price, "price"),
+                "allowed_slippage": MeasuredValue(self._slippage, "RUB"),
+                "instrument": MeasuredValue(instrument.ticker, "instrument-id"),
+                "timeframe": MeasuredValue(timeframe, "timeframe"),
+            },
+            result=MeasuredValue(True, "accepted"),
+            reason="stub-accepted-no-enforcement",
+            formula="observation-only slippage guard stub",
+            links=TraceLinks(signal_id=decision.event_id),
+        )
+        self._traces.record(trace)
 
     def dispatch(self, now: datetime, *, limit: int = 100) -> tuple[ExecutionEvent, ...]:
         """Deliver persisted outbox commands and immediately consume their outcomes."""
@@ -255,7 +285,8 @@ class TradeManager:
                 slippage=self._slippage,
             )
             try:
-                result = profile_cls().manage(ManagementContext(plan, state, market))
+                profile = profile_cls()
+                result, management_trace = profile.manage_with_trace(ManagementContext(plan, state, market))
             except Exception as exc:
                 log.warning("manage %s: %s", plan.trade_id, exc)
                 continue
@@ -263,7 +294,7 @@ class TradeManager:
                 if isinstance(action, AddToTrade):
                     continue
                 try:
-                    if self.submit_action(action, assignment_id=plan.assignment_id):
+                    if self.submit_action(action, assignment_id=plan.assignment_id, trace=management_trace):
                         results.append(action)
                 except ValueError as exc:
                     log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
@@ -287,25 +318,50 @@ class TradeManager:
         if _is_opposite(plan.side, decision.signal_type):
             result = handle_raw_opposite_signal(plan, state, decision)
             actions = result.actions
+            management_trace = calculation_trace(
+                "management.opposite-signal",
+                inputs={
+                    "current_side": MeasuredValue(plan.side, "side"),
+                    "signal": MeasuredValue(decision.signal_type.value, "signal"),
+                    "quantity": MeasuredValue(state.quantity, "contracts"),
+                },
+                result=MeasuredValue([type(action).__name__ for action in actions], "actions"),
+                reason="opposite-signal-management",
+                formula="opposite signal + current position -> management actions",
+                links=TraceLinks(assignment_id=assignment.id, trade_id=plan.trade_id,
+                                 signal_id=decision.event_id),
+            )
         else:
             if self._signal_filter is not None:
-                filtered = self._signal_filter.apply(
-                    decision,
-                    context,
-                    profile_name=assignment.filter_profile,
-                    instrument=instrument,
-                    timeframe=timeframe,
-                )
+                apply_with_trace = getattr(self._signal_filter, "apply_with_trace", None)
+                if callable(apply_with_trace):
+                    filtered, filter_trace = apply_with_trace(
+                        decision, context, profile_name=assignment.filter_profile,
+                        instrument=instrument.ticker, timeframe=timeframe
+                    )
+                    if filter_trace is not None:
+                        self._traces.record(filter_trace)
+                else:
+                    filtered = self._signal_filter.apply(
+                        decision,
+                        context,
+                        profile_name=assignment.filter_profile,
+                        instrument=instrument,
+                        timeframe=timeframe,
+                    )
                 if filtered.signal_type is SignalType.HOLD:
                     return ()
+            profile = profile_cls()
+            management_result, management_trace = profile.manage_with_trace(ManagementContext(plan, state, market))
             actions = tuple(
-                action for action in profile_cls().manage(ManagementContext(plan, state, market)).actions
+                action for action in management_result.actions
                 if isinstance(action, AddToTrade)
             )
+        self._record_slippage_stub(decision, instrument, timeframe)
         submitted: list[TradeAction] = []
         for action in actions:
             try:
-                if self.submit_action(action, assignment_id=assignment.id):
+                if self.submit_action(action, assignment_id=assignment.id, trace=management_trace):
                     submitted.append(action)
             except (ValueError, KeyError, TypeError) as exc:
                 log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
@@ -330,7 +386,8 @@ class TradeManager:
             slippage=self._slippage,
         )
         trade_id = decision.event_id or f"{assignment.id}:{timeframe}:{decision.signal_type.value}"
-        plan = profile_cls().plan(
+        profile = profile_cls()
+        plan, plan_trace = profile.plan_with_trace(
             PlanningContext(
                 trade_id=trade_id,
                 assignment_id=assignment.id,
@@ -365,12 +422,25 @@ class TradeManager:
             margin_amount=go * quantity,
         )
         budget = self._budget_base()
+        sizing_trace = calculation_trace(
+            "portfolio.position_sizing",
+            inputs={
+                "risk_budget": MeasuredValue(budget * self._risk_limits.per_trade / Decimal("100"), "RUB"),
+                "candidate_quantity": MeasuredValue(quantity, "contracts"),
+                "risk_amount": MeasuredValue(risk_amount, "RUB"),
+            },
+            result=MeasuredValue(quantity, "contracts"),
+            reason="risk-and-exposure-within-limits",
+            formula="largest quantity satisfying risk, exposure, and margin limits",
+            links=TraceLinks(assignment_id=assignment.id, trade_id=plan.trade_id, signal_id=plan.signal_id),
+        )
         accepted = self.submit_plan(
             plan,
             action,
             reservation=reservation,
             risk_budget=budget * self._risk_limits.per_trade / Decimal("100"),
             margin_budget=budget,
+            traces=(plan_trace, sizing_trace),
         )
         return (action,) if accepted else ()
 

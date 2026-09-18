@@ -18,19 +18,21 @@ from pathlib import Path
 from tempfile import mkstemp
 from typing import Mapping
 
+from src.trade_management.lifecycle import lifecycle_label
 
 log = logging.getLogger(__name__)
 
 _MSK = timezone(timedelta(hours=3))
 
 JOURNAL_COLUMNS = (
-    "occurred_at", "contract", "side", "strategy_tf", "event",
-    "quantity", "price", "fee", "reason",
+    "occurred_at", "contract", "side", "event", "quantity", "price",
+    "position_qty_before", "position_qty_after", "avg_price_before", "avg_price_after", "reason",
 )
 POSITIONS_COLUMNS = (
-    "contract", "side", "phase", "created_at", "quantity", "average_price", "stop",
-    "exit_price", "exit_at", "exit_reason", "net_realized_pnl", "fees", "risk_rub",
-    "go_buy", "go_sell", "updated_at",
+    "trade_id", "contract", "direction", "status", "entry_at", "exit_at", "duration",
+    "planned_entry", "planned_stop", "planned_tp1", "initial_quantity", "added_quantity",
+    "max_quantity", "average_entry", "exits", "average_exit", "final_reason", "exit_scenario",
+    "gross_pnl", "fees", "net_pnl", "initial_risk", "result_r", "mae_r", "mfe_r",
 )
 
 # Человекочитаемые русскоязычные заголовки CSV-проекций. Позиции соответствуют
@@ -39,31 +41,42 @@ POSITIONS_COLUMNS = (
 JOURNAL_HEADERS = (
     "Время (МСК)",
     "Контракт",
-    "Сторона",
-    "Стратегия",
+    "Направление",
     "Событие",
-    "Кол-во",
+    "Количество",
     "Цена",
-    "Комиссия, ₽",
+    "Объем позиции до",
+    "Объем позиции после",
+    "Средняя цена до",
+    "Средняя цена после",
     "Причина",
 )
 POSITIONS_HEADERS = (
+    "Trade ID",
     "Контракт",
-    "Сторона",
+    "Направление",
     "Статус",
-    "Открыта",
-    "Кол-во, контракты",
-    "Цена входа",
-    "Стоп",
-    "Цена выхода",
-    "Выход (МСК)",
-    "Причина выхода",
-    "Прибыль чистая, ₽",
-    "Комиссия, ₽",
-    "Риск, ₽",
-    "ГО (покупка), ₽",
-    "ГО (продажа), ₽",
-    "Обновлено (МСК)",
+    "Время входа",
+    "Время выхода",
+    "Длительность",
+    "План входа",
+    "План стопа",
+    "План TP1",
+    "Начальный объем",
+    "Добрано",
+    "Макс. объем",
+    "Средняя входа",
+    "Выходы",
+    "Средняя выхода",
+    "Финальная причина",
+    "Сценарий выхода",
+    "Gross PnL",
+    "Комиссия",
+    "Net PnL",
+    "Initial Risk",
+    "Result",
+    "MAE",
+    "MFE",
 )
 
 _SIDE_LABELS = {"BUY": "Покупка", "SELL": "Продажа"}
@@ -123,7 +136,6 @@ class CsvExporter:
         revision, journal_rows, position_rows = self._snapshot()
         files: list[tuple[Path, Path]] = []
         try:
-            self._backup_legacy_files()
             files = [
                 (self._write_temp(self._journal_path, JOURNAL_COLUMNS, JOURNAL_HEADERS, journal_rows),
                  self._journal_path),
@@ -147,38 +159,6 @@ class CsvExporter:
         self._record_success(revision)
         return True
 
-    def _backup_legacy_files(self) -> None:
-        """Preserve pre-SQLite CSVs once, before their first replacement."""
-        for path, headers in (
-            (self._journal_path, JOURNAL_HEADERS),
-            (self._positions_path, POSITIONS_HEADERS),
-        ):
-            if path.exists() and not self._is_current_projection(path, headers):
-                self._backup_legacy_file(path)
-
-    @staticmethod
-    def _is_current_projection(path: Path, headers: tuple[str, ...]) -> bool:
-        try:
-            with path.open(newline="", encoding="utf-8") as handle:
-                return tuple(csv.DictReader(handle).fieldnames or ()) == headers
-        except (OSError, UnicodeError):
-            return False
-
-    @staticmethod
-    def _backup_legacy_file(path: Path) -> None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        suffix = 0
-        while True:
-            disambiguator = "" if suffix == 0 else f".{suffix}"
-            backup = path.with_name(f"{path.name}.legacy.{timestamp}{disambiguator}")
-            try:
-                with path.open("rb") as source, backup.open("xb") as destination:
-                    while chunk := source.read(1024 * 1024):
-                        destination.write(chunk)
-                return
-            except FileExistsError:
-                suffix += 1
-
     def _snapshot(self) -> tuple[int, list[dict[str, object]], list[dict[str, object]]]:
         self._connection.execute("BEGIN")
         try:
@@ -186,79 +166,239 @@ class CsvExporter:
                 "SELECT required_revision FROM export_state WHERE export_id = 1"
             ).fetchone()[0]
             journal_rows = []
+            replay: dict[str, tuple[int, Decimal | None]] = {}
             for row in self._rows(
                 """
-                SELECT events.occurred_at, events.event_type, events.payload_json,
-                       trades.trade_id, trades.instrument_id, trades.side,
+                SELECT events.event_seq, events.event_id, events.occurred_at, events.event_type,
+                       events.payload_json, trades.trade_id, trades.instrument_id, trades.side,
                        orders.action_type, orders.quantity AS order_quantity,
-                       orders.requested_price AS order_price
+                       orders.requested_price AS order_price, fills.quantity AS fill_quantity,
+                       fills.price AS fill_price
                 FROM events
                 LEFT JOIN trades ON trades.trade_id = events.trade_id
                 LEFT JOIN orders ON orders.order_id = events.order_id
-                ORDER BY event_seq
+                LEFT JOIN fills ON fills.execution_id = events.event_id
+                ORDER BY events.event_seq
                 """
             ):
                 payload = self._payload(row.get("payload_json"))
-                quantity = payload.get("quantity") or row.get("order_quantity") or ""
+                trade_id = str(row.get("trade_id") or "")
+                before_qty, before_avg = replay.get(trade_id, (0, None))
+                quantity = row.get("fill_quantity") or payload.get("quantity") or row.get("order_quantity") or ""
+                price = row.get("fill_price") or payload.get("price") or row.get("order_price") or ""
+                actual_fill = row.get("fill_quantity") or payload.get("quantity")
+                after_qty, after_avg = (
+                    self._replay_fill(
+                        before_qty, before_avg, str(row.get("action_type") or ""), actual_fill, price
+                    )
+                    if actual_fill else (before_qty, before_avg)
+                )
+                if actual_fill:
+                    replay[trade_id] = (after_qty, after_avg)
                 journal_rows.append({
                     "occurred_at": self._msk(row.get("occurred_at")),
                     "contract": self._display_contract(str(row.get("instrument_id") or "")),
                     "side": _SIDE_LABELS.get(str(row.get("side") or "").upper(), ""),
-                    "strategy_tf": self._strategy_tf(row.get("trade_id")),
                     "event": self._describe_event(
                         str(row.get("event_type") or ""), str(row.get("action_type") or "")
                     ),
                     "quantity": quantity,
-                    "price": payload.get("price") or row.get("order_price") or "",
-                    "fee": self._money(payload.get("fee")),
+                    "price": price,
+                    "position_qty_before": before_qty if before_qty else "",
+                    "position_qty_after": after_qty if after_qty else "",
+                    "avg_price_before": self._money(before_avg) if before_avg is not None else "",
+                    "avg_price_after": self._money(after_avg) if after_avg is not None else "",
                     "reason": payload.get("reason") or "",
                 })
             position_rows = []
-            closing = self._closing_fills()
-            reasons = self._exit_reasons()
-            risk = self._entry_risk()
             for row in self._rows(
                 """
-                SELECT trades.instrument_id, positions.trade_id, positions.side, trades.created_at, trades.phase,
-                       positions.quantity, positions.average_price, positions.net_realized_pnl,
-                       positions.fees, positions.updated_at, protection.stop
+                SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
+                       trades.plan_json, positions.quantity, positions.average_price,
+                       positions.realized_pnl, positions.fees, positions.updated_at
                 FROM positions
                 JOIN trades ON trades.trade_id = positions.trade_id
-                LEFT JOIN (
-                    SELECT trade_id, COALESCE(confirmed_stop, pending_stop) AS stop
-                    FROM protection
-                ) protection ON protection.trade_id = positions.trade_id
                 ORDER BY positions.trade_id
                 """
             ):
                 ticker = str(row.get("instrument_id") or "")
-                trade_id = str(row.get("trade_id") or "")
                 meta = self._contracts.get(ticker)
-                close = closing.get(trade_id, {})
-                position_rows.append({
-                    "contract": self._display_contract(ticker),
-                    "side": _SIDE_LABELS.get(str(row.get("side") or "").upper(), ""),
-                    "phase": _PHASE_LABELS.get(str(row.get("phase") or "").upper(), str(row.get("phase") or "")),
-                    "created_at": self._msk(row.get("created_at")),
-                    "quantity": row.get("quantity", ""),
-                    "average_price": row.get("average_price") or "",
-                    "stop": self._money(row.get("stop")),
-                    "exit_price": self._money(close.get("exit_price")) if close else "",
-                    "exit_at": self._msk(close.get("exit_at")) if close else "",
-                    "exit_reason": reasons.get(trade_id, ""),
-                    "net_realized_pnl": self._money(row.get("net_realized_pnl")),
-                    "fees": self._money(row.get("fees")),
-                    "risk_rub": self._money(risk.get(trade_id)),
-                    "go_buy": self._money(str(meta.go_buy)) if meta is not None else "",
-                    "go_sell": self._money(str(meta.go_sell)) if meta is not None else "",
-                    "updated_at": self._msk(row.get("updated_at")),
-                })
+                position_rows.append(self._summary_row(row, meta))
         finally:
             self._connection.rollback()
         return revision, journal_rows, position_rows
 
-    def _rows(self, query: str) -> list[dict[str, object]]:
-        cursor = self._connection.execute(query)
+    @staticmethod
+    def _replay_fill(
+        quantity_before: int,
+        average_before: Decimal | None,
+        action_type: str,
+        quantity: object,
+        price: object,
+    ) -> tuple[int, Decimal | None]:
+        """Apply one confirmed fill to the lightweight event projection state."""
+        try:
+            qty = int(quantity)
+            fill_price = Decimal(str(price))
+        except (TypeError, ValueError, InvalidOperation):
+            return quantity_before, average_before
+        action = action_type.upper().split(":", 1)[0]
+        if qty <= 0 or fill_price <= 0:
+            return quantity_before, average_before
+        if action in {"OPEN", "ADD"}:
+            total = quantity_before + qty
+            weighted = fill_price if average_before is None else (
+                average_before * quantity_before + fill_price * qty
+            ) / total
+            return total, weighted
+        if action in {"REDUCE", "CLOSE", "TARGET", "STOP"}:
+            remaining = max(0, quantity_before - qty)
+            return remaining, average_before if remaining else None
+        return quantity_before, average_before
+
+    def _summary_row(self, row: Mapping[str, object], meta: object | None) -> dict[str, object]:
+        """Build one trader card from normalized fills and the immutable plan."""
+        trade_id = str(row["trade_id"])
+        plan = self._payload(row.get("plan_json"))
+        side = str(row.get("side") or "").upper()
+        entries, exits = self._fills(trade_id)
+        first_entry = entries[0] if entries else None
+        last_exit = exits[-1] if exits else None
+        entry_qty = sum(int(fill["quantity"]) for fill in entries[:1])
+        added_qty = sum(int(fill["quantity"]) for fill in entries[1:])
+        max_qty = 0
+        running = 0
+        for fill in entries + exits:
+            running += int(fill["quantity"]) if fill["kind"] == "entry" else -int(fill["quantity"])
+            max_qty = max(max_qty, running)
+        entry_value = sum((Decimal(str(fill["price"])) * int(fill["quantity"]) for fill in entries), Decimal("0"))
+        exit_value = sum((Decimal(str(fill["price"])) * int(fill["quantity"]) for fill in exits), Decimal("0"))
+        entry_total = sum(int(fill["quantity"]) for fill in entries)
+        exit_total = sum(int(fill["quantity"]) for fill in exits)
+        average_entry = entry_value / entry_total if entry_total else None
+        average_exit = exit_value / exit_total if exit_total else None
+        initial_risk = self._initial_risk(trade_id)
+        gross = Decimal(str(row.get("realized_pnl") or "0"))
+        fees = Decimal(str(row.get("fees") or "0"))
+        net = gross - fees
+        exit_reasons = [str(fill["reason"]) for fill in exits if fill["reason"]]
+        return {
+            "trade_id": trade_id,
+            "contract": self._display_contract(str(row.get("instrument_id") or "")),
+            "direction": "LONG" if side == "BUY" else "SHORT" if side == "SELL" else "",
+            "status": lifecycle_label(str(row.get("phase") or ""), quantity=int(row.get("quantity") or 0)),
+            "entry_at": self._msk(first_entry["executed_at"]) if first_entry else "",
+            "exit_at": self._msk(last_exit["executed_at"]) if last_exit else "",
+            "duration": self._duration(first_entry, last_exit),
+            "planned_entry": plan.get("reference_entry") or "",
+            "planned_stop": plan.get("stop_price") or "",
+            "planned_tp1": self._first_target(trade_id),
+            "initial_quantity": entry_qty or "",
+            "added_quantity": added_qty or "",
+            "max_quantity": max_qty or "",
+            "average_entry": self._money(average_entry) if average_entry is not None else "",
+            "exits": self._format_exits(exits),
+            "average_exit": self._money(average_exit) if average_exit is not None else "",
+            "final_reason": exit_reasons[-1] if row.get("quantity") == 0 and exit_reasons else "",
+            "exit_scenario": self._exit_scenario(exits, int(row.get("quantity") or 0)),
+            "gross_pnl": self._money(gross),
+            "fees": self._money(-fees),
+            "net_pnl": self._money(net),
+            "initial_risk": self._money(initial_risk) if initial_risk is not None else "",
+            "result_r": self._ratio(net, initial_risk),
+            "mae_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=True),
+            "mfe_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=False),
+        }
+
+    def _fills(self, trade_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        entries: list[dict[str, object]] = []
+        exits: list[dict[str, object]] = []
+        for row in self._rows(
+            """
+            SELECT f.quantity, f.price, f.executed_at, COALESCE(e.payload_json, '{}') AS payload_json,
+                   o.action_type
+            FROM fills f JOIN orders o ON o.order_id = f.order_id
+            LEFT JOIN events e ON e.event_id = f.execution_id
+            WHERE f.trade_id = ? ORDER BY f.executed_at, f.fill_id
+            """, (trade_id,)
+        ):
+            action = str(row["action_type"] or "").upper().split(":", 1)[0]
+            payload = self._payload(row["payload_json"])
+            value = dict(row)
+            value["kind"] = "entry" if action in {"OPEN", "ADD"} else "exit"
+            value["reason"] = payload.get("reason") or self._action_reason(str(row["action_type"]))
+            (entries if value["kind"] == "entry" else exits).append(value)
+        return entries, exits
+
+    def _first_target(self, trade_id: str) -> object:
+        row = self._connection.execute(
+            "SELECT price FROM targets WHERE trade_id = ? ORDER BY target_index LIMIT 1", (trade_id,)
+        ).fetchone()
+        return row[0] if row else ""
+
+    def _initial_risk(self, trade_id: str) -> Decimal | None:
+        row = self._connection.execute(
+            "SELECT original_risk_amount FROM reservations WHERE trade_id = ? ORDER BY created_at LIMIT 1",
+            (trade_id,),
+        ).fetchone()
+        return Decimal(str(row[0])) if row and row[0] not in (None, "") else None
+
+    @staticmethod
+    def _duration(first: Mapping[str, object] | None, last: Mapping[str, object] | None) -> str:
+        if not first or not last:
+            return ""
+        delta = datetime.fromisoformat(str(last["executed_at"])) - datetime.fromisoformat(str(first["executed_at"]))
+        return f"{int(delta.total_seconds() // 60)} мин"
+
+    @staticmethod
+    def _action_reason(action: str) -> str:
+        raw, _, target = action.partition(":")
+        if raw == "TARGET":
+            return f"TP{target}" if target else "TP"
+        return raw
+
+    @classmethod
+    def _format_exits(cls, exits: list[dict[str, object]]) -> str:
+        return "; ".join(
+            f"{fill['reason']}: {fill['quantity']} @{cls._money(fill['price'])}" for fill in exits
+        )
+
+    @staticmethod
+    def _exit_scenario(exits: list[dict[str, object]], remaining: int) -> str:
+        if not exits or remaining:
+            return ""
+        if len(exits) == 1:
+            return str(exits[0]["reason"])
+        return " + ".join(
+            f"{str(fill['reason'])}_PARTIAL" if index < len(exits) - 1 else f"{fill['reason']}_REMAINDER"
+            for index, fill in enumerate(exits)
+        )
+
+    @staticmethod
+    def _ratio(value: Decimal, divisor: Decimal | None) -> str:
+        return format(value / divisor, ".2f") if divisor and divisor != 0 else ""
+
+    def _extreme_r(
+        self, trade_id: str, entry: Decimal | None, risk: Decimal | None, side: str, *, adverse: bool
+    ) -> str:
+        if entry is None or not risk or risk == 0:
+            return ""
+        values: list[Decimal] = []
+        for row in self._rows("SELECT payload_json FROM events WHERE trade_id = ? ORDER BY event_seq", (trade_id,)):
+            payload = self._payload(row["payload_json"])
+            for key in (("low", "price") if adverse else ("high", "price")):
+                if payload.get(key) is not None:
+                    values.append(Decimal(str(payload[key])))
+                    break
+        if not values:
+            return ""
+        favorable = (max(values) - entry) if side == "BUY" else (entry - min(values))
+        unfavorable = (min(values) - entry) if side == "BUY" else (entry - max(values))
+        result = unfavorable if adverse else favorable
+        return format(result / risk, ".2f")
+
+    def _rows(self, query: str, parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
+        cursor = self._connection.execute(query, parameters)
         names = tuple(column[0] for column in cursor.description)
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
