@@ -12,6 +12,7 @@ from src.bot import TradingBot
 from src.instruments import Instrument
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, MoveStop, ReduceTrade
+from src.trade_management.models import RejectionReason, SignalAdmission
 
 
 def _assign(*names: str, profile: str = "basic_levels", timeframe: str = "1h") -> list[Assignment]:
@@ -100,6 +101,7 @@ class RecordingExecution:
     def __init__(self):
         self.decisions = []
         self.calls = []
+        self.rejections = []
 
     def execute(self, decision, instrument, *, filter_profile="", filtered_out=False, timeframe=""):
         self.decisions.append((decision, instrument))
@@ -107,6 +109,19 @@ class RecordingExecution:
             {
                 "filter_profile": filter_profile,
                 "filtered_out": filtered_out,
+                "timeframe": timeframe,
+            }
+        )
+
+    def report_rejection(
+        self, decision, instrument, *, reason_message="", filter_profile="", timeframe=""
+    ):
+        self.rejections.append(
+            {
+                "decision": decision,
+                "instrument": instrument,
+                "reason_message": reason_message,
+                "filter_profile": filter_profile,
                 "timeframe": timeframe,
             }
         )
@@ -222,7 +237,7 @@ class TestTradingBot:
         trade_manager.manage.return_value = ()
         trade_manager.actions_for_signal.side_effect = (
             lambda assignment, decision, instrument, *_args, **_kwargs:
-            admitted.append((assignment.id, instrument.ticker, decision.event_id)) or ()
+            admitted.append((assignment.id, instrument.ticker, decision.event_id)) or SignalAdmission()
         )
         assignments = {
             "AAA": [Assignment("assignment-b", "macd_rsi_stoch", "levels_rr", priority=1, timeframe="1h")],
@@ -299,7 +314,7 @@ class TestTradingBot:
     def test_decisions_notified_even_in_trading_mode(self):
         trade_manager = MagicMock()
         trade_manager.manage.return_value = ()
-        trade_manager.actions_for_signal.return_value = ()
+        trade_manager.actions_for_signal.return_value = SignalAdmission()
         execution = RecordingExecution()
         bot = _make_bot(
             timeline=FakeTimeline(),
@@ -318,14 +333,39 @@ class TestTradingBot:
         assert len(execution.decisions) == 1
         assert execution.calls[0]["timeframe"] == "1h"
         assert execution.calls[0]["filter_profile"] == "basic_levels"
+        assert execution.rejections == []
+
+    def test_unadmitted_signal_reported_to_port(self):
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        trade_manager.actions_for_signal.return_value = SignalAdmission(
+            rejections=(RejectionReason(code="zero-quantity", message="Размер позиции ниже минимального"),),
+        )
+        execution = RecordingExecution()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            execution=execution,
+            notifier=RecordingNotifier(),
+            strategy=_make_strategy(decision=Decision(SignalType.BUY, 100.5)),
+            share={"SBER": _assign("macd_rsi_stoch")},
+            trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert len(execution.rejections) == 1
+        assert execution.rejections[0]["reason_message"] == "Размер позиции ниже минимального"
+        assert len(execution.decisions) == 1
 
     def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
         signal_filter = MagicMock()
         action_executor = MagicMock()
         trade_manager = MagicMock()
         trade_manager.manage.return_value = ()
-        trade_manager.actions_for_signal.return_value = (
-            CloseTrade("close", "trade-1", 0, "raw-opposite-signal"),
+        trade_manager.actions_for_signal.return_value = SignalAdmission(
+            (CloseTrade("close", "trade-1", 0, "raw-opposite-signal"),),
         )
         bot = _make_bot(
             timeline=FakeTimeline(), cache=FakeCache(frames={"SBER": _df()}),

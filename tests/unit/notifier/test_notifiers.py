@@ -65,6 +65,32 @@ class TestNotifyDecision:
         )
 
 
+class TestNotifyRejection:
+    def test_delivers_formatted_rejection(self):
+        notifier = RecordingNotifier(formatter=DecisionFormatter())
+
+        notifier.notify_rejection(
+            Decision(SignalType.BUY, 100.5), "NG",
+            reason="Размер позиции ниже минимального", filter_profile="raw", timeframe="1h",
+        )
+
+        assert notifier.messages == [
+            "⛔ NG (1h) ➜ Сделка не допущена: Размер позиции ниже минимального"
+        ]
+
+    def test_custom_formatter_is_used_for_rejection(self):
+        formatter = MagicMock()
+        formatter.format_rejection.return_value = "custom rejection"
+        notifier = RecordingNotifier(formatter=formatter)
+
+        notifier.notify_rejection(Decision(SignalType.BUY, 100.5), "", reason="r")
+
+        assert notifier.messages == ["custom rejection"]
+        formatter.format_rejection.assert_called_once_with(
+            Decision(SignalType.BUY, 100.5), "", reason="r", filter_profile="", timeframe=""
+        )
+
+
 class TestConsoleNotifier:
     def test_notify_prints_message(self, capsys):
         ConsoleNotifier().notify("hello")

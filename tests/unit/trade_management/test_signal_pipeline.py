@@ -206,3 +206,76 @@ def test_next_bar_scheduled_entry_fills_and_reaches_journal(tmp_path):
         ).fetchone()
         assert phase == "OPEN"
         assert quantity == 2
+
+
+class _BrokerWithoutMetadata:
+    def contract_for(self, ticker: str):
+        return None
+
+    def submit(self, action, now):
+        raise AssertionError("broker must not be called without contract metadata")
+
+
+def test_actions_for_signal_rejects_without_contract_metadata(tmp_path):
+    assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                                 management="levels_rr", filter_profile="basic_levels",
+                                 priority=0, timeframe="15m")
+    decision = Decision(signal_type=SignalType.BUY, price=100.0, bar_time=BAR0,
+                        event_id="signal-1", available_at=BAR0, timeframe="15m")
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, _BrokerWithoutMetadata(), initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+        admission = manager.actions_for_signal(
+            assignment, decision, INSTRUMENT, _frame([100.0] * 25), _context(price=100.0), timeframe="15m",
+        )
+        assert len(admission) == 0
+        assert len(admission.rejections) == 1
+        assert admission.rejections[0].code == "no-contract-metadata"
+        assert admission.rejections[0].message
+
+
+def test_actions_for_signal_rejects_duplicate_signal(tmp_path):
+    assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                                 management="levels_rr", filter_profile="basic_levels",
+                                 priority=0, timeframe="15m")
+    decision = Decision(signal_type=SignalType.BUY, price=100.0, bar_time=BAR0,
+                        event_id="signal-1", available_at=BAR0, timeframe="15m")
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, _FillBroker(), initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+        first = manager.actions_for_signal(
+            assignment, decision, INSTRUMENT, _frame([100.0] * 25),
+            _context(levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)), timeframe="15m",
+        )
+        assert len(first) == 1
+        with storage.transaction() as connection:
+            connection.execute(
+                "UPDATE trades SET phase = 'CLOSED' WHERE trade_id = ?", (first[0].trade_id,)
+            )
+        admission = manager.actions_for_signal(
+            assignment, decision, INSTRUMENT, _frame([100.0] * 25),
+            _context(levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)), timeframe="15m",
+        )
+        assert len(admission) == 0
+        assert [reason.code for reason in admission.rejections] == ["duplicate-signal"]
+
+
+def test_actions_for_signal_rejects_zero_quantity(tmp_path):
+    assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                                 management="levels_rr", filter_profile="basic_levels",
+                                 priority=0, timeframe="15m")
+    decision = Decision(signal_type=SignalType.BUY, price=100.0, bar_time=BAR0,
+                        event_id="signal-1", available_at=BAR0, timeframe="15m")
+    zero_limits = RiskLimits(
+        per_trade=Decimal("0"), per_instrument=Decimal("0"),
+        per_group={}, portfolio=Decimal("0"),
+    )
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, _FillBroker(), initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=zero_limits, max_qty=4)
+        admission = manager.actions_for_signal(
+            assignment, decision, INSTRUMENT, _frame([100.0] * 25),
+            _context(levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)), timeframe="15m",
+        )
+        assert len(admission) == 0
+        assert [reason.code for reason in admission.rejections] == ["zero-quantity"]
