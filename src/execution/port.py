@@ -32,6 +32,19 @@ class ExecutionPort(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        """Доставляет уведомление о недопуске сделки с причиной."""
+        raise NotImplementedError
+
 
 class NotifyOnlyExecutionPort(ExecutionPort):
     """Доставляет решение трейдеру через нотификатор, не выполняя сделок."""
@@ -56,6 +69,21 @@ class NotifyOnlyExecutionPort(ExecutionPort):
             decision, label,
             filter_profile=filter_profile, filtered_out=filtered_out,
             timeframe=timeframe,
+        )
+
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        label = _short_contract_name(instrument)
+        self._notifier.notify_rejection(
+            decision, label,
+            reason=reason_message, filter_profile=filter_profile, timeframe=timeframe,
         )
 
 
@@ -96,6 +124,22 @@ class BrokerExecutionPort(ExecutionPort):
             filtered_out=filtered_out,
             timeframe=timeframe,
         )
+
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        if self._notifier is not None:
+            label = _short_contract_name(instrument)
+            self._notifier.notify_rejection(
+                decision, label,
+                reason=reason_message, filter_profile=filter_profile, timeframe=timeframe,
+            )
 
 
 def _short_contract_name(instrument) -> str:

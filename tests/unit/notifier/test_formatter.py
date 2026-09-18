@@ -207,6 +207,32 @@ class TestFilterProfileBlock:
         assert "Цена" not in result
 
 
+class TestFormatRejection:
+    def test_rejection_uses_marker_and_reason(self):
+        result = DecisionFormatter().format_rejection(
+            _decision(
+                SignalType.BUY,
+                100.5,
+                bar_time=pd.Timestamp("2026-08-26 22:00"),
+                strategy_name="macd_rsi_stoch",
+            ),
+            instrument_label="NG-10.26",
+            reason="Размер позиции ниже минимального",
+            filter_profile="raw",
+            timeframe="1h",
+        )
+        assert result == "⛔ NG-10.26 (1h) 22:00 | macd_rsi_stoch [raw] ➜ Сделка не допущена: Размер позиции ниже минимального"
+
+    def test_rejection_omits_profile_block_when_empty(self):
+        result = DecisionFormatter().format_rejection(
+            _decision(SignalType.BUY, 100.5),
+            reason="Нет метаданных контракта для инструмента",
+        )
+        assert result.startswith("⛔")
+        assert "[" not in result
+        assert result.endswith("Сделка не допущена: Нет метаданных контракта для инструмента")
+
+
 class TestTradePlanFormatter:
     def test_formats_profile_levels_as_plan_not_fill(self):
         plan = TradePlan(

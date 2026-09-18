@@ -331,21 +331,30 @@ class TradingBot:
         actions_for_signal = getattr(self._trade_manager, "actions_for_signal", None)
         if actions_for_signal is None:
             return
+        admission = actions_for_signal(
+            candidate.assignment,
+            candidate.decision,
+            candidate.instrument,
+            candidate.frame,
+            candidate.context,
+            timeframe=candidate.timeframe,
+        )
         self._dispatch_management_actions(
-            actions_for_signal(
-                candidate.assignment,
-                candidate.decision,
-                candidate.instrument,
-                candidate.frame,
-                candidate.context,
-                timeframe=candidate.timeframe,
-            ),
+            admission.actions,
             candidate.decision,
             candidate.context,
             candidate.assignment,
             candidate.instrument,
             candidate.timeframe,
         )
+        for reason in admission.rejections:
+            self._execution.report_rejection(
+                candidate.decision,
+                candidate.instrument,
+                reason_message=reason.message,
+                filter_profile=candidate.assignment.filter_profile,
+                timeframe=candidate.timeframe,
+            )
 
     def _manage(self, instrument: Instrument, assignments: list[Assignment], frame, context, tf: str) -> None:
         """Dispatch ongoing trade actions before evaluating new entry signals."""

@@ -75,6 +75,34 @@ class TestNotifyOnlyExecutionPort:
         notifier.notify_plan.assert_called_once_with(plan, "NG-10.26", timeframe="1h")
         assert portfolio.mock_calls == []
 
+    def test_report_rejection_forwards_reason_to_notifier(self):
+        notifier = Mock()
+        port = NotifyOnlyExecutionPort(notifier=notifier)
+        decision = Decision(SignalType.BUY, 100.5)
+        instrument = Instrument("SBER", "SBER", "share")
+
+        port.report_rejection(
+            decision, instrument,
+            reason_message="Размер позиции ниже минимального", filter_profile="basic_levels", timeframe="15m",
+        )
+
+        notifier.notify_rejection.assert_called_once_with(
+            decision, "контракт не указан", reason="Размер позиции ниже минимального",
+            filter_profile="basic_levels", timeframe="15m",
+        )
+
+    def test_report_rejection_uses_short_name_when_present(self):
+        notifier = Mock()
+        port = NotifyOnlyExecutionPort(notifier=notifier)
+        instrument = Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
+
+        port.report_rejection(Decision(SignalType.BUY, 100.5), instrument, reason_message="r")
+
+        notifier.notify_rejection.assert_called_once_with(
+            Decision(SignalType.BUY, 100.5), "NG-9.26", reason="r",
+            filter_profile="", timeframe="",
+        )
+
     def test_abstract_cannot_be_instantiated(self):
         with pytest.raises(TypeError):
             ExecutionPort()  # type: ignore[abstract]
@@ -114,3 +142,26 @@ class TestBrokerExecutionPort:
         port.execute(Decision(SignalType.SELL, 10.0), instrument)
 
         notifier.notify_decision.assert_not_called()
+
+    def test_report_rejection_forwards_reason_to_notifier(self):
+        notifier = Mock()
+        adapter = Mock()
+        port = BrokerExecutionPort(adapter=adapter, notifier=notifier)
+        instrument = Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
+
+        port.report_rejection(
+            Decision(SignalType.BUY, 100.5), instrument,
+            reason_message="r", filter_profile="raw", timeframe="1h",
+        )
+
+        notifier.notify_rejection.assert_called_once_with(
+            Decision(SignalType.BUY, 100.5), "NG-9.26",
+            reason="r", filter_profile="raw", timeframe="1h",
+        )
+        adapter.execute.assert_not_called()
+
+    def test_report_rejection_silent_without_notifier(self):
+        port = BrokerExecutionPort(adapter=Mock())
+        instrument = Instrument("SBER", "SBER", "share")
+
+        port.report_rejection(Decision(SignalType.BUY, 100.5), instrument, reason_message="r")
