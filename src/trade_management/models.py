@@ -137,6 +137,7 @@ class SignalAdmission:
 
     actions: tuple[TradeAction, ...] = ()
     rejections: tuple[RejectionReason, ...] = ()
+    plan: TradePlan | None = None
 
     def __iter__(self) -> Iterator[TradeAction]:
         return iter(self.actions)
@@ -152,7 +153,7 @@ _REJECTION_MESSAGES = {
     "no-contract-metadata": "Нет метаданных контракта для инструмента",
     "unknown-profile": "Неизвестный профиль управления",
     "zero-quantity": "Размер позиции ниже минимального",
-    "duplicate-signal": "Сигнал уже обработан ранее",
+    "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",
     "admission-error": "Ошибка при допуске сигнала",
     "insufficient-history": "Недостаточно истории для расчёта",
     "missing-structure": "Нет подтверждённой структуры",

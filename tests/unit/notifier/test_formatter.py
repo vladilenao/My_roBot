@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from src.notifier import DecisionFormatter
-from src.notifier.base import TradePlanFormatter
+from src.notifier.base import EntryAcceptedFormatter, TradePlanFormatter
 from src.strategies.contracts import Decision, SignalType
 from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
 
@@ -252,3 +252,42 @@ class TestTradePlanFormatter:
         assert result == "● NG-10.26 (1h) | levels_rr ➜ ПЛАН BUY — Вход: 100, Стоп: 96, Цели: 104, 108"
         assert "Сделка" not in result
         assert "исполн" not in result.lower()
+
+
+class TestEntryAcceptedFormatter:
+    def test_formats_accepted_entry_as_in_work_not_executed(self):
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("96"),
+            targets=(
+                TargetPlan("tp1", Decimal("104"), Decimal("0.5")),
+                TargetPlan("tp2", Decimal("108"), Decimal("0.5")),
+            ),
+            profile=ProfileSnapshot("levels_rr", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        result = EntryAcceptedFormatter.format(plan, "NG-10.26", quantity=4, timeframe="1h")
+
+        assert result == (
+            "● NG-10.26 (1h) ➜ Сделка BUY, объём 4 — Вход: 100, Стоп: 96, "
+            "Цели: 104, 108 — в работе, ждёт подтверждения"
+        )
+        assert "исполн" not in result.lower()
+
+    def test_accepts_entry_without_targets(self):
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="SELL", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("104"), targets=(),
+            profile=ProfileSnapshot("ma_cloud", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        result = EntryAcceptedFormatter.format(plan, "Si-12.26", quantity=2, timeframe="15m")
+
+        assert "● Si-12.26 (15m)" in result
+        assert "Сделка SELL, объём 2" in result
+        assert "Цели: нет" in result
+        assert "в работе, ждёт подтверждения" in result

@@ -49,6 +49,22 @@ def _bars_from_rows(rows):
     })
 
 
+class FlakyLoader(FakeLoader):
+    """Лоадер, бросающий rate-limit на заданном вызове (по счётчику вызовов)."""
+
+    def __init__(self, data, fail_on_call, error):
+        super().__init__(data)
+        self.fail_on_call = fail_on_call
+        self.error = error
+
+    def __call__(self, ticker, instrument_type, timeframe, start_date=None, end_date=None, token=None, instrument_id=None):
+        if len(self.calls) == self.fail_on_call - 1:
+            self.calls.append(start_date)
+            self.instrument_ids.append(instrument_id)
+            raise RuntimeError(self.error)
+        return super().__call__(ticker, instrument_type, timeframe, start_date, end_date, token, instrument_id)
+
+
 class TestMarketDataCache:
     def _make(self, data, clock_at):
         sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock_at[0])
@@ -235,6 +251,87 @@ class TestMarketDataCache:
         cache.refresh_if_new_candle("1h")
 
         assert loader.instrument_ids == [None, "uid-1"]  # повторная загрузка переиспользует UID
+
+    def test_force_reload_throttled_within_interval(self):
+        clock = [datetime(2024, 1, 1, 9, 0)]
+        loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                                      pd.Timestamp("2024-01-01 07:00"),
+                                      pd.Timestamp("2024-01-01 08:00"),
+                                      pd.Timestamp("2024-01-01 09:00")]})
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=300)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst, "1h")
+        assert len(loader.calls) == 1
+
+        loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
+                               pd.Timestamp("2024-01-01 07:00"),
+                               pd.Timestamp("2024-01-01 08:00"),
+                               pd.Timestamp("2024-01-01 09:00"),
+                               pd.Timestamp("2024-01-01 10:00")]
+        clock[0] = datetime(2024, 1, 1, 9, 3)  # 3 мин с прошлого API < 300с — форс дозагрузку тормозит
+        cache.refresh_if_new_candle("1h", force=True)
+        assert len(loader.calls) == 1
+
+        clock[0] = datetime(2024, 1, 1, 9, 8)  # 8 мин >= 300с — интервал истёк, дозагрузка выполняется
+        cache.refresh_if_new_candle("1h", force=True)
+        assert len(loader.calls) == 2
+        assert cache.has_fresh_closed_bar("1h") is True
+
+    def test_bounded_backfill_window_bounds_incremental_start(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        loader = FakeLoader({"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                                      pd.Timestamp("2024-01-01 07:00"),
+                                      pd.Timestamp("2024-01-01 08:00"),
+                                      pd.Timestamp("2024-01-01 09:00"),
+                                      pd.Timestamp("2024-01-01 10:00")]})
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_backfill_window_seconds=3600)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst, "1h")
+
+        loader.data["SBER"].append(pd.Timestamp("2024-01-01 11:00"))
+        clock[0] = datetime(2024, 1, 1, 11, 30)
+        cache.refresh_if_new_candle("1h")
+
+        start = loader.calls[-1]
+        assert start == pd.Timestamp("2024-01-01 10:30")  # max(09:00, 11:30-1h)
+        assert pd.Timestamp("2024-01-01 11:30") - start <= pd.Timedelta(seconds=3600)
+
+    def test_rate_limit_pauses_reload_and_resumes_after(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        loader = FlakyLoader(
+            {"SBER": [pd.Timestamp("2024-01-01 06:00"),
+                      pd.Timestamp("2024-01-01 07:00"),
+                      pd.Timestamp("2024-01-01 08:00"),
+                      pd.Timestamp("2024-01-01 09:00")]},
+            fail_on_call=2,
+            error="RESOURCE_EXHAUSTED ratelimit_reset=30",
+        )
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=5)
+        inst = Instrument("SBER", "SBER", "share")
+        cache.frame_for(inst, "1h")
+
+        clock[0] = datetime(2024, 1, 1, 11, 5)
+        loader.data["SBER"] = [pd.Timestamp("2024-01-01 06:00"),
+                               pd.Timestamp("2024-01-01 07:00"),
+                               pd.Timestamp("2024-01-01 08:00"),
+                               pd.Timestamp("2024-01-01 09:00"),
+                               pd.Timestamp("2024-01-01 10:00"),
+                               pd.Timestamp("2024-01-01 11:00")]
+        cache.refresh_if_new_candle("1h")
+        assert len(loader.calls) == 2  # неуспешная попытка зафиксирована
+        assert cache._retry_after is not None
+
+        clock[0] = datetime(2024, 1, 1, 11, 5, 10)  # 10с после сбоя < 30с — пауза не истекла
+        cache.refresh_if_new_candle("1h")
+        assert len(loader.calls) == 2  # API не дёргался
+
+        clock[0] = datetime(2024, 1, 1, 11, 6, 0)  # 60с >= 30с — дозагрузка возобновляется
+        cache.refresh_if_new_candle("1h")
+        assert len(loader.calls) == 3
+        assert cache.has_fresh_closed_bar("1h") is True
 
 
 

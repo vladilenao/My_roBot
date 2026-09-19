@@ -48,6 +48,9 @@ _DEFAULTS = {
     "instrument_type": "future",
     "ticker": "NGU6",
     "notifier": "console",
+    # Ограничение частоты API-дозагрузок свечей и окно bounded backfill
+    "data_refresh_min_interval": 5,
+    "data_backfill_window_seconds": 3600,
     # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
     "share_strategies": {
         "SBER": {
@@ -93,6 +96,11 @@ HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
 # (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).
 TICK_POLL_SECS = _CONFIG["tick_poll_secs"]
 TICK_TIMEOUT_SECS = _CONFIG["tick_timeout_secs"]
+
+# Ограничения дозагрузок свечевого кэша: мин. пауза между API-вызовами
+# и окно инкрементальной дозагрузки (bounded backfill).
+DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
+DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 
 # Канал уведомлений: "telegram" | "console"
 NOTIFIER = _CONFIG["notifier"]

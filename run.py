@@ -11,6 +11,8 @@ from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
     ACTIVE_TIMEFRAMES,
+    DATA_BACKFILL_WINDOW_SECONDS,
+    DATA_REFRESH_MIN_INTERVAL,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -45,6 +47,7 @@ from src.data.loader import load_candles
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
 from src.execution import NotifyOnlyExecutionPort
+from src.instruments import Instrument, normalize_instrument
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
 from src.notifier import get_notifier
@@ -70,7 +73,11 @@ def main():
         timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS
     )
     data_cache = MarketDataCache(
-        loader=load_candles, timeline=timeline, token=TINKOFF_TOKEN
+        loader=load_candles,
+        timeline=timeline,
+        token=TINKOFF_TOKEN,
+        data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL,
+        data_backfill_window_seconds=DATA_BACKFILL_WINDOW_SECONDS,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -122,6 +129,9 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
     the addressed candle simulator, and durable trade state is restored from
     SQLite rather than either legacy CSV projection.
     """
+    instruments = [
+        i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
+    ]
     if not trading_enabled():
         log.info("Торговый режим выключен — NotifyOnly.")
         return _Runtime(NotifyOnlyExecutionPort(notifier))
@@ -169,6 +179,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
     contracts = _load_contracts_metadata(instruments)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
+    storage.set_names(_instrument_names(instruments))
     broker.set_names(_instrument_names(instruments))
     print_contract_metadata(contracts)
 
@@ -179,20 +190,31 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
             for instrument in instruments:
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "Сбой загрузки бара 1m по %s: %s",
+                        _instrument_ticker(instrument), exc,
+                    )
                     continue
                 if frame.empty:
                     continue
                 bar_time = frame["datetime"].iloc[-1]
                 if hasattr(bar_time, "to_pydatetime"):
                     bar_time = bar_time.to_pydatetime()
-                bar_times.append(bar_time)
-                prices[instrument.ticker] = (
-                    float(frame["open"].iloc[-1]),
-                    float(frame["low"].iloc[-1]),
-                    float(frame["high"].iloc[-1]),
-                    float(frame["close"].iloc[-1]),
-                )
+                try:
+                    bar_times.append(bar_time)
+                    prices[instrument.ticker] = (
+                        float(frame["open"].iloc[-1]),
+                        float(frame["low"].iloc[-1]),
+                        float(frame["high"].iloc[-1]),
+                        float(frame["close"].iloc[-1]),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Сбой обработки бара %s по %s: %s",
+                        bar_time, _instrument_ticker(instrument), exc,
+                    )
+                    continue
             if prices:
                 broker.track_bar(max(bar_times), prices, contracts)
             for event in broker.drain_events():

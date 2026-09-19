@@ -1,10 +1,19 @@
+import time
+
 import pandas as pd
 from datetime import datetime, timedelta
 from t_tech.invest import Client
 from t_tech.invest.utils import now
 from src.config import TIMEFRAMES
 from src.api.instruments import find_working_instrument
-from src.api.retry import api_call_with_retry
+from src.api.retry import (
+    DEFAULT_BASE_DELAY,
+    DEFAULT_MAX_DELAY,
+    DEFAULT_MAX_RETRIES,
+    _is_rate_limited,
+    api_call_with_retry,
+    rate_limit_reset_secs,
+)
 from src.data.timeutil import to_aware_utc
 from src.logging_setup import get_logger
 
@@ -52,21 +61,46 @@ def load_candles(
         if instrument_id is None:
             instrument_id = find_working_instrument(client, ticker, instrument_type)
 
-        for candle in api_call_with_retry(
-            client.get_all_candles,
-            instrument_id=instrument_id,
-            from_=start_date,
-            to=end_date,
-            interval=TIMEFRAMES[timeframe],
-        ):
-            simple_df.append([
-            candle.time,
-            candle.open.units + candle.open.nano / 1e9,
-            candle.high.units + candle.high.nano / 1e9,
-            candle.low.units + candle.low.nano / 1e9,
-            candle.close.units + candle.close.nano / 1e9,
-            candle.volume,
-            ])
+        # Итерация по get_all_candles тоже может падать с RESOURCE_EXHAUSTED —
+        # api_call_with_retry оборачивает только создание потока. При rate-limit
+        # во время итерации ждём и переоткрываем поток с момента последней
+        # собранной свечи: прогресс не теряется.
+        retries = 0
+        candles_from = start_date
+        while True:
+            try:
+                for candle in api_call_with_retry(
+                    client.get_all_candles,
+                    instrument_id=instrument_id,
+                    from_=candles_from,
+                    to=end_date,
+                    interval=TIMEFRAMES[timeframe],
+                ):
+                    simple_df.append([
+                    candle.time,
+                    candle.open.units + candle.open.nano / 1e9,
+                    candle.high.units + candle.high.nano / 1e9,
+                    candle.low.units + candle.low.nano / 1e9,
+                    candle.close.units + candle.close.nano / 1e9,
+                    candle.volume,
+                    ])
+                break
+            except Exception as exc:
+                if not _is_rate_limited(exc) or retries >= DEFAULT_MAX_RETRIES:
+                    raise
+                retries += 1
+                reset = rate_limit_reset_secs(exc)
+                delay = min(
+                    DEFAULT_BASE_DELAY * (2 ** (retries - 1)),
+                    reset if reset is not None else DEFAULT_MAX_DELAY,
+                    DEFAULT_MAX_DELAY,
+                )
+                log.warning(
+                    "Rate limit при итерации свечей %s (%s). Ожидание %ds...",
+                    ticker, timeframe, delay,
+                )
+                time.sleep(delay)
+                candles_from = simple_df[-1][0] if simple_df else start_date
 
     if not simple_df:
         return pd.DataFrame(), instrument_id
