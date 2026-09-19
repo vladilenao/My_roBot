@@ -15,21 +15,36 @@ def _is_rate_limited(exc):
     return "RESOURCE_EXHAUSTED" in str(exc) or "resource_exhausted" in str(exc).lower()
 
 
-def _parse_reset_delay(exc):
+def rate_limit_reset_secs(exc) -> float | None:
+    """Секунды до сброса лимита API из исключения rate-limit (публичный хелпер).
+
+    Читает ``ratelimit_reset=N`` (или ``ratelimit_reset = N``) из сообщения ошибки
+    и возвращает число секунд (>=1). Если подсказки в тексте нет — ``None``, и
+    вызывающий опирается на собственную паузу/троттлинг, а не на сброс лимита.
+    """
     text = str(exc)
-    idx = text.find("ratelimit_reset=")
+    idx = text.find("ratelimit_reset")
     if idx == -1:
-        return DEFAULT_BASE_DELAY
-    rest = text[idx + len("ratelimit_reset="):]
-    num = ""
-    for ch in rest:
+        return None
+    rest = text[idx + len("ratelimit_reset"):]
+    if not rest.startswith("="):
+        return None
+    digit_part = ""
+    for ch in rest[1:]:
         if ch.isdigit():
-            num += ch
+            digit_part += ch
         else:
             break
-    if num:
-        return max(int(num), 1)
-    return DEFAULT_BASE_DELAY
+    reset = int(digit_part)
+    # reset=0 в тексте ошибки не бывает осмысленным, но тест фиксирует
+    # контракт: даже нулевая подсказка даёт минимальную паузу в 1 секунду.
+    return max(reset, 1)
+
+
+def _parse_reset_delay(exc):
+    """Пауза до сброса лимита; без подсказки — базовый интервал ретрая."""
+    reset = rate_limit_reset_secs(exc)
+    return reset if reset is not None else DEFAULT_BASE_DELAY
 
 
 def api_call_with_retry(fn, *args, max_retries=DEFAULT_MAX_RETRIES, base_delay=DEFAULT_BASE_DELAY, max_delay=DEFAULT_MAX_DELAY, **kwargs):

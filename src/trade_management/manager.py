@@ -124,6 +124,11 @@ class TradeManager:
             ).fetchone()
             if duplicate:
                 return False
+            existing = connection.execute(
+                "SELECT 1 FROM trades WHERE trade_id = ?", (plan.trade_id,)
+            ).fetchone()
+            if existing:
+                return False
             connection.execute(
                 "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, 'ENTRY_PENDING', 0, '{}', ?, ?)",
                 (plan.trade_id, plan.assignment_id, plan.instrument_id, plan.signal_id, plan.side,
@@ -459,7 +464,7 @@ class TradeManager:
             traces=(plan_trace, sizing_trace),
         )
         if accepted:
-            return SignalAdmission(actions=(action,))
+            return SignalAdmission(actions=(action,), plan=plan)
         return SignalAdmission(
             rejections=(rejection_reason("duplicate-signal"),),
         )

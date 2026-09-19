@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from src.data.loader import load_candles
+from src.data.loader import DEFAULT_MAX_RETRIES, load_candles
 
 
 def make_candle(hours, o=1, h=2, low=0, c=3, volume=10, nano=500000000):
@@ -157,3 +157,82 @@ class TestConversion:
         assert uid == "uid-123"
         assert isinstance(df, pd.DataFrame)
         assert df.empty
+
+
+class TestIterationRetry:
+    """Ретрай RESOURCE_EXHAUSTED во время итерации потока get_all_candles."""
+
+    def test_rate_limit_during_iteration_reopens_stream_without_losing_rows(self):
+        # Поток отдаёт партию свечей, затем на итерации падает с rate-limit;
+        # повторно открытый поток продолжает с последней собранной свечи.
+        made = [make_candle(0), make_candle(1), make_candle(2)]
+
+        with patch("src.data.loader.Client"), \
+             patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
+             patch("src.data.loader.time.sleep") as mock_sleep, \
+             patch("src.data.loader.api_call_with_retry") as mock_retry:
+
+            streams = {"n": 0}
+
+            def stream(from_=None):
+                streams["n"] += 1
+                batch = [c for c in made if from_ is None or c.time >= from_]
+                for c in batch:
+                    yield c
+                if streams["n"] == 1:
+                    raise RuntimeError("RESOURCE_EXHAUSTED ratelimit_reset=5")
+
+            mock_retry.side_effect = lambda *a, **k: stream(from_=k.get("from_"))
+
+            df, uid = load_candles("NGU6", "future", "1h", start_date="2024-01-01")
+
+        assert uid == "uid-123"
+        assert streams["n"] == 2  # поток переоткрыт один раз
+        # собранные до сбоя свечи сохранены; переоткрытие продолжило с них
+        hours = {pd.Timestamp(t) for t in df["datetime"]}
+        assert hours >= {
+            pd.Timestamp("2024-01-01 00:00"),
+            pd.Timestamp("2024-01-01 01:00"),
+            pd.Timestamp("2024-01-01 02:00"),
+        }
+        assert len(df) >= 3
+
+    def test_iteration_rate_limit_pauses_before_retry(self):
+        with patch("src.data.loader.Client"), \
+             patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
+             patch("src.data.loader.time.sleep") as mock_sleep, \
+             patch("src.data.loader.api_call_with_retry") as mock_retry:
+
+            calls = {"n": 0}
+
+            def stream(from_=None):
+                calls["n"] += 1
+                yield make_candle(0)
+                if calls["n"] < 2:
+                    raise RuntimeError("RESOURCE_EXHAUSTED ratelimit_reset=7")
+
+            mock_retry.side_effect = lambda *a, **k: stream()
+
+            load_candles("NGU6", "future", "1h")
+
+        assert calls["n"] == 2
+        assert mock_sleep.call_count == 1
+        slept = mock_sleep.call_args[0][0]
+        assert slept <= 7  # пауза ограничена ratelimit_reset
+
+    def test_iteration_rate_limit_rethrown_after_max_retries(self):
+        with patch("src.data.loader.Client"), \
+             patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
+             patch("src.data.loader.time.sleep") as mock_sleep, \
+             patch("src.data.loader.api_call_with_retry") as mock_retry:
+
+            def stream(from_=None):
+                yield make_candle(0)
+                raise RuntimeError("RESOURCE_EXHAUSTED")
+
+            mock_retry.side_effect = lambda *a, **k: stream()
+
+            with pytest.raises(RuntimeError, match="RESOURCE_EXHAUSTED"):
+                load_candles("NGU6", "future", "1h")
+
+        assert mock_sleep.call_count == DEFAULT_MAX_RETRIES

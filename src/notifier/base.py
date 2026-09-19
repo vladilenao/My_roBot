@@ -90,6 +90,29 @@ class TradePlanFormatter:
         )
 
 
+class EntryAcceptedFormatter:
+    """Formats an accepted entry: trade is in work, order awaits broker confirmation."""
+
+    @staticmethod
+    def format(
+        plan: TradePlan,
+        contract_name: str,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+    ) -> str:
+        label = f"● {contract_name}"
+        if timeframe:
+            label += f" ({timeframe})"
+        targets = ", ".join(_format_price(target.price) for target in plan.targets) or "нет"
+        return (
+            f"{label} ➜ Сделка {plan.side}, объём {quantity} — "
+            f"Вход: {_format_price(plan.reference_entry)}, "
+            f"Стоп: {_format_price(plan.stop_price)}, Цели: {targets} "
+            f"— в работе, ждёт подтверждения"
+        )
+
+
 def _format_price(value) -> str:
     return format(value, "f").rstrip("0").rstrip(".") if "." in format(value, "f") else format(value, "f")
 
@@ -136,6 +159,20 @@ class AbstractNotifier(ABC):
 
     def notify_plan(self, plan: TradePlan, contract_name: str, *, timeframe: str = "") -> None:
         self.notify(TradePlanFormatter.format(plan, contract_name, timeframe=timeframe))
+
+    def notify_entry_accepted(
+        self,
+        plan: TradePlan,
+        contract_name: str,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+    ) -> None:
+        self.notify(
+            EntryAcceptedFormatter.format(
+                plan, contract_name, quantity=quantity, timeframe=timeframe,
+            )
+        )
 
     def notify_rejection(
         self,

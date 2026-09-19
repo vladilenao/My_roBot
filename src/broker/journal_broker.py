@@ -127,6 +127,17 @@ def _pnl(side: str, avg: float, exit_price: float, qty: int, contract: ContractM
     return round(delta * qty * (-1 if side == "SELL" else 1), 2)
 
 
+def _naive_utc(value: datetime) -> datetime:
+    """Приводит время к единой базе naive UTC для сравнения активации заявок.
+
+    Naive значение трактуется как уже UTC; aware — конвертируется в UTC и
+    лишается пояса, чтобы сравнение не падало на смешении naive/aware.
+    """
+    if value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    return value
+
+
 def _notes(timeframe: str, over_risk: bool = False, extra: str = "", source: str = "") -> str:
     parts = [extra] if extra else []
     if timeframe:
@@ -525,7 +536,7 @@ class JournalBroker(BrokerPort):
         due, pending = [], []
         for scheduled in self._scheduled_actions:
             trade = self._addressed_trades.get(scheduled.action.trade_id)
-            if trade is not None and trade.plan.instrument_id in active_tickers and scheduled.submitted_at < now:
+            if trade is not None and trade.plan.instrument_id in active_tickers and _naive_utc(scheduled.submitted_at) < _naive_utc(now):
                 due.append(scheduled)
             else:
                 pending.append(scheduled)

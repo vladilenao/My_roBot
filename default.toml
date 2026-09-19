@@ -17,7 +17,7 @@ fallback_type = "future"
 fallback_ticker = "NGU6"
 
 [notifier]
-channel = "telegram" #console или
+channel = "console" #console или telegram
 
 # Явные привязки с глобальными ID и профилями управления; каскад ТФ: глобальный 1h, timeframe
 # тикера (NG → 15m), точечный tf в инлайне, дубли на разных ТФ.

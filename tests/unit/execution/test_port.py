@@ -103,6 +103,27 @@ class TestNotifyOnlyExecutionPort:
             filter_profile="", timeframe="",
         )
 
+    def test_report_entry_accepted_forwards_plan_and_short_name(self):
+        notifier = Mock()
+        port = NotifyOnlyExecutionPort(notifier=notifier)
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("96"),
+            targets=(TargetPlan("tp1", Decimal("104"), Decimal("1")),),
+            profile=ProfileSnapshot("levels_rr", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        instrument = Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
+
+        port.report_entry_accepted(
+            plan, instrument, quantity=4, filter_profile="basic_levels", timeframe="15m",
+        )
+
+        notifier.notify_entry_accepted.assert_called_once_with(
+            plan, "NG-9.26", quantity=4, timeframe="15m"
+        )
+
     def test_abstract_cannot_be_instantiated(self):
         with pytest.raises(TypeError):
             ExecutionPort()  # type: ignore[abstract]
@@ -165,3 +186,38 @@ class TestBrokerExecutionPort:
         instrument = Instrument("SBER", "SBER", "share")
 
         port.report_rejection(Decision(SignalType.BUY, 100.5), instrument, reason_message="r")
+
+    def test_report_entry_accepted_silent_without_notifier(self):
+        port = BrokerExecutionPort(adapter=Mock())
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("96"),
+            targets=(TargetPlan("tp1", Decimal("104"), Decimal("1")),),
+            profile=ProfileSnapshot("levels_rr", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        port.report_entry_accepted(plan, Instrument("SBER", "SBER", "share"), quantity=2)
+
+    def test_report_entry_accepted_forwards_when_notifier_given(self):
+        notifier = Mock()
+        adapter = Mock()
+        port = BrokerExecutionPort(adapter=adapter, notifier=notifier)
+        plan = TradePlan(
+            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
+            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
+            stop_price=Decimal("96"),
+            targets=(TargetPlan("tp1", Decimal("104"), Decimal("1")),),
+            profile=ProfileSnapshot("levels_rr", "1", {}),
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        port.report_entry_accepted(
+            plan, Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
+            quantity=2, timeframe="1h",
+        )
+
+        notifier.notify_entry_accepted.assert_called_once_with(
+            plan, "NG-9.26", quantity=2, timeframe="1h"
+        )

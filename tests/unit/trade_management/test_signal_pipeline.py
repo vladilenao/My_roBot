@@ -208,6 +208,39 @@ def test_next_bar_scheduled_entry_fills_and_reaches_journal(tmp_path):
         assert quantity == 2
 
 
+def test_naive_bar_time_activates_scheduled_entry_without_type_error(tmp_path):
+    broker = create_addressable_journal_broker(1_000_000, [], {})
+    broker.set_contracts({"NGV6": NG_META})
+    plan = TradePlan(
+        "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("96"),
+        (TargetPlan("tp-1", Decimal("103"), Decimal("1")),),
+        ProfileSnapshot("levels_rr", "1", {"buffer_ticks": 1}), NOW,
+    )
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+        assert manager.submit_plan(plan, OpenTrade("open-1", "trade-1", 0, "entry", 2))
+        events = manager.dispatch(BAR0)
+        assert events[0].status is ExecutionStatus.ACK
+
+        broker.track_bar(
+            datetime(2026, 1, 1, 10, 2),
+            {"NGV6": (100.0, 99.5, 101.0, 100.5)},
+            {"NGV6": NG_META},
+        )
+        fill = broker.drain_addressed_events()
+        assert fill
+        for event in fill:
+            manager.consume(event)
+
+        phase, quantity = storage.connection.execute(
+            "SELECT t.phase, p.quantity FROM trades t JOIN positions p ON p.trade_id = t.trade_id WHERE t.trade_id = ?",
+            (plan.trade_id,),
+        ).fetchone()
+        assert phase == "OPEN"
+        assert quantity == 2
+
+
 class _BrokerWithoutMetadata:
     def contract_for(self, ticker: str):
         return None
@@ -258,6 +291,65 @@ def test_actions_for_signal_rejects_duplicate_signal(tmp_path):
         )
         assert len(admission) == 0
         assert [reason.code for reason in admission.rejections] == ["duplicate-signal"]
+        assert admission.rejections[0].message == "дублирующий сигнал, сделка не взята в работу"
+
+
+def test_actions_for_signal_distinct_profiles_get_distinct_trade_ids(tmp_path):
+    assignment_a = SimpleNamespace(id="assignment-a", strategy="macd_rsi_stoch",
+                                   management="levels_rr", filter_profile="basic_levels",
+                                   priority=0, timeframe="15m")
+    assignment_b = SimpleNamespace(id="assignment-b", strategy="macd_rsi_stoch",
+                                   management="ma_cloud", filter_profile="raw",
+                                   priority=0, timeframe="15m")
+    bar_time = "2026-01-01T10:00:00+00:00"
+    decision_a = Decision(signal_type=SignalType.BUY, price=100.0, bar_time=BAR0,
+                          event_id=f"assignment-a:NGV6:15m:{bar_time}:BUY",
+                          available_at=BAR0, timeframe="15m")
+    decision_b = Decision(signal_type=SignalType.BUY, price=100.0, bar_time=BAR0,
+                          event_id=f"assignment-b:NGV6:15m:{bar_time}:BUY",
+                          available_at=BAR0, timeframe="15m")
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, _FillBroker(), initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+        first = manager.actions_for_signal(
+            assignment_a, decision_a, INSTRUMENT, _frame([100.0] * 25),
+            _context(levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)), timeframe="15m",
+        )
+        second = manager.actions_for_signal(
+            assignment_b, decision_b, INSTRUMENT, _frame([100.0] * 45),
+            _context(price=100.0), timeframe="15m",
+        )
+        assert len(first) == 1
+        assert len(second) == 1
+        assert first[0].trade_id == decision_a.event_id
+        assert second[0].trade_id == decision_b.event_id
+        assert first[0].trade_id != second[0].trade_id
+        rows = storage.connection.execute(
+            "SELECT trade_id, phase FROM trades ORDER BY trade_id"
+        ).fetchall()
+        assert {row[0] for row in rows} == {first[0].trade_id, second[0].trade_id}
+        assert {row[1] for row in rows} == {"ENTRY_PENDING"}
+
+
+def test_submit_plan_returns_false_for_existing_trade_id(tmp_path):
+    plan = TradePlan(
+        "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("96"),
+        (TargetPlan("tp-1", Decimal("103"), Decimal("1")),),
+        ProfileSnapshot("levels_rr", "1", {"buffer_ticks": 1}), NOW,
+    )
+    retry = TradePlan(
+        "trade-1", "assignment-1", "NGV6", "BUY", "signal-2", Decimal("100"), Decimal("96"),
+        (TargetPlan("tp-1", Decimal("103"), Decimal("1")),),
+        ProfileSnapshot("levels_rr", "1", {"buffer_ticks": 1}), NOW,
+    )
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, _FillBroker(), initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+        assert manager.submit_plan(plan, OpenTrade("open-1", "trade-1", 0, "entry", 2))
+        assert not manager.submit_plan(retry, OpenTrade("open-2", "trade-1", 0, "entry", 2))
+        assert storage.connection.execute(
+            "SELECT COUNT(*) FROM trades WHERE trade_id = ?", ("trade-1",)
+        ).fetchone()[0] == 1
 
 
 def test_actions_for_signal_rejects_zero_quantity(tmp_path):

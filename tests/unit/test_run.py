@@ -1,9 +1,11 @@
 from unittest.mock import ANY, MagicMock, patch
 
+import pandas as pd
 import pytest
 
 import run
 from src.execution import NotifyOnlyExecutionPort
+from src.instruments import Instrument
 from src.portfolio import ContractMeta
 
 
@@ -23,6 +25,16 @@ def fake_instrument():
 
 
 SELECTOR_NG = ("NG (Природный газ) — NG-10.26", "NGV6", "future", "NG-10.26")
+
+
+def _frame_with_candle():
+    return pd.DataFrame({
+        "datetime": pd.date_range("2024-01-01", periods=2, freq="1min"),
+        "open": [100.0, 100.0],
+        "low": [99.0, 99.0],
+        "high": [101.0, 101.0],
+        "close": [100.5, 100.5],
+    })
 
 
 class TestLoadContractsMetadata:
@@ -116,3 +128,35 @@ class TestRuntimeComposition:
         assert runtime.trade_manager is manager
         assert runtime.risk_manager.__class__.__name__ == "PortfolioRiskManager"
         assert isinstance(runtime.execution, NotifyOnlyExecutionPort)
+
+    def test_build_runtime_normalizes_selector_tuples_before_consumers(self):
+        notifier = MagicMock()
+        broker = MagicMock()
+        broker.drain_events.return_value = []
+        broker.drain_addressed_events.return_value = []
+        manager = MagicMock()
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        cache = MagicMock()
+        cache.frame_for.return_value = _frame_with_candle()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch(
+            "src.broker.create_addressable_journal_broker", return_value=broker
+        ), patch(
+            "src.trade_management.manager.TradeManager", return_value=manager
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"):
+            runtime = run._build_runtime([SELECTOR_NG], notifier, cache)
+
+        storage.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
+        broker.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
+
+        runtime.post_tick(("1m",))
+
+        instrument = cache.frame_for.call_args.args[0]
+        assert isinstance(instrument, Instrument)
+        assert instrument.ticker == "NGV6"
+        assert instrument.short_name == "NG-10.26"
+        broker.track_bar.assert_called_once()

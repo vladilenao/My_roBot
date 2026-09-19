@@ -2,7 +2,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from src.api.retry import (
     api_call_with_retry, with_retry,
-    _is_rate_limited, _parse_reset_delay,
+    _is_rate_limited, _parse_reset_delay, rate_limit_reset_secs,
     DEFAULT_MAX_RETRIES, DEFAULT_BASE_DELAY,
 )
 
@@ -23,6 +23,24 @@ class TestIsRateLimited:
     def test_grpc_status_code(self):
         exc = Exception("StatusCode.RESOURCE_EXHAUSTED: resource exhausted")
         assert _is_rate_limited(exc) is True
+
+
+class TestRateLimitResetSecs:
+    def test_parses_ratelimit_reset(self):
+        exc = Exception("RESOURCE_EXHAUSTED ratelimit_reset=30")
+        assert rate_limit_reset_secs(exc) == 30
+
+    def test_returns_none_when_absent(self):
+        exc = Exception("some other error")
+        assert rate_limit_reset_secs(exc) is None
+
+    def test_zero_reset_returns_one(self):
+        exc = Exception("ratelimit_reset=0")
+        assert rate_limit_reset_secs(exc) == 1
+
+    def test_reset_without_equals_sign_is_none(self):
+        exc = Exception("ratelimit_reset 30")
+        assert rate_limit_reset_secs(exc) is None
 
 
 class TestParseResetDelay:

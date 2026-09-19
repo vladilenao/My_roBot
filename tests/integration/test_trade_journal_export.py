@@ -46,6 +46,24 @@ def _change_snapshot(storage):
         connection.execute("UPDATE positions SET quantity = 1 WHERE trade_id = 'trade-1'")
 
 
+def test_export_uses_short_contract_name_from_storage_names(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_snapshot(storage)
+        storage.set_names({"NGV6": "NG-12.26"})
+
+        journal_rows = _read_csv(journal)
+        assert journal_rows
+        assert journal_rows[0]["Контракт"] == "NG-12.26"
+
+        position_rows = _read_csv(positions)
+        assert position_rows
+        assert position_rows[0]["Контракт"] == "NG-12.26"
+
+
 def test_startup_and_later_export_restore_deleted_csv_from_sqlite(tmp_path):
     database = tmp_path / "trades.sqlite3"
     journal = tmp_path / "journal.csv"
