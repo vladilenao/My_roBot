@@ -32,6 +32,32 @@ class ExecutionPort(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        """Доставляет уведомление о недопуске сделки с причиной."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def report_entry_accepted(
+        self,
+        plan,
+        instrument,
+        *,
+        quantity: int = 0,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        """Доставляет уведомление о принятой в работу сделке (ждёт подтверждения брокера)."""
+        raise NotImplementedError
+
 
 class NotifyOnlyExecutionPort(ExecutionPort):
     """Доставляет решение трейдеру через нотификатор, не выполняя сделок."""
@@ -56,6 +82,35 @@ class NotifyOnlyExecutionPort(ExecutionPort):
             decision, label,
             filter_profile=filter_profile, filtered_out=filtered_out,
             timeframe=timeframe,
+        )
+
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        label = _short_contract_name(instrument)
+        self._notifier.notify_rejection(
+            decision, label,
+            reason=reason_message, filter_profile=filter_profile, timeframe=timeframe,
+        )
+
+    def report_entry_accepted(
+        self,
+        plan,
+        instrument,
+        *,
+        quantity: int = 0,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        label = _short_contract_name(instrument)
+        self._notifier.notify_entry_accepted(
+            plan, label, quantity=quantity, timeframe=timeframe,
         )
 
 
@@ -96,6 +151,37 @@ class BrokerExecutionPort(ExecutionPort):
             filtered_out=filtered_out,
             timeframe=timeframe,
         )
+
+    def report_rejection(
+        self,
+        decision,
+        instrument,
+        *,
+        reason_message: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        if self._notifier is not None:
+            label = _short_contract_name(instrument)
+            self._notifier.notify_rejection(
+                decision, label,
+                reason=reason_message, filter_profile=filter_profile, timeframe=timeframe,
+            )
+
+    def report_entry_accepted(
+        self,
+        plan,
+        instrument,
+        *,
+        quantity: int = 0,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        if self._notifier is not None:
+            label = _short_contract_name(instrument)
+            self._notifier.notify_entry_accepted(
+                plan, label, quantity=quantity, timeframe=timeframe,
+            )
 
 
 def _short_contract_name(instrument) -> str:

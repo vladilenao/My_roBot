@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from src.api.retry import DEFAULT_BASE_DELAY, rate_limit_reset_secs
 from src.data.timeutil import to_naive
 from src.logging_setup import get_logger
 
@@ -26,10 +27,14 @@ class MarketDataCache:
     одного инструмента хранятся и обновляются независимо.
     """
 
-    def __init__(self, loader, timeline, token=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
+        self._data_refresh_min_interval = data_refresh_min_interval  # мин. пауза между API-дозагрузками
+        self._data_backfill_window_seconds = data_backfill_window_seconds  # окно инкр. дозагрузки (bounded backfill)
+        self._last_api_attempt: pd.Timestamp | None = None  # глобальный страж последнего обращения к API (tz-naive UTC)
+        self._retry_after: pd.Timestamp | None = None  # до этого времени дозагрузки приостановлены (tz-naive)
         self._frames: dict[tuple, pd.DataFrame | None] = {}
         self._instruments: dict[tuple, object] = {}
         self._last_loaded: dict[tuple, pd.Timestamp] = {}
@@ -41,6 +46,7 @@ class MarketDataCache:
 
     def _load(self, instrument, timeframe: str, start_date=None) -> pd.DataFrame:
         key = self._key(instrument, timeframe)
+        self._last_api_attempt = _naive(self._timeline.now())
         df, instrument_id = self._loader(
             ticker=instrument.ticker,
             instrument_type=instrument.instrument_type,
@@ -80,8 +86,23 @@ class MarketDataCache:
         frame = self._frames[key]
         if frame is None or frame.empty:
             return
+        now = _naive(self._timeline.now())
+        if self._retry_after is not None:
+            if now < self._retry_after:
+                return
+            self._retry_after = None
+        if self._throttled(now):
+            return
         last_dt = self._last_loaded.get(key)
-        new_df = self._load(self._instruments[key], timeframe, start_date=last_dt)
+        start = self._incremental_start(last_dt, now)
+        try:
+            new_df = self._load(self._instruments[key], timeframe, start_date=start)
+        except Exception as exc:
+            if "resource_exhausted" in str(exc).lower():
+                log.warning("Rate limit при дозагрузке %s: %s", key, exc)
+                self._retry_after = self._pause_after_rate_limit(exc, now)
+                return
+            raise
         merged = self._merge_new_bars(frame, new_df, last_dt)
         self._frames[key] = merged
         closed = self._closed_only(merged, timeframe)
@@ -96,7 +117,12 @@ class MarketDataCache:
         который из-за задержки публикации может быть временно недоступен).
         """
         grid = self._timeline.grid(timeframe)
-        boundary = _naive(grid.current_candle_start(now or self._timeline.now()))
+        now = _naive(now or self._timeline.now())
+        boundary = _naive(grid.current_candle_start(now))
+        if self._retry_after is not None:
+            if now < self._retry_after:
+                return
+            self._retry_after = None
         for key in list(self._frames.keys()):
             if key[2] != timeframe:
                 continue
@@ -106,8 +132,19 @@ class MarketDataCache:
             if frame is None or frame.empty:
                 self._observed[key] = boundary
                 continue
+            if self._throttled(now):
+                self._observed[key] = boundary
+                continue
             last_dt = self._last_loaded.get(key)
-            new_df = self._load(self._instruments[key], timeframe, start_date=last_dt)
+            start = self._incremental_start(last_dt, now)
+            try:
+                new_df = self._load(self._instruments[key], timeframe, start_date=start)
+            except Exception as exc:
+                if "resource_exhausted" in str(exc).lower():
+                    log.warning("Rate limit при дозагрузке %s: %s", key, exc)
+                    self._retry_after = self._pause_after_rate_limit(exc, now)
+                    continue
+                raise
             merged = self._merge_new_bars(frame, new_df, last_dt)
             self._frames[key] = merged
             closed = self._closed_only(merged, timeframe)
@@ -166,3 +203,24 @@ class MarketDataCache:
         return pd.concat([frame, new_df], ignore_index=True).drop_duplicates(
             subset="datetime", keep="last"
         ).sort_values("datetime").reset_index(drop=True)
+
+    def _throttled(self, now) -> bool:
+        """Дозагрузка запрещена троттлингом: с последнего API-вызова прошло меньше интервала."""
+        if not self._data_refresh_min_interval or self._last_api_attempt is None:
+            return False
+        return (now - self._last_api_attempt).total_seconds() < self._data_refresh_min_interval
+
+    def _incremental_start(self, last_dt, now):
+        """start_date дозагрузки: не раньше окна bounded backfill (``now - window``)."""
+        if self._data_backfill_window_seconds is None:
+            return last_dt
+        window_start = now - pd.Timedelta(seconds=self._data_backfill_window_seconds)
+        if last_dt is None:
+            return window_start
+        return max(window_start, _naive(last_dt))
+
+    def _pause_after_rate_limit(self, exc, now) -> pd.Timestamp:
+        """Момент возобновления дозагрузок после RESOURCE_EXHAUSTED (tz-naive wall-time)."""
+        reset = rate_limit_reset_secs(exc) or 0
+        pause = max(reset, self._data_refresh_min_interval or DEFAULT_BASE_DELAY)
+        return now + pd.Timedelta(seconds=pause)

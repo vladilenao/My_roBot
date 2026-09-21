@@ -65,6 +65,32 @@ class TestNotifyDecision:
         )
 
 
+class TestNotifyRejection:
+    def test_delivers_formatted_rejection(self):
+        notifier = RecordingNotifier(formatter=DecisionFormatter())
+
+        notifier.notify_rejection(
+            Decision(SignalType.BUY, 100.5), "NG",
+            reason="Размер позиции ниже минимального", filter_profile="raw", timeframe="1h",
+        )
+
+        assert notifier.messages == [
+            "⛔ NG (1h) ➜ Сделка не допущена: Размер позиции ниже минимального"
+        ]
+
+    def test_custom_formatter_is_used_for_rejection(self):
+        formatter = MagicMock()
+        formatter.format_rejection.return_value = "custom rejection"
+        notifier = RecordingNotifier(formatter=formatter)
+
+        notifier.notify_rejection(Decision(SignalType.BUY, 100.5), "", reason="r")
+
+        assert notifier.messages == ["custom rejection"]
+        formatter.format_rejection.assert_called_once_with(
+            Decision(SignalType.BUY, 100.5), "", reason="r", filter_profile="", timeframe=""
+        )
+
+
 class TestConsoleNotifier:
     def test_notify_prints_message(self, capsys):
         ConsoleNotifier().notify("hello")
@@ -94,29 +120,37 @@ class TestTelegramDefaults:
     def test_defaults_from_config(self, monkeypatch):
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_BOT_TOKEN", "cfg-token")
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_CHANNEL_ID", "cfg-chat")
+        monkeypatch.setattr("src.notifier.telegram.CLOUDFLARE_URL", "cfg-proxy")
 
         notifier = TelegramNotifier()
 
         assert notifier.bot_token == "cfg-token"
         assert notifier.channel_id == "cfg-chat"
+        assert notifier.cloudflare_url == "cfg-proxy"
 
     def test_explicit_params_override_config(self, monkeypatch):
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_BOT_TOKEN", "cfg-token")
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_CHANNEL_ID", "cfg-chat")
+        monkeypatch.setattr("src.notifier.telegram.CLOUDFLARE_URL", "cfg-proxy")
 
-        notifier = TelegramNotifier(bot_token="own-token", channel_id="own-chat")
+        notifier = TelegramNotifier(
+            bot_token="own-token", channel_id="own-chat", cloudflare_url="own-proxy"
+        )
 
         assert notifier.bot_token == "own-token"
         assert notifier.channel_id == "own-chat"
+        assert notifier.cloudflare_url == "own-proxy"
 
     def test_empty_params_fall_back_to_config(self, monkeypatch):
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_BOT_TOKEN", "cfg-token")
         monkeypatch.setattr("src.notifier.telegram.TELEGRAM_CHANNEL_ID", "cfg-chat")
+        monkeypatch.setattr("src.notifier.telegram.CLOUDFLARE_URL", "cfg-proxy")
 
-        notifier = TelegramNotifier(bot_token="", channel_id=None)
+        notifier = TelegramNotifier(bot_token="", channel_id=None, cloudflare_url=None)
 
         assert notifier.bot_token == "cfg-token"
         assert notifier.channel_id == "cfg-chat"
+        assert notifier.cloudflare_url == "cfg-proxy"
 
 
 class TestTelegramNotify:
@@ -124,10 +158,13 @@ class TestTelegramNotify:
     def test_successful_send_uses_correct_request_without_echo(self, mock_post, capsys):
         mock_post.return_value.status_code = 200
 
-        TelegramNotifier(bot_token="tok", channel_id="chat").notify("hi")
+        TelegramNotifier(
+            bot_token="tok", channel_id="chat",
+            cloudflare_url="https://telegram-proxy.example",
+        ).notify("hi")
 
         mock_post.assert_called_once_with(
-            "https://api.telegram.org/bottok/sendMessage",
+            "https://telegram-proxy.example/bottok/sendMessage",
             data={"chat_id": "chat", "text": "hi"},
             timeout=10,
         )

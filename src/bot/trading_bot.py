@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
+from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
 from src.logging_setup import correlation_id_var, get_logger
 from src.notifier.errors import user_error_message
@@ -130,7 +132,13 @@ class TradingBot:
                 return
             except Exception as exc:
                 self._report_error(exc, "обработка тика")
-                time.sleep(self._timeline.fallback_secs())
+                if _is_rate_limited(exc):
+                    reset = rate_limit_reset_secs(exc) or DEFAULT_BASE_DELAY
+                    delay = min(self._timeline.fallback_secs(), reset)
+                    log.warning("Rate limit (обработка тика). Ожидание %ds...", delay)
+                    time.sleep(delay)
+                else:
+                    time.sleep(self._timeline.fallback_secs())
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
@@ -260,11 +268,16 @@ class TradingBot:
                     self._ta_digest(ta),
                 )
                 bar_time = self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1])
+                msk_time = bar_time + timedelta(hours=BAR_TIME_TZ_OFFSET_HOURS)
+                event_id = (
+                    f"{assignment.id}:{instrument.ticker}:{tf}:"
+                    f"{msk_time.isoformat()}:{decision.signal_type.value}"
+                )
                 decision = replace(
                     decision,
                     bar_time=bar_time,
                     available_at=decision.available_at or bar_time,
-                    event_id=decision.event_id or f"{assignment.id}:{instrument.ticker}:{tf}:{bar_time.isoformat()}:{decision.signal_type.value}",
+                    event_id=event_id,
                 )
                 if self._trade_manager is not None:
                     actions_for_signal = getattr(self._trade_manager, "actions_for_signal", None)
@@ -331,21 +344,39 @@ class TradingBot:
         actions_for_signal = getattr(self._trade_manager, "actions_for_signal", None)
         if actions_for_signal is None:
             return
-        self._dispatch_management_actions(
-            actions_for_signal(
-                candidate.assignment,
-                candidate.decision,
+        admission = actions_for_signal(
+            candidate.assignment,
+            candidate.decision,
+            candidate.instrument,
+            candidate.frame,
+            candidate.context,
+            timeframe=candidate.timeframe,
+        )
+        if admission.plan is not None:
+            quantity = admission.actions[0].quantity if admission.actions else 0
+            self._execution.report_entry_accepted(
+                admission.plan,
                 candidate.instrument,
-                candidate.frame,
-                candidate.context,
+                quantity=quantity,
+                filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
-            ),
+            )
+        self._dispatch_management_actions(
+            admission.actions,
             candidate.decision,
             candidate.context,
             candidate.assignment,
             candidate.instrument,
             candidate.timeframe,
         )
+        for reason in admission.rejections:
+            self._execution.report_rejection(
+                candidate.decision,
+                candidate.instrument,
+                reason_message=reason.message,
+                filter_profile=candidate.assignment.filter_profile,
+                timeframe=candidate.timeframe,
+            )
 
     def _manage(self, instrument: Instrument, assignments: list[Assignment], frame, context, tf: str) -> None:
         """Dispatch ongoing trade actions before evaluating new entry signals."""

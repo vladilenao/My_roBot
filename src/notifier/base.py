@@ -20,23 +20,7 @@ class DecisionFormatter:
         filtered_out: bool = False,
         timeframe: str = "",
     ) -> str:
-        parts: list[str] = []
-        if instrument_label:
-            label_block = f"● {instrument_label}"
-            if timeframe:
-                label_block += f" ({timeframe})"
-            parts.append(label_block)
-        else:
-            parts.append("●")
-        if decision.bar_time is not None:
-            parts.append(
-                (decision.bar_time + timedelta(hours=self._tz_offset)).strftime("%H:%M")
-            )
-        if decision.strategy_name:
-            strategy_block = f"| {decision.strategy_name}"
-            if filter_profile:
-                strategy_block += f" [{filter_profile}]"
-            parts.append(strategy_block)
+        parts = self._header_parts(decision, instrument_label, "●", filter_profile, timeframe)
 
         if filtered_out:
             signal = "❌ Отклонено фильтром."
@@ -48,6 +32,46 @@ class DecisionFormatter:
             signal = "⏳ Нет сигнала."
 
         return " ".join(parts) + f" ➜ {signal}"
+
+    def format_rejection(
+        self,
+        decision: Decision,
+        instrument_label: str = "",
+        *,
+        reason: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> str:
+        """Форматирует сообщение о недопуске сделки с маркером ⛔."""
+        parts = self._header_parts(decision, instrument_label, "⛔", filter_profile, timeframe)
+        return " ".join(parts) + f" ➜ Сделка не допущена: {reason}"
+
+    def _header_parts(
+        self,
+        decision: Decision,
+        instrument_label: str,
+        marker: str,
+        filter_profile: str,
+        timeframe: str,
+    ) -> list[str]:
+        parts: list[str] = []
+        if instrument_label:
+            label_block = f"{marker} {instrument_label}"
+            if timeframe:
+                label_block += f" ({timeframe})"
+            parts.append(label_block)
+        else:
+            parts.append(marker)
+        if decision.bar_time is not None:
+            parts.append(
+                (decision.bar_time + timedelta(hours=self._tz_offset)).strftime("%H:%M")
+            )
+        if decision.strategy_name:
+            strategy_block = f"| {decision.strategy_name}"
+            if filter_profile:
+                strategy_block += f" [{filter_profile}]"
+            parts.append(strategy_block)
+        return parts
 
 
 class TradePlanFormatter:
@@ -63,6 +87,29 @@ class TradePlanFormatter:
             f"{label} | {plan.profile.name} ➜ ПЛАН {plan.side} — "
             f"Вход: {_format_price(plan.reference_entry)}, "
             f"Стоп: {_format_price(plan.stop_price)}, Цели: {targets}"
+        )
+
+
+class EntryAcceptedFormatter:
+    """Formats an accepted entry: trade is in work, order awaits broker confirmation."""
+
+    @staticmethod
+    def format(
+        plan: TradePlan,
+        contract_name: str,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+    ) -> str:
+        label = f"● {contract_name}"
+        if timeframe:
+            label += f" ({timeframe})"
+        targets = ", ".join(_format_price(target.price) for target in plan.targets) or "нет"
+        return (
+            f"{label} ➜ Сделка {plan.side}, объём {quantity} — "
+            f"Вход: {_format_price(plan.reference_entry)}, "
+            f"Стоп: {_format_price(plan.stop_price)}, Цели: {targets} "
+            f"— в работе, ждёт подтверждения"
         )
 
 
@@ -112,6 +159,36 @@ class AbstractNotifier(ABC):
 
     def notify_plan(self, plan: TradePlan, contract_name: str, *, timeframe: str = "") -> None:
         self.notify(TradePlanFormatter.format(plan, contract_name, timeframe=timeframe))
+
+    def notify_entry_accepted(
+        self,
+        plan: TradePlan,
+        contract_name: str,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+    ) -> None:
+        self.notify(
+            EntryAcceptedFormatter.format(
+                plan, contract_name, quantity=quantity, timeframe=timeframe,
+            )
+        )
+
+    def notify_rejection(
+        self,
+        decision: Decision,
+        instrument_label: str = "",
+        *,
+        reason: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        self.notify(
+            self._formatter.format_rejection(
+                decision, instrument_label,
+                reason=reason, filter_profile=filter_profile, timeframe=timeframe,
+            )
+        )
 
     def notify_event(self, event_type: str, position_id: str, message: str) -> None:
         self.notify(DealEventFormatter.format_event(event_type, position_id, message))

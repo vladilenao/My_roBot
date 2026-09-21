@@ -23,7 +23,7 @@ from src.trade_management.audit import (
     TraceLinks,
     calculation_trace,
 )
-from src.trade_management.models import TradePhase, TradePlan
+from src.trade_management.models import SignalAdmission, TradePhase, TradePlan, rejection_reason
 from src.trade_management.opposite_signals import handle_raw_opposite_signal
 from src.trade_management.pipeline import (
     PROFILE_CLASSES,
@@ -123,6 +123,11 @@ class TradeManager:
                 (plan.assignment_id, plan.signal_id),
             ).fetchone()
             if duplicate:
+                return False
+            existing = connection.execute(
+                "SELECT 1 FROM trades WHERE trade_id = ?", (plan.trade_id,)
+            ).fetchone()
+            if existing:
                 return False
             connection.execute(
                 "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, 'ENTRY_PENDING', 0, '{}', ?, ?)",
@@ -233,25 +238,34 @@ class TradeManager:
         context=None,
         *,
         timeframe: str | None = None,
-    ) -> tuple[TradeAction, ...]:
-        """Admit one raw strategy event: manage an owned trade or plan a new entry."""
+    ) -> SignalAdmission:
+        """Admit one raw strategy event: manage an owned trade or plan a new entry.
+
+        Returns admitted actions plus the reasons why a tradable signal was not
+        admitted. HOLD yields an empty admission without reasons (no signal).
+        """
         if decision.signal_type is SignalType.HOLD:
-            return ()
+            return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
         contract = getattr(self._broker, "contract_for", None)
         meta = contract(instrument.ticker) if callable(contract) else None
         if meta is None:
             log.debug("actions_for_signal %s: нет метаданных контракта", instrument.ticker)
-            return ()
+            return SignalAdmission(
+                rejections=(rejection_reason("no-contract-metadata"),),
+            )
         try:
             recovered = self.restore()
             owned = self._owned_trade(recovered, assignment.id)
             if owned is not None:
-                return self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
+                actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
+                return SignalAdmission(actions=actions)
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except Exception as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
-            return ()
+            return SignalAdmission(
+                rejections=(rejection_reason("admission-error", message=f"Ошибка при допуске сигнала: {exc}"),),
+            )
 
     def manage(
         self,
@@ -367,11 +381,13 @@ class TradeManager:
                 log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(submitted)
 
-    def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> tuple[TradeAction, ...]:
+    def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
         profile_cls = PROFILE_CLASSES.get(assignment.management)
         if profile_cls is None:
             log.warning("Неизвестный профиль управления %r", assignment.management)
-            return ()
+            return SignalAdmission(
+                rejections=(rejection_reason("unknown-profile", message=f"Неизвестный профиль управления {assignment.management!r}"),),
+            )
         snapshot = build_profile_snapshot(
             assignment.management, self._profiles_config.get(assignment.management, {})
         )
@@ -398,10 +414,15 @@ class TradeManager:
             )
         )
         if isinstance(plan, ProfileResult) or plan is None:
-            return ()
+            code = str((plan.state or {}).get("reason", "profile-rejected")) if isinstance(plan, ProfileResult) else "profile-rejected"
+            return SignalAdmission(
+                rejections=(rejection_reason(code),),
+            )
         quantity, risk_amount = self._size_open_quantity(plan, meta)
         if quantity <= 0:
-            return ()
+            return SignalAdmission(
+                rejections=(rejection_reason("zero-quantity"),),
+            )
         action = OpenTrade(
             command_id=f"{plan.trade_id}:entry",
             trade_id=plan.trade_id,
@@ -442,7 +463,11 @@ class TradeManager:
             margin_budget=budget,
             traces=(plan_trace, sizing_trace),
         )
-        return (action,) if accepted else ()
+        if accepted:
+            return SignalAdmission(actions=(action,), plan=plan)
+        return SignalAdmission(
+            rejections=(rejection_reason("duplicate-signal"),),
+        )
 
     def _size_open_quantity(self, plan: TradePlan, meta) -> tuple[int, Decimal]:
         """Size a fresh entry within per-trade/instrument/portfolio risk and margin."""

@@ -3,7 +3,9 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterator, Mapping
+
+from src.trade_management.actions import TradeAction
 
 
 def _freeze(value: object) -> object:
@@ -109,3 +111,62 @@ class TradeState:
             raise ValueError("average_price requires a non-zero quantity")
         if self.quantity > 0 and self.average_price is None:
             raise ValueError("non-zero quantity requires average_price")
+
+
+@dataclass(frozen=True)
+class RejectionReason:
+    """Машиночитаемый код + человекочитаемое описание причины недопуска сигнала."""
+
+    code: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("code is required")
+        if not self.message:
+            raise ValueError("message is required")
+
+
+@dataclass(frozen=True)
+class SignalAdmission:
+    """Результат допуска сигнала: допущенные действия и причины недопуска.
+
+    Итерируется как кортеж допущенных действий для совместимости с прежним
+    возвращаемым типом ``tuple[TradeAction, ...]``.
+    """
+
+    actions: tuple[TradeAction, ...] = ()
+    rejections: tuple[RejectionReason, ...] = ()
+    plan: TradePlan | None = None
+
+    def __iter__(self) -> Iterator[TradeAction]:
+        return iter(self.actions)
+
+    def __len__(self) -> int:
+        return len(self.actions)
+
+    def __getitem__(self, index):
+        return self.actions[index]
+
+
+_REJECTION_MESSAGES = {
+    "no-contract-metadata": "Нет метаданных контракта для инструмента",
+    "unknown-profile": "Неизвестный профиль управления",
+    "zero-quantity": "Размер позиции ниже минимального",
+    "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",
+    "admission-error": "Ошибка при допуске сигнала",
+    "insufficient-history": "Недостаточно истории для расчёта",
+    "missing-structure": "Нет подтверждённой структуры",
+    "missing-pattern-context": "Нет подтверждённых ориентиров формации",
+    "target-not-ahead": "Цель не впереди входа",
+}
+
+
+def rejection_message(code: str) -> str:
+    """Человекочитаемое описание причины недопуска; fallback — сырой код."""
+    return _REJECTION_MESSAGES.get(code, code)
+
+
+def rejection_reason(code: str, *, message: str | None = None) -> RejectionReason:
+    """Собрать RejectionReason, подставляя известный текст для кода."""
+    return RejectionReason(code=code, message=message or rejection_message(code))
