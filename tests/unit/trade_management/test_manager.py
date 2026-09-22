@@ -1,13 +1,15 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.portfolio.models import ContractMeta
 from src.trade_journal.storage import Storage
-from src.trade_management.actions import AddToTrade, MoveStop, OpenTrade
+from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade
 from src.trade_management.manager import TradeManager
-from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
+from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePhase, TradePlan
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -29,11 +31,55 @@ class FakeBroker(BrokerPort):
         )
 
 
+class ContractBroker(FakeBroker):
+    """Брокер с ``contract_for`` и честным учётом наполнения позиций.
+
+    Входы исполняются (FILL), отмены возвращаются REJECT-классом ``CANCEL``,
+    закрытия списывают оставшийся объём.
+    """
+
+    def __init__(self, meta: ContractMeta | None) -> None:
+        super().__init__()
+        self.meta = meta
+        self.quantities: dict[str, int] = {}
+
+    def contract_for(self, ticker: str) -> ContractMeta | None:
+        return self.meta
+
+    def submit(self, action, now):
+        self.actions.append(action)
+        if isinstance(action, (OpenTrade, AddToTrade)):
+            self.quantities[action.trade_id] = self.quantities.get(action.trade_id, 0) + action.quantity
+            filled, status = action.quantity, ExecutionStatus.FILL
+        elif isinstance(action, CancelEntry):
+            filled, status = 0, ExecutionStatus.CANCEL
+        else:
+            filled = self.quantities.get(action.trade_id, 0)
+            self.quantities[action.trade_id] = 0
+            status = ExecutionStatus.FILL
+        return ExecutionEvent(
+            f"{action.command_id}:{status.value}", action.command_id, action.command_id, action.trade_id,
+            status, filled, Decimal("100") if filled else None, Decimal("0"), now, action.reason,
+        )
+
+
 def _plan() -> TradePlan:
     return TradePlan(
         "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("96"),
         (TargetPlan("tp-1", Decimal("104"), Decimal("1")),),
         ProfileSnapshot("levels_rr", "1", {"buffer": Decimal("1")}), NOW,
+    )
+
+
+def _contract(expiration_days: int | None) -> ContractMeta:
+    """Контракт с датой экспирации через ``expiration_days`` суток (naive UTC)."""
+    if expiration_days is None:
+        expiration_date = None
+    else:
+        expiration_date = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=expiration_days)
+    return ContractMeta(
+        ticker="NGV6", price_step=1.0, step_cost=100.0, go_buy=5000.0, go_sell=5000.0,
+        expiration_date=expiration_date,
     )
 
 
@@ -100,3 +146,50 @@ def test_stop_ack_confirms_protection_and_advances_durable_revision(tmp_path):
     assert recovered.state.confirmed_stop == Decimal("100")
     assert recovered.state.pending_stop is None
     assert recovered.state.state_revision == 2
+
+
+class TestManageExpiringContract:
+    def test_manage_cancels_entry_pending_when_contract_expiring(self, tmp_path):
+        broker = ContractBroker(_contract(expiration_days=1))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker)
+            manager.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 1))
+
+            actions = manager.manage(SimpleNamespace(ticker="NGV6"), [], None)
+
+            (cancel,) = actions
+            assert isinstance(cancel, CancelEntry)
+            assert cancel.reason == "contract-expiring"
+            assert cancel.trade_id == "trade-1"
+            stored = storage.connection.execute(
+                "SELECT phase FROM trades WHERE trade_id = ?", ("trade-1",)
+            ).fetchone()
+            assert stored[0] == TradePhase.ENTRY_PENDING.value
+
+    def test_manage_closes_open_position_when_contract_expiring(self, tmp_path):
+        broker = ContractBroker(_contract(expiration_days=1))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker, initial_balance=Decimal("1000"))
+            manager.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 2))
+            manager.dispatch(NOW)
+
+            actions = manager.manage(SimpleNamespace(ticker="NGV6"), [], None)
+
+            (close,) = actions
+            assert isinstance(close, CloseTrade)
+            assert close.reason == "contract-expiring"
+            assert close.trade_id == "trade-1"
+
+    def test_manage_leaves_share_contract_without_expiration_unaffected(self, tmp_path):
+        broker = ContractBroker(_contract(expiration_days=None))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker, initial_balance=Decimal("1000"))
+            manager.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 2))
+            manager.dispatch(NOW)
+
+            actions = manager.manage(SimpleNamespace(ticker="NGV6"), [], None)
+
+            assert not any(getattr(action, "reason", None) == "contract-expiring" for action in actions)
+            recovered, = manager.restore()
+            assert recovered.state.phase is TradePhase.OPEN
+            assert recovered.state.quantity == 2

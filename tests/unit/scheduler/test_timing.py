@@ -285,3 +285,94 @@ class TestMultiTimeframeScheduler:
     def test_empty_timeframes_raise(self):
         with pytest.raises(ValueError):
             MultiTimeframeScheduler([])
+
+
+class TestCatchUp:
+    """Догон поздно опубликованных баров (catch_up_bars > 0)."""
+
+    @staticmethod
+    def _fast_timeout():
+        state = {"t": 0.0}
+
+        def monotonic():
+            state["t"] += 100.0
+            return state["t"]
+
+        return monotonic
+
+    def _tick(self, s, bar_ready, wait_boundary=True):
+        with patch("src.scheduler.timing.time.sleep"), patch(
+            "src.scheduler.timing.time.monotonic", self._fast_timeout()
+        ):
+            return s.wait_until_bar_published(
+                bar_ready, poll_secs=1.0, timeout_secs=5.0,
+                wait_boundary=wait_boundary,
+            )
+
+    def test_late_bar_within_horizon_is_ready_on_next_tick(self):
+        now = [_utc(2024, 1, 1, 10, 15)]
+        s = MultiTimeframeScheduler(["1m", "15m"], clock=lambda: now[0], catch_up_bars=2)
+
+        assert self._tick(s, lambda tf: False, wait_boundary=False) == set()
+
+        # 10:16 — пересеклась только 1m, а просроченная 15m догоняется из pending
+        now[0] = _utc(2024, 1, 1, 10, 16)
+        ready = self._tick(s, lambda tf: tf == "15m")
+
+        assert ready == {"15m"}
+
+    def test_catch_up_holds_several_ticks_within_horizon(self):
+        now = [_utc(2024, 1, 1, 10, 15)]
+        s = MultiTimeframeScheduler(["1m", "15m"], clock=lambda: now[0], catch_up_bars=2)
+        self._tick(s, lambda tf: False, wait_boundary=False)
+
+        now[0] = _utc(2024, 1, 1, 10, 16)
+        assert self._tick(s, lambda tf: False) == set()
+
+        now[0] = _utc(2024, 1, 1, 10, 17)
+        ready = self._tick(s, lambda tf: tf == "15m")
+
+        assert ready == {"15m"}
+
+    def test_beyond_horizon_tf_is_dropped_and_ticks_continue(self):
+        now = [_utc(2024, 1, 1, 10, 15)]
+        s = MultiTimeframeScheduler(["1m", "15m"], clock=lambda: now[0], catch_up_bars=2)
+        self._tick(s, lambda tf: False, wait_boundary=False)
+
+        # тик на границе 10:45 — 15m не готова, pending остаётся (старая граница 10:15)
+        now[0] = _utc(2024, 1, 1, 10, 45)
+        self._tick(s, lambda tf: False)
+
+        # 10:46 — 15m не пересекалась с прошлого тика (последняя граница 10:45),
+        # а её pending-запись старше горизонта 2×15m = 30 мин → отбрасывается
+        now[0] = _utc(2024, 1, 1, 10, 46)
+        with patch("src.scheduler.timing.log.warning") as mock_warn:
+            ready = self._tick(s, lambda tf: True)
+
+        assert ready == {"1m"}
+        dropped = any(
+            "15m" in str(call.args) and "потерян" in str(call.args)
+            for call in mock_warn.call_args_list
+        )
+        assert dropped
+
+    def test_catch_up_zero_keeps_legacy_behavior(self):
+        now = [_utc(2024, 1, 1, 10, 15)]
+        s = MultiTimeframeScheduler(["1m", "15m"], clock=lambda: now[0], catch_up_bars=0)
+        self._tick(s, lambda tf: False, wait_boundary=False)
+
+        # без догона просроченная 15m не пере-опросется на 10:16
+        now[0] = _utc(2024, 1, 1, 10, 16)
+        ready = self._tick(s, lambda tf: True)
+
+        assert ready == {"1m"}
+        assert "15m" not in ready
+
+    def test_bootstrap_pending_retried_without_boundary_wait(self):
+        now = [_utc(2024, 1, 1, 10, 15)]
+        s = MultiTimeframeScheduler(["1m", "15m"], clock=lambda: now[0], catch_up_bars=2)
+
+        ready = self._tick(s, lambda tf: tf == "1m", wait_boundary=False)
+
+        assert ready == {"1m"}
+        assert s._pending == {"15m": _utc(2024, 1, 1, 10, 15)}

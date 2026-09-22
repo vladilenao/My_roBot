@@ -151,6 +151,7 @@ class SignalAdmission:
 
 _REJECTION_MESSAGES = {
     "no-contract-metadata": "Нет метаданных контракта для инструмента",
+    "contract-expiring": "Контракт скоро истекает, вход запрещён",
     "unknown-profile": "Неизвестный профиль управления",
     "zero-quantity": "Размер позиции ниже минимального",
     "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",

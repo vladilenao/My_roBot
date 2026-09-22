@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Mapping
+from uuid import uuid4
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.logging_setup import get_logger
@@ -53,6 +54,19 @@ def _is_opposite(side: str, signal_type: SignalType) -> bool:
     )
 
 
+def _expires_within(meta, now: datetime, block_days: int) -> bool:
+    """Близость экспирации контракта к моменту ``now`` (оба в naive UTC).
+
+    ``expiration_date`` у акций отсутствует (``None``) — такие контракты всегда
+    считаются неистекшими. Порог трактуется как календарные сутки: частичные
+    сутки попадают в него.
+    """
+    expiration_date = getattr(meta, "expiration_date", None)
+    if expiration_date is None:
+        return False
+    return (expiration_date - now).total_seconds() <= block_days * 86400
+
+
 class TradeManager:
     """Coordinates workflow intent without duplicating factual broker state.
 
@@ -73,6 +87,7 @@ class TradeManager:
         commission: Decimal | float | str | None = None,
         slippage: Decimal | float | str | None = None,
         signal_filter: object | None = None,
+        contract_expiry_block_days: int = 2,
     ) -> None:
         self._storage = storage
         self._broker = broker
@@ -87,6 +102,7 @@ class TradeManager:
         self._signal_filter = signal_filter
         self._risk = PortfolioRiskManager()
         self._traces = CalculationTraceRepository(storage)
+        self._contract_expiry_block_days = contract_expiry_block_days
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -254,6 +270,11 @@ class TradeManager:
             return SignalAdmission(
                 rejections=(rejection_reason("no-contract-metadata"),),
             )
+        if _expires_within(meta, datetime.now(timezone.utc).replace(tzinfo=None), self._contract_expiry_block_days):
+            log.info("actions_for_signal %s: вход отклонён — близкая экспирация", instrument.ticker)
+            return SignalAdmission(
+                rejections=(rejection_reason("contract-expiring"),),
+            )
         try:
             recovered = self.restore()
             owned = self._owned_trade(recovered, assignment.id)
@@ -281,6 +302,8 @@ class TradeManager:
         meta = contract(instrument.ticker) if callable(contract) else None
         if meta is None:
             return ()
+        if _expires_within(meta, datetime.now(timezone.utc).replace(tzinfo=None), self._contract_expiry_block_days):
+            return self._close_expiring(instrument.ticker)
         results: list[TradeAction] = []
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
@@ -313,6 +336,43 @@ class TradeManager:
                 except ValueError as exc:
                     log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(results)
+
+    def _close_expiring(self, ticker: str) -> tuple[TradeAction, ...]:
+        """Принудительная защита сделок по контракту с близкой экспирацией.
+
+        Незаполненные входы отменяются, живые позиции закрываются. Профильные
+        расчёты для этого инструмента пропускаются. Повторные тики после
+        подтверждения брокера отфильтровываются переходами фаз (``CANCELLED``,
+        остаток ``0``).
+        """
+        submitted: list[TradeAction] = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker or state.phase is not TradePhase.ENTRY_PENDING:
+                continue
+            log.info("manage %s: отмена незаполненного входа %s (близкая экспирация)", ticker, plan.trade_id)
+            action = CancelEntry(
+                command_id=uuid4().hex,
+                trade_id=plan.trade_id,
+                state_revision=state.state_revision,
+                reason="contract-expiring",
+            )
+            if self.submit_action(action, assignment_id=plan.assignment_id):
+                submitted.append(action)
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker or state.phase not in _MANAGEABLE or state.quantity <= 0:
+                continue
+            log.info("manage %s: принудительное закрытие %s (близкая экспирация)", ticker, plan.trade_id)
+            action = CloseTrade(
+                command_id=uuid4().hex,
+                trade_id=plan.trade_id,
+                state_revision=state.state_revision,
+                reason="contract-expiring",
+            )
+            if self.submit_action(action, assignment_id=plan.assignment_id):
+                submitted.append(action)
+        return tuple(submitted)
 
     def _manage_owned(self, owned, assignment, decision, instrument, frame, context, meta, timeframe) -> tuple[TradeAction, ...]:
         plan, state = owned.plan, owned.state

@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.execution import BrokerExecutionPort, ExecutionPort, NotifyOnlyExecutionPort
+from src.execution import ExecutionPort, NotifyOnlyExecutionPort
 from src.instruments import Instrument
 from src.strategies.contracts import Decision, SignalType
 from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
@@ -127,97 +127,3 @@ class TestNotifyOnlyExecutionPort:
     def test_abstract_cannot_be_instantiated(self):
         with pytest.raises(TypeError):
             ExecutionPort()  # type: ignore[abstract]
-
-
-class TestBrokerExecutionPort:
-    def test_delegates_to_adapter(self):
-        port = BrokerExecutionPort(adapter=Mock())
-        decision = Decision(SignalType.BUY, 100.5)
-        instrument = Instrument("SBER", "SBER", "share")
-
-        port.execute(decision, instrument)
-
-        port._adapter.execute.assert_called_once_with(
-            decision, instrument, filter_profile="", filtered_out=False, timeframe=""
-        )
-
-    def test_keeps_signal_notifications_when_notifier_given(self):
-        notifier = Mock()
-        adapter = Mock()
-        port = BrokerExecutionPort(adapter=adapter, notifier=notifier)
-        decision = Decision(SignalType.BUY, 100.5)
-        instrument = Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
-
-        port.execute(decision, instrument)
-
-        notifier.notify_decision.assert_called_once_with(
-            decision, "NG-9.26", filter_profile="", filtered_out=False, timeframe=""
-        )
-        adapter.execute.assert_called_once()
-
-    def test_no_notification_without_notifier(self):
-        notifier = Mock()
-        port = BrokerExecutionPort(adapter=Mock())
-        instrument = Instrument("SBER", "SBER", "share")
-
-        port.execute(Decision(SignalType.SELL, 10.0), instrument)
-
-        notifier.notify_decision.assert_not_called()
-
-    def test_report_rejection_forwards_reason_to_notifier(self):
-        notifier = Mock()
-        adapter = Mock()
-        port = BrokerExecutionPort(adapter=adapter, notifier=notifier)
-        instrument = Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
-
-        port.report_rejection(
-            Decision(SignalType.BUY, 100.5), instrument,
-            reason_message="r", filter_profile="raw", timeframe="1h",
-        )
-
-        notifier.notify_rejection.assert_called_once_with(
-            Decision(SignalType.BUY, 100.5), "NG-9.26",
-            reason="r", filter_profile="raw", timeframe="1h",
-        )
-        adapter.execute.assert_not_called()
-
-    def test_report_rejection_silent_without_notifier(self):
-        port = BrokerExecutionPort(adapter=Mock())
-        instrument = Instrument("SBER", "SBER", "share")
-
-        port.report_rejection(Decision(SignalType.BUY, 100.5), instrument, reason_message="r")
-
-    def test_report_entry_accepted_silent_without_notifier(self):
-        port = BrokerExecutionPort(adapter=Mock())
-        plan = TradePlan(
-            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
-            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
-            stop_price=Decimal("96"),
-            targets=(TargetPlan("tp1", Decimal("104"), Decimal("1")),),
-            profile=ProfileSnapshot("levels_rr", "1", {}),
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        )
-
-        port.report_entry_accepted(plan, Instrument("SBER", "SBER", "share"), quantity=2)
-
-    def test_report_entry_accepted_forwards_when_notifier_given(self):
-        notifier = Mock()
-        adapter = Mock()
-        port = BrokerExecutionPort(adapter=adapter, notifier=notifier)
-        plan = TradePlan(
-            trade_id="trade-1", assignment_id="assignment-1", instrument_id="NGU6",
-            side="BUY", signal_id="signal-1", reference_entry=Decimal("100"),
-            stop_price=Decimal("96"),
-            targets=(TargetPlan("tp1", Decimal("104"), Decimal("1")),),
-            profile=ProfileSnapshot("levels_rr", "1", {}),
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        )
-
-        port.report_entry_accepted(
-            plan, Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
-            quantity=2, timeframe="1h",
-        )
-
-        notifier.notify_entry_accepted.assert_called_once_with(
-            plan, "NG-9.26", quantity=2, timeframe="1h"
-        )
