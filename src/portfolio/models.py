@@ -16,7 +16,11 @@ class OrderStatus(str, Enum):
 
 @dataclass(frozen=True)
 class ContractMeta:
-    """Биржевые параметры контракта (фьючерс): шаг цены, стоимость шага, ГО."""
+    """Биржевые параметры контракта (фьючерс): шаг цены, стоимость шага, ГО.
+
+    ``expiration_date`` — naive UTC момент экспирации фьючерса; для контрактов
+    без даты экспирации (акции) остаётся ``None``.
+    """
 
     ticker: str
     price_step: float
@@ -24,6 +28,7 @@ class ContractMeta:
     go_buy: float
     go_sell: float
     currency: str = "RUB"
+    expiration_date: Optional[datetime] = None
 
     def position_value(self, qty: int, price: float) -> float:
         """Номинальная стоимость позиции в валюте: qty * шагов * стоимость шага."""

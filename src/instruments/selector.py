@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import time
 from t_tech.invest import InstrumentStatus
 
 from src.api.client import client_context
 from src.api.instruments import find_working_instrument
-from src.api.retry import api_call_with_retry
+from src.api.retry import _is_rate_limited, api_call_with_retry, rate_limit_reset_secs
 from src.data.timeutil import to_naive
 
 
@@ -75,9 +76,13 @@ def _ask_choice(prompt, options):
         print(f"Неверный ввод. Допустимые варианты: {allowed}")
 
 
-def _validate_instruments(client, entries, inst_type):
+def _validate_instruments(client, entries, inst_type, validation_pause_secs=0):
     valid = []
+    first = True
     for entry in entries:
+        if validation_pause_secs > 0 and not first:
+            time.sleep(validation_pause_secs)
+        first = False
         if isinstance(entry, tuple):
             display_name, ticker, *_ = entry
             short_name = entry[3] if len(entry) >= 4 else None
@@ -95,11 +100,17 @@ def _validate_instruments(client, entries, inst_type):
         except ValueError as e:
             print(f"  ✗ {display_name}: {e}")
         except Exception as e:
+            if _is_rate_limited(e):
+                wait = rate_limit_reset_secs(e) or validation_pause_secs
+                if wait > 0:
+                    print(f"  ⏳ {display_name}: rate limit, пауза {wait}с")
+                    time.sleep(wait)
+                    continue
             print(f"  ✗ {display_name}: ошибка API — {e}")
     return valid
 
 
-def _select_from_list(client, entries, inst_type):
+def _select_from_list(client, entries, inst_type, validation_pause_secs=0):
     if not entries:
         print("  Нет доступных инструментов.")
         return []
@@ -136,7 +147,7 @@ def _select_from_list(client, entries, inst_type):
         return []
 
     print()
-    return _validate_instruments(client, selected_entries, inst_type)
+    return _validate_instruments(client, selected_entries, inst_type, validation_pause_secs)
 
 
 def _deduplicate(instruments):
@@ -157,7 +168,7 @@ def _show_current(instruments):
             print(f"  - {item[0]} ({item[2]})")
 
 
-def select_instruments():
+def select_instruments(validation_pause_secs=0):
     instruments = []
     print("=== Выбор торговых инструментов ===\n")
 
@@ -170,7 +181,7 @@ def select_instruments():
 
             if choice == "1":
                 stock_entries = [(t, t, "share") for t in RTS_STOCK_TICKERS]
-                found = _select_from_list(client, stock_entries, "share")
+                found = _select_from_list(client, stock_entries, "share", validation_pause_secs)
                 instruments.extend(found)
                 instruments = _deduplicate(instruments)
             else:
@@ -183,7 +194,7 @@ def select_instruments():
                 if not futures:
                     print("  Нет фьючерсов с экспирацией в ближайшие 6 месяцев.")
                 else:
-                    found = _select_from_list(client, futures, "future")
+                    found = _select_from_list(client, futures, "future", validation_pause_secs)
                     instruments.extend(found)
                     instruments = _deduplicate(instruments)
 

@@ -212,6 +212,8 @@ class MultiTimeframeScheduler:
     цикл на ближайшей границе среди активных ТФ, определяет, какие ТФ закрыли
     свечу с прошлого тика, и per-ТФ дожидается публикации свежего закрытого бара.
     При единственном ТФ поведение совпадает с однотаймфреймным ритмом.
+    При ``catch_up_bars > 0`` границы, чей бар не опубликован в окне ожидания,
+    повторно опрашиваются на последующих тиках в пределах горизонта догона.
     """
 
     def __init__(
@@ -219,6 +221,7 @@ class MultiTimeframeScheduler:
         timeframes: Iterable[str],
         sleep_secs: float = 3600.0,
         clock: Callable[[], datetime] | None = None,
+        catch_up_bars: int = 0,
     ) -> None:
         unique = tuple(dict.fromkeys(timeframes))
         if not unique:
@@ -233,6 +236,8 @@ class MultiTimeframeScheduler:
         self._lazy_grids: dict[str, CandleScheduler] = {}
         self._fallback = sleep_secs
         self._last_tick: datetime | None = None
+        self._catch_up_bars = catch_up_bars
+        self._pending: dict[str, datetime] = {}
 
     def now(self) -> datetime:
         """Текущее рыночное время (UTC)."""
@@ -290,19 +295,18 @@ class MultiTimeframeScheduler:
         При ``wait_boundary=False`` (первый тик при запуске) кандидаты — все
         активные ТФ, ожидание границы пропускается. ТФ, бар которого не
         опубликован за ``timeout_secs``, в результат не включается.
+
+        При ``catch_up_bars > 0`` непрочитанный бар границы, пройденной на тике,
+        не теряется: он остаётся кандидатом на последующих тиках и повторно
+        опрашивается, пока не появится или не истечёт горизонт догона
+        (``catch_up_bars × период ТФ``).
         """
         if wait_boundary:
             target = self.next_boundary()
             delay = (target - self.now()).total_seconds()
             if delay > 0:
                 self._sleep(delay)
-            candidates = (
-                self._crossed_since(self._last_tick)
-                if self._last_tick is not None
-                else set(self._grids)
-            )
-        else:
-            candidates = set(self._grids)
+        candidates = self._candidates(self.now(), wait_boundary)
         self._last_tick = self.now()
 
         deadline = time.monotonic() + timeout_secs
@@ -316,15 +320,52 @@ class MultiTimeframeScheduler:
             if not pending or time.monotonic() >= deadline:
                 break
             self._sleep(poll_secs)
+        # не явившиеся за окно остаются в pending до истечения горизонта догона
+        self._pending = (
+            {tf: candidates[tf] for tf in pending}
+            if self._catch_up_bars > 0
+            else {}
+        )
         return ready
 
-    def _crossed_since(self, t0: datetime) -> set[str]:
+    def _candidates(self, now: datetime, wait_boundary: bool) -> dict[str, datetime]:
+        """ТФ-кандидаты тика с границами, которые ждём: pending + пройденные.
+
+        Возвращает ``{ТФ: граница}``. Pending-записи держат ИСХОДНУЮ границу
+        пропуска (горизонт отсчитывается от неё); пока запись в пределах
+        горизонта догона, она имеет приоритет над свежим пересечением — бар
+        границы не теряется при повторных пересечениях ТФ. Вышедшие за горизонт
+        отбрасываются с предупреждением. Свежепересечённые ТФ без pending
+        берутся по только что пройденной границе.
+        """
+        result: dict[str, datetime] = {}
+        if self._catch_up_bars > 0:
+            for tf, boundary in list(self._pending.items()):
+                if (now - boundary).total_seconds() > self._catch_up_bars * self._period_secs(tf, now):
+                    log.warning("Бар ТФ %s потерян: горизонт догона истёк.", tf)
+                    self._pending.pop(tf, None)
+                else:
+                    result[tf] = boundary
+        if wait_boundary and self._last_tick is not None:
+            crossed = self._crossed_since(self._last_tick, now)
+        else:
+            crossed = set(self._grids)
+        for tf in crossed:
+            result.setdefault(tf, self._grids[tf].current_candle_start(now))
+        return result
+
+    def _period_secs(self, timeframe: str, now: datetime) -> float:
+        """Длительность периода ТФ (как в ``fallback_secs``) на сетке таймфрейма."""
+        grid = self._grids[timeframe]
+        return (grid.next_candle_close(now) - grid.current_candle_start(now)).total_seconds()
+
+    def _crossed_since(self, t0: datetime, now: datetime | None = None) -> set[str]:
         """ТФ, у которых граница закрытия свечи пройдена между t0 и now."""
-        now = self.now()
+        current = now or self.now()
         return {
             tf
             for tf, g in self._grids.items()
-            if g.current_candle_start(now) > g.current_candle_start(t0)
+            if g.current_candle_start(current) > g.current_candle_start(t0)
         }
 
     def _sleep(self, secs: float) -> None:

@@ -10,7 +10,7 @@ data_dir = "data"
 
 [tick]
 poll_secs = 1
-timeout_secs = 65
+timeout_secs = 300
 
 [instruments]
 fallback_type = "future"
@@ -103,6 +103,7 @@ database_file = "trades.sqlite3"                      # durable-журнал с�
 journal_file = "trade_event.csv"                      # append-only лента сделок (CSV-проекция журнала)
 positions_file = "trade_summary.csv"                  # карточки открытых позиций (CSV-проекция журнала)
 clearing_times = ["14:05", "19:00"]                   # времена дневного клиринга (МСК): исполнение сделок приостановлено
+contract_expiry_block_days = 2                        # порог экспирации фьючерсов: вход запрещён и сделки закрываются за N календарных суток до экспирации
 
 [trading.risk_limits]
 trade_pct = 2.0         # макс. риск одной сделки, % от текущего баланса (stop-убыток + комиссии)

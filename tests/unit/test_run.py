@@ -121,6 +121,7 @@ class TestRuntimeComposition:
             max_qty=run.RISK_LIMITS.get("max_qty"),
             commission=run.RISK_LIMITS.get("commission"),
             slippage=run.RISK_LIMITS.get("slippage"),
+            contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
             signal_filter=ANY,
         )
         manager.restore.assert_called_once_with()

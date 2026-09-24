@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -21,6 +21,15 @@ BAR0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
 BAR1 = datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc)
 
 NG_META = ContractMeta(ticker="NGV6", price_step=1.0, step_cost=100.0, go_buy=5000.0, go_sell=5000.0)
+
+
+def _meta_expiring_in(days: int) -> ContractMeta:
+    """Контракт, истекающий через ``days`` календарных суток от текущего момента."""
+    expiration_date = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=days)
+    return ContractMeta(
+        ticker="NGV6", price_step=1.0, step_cost=100.0, go_buy=5000.0, go_sell=5000.0,
+        expiration_date=expiration_date,
+    )
 
 PROFILES = {
     "levels_rr": {"buffer_ticks": 1, "target_R": (1, 2), "shares": (0.5, 0.5)},
@@ -112,6 +121,79 @@ def test_actions_for_signal_plans_sizes_and_fills_entry(tmp_path):
             "SELECT phase FROM trades WHERE trade_id = ?", (opening.trade_id,)
         ).fetchone()[0]
         assert phase == "OPEN"
+
+
+def _assignment():
+    return SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                           management="levels_rr", filter_profile="basic_levels",
+                           priority=0, timeframe="15m")
+
+
+def _decision(signal_type, event_id, bar_time=BAR0):
+    return Decision(signal_type=signal_type, price=100.0, bar_time=bar_time,
+                    event_id=event_id, available_at=bar_time, timeframe="15m")
+
+
+class TestExpiringContractAdmission:
+    def test_actions_for_signal_rejects_entry_close_to_expiration(self, tmp_path):
+        broker = _FillBroker(_meta_expiring_in(1))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                                   profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+            admission = manager.actions_for_signal(
+                _assignment(), _decision(SignalType.BUY, "signal-1"), INSTRUMENT,
+                _frame([100.0] * 25), _context(price=100.0), timeframe="15m",
+            )
+
+            assert admission.actions == ()
+            assert len(admission.rejections) == 1
+            reason = admission.rejections[0]
+            assert reason.code == "contract-expiring"
+            assert reason.message
+
+    def test_actions_for_signal_rejects_add_close_to_expiration(self, tmp_path):
+        broker = _FillBroker(_meta_expiring_in(10))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                                   profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+            entry = _decision(SignalType.BUY, "signal-1")
+            opening = manager.actions_for_signal(
+                _assignment(), entry, INSTRUMENT,
+                _frame([100.0] * 25),
+                _context(price=100.0, levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)),
+                timeframe="15m",
+            )
+            assert isinstance(opening[0], OpenTrade)
+            manager.dispatch(BAR0)
+            broker._meta = _meta_expiring_in(1)
+
+            admission = manager.actions_for_signal(
+                _assignment(), _decision(SignalType.BUY, "signal-2", BAR1), INSTRUMENT,
+                _frame([100.0] * 25),
+                _context(price=100.0, levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)),
+                timeframe="15m",
+            )
+
+            assert admission.actions == ()
+            assert admission.rejections[0].code == "contract-expiring"
+            recovered, = manager.restore()
+            assert recovered.state.phase.value == "OPEN"
+
+    def test_actions_for_signal_admits_entry_outside_threshold(self, tmp_path):
+        broker = _FillBroker(_meta_expiring_in(10))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                                   profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4)
+            entry = _decision(SignalType.BUY, "signal-1")
+            admission = manager.actions_for_signal(
+                _assignment(), entry, INSTRUMENT,
+                _frame([100.0] * 25),
+                _context(price=100.0, levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)),
+                timeframe="15m",
+            )
+
+            assert admission.rejections == ()
+            assert isinstance(admission.actions[0], OpenTrade)
 
 
 def test_actions_for_signal_closes_owned_trade_on_opposite_signal(tmp_path):
