@@ -190,6 +190,44 @@ class JournalBroker(BrokerPort):
             raise ValueError(f"trade {plan.trade_id!r} is already registered with another plan")
         self._addressed_trades.setdefault(plan.trade_id, AddressedTrade(plan))
 
+    def resume_trade(self, recovered: object) -> None:
+        """Восстановить живое состояние защиты открытой сделки после рестарта.
+
+        Вызывается из ``TradeManager.restore``: для сделки, впервые
+        зарегистрированной в этом процессе, возвращается позиция, активный стоп,
+        состояние целей и ревизия из durable-снимка, чтобы сопровождение
+        (защитный стоп по закрытым барам) и проверки менеджера продолжали
+        работать. Сделки, уже живые в этом процессе (``revision != 0`` или
+        исполненная позиция), решением не перезаписываются.
+        """
+        plan = getattr(recovered, "plan", None)
+        state = getattr(recovered, "state", None)
+        if plan is None or state is None:
+            return
+        trade = self._addressed_trades.get(plan.trade_id)
+        if trade is None or trade.revision != 0 or trade.entry_quantity != 0:
+            return
+        if state.quantity <= 0 or state.average_price is None:
+            return
+        active_stop = state.confirmed_stop or plan.stop_price
+        trade.confirmed_stop = active_stop
+        trade.entry_quantity = getattr(recovered, "entry_quantity", None) or state.quantity
+        trade.revision = state.state_revision
+        trade.opened_bar = None
+        for target_id, filled in (getattr(recovered, "target_filled", None) or {}).items():
+            if target_id in trade.target_filled:
+                trade.target_filled[target_id] = filled
+        self.manager.positions[plan.trade_id] = Position(
+            position_id=plan.trade_id,
+            ticker=plan.instrument_id,
+            side=plan.side,
+            qty=state.quantity,
+            avg_price=float(state.average_price),
+            stop_price=float(active_stop),
+            take_profit=None,
+            ts_entry=plan.created_at,
+        )
+
     def trade_state(self, trade_id: str) -> AddressedTrade | None:
         """Return simulator state for tests and the orchestration boundary."""
         return self._addressed_trades.get(trade_id)
@@ -212,6 +250,8 @@ class JournalBroker(BrokerPort):
         elif isinstance(action, (OpenTrade, AddToTrade, MoveStop, CloseTrade)) or (
             isinstance(action, ReduceTrade) and action.target_id is None
         ):
+            if isinstance(action, MoveStop):
+                trade.revision += 1
             self._scheduled_actions.append(ScheduledAction(action, now))
             event = self._command_outcome(action, now, ExecutionStatus.ACK, "next-bar")
         else:
@@ -237,7 +277,6 @@ class JournalBroker(BrokerPort):
             position.stop_price = float(action.stop_price)
             trade.confirmed_stop = action.stop_price
             trade.pending_stop = None
-            trade.revision += 1
             return self._command_outcome(action, now, ExecutionStatus.ACK, action.reason)
         if isinstance(action, (OpenTrade, AddToTrade)):
             quantity = action.quantity
@@ -317,6 +356,26 @@ class JournalBroker(BrokerPort):
             execution_id=f"{action.command_id}:fill", order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=ExecutionStatus.FILL,
             filled_quantity=quantity, price=price, fee=Decimal("0"), timestamp=now, reason=action.reason,
+        )
+
+    def _pv_fill(self, trade: AddressedTrade, now: datetime, quantity: int, price: Decimal, *,
+                 kind: str, target_id: str | None = None) -> ExecutionEvent:
+        """Исполнение защитного закрытия с детерминированным (сделка, бар) id.
+
+        ``kind`` — ``stop`` (стоп) либо ``tp`` (исполненная цель). Идентификаторы
+        строятся из сделки, вида, цели (для целей) и времени бара, поэтому
+        повторная доставка по тому же бару воспроизводится и не задваивает
+        объёмы.
+        """
+        command_id = f"{trade.plan.trade_id}:pv:{kind}"
+        if target_id is not None:
+            command_id += f":{target_id}"
+        command_id += f":{_naive_utc(now).isoformat()}"
+        return ExecutionEvent(
+            execution_id=f"{command_id}:fill", order_id=command_id, command_id=command_id,
+            trade_id=trade.plan.trade_id, status=ExecutionStatus.FILL, filled_quantity=quantity,
+            price=price, fee=Decimal("0"), timestamp=now,
+            reason=f"tp:{target_id}" if kind == "tp" else "protective",
         )
 
     def set_names(self, names: Optional[Mapping[str, str]]) -> None:
@@ -575,7 +634,7 @@ class JournalBroker(BrokerPort):
     def _execute_scheduled(
         self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
     ) -> ExecutionEvent:
-        if action.state_revision != trade.revision:
+        if not isinstance(action, MoveStop) and action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
             self._addressed_events.append(event)
             return event
@@ -606,6 +665,16 @@ class JournalBroker(BrokerPort):
                 position.reduce(filled)
                 trade.target_filled[target.target_id] += filled
                 trade.revision += 1
+                event = self._pv_fill(
+                    trade, now, filled, Decimal(str(target.price)), kind="tp", target_id=target.target_id
+                )
+                self._addressed_events.append(event)
+                self._emit(
+                    "fill",
+                    now,
+                    trade.plan.trade_id,
+                    f"Цель {filled} {self._display(trade.plan.instrument_id)} по {target.price}",
+                )
                 if position.qty == 0:
                     self.manager.positions.pop(trade.plan.trade_id, None)
                     trade.confirmed_stop = None
@@ -627,6 +696,14 @@ class JournalBroker(BrokerPort):
         trade.confirmed_stop = None
         trade.last_stop_fill = price
         trade.revision += 1
+        event = self._pv_fill(trade, now, quantity, price, kind="stop")
+        self._addressed_events.append(event)
+        self._emit(
+            "fill",
+            now,
+            trade.plan.trade_id,
+            f"Защитный стоп {quantity} {self._display(trade.plan.instrument_id)} по {price}",
+        )
         return True
 
     def _update_floating(self, closes: Mapping[str, float]) -> None:

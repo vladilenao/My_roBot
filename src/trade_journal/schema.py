@@ -6,7 +6,7 @@ import sqlite3
 from decimal import Decimal
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -79,13 +79,14 @@ CREATE TABLE fills (
 );
 
 CREATE TABLE targets (
-    target_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
     trade_id TEXT NOT NULL REFERENCES trades(trade_id) ON DELETE CASCADE,
     target_index INTEGER NOT NULL CHECK (target_index >= 0),
     price TEXT NOT NULL,
     planned_quantity INTEGER NOT NULL DEFAULT 0 CHECK (planned_quantity >= 0),
     filled_quantity INTEGER NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
     status TEXT NOT NULL,
+    PRIMARY KEY (trade_id, target_id),
     UNIQUE (trade_id, target_index)
 );
 
@@ -223,11 +224,29 @@ ALTER TABLE export_state ADD COLUMN audit_failed_revision INTEGER CHECK (audit_f
 ALTER TABLE export_state ADD COLUMN audit_last_error TEXT;
 """
 
+MIGRATE_V6_TO_V7_SQL = """
+CREATE TABLE targets_new (
+    target_id TEXT NOT NULL,
+    trade_id TEXT NOT NULL REFERENCES trades(trade_id) ON DELETE CASCADE,
+    target_index INTEGER NOT NULL CHECK (target_index >= 0),
+    price TEXT NOT NULL,
+    planned_quantity INTEGER NOT NULL DEFAULT 0 CHECK (planned_quantity >= 0),
+    filled_quantity INTEGER NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
+    status TEXT NOT NULL,
+    PRIMARY KEY (trade_id, target_id),
+    UNIQUE (trade_id, target_index)
+);
+INSERT INTO targets_new (target_id, trade_id, target_index, price, planned_quantity, filled_quantity, status)
+    SELECT target_id, trade_id, target_index, price, planned_quantity, filled_quantity, status FROM targets;
+DROP TABLE targets;
+ALTER TABLE targets_new RENAME TO targets;
+"""
+
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
     """Create the current schema or reject a database from another version."""
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
+    if version not in (0, 1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
         raise UnsupportedSchemaVersion(
             f"unsupported SQLite schema version {version}; expected {SCHEMA_VERSION}"
         )
@@ -254,6 +273,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V4_TO_V5_SQL)
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 2:
         with connection:
@@ -262,6 +282,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V4_TO_V5_SQL)
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 3:
         with connection:
@@ -269,15 +290,22 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V4_TO_V5_SQL)
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 4:
         with connection:
             connection.executescript(MIGRATE_V4_TO_V5_SQL)
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 5:
         with connection:
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    elif version == 6:
+        with connection:
+            connection.executescript(MIGRATE_V6_TO_V7_SQL)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     violations = connection.execute("PRAGMA foreign_key_check").fetchall()

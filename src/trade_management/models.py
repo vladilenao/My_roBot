@@ -73,6 +73,7 @@ class TradePlan:
     targets: tuple[TargetPlan, ...]
     profile: ProfileSnapshot
     created_at: datetime
+    timeframe: str = ""
 
     def __post_init__(self) -> None:
         if not all((self.trade_id, self.assignment_id, self.instrument_id, self.signal_id)):
@@ -156,6 +157,7 @@ _REJECTION_MESSAGES = {
     "zero-quantity": "Размер позиции ниже минимального",
     "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",
     "admission-error": "Ошибка при допуске сигнала",
+    "risk-or-margin-budget": "не хватает лимитов риска или гарантийного обеспечения",
     "insufficient-history": "Недостаточно истории для расчёта",
     "missing-structure": "Нет подтверждённой структуры",
     "missing-pattern-context": "Нет подтверждённых ориентиров формации",

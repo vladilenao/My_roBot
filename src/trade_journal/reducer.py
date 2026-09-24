@@ -144,6 +144,8 @@ class ExecutionReducer:
             ).fetchone():
                 return False
 
+            if self._is_broker_initiated(event.command_id):
+                self._ensure_pv_order(connection, event)
             order = self._order(connection, event)
             self._assert_event_matches_order(event, order)
             now = event.timestamp.isoformat()
@@ -210,6 +212,106 @@ class ExecutionReducer:
         if row is None:
             raise ValueError(f"unknown command {event.command_id}")
         return dict(zip((column[0] for column in cursor.description), row, strict=True))
+
+    @staticmethod
+    def _is_broker_initiated(command_id: str) -> bool:
+        """Защитные закрытия брокера помечены маркером ``:pv:`` в command_id."""
+        return ":pv:" in command_id
+
+    def _ensure_pv_order(self, connection, event: ExecutionEvent) -> None:
+        """Синтезировать durable-заявку для закрытия, не порождённого командой.
+
+        Схема связывает каждый филл с заявкой и каждую заявку с командой, но у
+        защитного закрытия команды менеджера нет. Чтобы применять его штатным
+        путём филла, создаётся пара ``outbox('SENT')`` + ``orders`` с типом
+        ``STOP`` или ``TARGET:<id>``. Статус ``SENT`` исключает повторный
+        диспатч ``claim_outbox`` (берёт только ``PENDING``). Повторный реплей
+        того же события до синтеза отсекается проверкой ``execution_id`` выше.
+        """
+        if connection.execute(
+            "SELECT 1 FROM orders WHERE command_id = ?", (event.command_id,)
+        ).fetchone():
+            return
+        action_type, _, target_id = self._pv_action(event)
+        now = event.timestamp.isoformat()
+        connection.execute(
+            "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at, sent_at) "
+            "VALUES (?, ?, ?, 'SENT', ?, ?)",
+            (event.command_id, event.trade_id, "{}", now, now),
+        )
+        connection.execute(
+            "INSERT INTO orders (order_id, trade_id, command_id, action_type, status, quantity, "
+            "filled_quantity, requested_price, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'PENDING', ?, 0, NULL, ?, ?)",
+            (event.command_id, event.trade_id, event.command_id, action_type,
+             event.filled_quantity, now, now),
+        )
+        if target_id:
+            self._bind_target_plan(connection, event.trade_id, target_id)
+
+    @staticmethod
+    def _pv_action(event: ExecutionEvent) -> tuple[str, str, str]:
+        """Разобрать ``<trade>:pv:<stop|tp>[:<target>]:<bar>`` в (action, kind, target)."""
+        _, _, rest = event.command_id.partition(":pv:")
+        kind, _, payload = rest.partition(":")
+        if kind == "stop":
+            return "STOP", kind, ""
+        if kind == "tp":
+            target_id = payload.partition(":")[0]
+            return f"TARGET:{target_id}", kind, target_id
+        raise ValueError(f"unsupported protective directive {kind!r}")
+
+    @staticmethod
+    def _bind_target_plan(connection, trade_id: str, target_id: str) -> None:
+        """Заполнить ``planned_quantity`` цели из подтверждённых входов.
+
+        Профильные планы не знают объём цели заранее: он зависит от накопленных
+        входов. Защитное закрытие цели применяется через ``_update_target``,
+        который сравнивает заполнение с ``planned_quantity`` — её нужно связать
+        из суммы исполнений ``OPEN``/``ADD`` и долей цели по плану (та же
+        аллокация, что у брокера: последняя цель получает остаток).
+        """
+        row = connection.execute(
+            "SELECT planned_quantity FROM targets WHERE trade_id = ? AND target_id = ?",
+            (trade_id, target_id),
+        ).fetchone()
+        if row is None or row[0] != 0:
+            return
+        entry_quantity = connection.execute(
+            "SELECT COALESCE(SUM(f.quantity), 0) FROM fills f "
+            "JOIN orders o ON o.order_id = f.order_id "
+            "WHERE f.trade_id = ? AND o.action_type IN ('OPEN', 'ADD')",
+            (trade_id,),
+        ).fetchone()[0]
+        if entry_quantity <= 0:
+            return
+        plan_row = connection.execute(
+            "SELECT plan_json FROM trades WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        shares = {
+            item["target_id"]: Decimal(str(item["share"]))
+            for item in json.loads(plan_row[0]).get("targets", [])
+        }
+        ids = [t[0] for t in connection.execute(
+            "SELECT target_id FROM targets WHERE trade_id = ? ORDER BY target_index", (trade_id,)
+        ).fetchall()]
+        allocated = 0
+        planned = 0
+        for index, item in enumerate(ids):
+            quantity = (
+                entry_quantity - allocated
+                if index == len(ids) - 1
+                else int(entry_quantity * shares.get(item, Decimal("0")))
+            )
+            allocated += quantity
+            if item == target_id:
+                planned = quantity
+                break
+        if planned > 0:
+            connection.execute(
+                "UPDATE targets SET planned_quantity = ? WHERE trade_id = ? AND target_id = ?",
+                (planned, trade_id, target_id),
+            )
 
     @staticmethod
     def _assert_event_matches_order(event: ExecutionEvent, order: dict[str, object]) -> None:
@@ -322,7 +424,7 @@ class ExecutionReducer:
         action = str(order["action_type"]).upper().split(":", 1)[0]
         if event.status is ExecutionStatus.REJECT and action == "OPEN":
             phase = "REJECTED"
-        elif action == "OPEN":
+        elif action in {"OPEN", "CANCEL"}:
             quantity = connection.execute(
                 "SELECT quantity FROM positions WHERE trade_id = ?", (event.trade_id,)
             ).fetchone()
