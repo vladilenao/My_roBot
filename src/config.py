@@ -45,6 +45,9 @@ _DEFAULTS = {
     "heartbeat_every_ticks": 60,
     "tick_poll_secs": 1,
     "tick_timeout_secs": 65,
+    # Горизонт догона поздно опубликованных баров (в периодах ТФ) — управляет
+    # и планировщиком (D1), и терпимостью готовности к отстающим инструментам (D2).
+    "tick_catch_up_bars": 2,
     "instrument_type": "future",
     "ticker": "NGU6",
     "notifier": "console",
@@ -77,6 +80,9 @@ _DEFAULTS = {
     "audit_file": "trade_decision_trace.log",
     "audit_max_bytes": 10_485_760,
     "audit_backup_count": 5,
+    # Горизонт блокировки входов и принудительного закрытия фьючерсов:
+    # календарные сутки до момента экспирации контракта.
+    "contract_expiry_block_days": 2,
 }
 
 _CONFIG = load_config(_DEFAULTS)
@@ -96,6 +102,10 @@ HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
 # (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).
 TICK_POLL_SECS = _CONFIG["tick_poll_secs"]
 TICK_TIMEOUT_SECS = _CONFIG["tick_timeout_secs"]
+
+# Догон баров, опубликованных позже окна ожидания: горизонт повторного опроса
+# границы в периодах таймфрейма; одновременно порог «неактивности» пары в гейте.
+CATCH_UP_BARS = _CONFIG["tick_catch_up_bars"]
 
 # Ограничения дозагрузок свечевого кэша: мин. пауза между API-вызовами
 # и окно инкрементальной дозагрузки (bounded backfill).
@@ -236,6 +246,7 @@ AUDIT_MAX_BYTES = _CONFIG.get("audit_max_bytes", 10_485_760)
 AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
+CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
 
 
 def trading_enabled() -> bool:

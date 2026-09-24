@@ -11,6 +11,7 @@ from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
     ACTIVE_TIMEFRAMES,
+    CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
     FUTURE_STRATEGIES,
@@ -38,6 +39,7 @@ from src.config import (
     AUDIT_MAX_BYTES,
     AUDIT_BACKUP_COUNT,
     TRADE_MANAGEMENT_PROFILES,
+    CONTRACT_EXPIRY_BLOCK_DAYS,
     trading_enabled,
     runtime_dir,
 )
@@ -67,10 +69,11 @@ def main():
         backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
-    instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+    instruments = select_instruments(validation_pause_secs=DATA_REFRESH_MIN_INTERVAL) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
     notifier = get_notifier()
     timeline = MultiTimeframeScheduler(
-        timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS
+        timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS,
+        catch_up_bars=CATCH_UP_BARS,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
@@ -78,6 +81,7 @@ def main():
         token=TINKOFF_TOKEN,
         data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL,
         data_backfill_window_seconds=DATA_BACKFILL_WINDOW_SECONDS,
+        freshness_tolerance_bars=CATCH_UP_BARS,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -171,6 +175,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         max_qty=RISK_LIMITS.get("max_qty"),
         commission=RISK_LIMITS.get("commission"),
         slippage=RISK_LIMITS.get("slippage"),
+        contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
         signal_filter=SignalFilter(),
     )
     trade_manager.restore()

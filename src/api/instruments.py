@@ -2,6 +2,7 @@ from t_tech.invest import InstrumentStatus, CandleInterval
 from t_tech.invest.utils import now
 from datetime import timedelta
 from src.api.retry import api_call_with_retry
+from src.data.timeutil import to_naive
 from src.logging_setup import get_logger
 from src.portfolio import ContractMeta
 
@@ -52,6 +53,7 @@ def load_futures_contracts(client, tickers=None) -> dict[str, ContractMeta]:
             go_sell=_quotation_to_float(
                 margin.initial_margin_on_sell if margin else inst.initial_margin_on_sell
             ),
+            expiration_date=to_naive(inst.expiration_date),
         )
     return contracts
 

@@ -105,6 +105,40 @@ _ACTION_LABELS = {
     "STOP": "стоп",
 }
 
+REASON_LABELS = {
+    "next-bar": "вход перенесён на следующий бар",
+    "entry-timeout": "вход не исполнен в отведённое время",
+    "contract-expiring": "контракт истекает",
+    "profile-entry": "вход по профилю",
+    "protective": "стоп",
+    "tp": "цель по цене",
+    "risk-cap": "лимит риска",
+    "duplicate-signal": "дублирующий сигнал",
+    "opposite-exposure": "встречная позиция",
+    "opposite-signal-management": "управление по встречному сигналу",
+    "raw-opposite-signal": "встречный сигнал",
+    "ma40-opposite-close": "цена ушла за MA40",
+    "ma10-or-cloud-partial-exit": "частичный выход по MA10/облаку",
+    "factual-increase-fill-invalidates-protection": "добор нарушил защиту",
+    "factual-increase-fill-violates-risk": "добор нарушил лимиты риска",
+    "late-increase-fill-after-cancel": "компенсация позднего добора",
+    "clearing": "клиринг",
+    "ttl": "истёк срок заявки",
+    "close-not-confirmed": "закрытие не подтверждено",
+    "filter-rejected": "сигнал отфильтрован",
+    "no-contract-meta": "нет метаданных контракта",
+    "insufficient-history": "недостаточно истории",
+    "stale-state-revision": "устарела ревизия состояния",
+}
+
+
+def reason_label(code: object) -> str:
+    """Перевести код причины в русскую фразу; неизвестный код — как есть."""
+    text = str(code or "")
+    if text.startswith("tp:"):
+        return REASON_LABELS["tp"]
+    return REASON_LABELS.get(text, text)
+
 
 class CsvExporter:
     """Exports both user-facing projections from one read-only SQLite snapshot."""
@@ -208,7 +242,7 @@ class CsvExporter:
                     "position_qty_after": after_qty if after_qty else "",
                     "avg_price_before": self._money(before_avg) if before_avg is not None else "",
                     "avg_price_after": self._money(after_avg) if after_avg is not None else "",
-                    "reason": payload.get("reason") or "",
+                    "reason": reason_label(payload.get("reason")),
                 })
             position_rows = []
             for row in self._rows(
@@ -299,7 +333,7 @@ class CsvExporter:
             "average_entry": self._money(average_entry) if average_entry is not None else "",
             "exits": self._format_exits(exits),
             "average_exit": self._money(average_exit) if average_exit is not None else "",
-            "final_reason": exit_reasons[-1] if row.get("quantity") == 0 and exit_reasons else "",
+            "final_reason": reason_label(exit_reasons[-1]) if row.get("quantity") == 0 and exit_reasons else "",
             "exit_scenario": self._exit_scenario(exits, int(row.get("quantity") or 0)),
             "gross_pnl": self._money(gross),
             "fees": self._money(-fees),

@@ -49,6 +49,9 @@ class RecoveredTrade:
 
     plan: TradePlan
     state: TradeState
+    entry_ack_at: datetime | None = None
+    entry_quantity: int | None = None
+    target_filled: Mapping[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -394,7 +397,7 @@ class Storage:
             profile_data = json.loads(trade["profile_json"])
             profile_state = json.loads(trade["profile_state_json"])
             targets = self.connection.execute(
-                "SELECT target_id, price, status FROM targets WHERE trade_id = ? ORDER BY target_index",
+                "SELECT target_id, price, status, filled_quantity FROM targets WHERE trade_id = ? ORDER BY target_index",
                 (trade["trade_id"],),
             ).fetchall()
             protection = self.connection.execute(
@@ -420,7 +423,7 @@ class Storage:
                 stop_price=Decimal(plan_data["stop_price"]),
                 targets=tuple(
                     TargetPlan(target_id, Decimal(price), Decimal(target_shares[target_id]))
-                    for target_id, price, _ in targets
+                    for target_id, price, _, _ in targets
                 ),
                 profile=ProfileSnapshot(
                     name=profile_data["name"],
@@ -428,6 +431,7 @@ class Storage:
                     parameters=profile_data["parameters"],
                 ),
                 created_at=datetime.fromisoformat(trade["created_at"]),
+                timeframe=str(plan_data.get("timeframe", "")),
             )
             quantity, average_price = position if position is not None else (0, None)
             confirmed_stop, pending_stop = protection if protection is not None else (None, None)
@@ -438,7 +442,7 @@ class Storage:
                 quantity=quantity,
                 average_price=Decimal(average_price) if average_price is not None else None,
                 completed_target_ids=frozenset(
-                    target_id for target_id, _, status in targets if status == "FILLED"
+                    target_id for target_id, _, status, _ in targets if status == "FILLED"
                 ),
                 add_count=int(profile_state.get("add_count", 0)),
                 trailing_extreme=(
@@ -448,9 +452,34 @@ class Storage:
                 confirmed_stop=Decimal(confirmed_stop) if confirmed_stop is not None else None,
                 pending_stop=Decimal(pending_stop) if pending_stop is not None else None,
             )
+            entry_ack_at = None
+            entry_quantity = self.connection.execute(
+                "SELECT COALESCE(SUM(f.quantity), 0) FROM fills f "
+                "JOIN orders o ON o.order_id = f.order_id "
+                "WHERE f.trade_id = ? AND o.action_type IN ('OPEN', 'ADD')",
+                (trade["trade_id"],),
+            ).fetchone()[0]
+            entry_order = self.connection.execute(
+                "SELECT status, updated_at FROM orders WHERE trade_id = ? AND action_type = 'OPEN' "
+                "ORDER BY created_at LIMIT 1",
+                (trade["trade_id"],),
+            ).fetchone()
+            if entry_order is not None and entry_order[0] == "ACK" and entry_order[1]:
+                try:
+                    ack = datetime.fromisoformat(entry_order[1])
+                except ValueError:
+                    ack = None
+                if ack is not None and ack.tzinfo is not None:
+                    entry_ack_at = ack
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError(f"cannot recover trade {trade['trade_id']!r} from SQLite") from error
-        return RecoveredTrade(plan=plan, state=state)
+        return RecoveredTrade(
+            plan=plan,
+            state=state,
+            entry_ack_at=entry_ack_at,
+            entry_quantity=entry_quantity,
+            target_filled={target_id: filled for target_id, _, _, filled in targets},
+        )
 
     @staticmethod
     def _enqueue(

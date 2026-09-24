@@ -422,3 +422,98 @@ class TestConstants:
 
     def test_ttl_is_6_months(self):
         assert FUTURES_TTL.days == 183
+
+
+class TestValidateInstrumentsPacing:
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    def test_pause_between_validations_not_before_first(self, mock_find, mock_sleep):
+        client = _mock_client()
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        result = _validate_instruments(client, entries, "share", validation_pause_secs=0.5)
+        assert len(result) == 2
+        mock_sleep.assert_called_once_with(0.5)
+
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    def test_zero_pause_no_sleep(self, mock_find, mock_sleep):
+        client = _mock_client()
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        result = _validate_instruments(client, entries, "share")
+        assert len(result) == 2
+        mock_sleep.assert_not_called()
+
+    @patch("src.instruments.selector.find_working_instrument")
+    def test_rate_limit_pauses_until_reset_and_continues(self, mock_find):
+        exc = RuntimeError("RESOURCE_EXHAUSTED: ratelimit_reset=30")
+        mock_find.side_effect = [exc, "uid-123"]
+        client = _mock_client()
+        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share")]
+        with patch("src.instruments.selector.time.sleep") as mock_sleep:
+            result = _validate_instruments(client, entries, "share", validation_pause_secs=1.0)
+        mock_sleep.assert_any_call(30.0)
+        assert result == [("GAZP", "GAZP", "share")]
+
+    @patch("src.instruments.selector.find_working_instrument")
+    def test_rate_limit_without_reset_hint_uses_pause(self, mock_find):
+        exc = RuntimeError("RESOURCE_EXHAUSTED")
+        mock_find.side_effect = [exc, "uid-123"]
+        client = _mock_client()
+        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share")]
+        with patch("src.instruments.selector.time.sleep") as mock_sleep:
+            result = _validate_instruments(client, entries, "share", validation_pause_secs=2.0)
+        mock_sleep.assert_any_call(2.0)
+        assert result == [("GAZP", "GAZP", "share")]
+
+    @patch("src.instruments.selector.find_working_instrument")
+    def test_rate_limit_all_dropped(self, mock_find):
+        mock_find.side_effect = RuntimeError("RESOURCE_EXHAUSTED ratelimit_reset=5")
+        client = _mock_client()
+        entries = [("NG", "NGU6", "future")]
+        with patch("src.instruments.selector.time.sleep"):
+            result = _validate_instruments(client, entries, "future", validation_pause_secs=1.0)
+        assert result == []
+
+
+class TestSelectFromListPacing:
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", return_value="1,2")
+    def test_pause_passed_through(self, mock_input, mock_find, mock_sleep):
+        client = _mock_client()
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        result = _select_from_list(client, entries, "share", validation_pause_secs=1.5)
+        assert len(result) == 2
+        mock_sleep.assert_called_once_with(1.5)
+
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", return_value="1,2")
+    def test_zero_pause_default_no_sleep(self, mock_input, mock_find, mock_sleep):
+        client = _mock_client()
+        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        result = _select_from_list(client, entries, "share")
+        assert len(result) == 2
+        mock_sleep.assert_not_called()
+
+
+class TestSelectInstrumentsPacing:
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", side_effect=["1", "1,2", "", "нет"])
+    def test_validation_pause_wired_into_selection(self, mock_input, mock_find, mock_sleep):
+        ctx = _mock_client()
+        with patch("src.instruments.selector.client_context", return_value=ctx):
+            result = select_instruments(validation_pause_secs=0.3)
+        assert len(result) == 2
+        mock_sleep.assert_called_once_with(0.3)
+
+    @patch("src.instruments.selector.time.sleep")
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", side_effect=["1", "1", "", "нет"])
+    def test_default_zero_pause_no_sleep(self, mock_input, mock_find, mock_sleep):
+        ctx = _mock_client()
+        with patch("src.instruments.selector.client_context", return_value=ctx):
+            result = select_instruments()
+        assert result == [("SBER", "SBER", "share")]
+        mock_sleep.assert_not_called()
