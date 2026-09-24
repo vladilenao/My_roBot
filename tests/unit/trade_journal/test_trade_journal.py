@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -14,6 +15,10 @@ from src.trade_journal import (
     parse_dt,
     parse_hhmm,
 )
+from src.trade_journal.storage import Storage
+from src.trade_management.actions import OpenTrade
+from src.trade_management.manager import TradeManager
+from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
 
 UTC = timezone.utc
 
@@ -357,3 +362,53 @@ class TestJournalMalformedRows:
         assert header.split(",") == COLUMNS_RU
         assert j.events() == []
         assert j.next_id == 1
+
+
+class TestPlanPayloadTimeframe:
+    def _plan(self, timeframe: str) -> TradePlan:
+        return TradePlan(
+            "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("96"),
+            (TargetPlan("tp-1", Decimal("104"), Decimal("1")),),
+            ProfileSnapshot("levels_rr", "1", {"buffer": Decimal("1")}),
+            datetime(2026, 9, 18, 13, 55, tzinfo=UTC), timeframe,
+        )
+
+    def test_plan_json_payload_keeps_timeframe(self):
+        from src.trade_management.manager import _plan_payload
+
+        payload = _plan_payload(self._plan("5m"))
+        assert payload["timeframe"] == "5m"
+
+    def test_restore_keeps_timeframe(self, tmp_path):
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = TradeManager(storage, _RestoreBroker())
+            manager.submit_plan(self._plan("5m"), OpenTrade("open-1", "trade-1", 0, "entry", 1))
+
+            recovered, = manager.restore()
+            assert recovered.plan.timeframe == "5m"
+
+    def test_restore_legacy_plan_without_timeframe_defaults_empty(self, tmp_path):
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            now = "2026-09-18T10:00:00+00:00"
+            with storage.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO trades VALUES ('trade-9', 'assignment-1', 'NGV6', 'signal-9', 'BUY', "
+                    "'{\"reference_entry\": \"100\", \"stop_price\": \"96\", \"targets\": []}', "
+                    "'{\"name\": \"levels_rr\", \"version\": \"1\", \"parameters\": {}}', "
+                    "'ENTRY_PENDING', 0, '{}', ?, ?)",
+                    (now, now),
+                )
+                connection.execute(
+                    "INSERT INTO positions VALUES ('trade-9', 'BUY', 0, NULL, '0', '0', '0', ?)", (now,)
+                )
+
+            recovered, = TradeManager(storage, _RestoreBroker()).restore()
+            assert recovered.plan.timeframe == ""
+
+
+class _RestoreBroker:
+    def register_trade(self, plan: TradePlan) -> None:
+        self.plans.append(plan)
+
+    def __init__(self) -> None:
+        self.plans = []

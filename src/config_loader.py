@@ -36,6 +36,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
     "tick": {
         "poll_secs": "tick_poll_secs",
         "timeout_secs": "tick_timeout_secs",
+        "catch_up_bars": "tick_catch_up_bars",
     },
     "instruments": {
         "fallback_type": "instrument_type",
@@ -69,6 +70,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "clearing_times": "clearing_times",
         "database_file": "database_file",
         "risk_limits": "risk_limits",
+        "contract_expiry_block_days": "contract_expiry_block_days",
     },
     "trade_management": {
         "profiles": "trade_management_profiles",
@@ -81,6 +83,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "heartbeat_every_ticks": int,
     "tick_poll_secs": int,
     "tick_timeout_secs": int,
+    "tick_catch_up_bars": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -104,6 +107,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "audit_backup_count": int,
     "risk_limits": dict,
     "trade_management_profiles": dict,
+    "contract_expiry_block_days": int,
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
@@ -369,6 +373,14 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             raise ConfigError(f"{path}: [{key}] должен быть непустой строкой")
         if key in {"audit_max_bytes", "audit_backup_count"} and value < 0:
             raise ConfigError(f"{path}: [{key}] должен быть неотрицательным целым числом")
+        if key == "tick_catch_up_bars" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [tick] catch_up_bars должен быть неотрицательным целым числом"
+            )
+        if key == "contract_expiry_block_days" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [trading] contract_expiry_block_days должен быть неотрицательным целым числом"
+            )
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value

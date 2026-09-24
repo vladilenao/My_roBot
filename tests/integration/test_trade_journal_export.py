@@ -46,6 +46,69 @@ def _change_snapshot(storage):
         connection.execute("UPDATE positions SET quantity = 1 WHERE trade_id = 'trade-1'")
 
 
+def _write_reason_fill(storage, reason):
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.transaction() as connection:
+        connection.execute(
+            "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'SELL', "
+            "'{}', '{}', 'CLOSED', 1, '{}', ?, ?)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO positions VALUES ('trade-1', 'SELL', 0, '100', '0', '0', '0', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at) "
+            "VALUES ('cmd-1', 'trade-1', '{}', 'SENT', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO orders VALUES ('order-1', 'trade-1', 'cmd-1', 'CLOSE', 'FILLED', 2, 2, "
+            "'100', ?, ?)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO fills VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO events (event_id, trade_id, order_id, command_id, event_type, payload_json, occurred_at) "
+            "VALUES ('exec-1', 'trade-1', 'order-1', 'cmd-1', 'FILL', ?, ?)",
+            (json.dumps({"reason": reason}), now),
+        )
+
+
+def _export_reason_rows(tmp_path, reason):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_reason_fill(storage, reason)
+        return _read_csv(journal), _read_csv(positions)
+
+
+def test_reason_labels_render_known_codes_in_russian(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "opposite-signal-management")
+
+    assert journal_rows[0]["Причина"] == "управление по встречному сигналу"
+    assert position_rows[0]["Финальная причина"] == "управление по встречному сигналу"
+
+
+def test_stale_state_revision_reason_is_russian(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "stale-state-revision")
+
+    assert journal_rows[0]["Причина"] == "устарела ревизия состояния"
+    assert position_rows[0]["Финальная причина"] == "устарела ревизия состояния"
+
+
+def test_reason_labels_pass_through_unknown_codes(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "custom-machine-code")
+
+    assert journal_rows[0]["Причина"] == "custom-machine-code"
+    assert position_rows[0]["Финальная причина"] == "custom-machine-code"
+
+
 def test_export_uses_short_contract_name_from_storage_names(tmp_path):
     database = tmp_path / "trades.sqlite3"
     journal = tmp_path / "journal.csv"

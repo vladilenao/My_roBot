@@ -11,9 +11,8 @@ log = get_logger(__name__)
 class ExecutionPort(ABC):
     """Выходной слой принятых решений робота.
 
-    Единая точка, в которую оркестратор отдаёт решение. Реализации: уведомление
-    трейдера (`NotifyOnlyExecutionPort`) или имитация исполнения
-    (`BrokerExecutionPort`), возвращающая результат сделки.
+    Единая точка, в которую оркестратор отдаёт решение. Реализация:
+    уведомление трейдера (`NotifyOnlyExecutionPort`).
     """
 
     @abstractmethod
@@ -112,76 +111,6 @@ class NotifyOnlyExecutionPort(ExecutionPort):
         self._notifier.notify_entry_accepted(
             plan, label, quantity=quantity, timeframe=timeframe,
         )
-
-
-class BrokerExecutionPort(ExecutionPort):
-    """Имитированное исполнение: портфельные проверки + брокер через адаптер.
-
-    Обёртка `BrokerExecutionAdapter`, публикующая протокол `ExecutionPort`:
-    решение стратегии → сигнал исполнителю → результат сделки.
-
-    При наличии нотификатора решение также доставляется наружу как уведомление
-    (`notify_decision`), сохраняя прежние строки о сигналах в командной строке.
-    """
-
-    def __init__(self, adapter, notifier=None) -> None:
-        self._adapter = adapter
-        self._notifier = notifier
-
-    def execute(
-        self,
-        decision,
-        instrument,
-        *,
-        filter_profile: str = "",
-        filtered_out: bool = False,
-        timeframe: str = "",
-    ) -> object | None:
-        if self._notifier is not None:
-            label = _short_contract_name(instrument)
-            self._notifier.notify_decision(
-                decision, label,
-                filter_profile=filter_profile, filtered_out=filtered_out,
-                timeframe=timeframe,
-            )
-        return self._adapter.execute(
-            decision,
-            instrument,
-            filter_profile=filter_profile,
-            filtered_out=filtered_out,
-            timeframe=timeframe,
-        )
-
-    def report_rejection(
-        self,
-        decision,
-        instrument,
-        *,
-        reason_message: str,
-        filter_profile: str = "",
-        timeframe: str = "",
-    ) -> None:
-        if self._notifier is not None:
-            label = _short_contract_name(instrument)
-            self._notifier.notify_rejection(
-                decision, label,
-                reason=reason_message, filter_profile=filter_profile, timeframe=timeframe,
-            )
-
-    def report_entry_accepted(
-        self,
-        plan,
-        instrument,
-        *,
-        quantity: int = 0,
-        filter_profile: str = "",
-        timeframe: str = "",
-    ) -> None:
-        if self._notifier is not None:
-            label = _short_contract_name(instrument)
-            self._notifier.notify_entry_accepted(
-                plan, label, quantity=quantity, timeframe=timeframe,
-            )
 
 
 def _short_contract_name(instrument) -> str:

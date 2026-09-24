@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -401,6 +402,101 @@ class TestMultiTimeframeCache:
         assert cache.has_fresh_closed_bar("15m") is True
         assert cache.has_fresh_closed_bar("1h") is False
 
+    def test_force_fairly_refreshes_all_frames_across_windows(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        data = {
+            ("BR", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8)],
+            ("ED", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8)],
+            ("SBER", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8)],
+        }
+        loader = FakeLoaderPerTf(data)
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=300)
+        for ticker in ("BR", "ED", "SBER"):
+            cache._last_api_attempt = pd.Timestamp("2020-01-01")  # не спать в _initial_load между кадрами
+            cache.frame_for(Instrument(ticker, ticker, "share"), "1h")
+        assert len(loader.calls) == 3
+
+        # свежие закрытые бары 09:00 публикуются с задержкой у всех пар
+        for ticker in ("BR", "ED", "SBER"):
+            data[(ticker, "1h")].append(pd.Timestamp("2024-01-01 09:00"))
+        assert cache.has_fresh_closed_bar("1h") is False
+
+        # одно окно (>= интервала) — одна дозагрузка; готовность — не более чем за число кадров окон
+        windows = 0
+        while not cache.has_fresh_closed_bar("1h") and windows < 6:
+            clock[0] += timedelta(seconds=301)
+            cache.refresh_if_new_candle("1h", force=True)
+            windows += 1
+
+        assert windows == 3  # не больше числа кадров ТФ
+        assert cache.has_fresh_closed_bar("1h") is True
+        assert [c[0] for c in loader.calls[3:]] == ["BR", "ED", "SBER"]  # детерминированный порядок
+        for ticker in ("BR", "ED", "SBER"):
+            frame = cache.frame_for(Instrument(ticker, ticker, "share"), "1h")
+            assert frame["datetime"].max() == pd.Timestamp("2024-01-01 09:00")
+
+    def test_throttled_frame_not_marked_observed(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        data = {
+            ("BR", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8, 9)],
+            ("SBER", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8, 9)],
+        }
+        loader = FakeLoaderPerTf(data)
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=7200)
+        for ticker in ("BR", "SBER"):
+            cache._last_api_attempt = pd.Timestamp("2020-01-01")  # не спать в _initial_load между кадрами
+            cache.frame_for(Instrument(ticker, ticker, "share"), "1h")
+
+        observed_before = {
+            ticker: cache._observed[(ticker, "share", "1h")]
+            for ticker in ("BR", "SBER")
+        }
+        clock[0] = datetime(2024, 1, 1, 11, 2)  # граница 11:00, но 62 мин < 7200с — окно закрыто
+        cache.refresh_if_new_candle("1h", force=True)
+
+        assert len(loader.calls) == 2  # API не дёргался
+        assert all(cache._observed[(t, "share", "1h")] == observed_before[t] for t in ("BR", "SBER"))
+
+        # окно открылось — дозагружается самый отстающий кадр за один вызов
+        clock[0] = datetime(2024, 1, 1, 12, 30)
+        cache.refresh_if_new_candle("1h", force=True)
+        assert len(loader.calls) == 3
+        assert loader.calls[-1] == ("BR", "1h")  # BR отсортирован первым
+        assert cache._observed[("SBER", "share", "1h")] == observed_before["SBER"]
+
+    def test_refresh_prioritizes_most_stale_frame(self):
+        clock = [datetime(2024, 1, 1, 10, 0)]
+        data = {
+            # SBER уже обладает свежим закрытым баром 09:00
+            ("SBER", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8, 9)],
+            # BR отстаёт: бар 09:00 в данных так и не появился
+            ("BR", "1h"): [pd.Timestamp(f"2024-01-01 0{i}:00") for i in (6, 7, 8)],
+        }
+        loader = FakeLoaderPerTf(data)
+        sched = MultiTimeframeScheduler(["1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=300)
+        cache._last_api_attempt = pd.Timestamp("2020-01-01")  # не спать в _initial_load между кадрами
+        cache.frame_for(Instrument("SBER", "SBER", "share"), "1h")
+        cache._last_api_attempt = pd.Timestamp("2020-01-01")
+        cache.frame_for(Instrument("BR", "BR", "share"), "1h")
+        assert cache.has_fresh_closed_bar("1h") is False  # BR держит гейт
+
+        for _ in range(5):
+            clock[0] += timedelta(seconds=301)
+            cache.refresh_if_new_candle("1h", force=True)
+
+        # свежий кадр SBER не перезапрашивается вхолостую — лимит уходит отстающему BR
+        assert [c for c in loader.calls if c[0] == "SBER"] == [("SBER", "1h")]  # только первичная загрузка
+        assert cache.has_fresh_closed_bar("1h") is False
+
+        # BR получил поздний бар 09:00 — следующее окно закрывает гейт
+        data[("BR", "1h")].append(pd.Timestamp("2024-01-01 09:00"))
+        clock[0] += timedelta(seconds=301)
+        cache.refresh_if_new_candle("1h", force=True)
+        assert cache.has_fresh_closed_bar("1h") is True
+
 
 class FakeLoaderWithStart:
     """Лоадер по паре (тикер, таймфрейм) с записью start_date дозагрузок."""
@@ -482,3 +578,108 @@ class TestEnsureLoaded:
             pd.Timestamp("2024-01-01 00:00"),
             pd.Timestamp("2024-01-01 04:00"),
         ]
+
+
+class TestFreshnessTolerance:
+    """Терпимый гейт готовности кадра: freshness_tolerance_bars (догон бар-публикации)."""
+
+    def _make(self, clock, tolerance):
+        sched = MultiTimeframeScheduler(["1m", "1h"], clock=lambda: clock[0])
+        cache = MarketDataCache(loader=FakeLoader({}), timeline=sched, freshness_tolerance_bars=tolerance)
+        return cache
+
+    @staticmethod
+    def _seed(cache, ticker, tf, times):
+        cache._frames[(ticker, "future", tf)] = _bars(times)
+
+    def test_lagging_pair_within_tolerance_still_blocks(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 2)  # now 10:20, expected 10:19, tol = 2 бара = 120с
+        self._seed(cache, "NG", "1m", ["10:18"])  # в допуске, но отстаёт от ожидаемого
+        self._seed(cache, "SI", "1m", ["10:19"])  # в норме
+
+        assert cache.has_fresh_closed_bar("1m") is False
+
+    def test_lagging_pair_over_tolerance_excluded(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 2)
+        self._seed(cache, "NG", "1m", ["10:16"])  # старше threshold 10:17 — неликвид, исключён
+        self._seed(cache, "SI", "1m", ["10:19"])  # в норме
+
+        assert cache.has_fresh_closed_bar("1m") is True
+
+    def test_all_pairs_stale_no_fresh_bars(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 2)
+        self._seed(cache, "NG", "1m", ["10:16"])
+        self._seed(cache, "SI", "1m", ["10:15"])
+
+        assert cache.has_fresh_closed_bar("1m") is False
+
+    def test_no_frames_returns_true(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 2)
+
+        assert cache.has_fresh_closed_bar("1m") is True
+
+    def test_tolerance_applies_per_timeframe(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 2)
+        self._seed(cache, "NG", "1m", ["10:16"])  # вне допуска по 1m
+        self._seed(cache, "SI", "1m", ["10:19"])
+        self._seed(cache, "NG", "1h", ["07:00"])  # 1h-кадр отстаёт по своему ТФ
+        self._seed(cache, "SI", "1h", ["09:00"])
+
+        assert cache.has_fresh_closed_bar("1m") is True
+        assert cache.has_fresh_closed_bar("1h") is False
+
+    def test_zero_tolerance_keeps_legacy_hard_and(self):
+        clock = [datetime(2024, 1, 1, 10, 20)]
+        cache = self._make(clock, 0)
+        self._seed(cache, "SI", "1m", ["10:19"])
+        self._seed(cache, "NG", "1m", ["10:16"])  # отстающая — блокирует при tol=0
+
+        assert cache.has_fresh_closed_bar("1m") is False
+
+
+class TestInitialLoadThrottle:
+    """Разнос стартовых загрузок кадров (data_refresh_min_interval)."""
+
+    def _make(self, clock_value, interval=5.0):
+        clock = [clock_value]
+        sched = MultiTimeframeScheduler(["1m"], clock=lambda: clock[0])
+        loader = FakeLoader({"NG": [pd.Timestamp("2024-01-01 10:10"),
+                                    pd.Timestamp("2024-01-01 10:19")]})
+        cache = MarketDataCache(loader=loader, timeline=sched, data_refresh_min_interval=interval)
+        return cache
+
+    def test_first_initial_load_not_throttled(self):
+        cache = self._make(datetime(2024, 1, 1, 10, 20))
+        inst = Instrument("NG", "NG", "future")
+        with patch("src.data.cache.time.sleep") as sleep:
+            cache.frame_for(inst, "1m")
+        sleep.assert_not_called()
+
+    def test_initial_load_waits_remaining_interval(self):
+        cache = self._make(datetime(2024, 1, 1, 10, 20))
+        cache._last_api_attempt = pd.Timestamp("2024-01-01 10:19:57")  # 3с назад, остаток 2с
+        inst = Instrument("NG", "NG", "future")
+        with patch("src.data.cache.time.sleep") as sleep:
+            cache.frame_for(inst, "1m")
+        sleep.assert_called_once_with(2.0)
+
+    def test_initial_load_skips_wait_when_interval_elapsed(self):
+        cache = self._make(datetime(2024, 1, 1, 10, 20))
+        cache._last_api_attempt = pd.Timestamp("2024-01-01 10:19:54")  # прошло 6с >= 5с
+        inst = Instrument("NG", "NG", "future")
+        with patch("src.data.cache.time.sleep") as sleep:
+            cache.frame_for(inst, "1m")
+        sleep.assert_not_called()
+
+    def test_interval_zero_disables_throttle(self):
+        cache = self._make(datetime(2024, 1, 1, 10, 20), interval=0.0)
+        cache._last_api_attempt = pd.Timestamp("2024-01-01 10:19:58")
+        inst = Instrument("NG", "NG", "future")
+        with patch("src.data.cache.time.sleep") as sleep:
+            cache.frame_for(inst, "1m")
+        sleep.assert_not_called()

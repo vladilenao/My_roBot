@@ -181,6 +181,64 @@ def test_wrong_type_raises_config_error(tmp_path):
         load_config(_defaults(), config_file=bad)
 
 
+class TestCatchUpBars:
+    def test_key_optional_in_tick_section(self, tmp_path):
+        cfg = load_config(_defaults(), config_file=_write(tmp_path, "[tick]\npoll_secs = 1\n"))
+        assert "tick_catch_up_bars" not in cfg
+
+    def test_valid_int_value(self, tmp_path):
+        cfg = load_config(_defaults(), config_file=_write(tmp_path, "[tick]\ncatch_up_bars = 2\n"))
+        assert cfg["tick_catch_up_bars"] == 2
+
+    def test_wrong_type_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[tick]\ncatch_up_bars = \"2\"\n")
+        with pytest.raises(ConfigError, match="tick_catch_up_bars"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_negative_value_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[tick]\ncatch_up_bars = -1\n")
+        with pytest.raises(ConfigError, match="catch_up_bars"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_bool_value_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[tick]\ncatch_up_bars = true\n")
+        with pytest.raises(ConfigError, match="catch_up_bars"):
+            load_config(_defaults(), config_file=cfg)
+
+
+class TestContractExpiryBlockDays:
+    def test_key_optional_in_trading_section(self, tmp_path):
+        cfg = load_config(_defaults(), config_file=_write(tmp_path, "[trading]\ninitial_deposit = 100000\n"))
+        assert "contract_expiry_block_days" not in cfg
+
+    def test_key_overrides_default(self, tmp_path):
+        cfg = load_config(
+            _defaults(), config_file=_write(tmp_path, "[trading]\ncontract_expiry_block_days = 5\n")
+        )
+        assert cfg["contract_expiry_block_days"] == 5
+
+    def test_zero_is_allowed(self, tmp_path):
+        cfg = load_config(
+            _defaults(), config_file=_write(tmp_path, "[trading]\ncontract_expiry_block_days = 0\n")
+        )
+        assert cfg["contract_expiry_block_days"] == 0
+
+    def test_wrong_type_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[trading]\ncontract_expiry_block_days = \"2\"\n")
+        with pytest.raises(ConfigError, match="contract_expiry_block_days"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_negative_value_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[trading]\ncontract_expiry_block_days = -1\n")
+        with pytest.raises(ConfigError, match="contract_expiry_block_days"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_bool_value_rejected(self, tmp_path):
+        cfg = _write(tmp_path, "[trading]\ncontract_expiry_block_days = true\n")
+        with pytest.raises(ConfigError, match="contract_expiry_block_days"):
+            load_config(_defaults(), config_file=cfg)
+
+
 def _write(tmp_path, body: str):
     cfg = tmp_path / "robot.toml"
     cfg.write_text(body, encoding="utf-8")
