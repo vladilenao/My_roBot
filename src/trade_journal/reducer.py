@@ -13,6 +13,7 @@ from src.trade_management.audit import CalculationTrace, CalculationTraceReposit
 
 _INCREASE_ACTIONS = {"OPEN", "ADD"}
 _REDUCE_ACTIONS = {"REDUCE", "CLOSE", "TARGET", "STOP"}
+_TERMINAL_PHASES = ("CLOSED", "CANCELLED", "REJECTED", "ERROR")
 def _decimal(value: str | Decimal) -> Decimal:
     return Decimal(value)
 
@@ -56,8 +57,15 @@ def apply_fill(
     quantity: int,
     price: Decimal,
     fee: Decimal,
+    price_step: Decimal | None = None,
+    step_cost: Decimal | None = None,
 ) -> tuple[PositionState, AccountState]:
-    """Pure state transition for one incremental confirmed fill."""
+    """Pure state transition for one incremental confirmed fill.
+
+    Для сделок-снапшотов (``price_step`` и ``step_cost`` не ``None``) выходной
+    PnL считается в рублях через стоимость шага; без снапшота сохраняется
+    прежний сырой расчёт ``цена × объём`` (fallback, как у брокера).
+    """
     if quantity <= 0:
         raise ValueError("fill quantity must be positive")
     if price <= 0 or fee < 0:
@@ -82,7 +90,11 @@ def apply_fill(
         if position.average_price is None or quantity > position.quantity:
             raise ValueError("reducing fill exceeds open position")
         direction = Decimal("1") if side == "BUY" else Decimal("-1")
-        gross = direction * (price - position.average_price) * quantity
+        delta = price - position.average_price
+        if price_step is not None and step_cost is not None and price_step > 0:
+            gross = direction * delta / price_step * step_cost * quantity
+        else:
+            gross = direction * delta * quantity
         remaining = position.quantity - quantity
         next_position = PositionState(
             quantity=remaining,
@@ -111,18 +123,26 @@ def apply_fill_with_trace(
     quantity, price, fee = int(kwargs["quantity"]), kwargs["price"], kwargs["fee"]
     assert isinstance(price, Decimal) and isinstance(fee, Decimal)
     gross = next_account.realized_pnl - account.realized_pnl
+    price_step = kwargs.get("price_step")
+    step_cost = kwargs.get("step_cost")
     trace = calculation_trace(
         "clearing.apply_fill", inputs={
             "side": MeasuredValue(side, "side"), "action": MeasuredValue(action, "action"),
             "quantity": MeasuredValue(quantity, "contracts"), "fill_price": MeasuredValue(price, "price"),
             "average_price_before": MeasuredValue(position.average_price, "price"),
+            "price_step": MeasuredValue(price_step, "price") if price_step is not None
+            else MeasuredValue("", "price"),
+            "step_cost": MeasuredValue(step_cost, "RUB") if step_cost is not None
+            else MeasuredValue("", "RUB"),
             "fee": MeasuredValue(fee, "RUB"), "gross_pnl_before": MeasuredValue(position.realized_pnl, "RUB"),
             "fees_before": MeasuredValue(position.fees, "RUB"),
         }, result=MeasuredValue({"quantity": next_position.quantity, "gross_pnl": str(gross),
                                   "fees": str(next_position.fees), "net_pnl": str(next_position.net_realized_pnl),
                                   "balance": str(next_account.balance)}, "position-account-state"),
         reason="confirmed-fill-cleared",
-        formula="increase: weighted average; reduce: direction*(fill-average)*quantity; balance += gross-fee",
+        formula=("increase: weighted average; "
+                 "reduce: direction*(fill-average)/price_step*step_cost*quantity (raw fallback without factors); "
+                 "balance += gross-fee"),
         links=TraceLinks(),
     )
     return next_position, next_account, trace
@@ -155,16 +175,20 @@ class ExecutionReducer:
 
             if filled:
                 position, account = self._states(connection, event.trade_id)
+                trade_row = connection.execute(
+                    "SELECT side, price_step, step_cost FROM trades WHERE trade_id = ?",
+                    (event.trade_id,),
+                ).fetchone()
                 next_position, next_account, fill_trace = apply_fill_with_trace(
                     position,
                     account,
-                    side=connection.execute(
-                        "SELECT side FROM trades WHERE trade_id = ?", (event.trade_id,)
-                    ).fetchone()[0],
+                    side=trade_row[0],
                     action_type=action_type,
                     quantity=event.filled_quantity,
                     price=event.price,
                     fee=event.fee,
+                    price_step=Decimal(str(trade_row[1])) if trade_row[1] is not None else None,
+                    step_cost=Decimal(str(trade_row[2])) if trade_row[2] is not None else None,
                 )
                 self._traces.record_in_transaction(connection, fill_trace)
                 total_filled = order["filled_quantity"] + event.filled_quantity
@@ -185,6 +209,7 @@ class ExecutionReducer:
                 self._update_reservation(connection, order, total_filled, now)
                 self._update_target(connection, event.trade_id, action_type, event.filled_quantity)
                 self._update_phase(connection, event.trade_id, action_type, next_position.quantity)
+                self._release_reservations_if_terminal(connection, event.trade_id, now)
             else:
                 order_status = status
                 connection.execute(
@@ -194,6 +219,7 @@ class ExecutionReducer:
                 if event.status in {ExecutionStatus.REJECT, ExecutionStatus.CANCEL}:
                     self._release_reservation(connection, order, now)
                     self._update_terminal_outcome(connection, event, order, now)
+                    self._release_reservations_if_terminal(connection, event.trade_id, now)
 
             connection.execute(
                 "INSERT INTO events (event_id, trade_id, order_id, command_id, event_type, payload_json, occurred_at) "
@@ -378,6 +404,26 @@ class ExecutionReducer:
                 "WHERE reservation_id=?",
                 (now, row[0]),
             )
+
+    @staticmethod
+    def _release_reservations_if_terminal(connection, trade_id: str, now: str) -> None:
+        """Free the whole risk budget once the trade reached a terminal phase.
+
+        :meth:`_release_reservation` only frees the remainder of the very order
+        the event refers to.  An unfilled entry is cancelled through a separate
+        ``CANCEL`` command, so its entry reservation is never touched there and
+        would keep blocking every later admission.
+        """
+        row = connection.execute(
+            "SELECT phase FROM trades WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        if row is None or row[0] not in _TERMINAL_PHASES:
+            return
+        connection.execute(
+            "UPDATE reservations SET risk_amount='0', margin_amount='0', status='RELEASED', updated_at=? "
+            "WHERE trade_id = ? AND status = 'ACTIVE'",
+            (now, trade_id),
+        )
 
     @staticmethod
     def _update_target(connection, trade_id: str, action_type: str, quantity: int) -> None:

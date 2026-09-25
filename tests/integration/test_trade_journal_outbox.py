@@ -12,7 +12,7 @@ def _seed_trade(storage: Storage) -> None:
     now = "2026-01-01T00:00:00+00:00"
     storage.connection.execute(
         "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', "
-        "'BUY', '{}', '{}', 'OPEN', 0, '{}', ?, ?)",
+        "'BUY', '{}', '{}', 'OPEN', 0, '{}', ?, ?, NULL, NULL)",
         (now, now),
     )
     storage.connection.execute(

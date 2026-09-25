@@ -16,7 +16,7 @@ def test_recovery_uses_sqlite_snapshot_for_removed_assignment_and_ignores_legacy
     with Storage(database) as storage:
         connection = storage.connection
         connection.execute(
-            "INSERT INTO trades VALUES (?, ?, ?, ?, 'BUY', ?, ?, 'REDUCING', 7, ?, ?, ?)",
+            "INSERT INTO trades VALUES (?, ?, ?, ?, 'BUY', ?, ?, 'REDUCING', 7, ?, ?, ?, NULL, NULL)",
             (
                 "trade-removed-assignment", "removed-assignment", "NGV6", "signal-1",
                 '{"reference_entry": "100", "stop_price": "96", "targets": ['

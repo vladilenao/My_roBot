@@ -108,6 +108,7 @@ class TestRuntimeComposition:
             audit_path=run.runtime_dir() / run.AUDIT_FILE,
             audit_max_bytes=run.AUDIT_MAX_BYTES,
             audit_backup_count=run.AUDIT_BACKUP_COUNT,
+            initial_deposit=str(run.INITIAL_DEPOSIT),
         )
         broker_factory.assert_called_once_with(
             run.INITIAL_DEPOSIT, run.CLEARING_TIMES, contract_names={}

@@ -32,7 +32,7 @@ POSITIONS_COLUMNS = (
     "trade_id", "contract", "direction", "status", "entry_at", "exit_at", "duration",
     "planned_entry", "planned_stop", "planned_tp1", "initial_quantity", "added_quantity",
     "max_quantity", "average_entry", "exits", "average_exit", "final_reason", "exit_scenario",
-    "gross_pnl", "fees", "net_pnl", "initial_risk", "result_r", "mae_r", "mfe_r",
+    "gross_pnl", "fees", "net_pnl", "pnl_units", "initial_risk", "result_r", "mae_r", "mfe_r",
 )
 
 # Человекочитаемые русскоязычные заголовки CSV-проекций. Позиции соответствуют
@@ -73,6 +73,7 @@ POSITIONS_HEADERS = (
     "Gross PnL",
     "Комиссия",
     "Net PnL",
+    "Ед. PnL",
     "Initial Risk",
     "Result",
     "MAE",
@@ -247,12 +248,13 @@ class CsvExporter:
             position_rows = []
             for row in self._rows(
                 """
-                SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
-                       trades.plan_json, positions.quantity, positions.average_price,
-                       positions.realized_pnl, positions.fees, positions.updated_at
-                FROM positions
-                JOIN trades ON trades.trade_id = positions.trade_id
-                ORDER BY positions.trade_id
+SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
+       trades.plan_json, trades.price_step, trades.step_cost,
+       positions.quantity, positions.average_price,
+       positions.realized_pnl, positions.fees, positions.updated_at
+FROM positions
+JOIN trades ON trades.trade_id = positions.trade_id
+ORDER BY positions.trade_id
                 """
             ):
                 ticker = str(row.get("instrument_id") or "")
@@ -316,6 +318,7 @@ class CsvExporter:
         fees = Decimal(str(row.get("fees") or "0"))
         net = gross - fees
         exit_reasons = [str(fill["reason"]) for fill in exits if fill["reason"]]
+        units = self._pnl_units(row.get("price_step"), row.get("step_cost"))
         return {
             "trade_id": trade_id,
             "contract": self._display_contract(str(row.get("instrument_id") or "")),
@@ -338,6 +341,7 @@ class CsvExporter:
             "gross_pnl": self._money(gross),
             "fees": self._money(-fees),
             "net_pnl": self._money(net),
+            "pnl_units": units,
             "initial_risk": self._money(initial_risk) if initial_risk is not None else "",
             "result_r": self._ratio(net, initial_risk),
             "mae_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=True),
@@ -516,6 +520,16 @@ class CsvExporter:
         except InvalidOperation:
             return str(text)
         return format(value.quantize(Decimal("0.01")), "f")
+
+    @staticmethod
+    def _pnl_units(price_step: object, step_cost: object) -> str:
+        """Единицы PnL карточки: RUB для сделок со снапшотом факторов, иначе RAW."""
+        if price_step in (None, "") or step_cost in (None, ""):
+            return "RAW"
+        try:
+            return "RUB" if Decimal(str(price_step)) != 0 else "RAW"
+        except InvalidOperation:
+            return "RAW"
 
     def _display_contract(self, ticker: str) -> str:
         return self._names.get(ticker) or ticker

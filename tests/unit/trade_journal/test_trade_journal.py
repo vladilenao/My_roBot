@@ -15,6 +15,7 @@ from src.trade_journal import (
     parse_dt,
     parse_hhmm,
 )
+from src.trade_journal.reducer import AccountState, PositionState, apply_fill, apply_fill_with_trace
 from src.trade_journal.storage import Storage
 from src.trade_management.actions import OpenTrade
 from src.trade_management.manager import TradeManager
@@ -395,7 +396,7 @@ class TestPlanPayloadTimeframe:
                     "INSERT INTO trades VALUES ('trade-9', 'assignment-1', 'NGV6', 'signal-9', 'BUY', "
                     "'{\"reference_entry\": \"100\", \"stop_price\": \"96\", \"targets\": []}', "
                     "'{\"name\": \"levels_rr\", \"version\": \"1\", \"parameters\": {}}', "
-                    "'ENTRY_PENDING', 0, '{}', ?, ?)",
+                    "'ENTRY_PENDING', 0, '{}', ?, ?, NULL, NULL)",
                     (now, now),
                 )
                 connection.execute(
@@ -404,6 +405,61 @@ class TestPlanPayloadTimeframe:
 
             recovered, = TradeManager(storage, _RestoreBroker()).restore()
             assert recovered.plan.timeframe == ""
+
+
+class TestApplyFillRubleEpoch:
+    def test_reducing_buy_uses_ruble_step_cost(self):
+        position, account = apply_fill(
+            PositionState(1, Decimal("100"), Decimal("0"), Decimal("0")),
+            AccountState(Decimal("1000"), Decimal("1000"), Decimal("0"), Decimal("0")),
+            side="BUY", action_type="CLOSE", quantity=1, price=Decimal("104"),
+            fee=Decimal("0.5"), price_step=Decimal("10"), step_cost=Decimal("8.4"),
+        )
+        assert position == PositionState(0, None, Decimal("3.36"), Decimal("0.5"))
+        assert account == AccountState(Decimal("1002.86"), Decimal("1002.86"), Decimal("3.36"), Decimal("0.5"))
+        assert position.net_realized_pnl == Decimal("2.86")
+
+    def test_reducing_short_profits_in_rubles(self):
+        position, account = apply_fill(
+            PositionState(2, Decimal("100"), Decimal("0"), Decimal("0")),
+            AccountState(Decimal("1000"), Decimal("1000"), Decimal("0"), Decimal("0")),
+            side="SELL", action_type="CLOSE", quantity=2, price=Decimal("96"),
+            fee=Decimal("1"), price_step=Decimal("10"), step_cost=Decimal("8.4"),
+        )
+        gross = Decimal("2") * Decimal("4") / Decimal("10") * Decimal("8.4")
+        assert position == PositionState(0, None, gross, Decimal("1"))
+        assert account == AccountState(Decimal("1005.72"), Decimal("1005.72"), gross, Decimal("1"))
+
+    def test_fallback_to_raw_without_factors(self):
+        position, account = apply_fill(
+            PositionState(1, Decimal("100"), Decimal("0"), Decimal("0")),
+            AccountState(Decimal("1000"), Decimal("1000"), Decimal("0"), Decimal("0")),
+            side="BUY", action_type="CLOSE", quantity=1, price=Decimal("104"),
+            fee=Decimal("0.5"), price_step=None, step_cost=None,
+        )
+        assert position.realized_pnl == Decimal("4")
+
+    def test_zero_price_step_falls_back_to_raw(self):
+        position, account = apply_fill(
+            PositionState(1, Decimal("100"), Decimal("0"), Decimal("0")),
+            AccountState(Decimal("1000"), Decimal("1000"), Decimal("0"), Decimal("0")),
+            side="BUY", action_type="CLOSE", quantity=1, price=Decimal("104"),
+            fee=Decimal("0.5"), price_step=Decimal("0"), step_cost=Decimal("8.4"),
+        )
+        assert position.realized_pnl == Decimal("4")
+
+    def test_trace_records_step_factors_inputs(self):
+        position, account, trace = apply_fill_with_trace(
+            PositionState(1, Decimal("100"), Decimal("0"), Decimal("0")),
+            AccountState(Decimal("1000"), Decimal("1000"), Decimal("0"), Decimal("0")),
+            side="BUY", action_type="CLOSE", quantity=1, price=Decimal("104"),
+            fee=Decimal("1"), price_step=Decimal("10"), step_cost=Decimal("8.4"),
+        )
+        assert position.realized_pnl == Decimal("3.36")
+        assert account.balance == Decimal("1002.36")
+        assert trace.inputs["price_step"].value == Decimal("10")
+        assert trace.inputs["step_cost"].value == Decimal("8.4")
+        assert trace.result.value["gross_pnl"] == "3.36"
 
 
 class _RestoreBroker:
