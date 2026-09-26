@@ -80,6 +80,9 @@ def _open_v6_database(path):
     connection = sqlite3.connect(path)
     with connection:
         connection.executescript(SCHEMA_SQL)
+        connection.execute("ALTER TABLE trades DROP COLUMN price_step")
+        connection.execute("ALTER TABLE trades DROP COLUMN step_cost")
+        connection.execute("DROP TABLE instrument_names")
         connection.execute("DROP TABLE targets")
         connection.executescript(V6_TARGETS_DDL)
         connection.execute(

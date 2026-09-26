@@ -21,7 +21,27 @@ class ControlledExecutor:
 def _seed(storage, phase="OPEN"):
     connection = storage.connection
     now = "2026-01-01T00:00:00+00:00"
-    connection.execute("INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'BUY', '{}', '{}', ?, 0, '{}', ?, ?)", (phase, now, now))
+    connection.execute("INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'BUY', '{}', '{}', ?, 0, '{}', ?, ?, NULL, NULL)", (phase, now, now))
+    connection.execute("INSERT INTO positions VALUES ('trade-1', 'BUY', 0, NULL, '0', '0', '0', ?)", (now,))
+    connection.execute("INSERT INTO account VALUES (1, '1000', '1000', '0', '0', '0', ?)", (now,))
+    connection.execute("INSERT INTO outbox VALUES ('command-1', 'trade-1', '{}', 'SENT', ?, NULL)", (now,))
+    connection.execute("INSERT INTO orders VALUES ('order-1', 'trade-1', 'command-1', 'OPEN', 'PENDING', 2, 0, NULL, ?, ?)", (now, now))
+    connection.execute(
+        "INSERT INTO reservations VALUES ('reservation-1', 'trade-1', 'order-1', '20', '40', '20', '40', 'ACTIVE', ?, ?)",
+        (now, now),
+    )
+    connection.execute("INSERT INTO targets VALUES ('target-1', 'trade-1', 0, '104', 1, 0, 'PENDING')")
+    connection.commit()
+
+
+def _ruble_seed(storage, phase="OPEN"):
+    connection = storage.connection
+    now = "2026-01-01T00:00:00+00:00"
+    connection.execute(
+        "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'BRV6', 'signal-1', 'BUY', '{}', '{}', ?, 0, "
+        "'{}', ?, ?, '10', '8.4')",
+        (phase, now, now),
+    )
     connection.execute("INSERT INTO positions VALUES ('trade-1', 'BUY', 0, NULL, '0', '0', '0', ?)", (now,))
     connection.execute("INSERT INTO account VALUES (1, '1000', '1000', '0', '0', '0', ?)", (now,))
     connection.execute("INSERT INTO outbox VALUES ('command-1', 'trade-1', '{}', 'SENT', ?, NULL)", (now,))
@@ -111,6 +131,35 @@ def test_every_fill_fee_is_accumulated_once_and_net_pnl_is_separate(tmp_path):
             "SELECT realized_pnl, fees, net_realized_pnl FROM account"
         ).fetchone() == ("3.875", "0.75", "3.125")
         assert storage.connection.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 2
+
+
+def test_new_trade_closes_in_rubles_and_replay_reproduces_values(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    with Storage(database) as storage:
+        _ruble_seed(storage)
+        reducer = ExecutionReducer(storage)
+        reducer.apply(_event())
+        now = "2026-01-01T00:00:00+00:00"
+        storage.connection.execute("INSERT INTO outbox VALUES ('command-2', 'trade-1', '{}', 'SENT', ?, NULL)", (now,))
+        storage.connection.execute("INSERT INTO orders VALUES ('order-2', 'trade-1', 'command-2', 'TARGET:target-1', 'PENDING', 1, 0, NULL, ?, ?)", (now, now))
+        storage.connection.commit()
+        reducer.apply(ExecutionEvent(
+            "execution-2", "order-2", "command-2", "trade-1", ExecutionStatus.FILL, 1,
+            Decimal("104"), Decimal("0.25"), datetime.now(timezone.utc), "target-hit",
+        ))
+        assert storage.connection.execute(
+            "SELECT realized_pnl, fees, net_realized_pnl FROM positions"
+        ).fetchone() == ("3.25500", "0.75", "2.50500")
+        assert storage.connection.execute(
+            "SELECT balance, realized_pnl, net_realized_pnl FROM account"
+        ).fetchone() == ("1002.50500", "3.25500", "2.50500")
+    with Storage(database) as storage:
+        assert storage.connection.execute(
+            "SELECT realized_pnl, fees, net_realized_pnl FROM positions"
+        ).fetchone() == ("3.25500", "0.75", "2.50500")
+        assert storage.connection.execute(
+            "SELECT balance, realized_pnl FROM account"
+        ).fetchone() == ("1002.50500", "3.25500")
 
 
 def test_controlled_executor_keeps_phase_and_target_pending_until_late_fills(tmp_path):

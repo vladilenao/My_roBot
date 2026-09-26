@@ -146,6 +146,8 @@ class TradeManager:
         risk_budget: Decimal | None = None,
         margin_budget: Decimal | None = None,
         traces: tuple[object, ...] = (),
+        price_step: Decimal | None = None,
+        step_cost: Decimal | None = None,
     ) -> bool:
         """Persist a newly planned entry and its durable broker intent atomically."""
         if action.trade_id != plan.trade_id or action.state_revision != 0:
@@ -170,10 +172,14 @@ class TradeManager:
             if existing:
                 return False
             connection.execute(
-                "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, 'ENTRY_PENDING', 0, '{}', ?, ?)",
+                "INSERT INTO trades (trade_id, assignment_id, instrument_id, signal_id, side, "
+                "plan_json, profile_json, phase, state_revision, profile_state_json, "
+                "created_at, updated_at, price_step, step_cost) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ENTRY_PENDING', 0, '{}', ?, ?, ?, ?)",
                 (plan.trade_id, plan.assignment_id, plan.instrument_id, plan.signal_id, plan.side,
                  json.dumps(_plan_payload(plan), sort_keys=True),
-                 json.dumps(_profile_payload(plan), sort_keys=True), now, now),
+                 json.dumps(_profile_payload(plan), sort_keys=True), now, now,
+                 _factor_text(price_step), _factor_text(step_cost)),
             )
             connection.execute(
                 "INSERT INTO positions VALUES (?, ?, 0, NULL, '0', '0', '0', ?)",
@@ -594,6 +600,8 @@ class TradeManager:
             risk_budget=budget * self._risk_limits.per_trade / Decimal("100"),
             margin_budget=budget,
             traces=(plan_trace, sizing_trace),
+            price_step=Decimal(str(meta.price_step)),
+            step_cost=Decimal(str(meta.step_cost)),
         )
         if accepted:
             return SignalAdmission(actions=(action,), plan=plan)
@@ -792,6 +800,11 @@ def _plan_payload(plan: TradePlan) -> dict[str, object]:
         "targets": [{"target_id": target.target_id, "share": str(target.share)} for target in plan.targets],
         "timeframe": plan.timeframe,
     }
+
+
+def _factor_text(value: Decimal | None) -> str | None:
+    """Текстовое представление снапшота фактора контракта или ``None``."""
+    return format(value, "f") if value is not None else None
 
 
 def _action_payload(action: TradeAction) -> dict[str, object]:

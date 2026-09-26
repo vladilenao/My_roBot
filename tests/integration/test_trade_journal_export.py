@@ -22,7 +22,7 @@ def _write_snapshot(storage):
     with storage.transaction() as connection:
         connection.execute(
             "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'BUY', "
-            "'{}', '{}', 'OPEN', 1, '{}', ?, ?)",
+            "'{}', '{}', 'OPEN', 1, '{}', ?, ?, NULL, NULL)",
             (now, now),
         )
         connection.execute(
@@ -51,7 +51,7 @@ def _write_reason_fill(storage, reason):
     with storage.transaction() as connection:
         connection.execute(
             "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'SELL', "
-            "'{}', '{}', 'CLOSED', 1, '{}', ?, ?)",
+            "'{}', '{}', 'CLOSED', 1, '{}', ?, ?, NULL, NULL)",
             (now, now),
         )
         connection.execute(

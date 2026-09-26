@@ -93,12 +93,12 @@ def configure_connection(connection: sqlite3.Connection) -> None:
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
 
 
-def connect(database: str | Path) -> sqlite3.Connection:
+def connect(database: str | Path, *, initial_deposit: str | None = None) -> sqlite3.Connection:
     """Open a database only after its schema is known to this application."""
     connection = sqlite3.connect(database)
     try:
         configure_connection(connection)
-        initialize_schema(connection)
+        initialize_schema(connection, initial_balance=initial_deposit)
     except BaseException:
         connection.close()
         raise
@@ -117,6 +117,7 @@ class Storage:
         audit_path: str | Path | None = None,
         audit_max_bytes: int = 10_485_760,
         audit_backup_count: int = 5,
+        initial_deposit: str | None = None,
     ) -> None:
         if (journal_path is None) != (positions_path is None):
             raise ValueError("journal and positions export paths must be configured together")
@@ -127,7 +128,7 @@ class Storage:
                     raise ValueError(f"database path must not match {name} export path")
         if audit_path is not None and Path(database).resolve() == Path(audit_path).resolve():
             raise ValueError("database path must not match audit export path")
-        self.connection = connect(database)
+        self.connection = connect(database, initial_deposit=initial_deposit)
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
             CsvExporter(self.connection, Path(journal_path), Path(positions_path))
@@ -143,6 +144,7 @@ class Storage:
             if audit_path is not None else None
         )
         self.requeue_claimed_outbox()
+        self.release_terminal_reservations()
         self.export()
 
     def close(self) -> None:
@@ -184,11 +186,40 @@ class Storage:
         self.export()
 
     def set_names(self, names: Mapping[str, str]) -> None:
-        """Hand ticker -> short contract name mapping to the CSV projections."""
-        if self._exporter is None:
-            return
-        self._exporter.set_names(names)
+        """Hand ticker -> short contract name mapping to the CSV projections.
+
+        The same mapping is persisted so that tools opening the database without
+        a running bot can render short contract names.  The persisted map is not
+        part of any projection, so saving it does not raise an export revision.
+        """
+        if self._exporter is not None:
+            self._exporter.set_names(names)
+        self._save_instrument_names(names)
         self.export()
+
+    def _save_instrument_names(self, names: Mapping[str, str]) -> None:
+        rows = [
+            (ticker, short_name)
+            for ticker, short_name in names.items()
+            if ticker and short_name
+        ]
+        if not rows:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO instrument_names (ticker, short_name, updated_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(ticker) DO UPDATE SET short_name = excluded.short_name, "
+                "updated_at = excluded.updated_at",
+                rows,
+            )
+
+    def instrument_names(self) -> dict[str, str]:
+        """Read the persisted ticker -> short contract name mapping."""
+        rows = self.connection.execute(
+            "SELECT ticker, short_name FROM instrument_names"
+        ).fetchall()
+        return {ticker: short_name for ticker, short_name in rows}
 
     def _mark_export_required(self) -> None:
         if self._exporter is None and self._audit_exporter is None:
@@ -371,6 +402,21 @@ class Storage:
         with self.transaction() as connection:
             return connection.execute(
                 "UPDATE outbox SET status = 'PENDING' WHERE status = 'CLAIMED'"
+            ).rowcount
+
+    def release_terminal_reservations(self) -> int:
+        """Free risk and margin still reserved by trades that already finished.
+
+        Reservations of a filled entry are released by its own execution event,
+        but an unfilled entry is cancelled through a separate ``CANCEL`` command
+        and its reservation used to survive the trade.  Repairing the leftovers
+        on startup keeps a stale reservation from blocking every later entry.
+        """
+        with self.transaction() as connection:
+            return connection.execute(
+                "UPDATE reservations SET risk_amount='0', margin_amount='0', status='RELEASED', "
+                "updated_at=datetime('now') WHERE status = 'ACTIVE' AND trade_id IN "
+                "(SELECT trade_id FROM trades WHERE phase IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR'))"
             ).rowcount
 
     def load_trades(self, *, include_terminal: bool = False) -> tuple[RecoveredTrade, ...]:

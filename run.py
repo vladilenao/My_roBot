@@ -155,6 +155,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
             audit_path=state_dir / AUDIT_FILE,
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
+            initial_deposit=str(INITIAL_DEPOSIT),
         )
         broker = create_addressable_journal_broker(
             INITIAL_DEPOSIT,

@@ -10,7 +10,7 @@ from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.market_context.models import MarketContext, TrendDirection, TrendResult
 from src.portfolio.models import ContractMeta
 from src.strategies.contracts import Decision, SignalType
-from src.trade_journal.storage import Storage
+from src.trade_journal.storage import ReservationCandidate, Storage
 from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade
 from src.trade_management.manager import TradeManager, _entry_ttl_seconds
 from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePhase, TradePlan
@@ -323,6 +323,58 @@ class TestManageStaleEntry:
             (cancel,) = old_actions
             assert isinstance(cancel, CancelEntry)
             assert cancel.reason == "entry-timeout"
+
+    def test_cancelled_stale_entry_releases_its_reservation(self, tmp_path):
+        plan = _plan_on("5m")
+        reservation = ReservationCandidate(
+            reservation_id=f"reservation:{plan.trade_id}", trade_id=plan.trade_id,
+            order_id="open-1", priority=0, assignment_id=plan.assignment_id,
+            instrument_id=plan.instrument_id, signal_id=plan.signal_id,
+            risk_amount=Decimal("800"), margin_amount=Decimal("10000"),
+        )
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            broker = StaleEntryBroker(_contract(expiration_days=None))
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"))
+            manager.submit_plan(
+                plan, OpenTrade("open-1", plan.trade_id, 0, "entry", 2),
+                reservation=reservation,
+                risk_budget=Decimal("2000"), margin_budget=Decimal("100000"),
+            )
+            manager.dispatch(NOW)
+            assert _active_reserved_risk(storage) == [Decimal("800")]
+
+            manager.manage(SimpleNamespace(ticker="NGV6"), [], None, now=NOW + timedelta(seconds=3601))
+            manager.dispatch(NOW + timedelta(seconds=3601))
+
+            assert _active_reserved_risk(storage) == []
+
+    def test_pending_entry_keeps_its_reservation(self, tmp_path):
+        plan = _plan_on("5m")
+        reservation = ReservationCandidate(
+            reservation_id=f"reservation:{plan.trade_id}", trade_id=plan.trade_id,
+            order_id="open-1", priority=0, assignment_id=plan.assignment_id,
+            instrument_id=plan.instrument_id, signal_id=plan.signal_id,
+            risk_amount=Decimal("800"), margin_amount=Decimal("10000"),
+        )
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            broker = StaleEntryBroker(_contract(expiration_days=None))
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"))
+            manager.submit_plan(
+                plan, OpenTrade("open-1", plan.trade_id, 0, "entry", 2),
+                reservation=reservation,
+                risk_budget=Decimal("2000"), margin_budget=Decimal("100000"),
+            )
+            manager.dispatch(NOW)
+
+            assert _active_reserved_risk(storage) == [Decimal("800")]
+
+
+def _active_reserved_risk(storage: Storage) -> list[Decimal]:
+    return [
+        Decimal(row[0]) for row in storage.connection.execute(
+            "SELECT risk_amount FROM reservations WHERE status = 'ACTIVE' ORDER BY reservation_id"
+        ).fetchall()
+    ]
 
 
 def test_entry_ttl_seconds_follows_timeframe():

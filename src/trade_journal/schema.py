@@ -6,7 +6,7 @@ import sqlite3
 from decimal import Decimal
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -27,6 +27,8 @@ CREATE TABLE trades (
     profile_state_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    price_step TEXT,
+    step_cost TEXT,
     UNIQUE (assignment_id, instrument_id, trade_id)
 );
 CREATE UNIQUE INDEX active_trade_per_assignment_instrument
@@ -187,6 +189,12 @@ CREATE TABLE export_state (
     audit_last_error TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE instrument_names (
+    ticker TEXT PRIMARY KEY,
+    short_name TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 MIGRATE_V1_TO_V2_SQL = """
@@ -242,11 +250,30 @@ DROP TABLE targets;
 ALTER TABLE targets_new RENAME TO targets;
 """
 
+MIGRATE_V7_TO_V8_SQL = """
+ALTER TABLE trades ADD COLUMN price_step TEXT;
+ALTER TABLE trades ADD COLUMN step_cost TEXT;
+"""
 
-def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Create the current schema or reject a database from another version."""
+MIGRATE_V8_TO_V9_SQL = """
+CREATE TABLE instrument_names (
+    ticker TEXT PRIMARY KEY,
+    short_name TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | None = None) -> None:
+    """Create the current schema or reject a database from another version.
+
+    ``initial_balance`` задаёт рублёвое переоснование счёта (ruble epoch) при
+    миграции на версию 8: legacy-сделки остаются в прежних единицах PnL и их
+    агрегаты больше не смешиваются со счётом. Если ``None`` — выполняется
+    только изменение схемы без сброса счёта.
+    """
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
+    if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION):
         raise UnsupportedSchemaVersion(
             f"unsupported SQLite schema version {version}; expected {SCHEMA_VERSION}"
         )
@@ -274,6 +301,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 2:
         with connection:
@@ -283,6 +312,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 3:
         with connection:
@@ -291,26 +322,61 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             _backfill_net_realized_pnl(connection)
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 4:
         with connection:
             connection.executescript(MIGRATE_V4_TO_V5_SQL)
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 5:
         with connection:
             connection.executescript(MIGRATE_V5_TO_V6_SQL)
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 6:
         with connection:
             connection.executescript(MIGRATE_V6_TO_V7_SQL)
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    elif version == 7:
+        with connection:
+            _migrate_v7_to_v8(connection, initial_balance)
+            _migrate_v8_to_v9(connection)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    elif version == 8:
+        with connection:
+            _migrate_v8_to_v9(connection)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
 
     violations = connection.execute("PRAGMA foreign_key_check").fetchall()
     if violations:
         raise sqlite3.IntegrityError(f"foreign key integrity check failed: {violations!r}")
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection, initial_balance: str | None) -> None:
+    """Перенести v7 → v8: снапшот факторов контракта и рублёвая эпоха счёта."""
+    connection.executescript(MIGRATE_V7_TO_V8_SQL)
+    if initial_balance is None:
+        return
+    connection.execute(
+        "UPDATE account SET balance = ?, equity = ?, realized_pnl = '0', fees = '0', "
+        "net_realized_pnl = '0', updated_at = datetime('now') WHERE account_id = 1",
+        (initial_balance, initial_balance),
+    )
+
+
+def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
+    """Перенести v8 → v9: сохраняемая карта коротких имён контрактов."""
+    connection.executescript(MIGRATE_V8_TO_V9_SQL)
 
 
 def _backfill_net_realized_pnl(connection: sqlite3.Connection) -> None:
