@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
+from src.events.types import EVENT_TYPE_NAMES
+from src.logging_setup import get_logger
 
 CONFIG_FILENAME = "robot.toml"
 BUNDLED_FILENAME = "default.toml"
@@ -43,6 +45,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "fallback_ticker": "ticker",
     },
     "notifier": {
+        "channels": "notifier_channels",
         "channel": "notifier",
     },
     "strategies": {
@@ -87,7 +90,9 @@ _EXPECTED_TYPES: dict[str, type] = {
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
-    "notifier": str,
+    "notifier_channels": list,
+    "notifier_console_events": list,
+    "notifier_telegram_events": list,
     "share_strategies": dict,
     "future_strategies": dict,
     "triple_screen_params": dict,
@@ -111,6 +116,9 @@ _EXPECTED_TYPES: dict[str, type] = {
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
+_NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
+_NOTIFIER_EVENTS_KEYS = {"notifier_console_events", "notifier_telegram_events"}
+_NOTIFIER_EVENT_KEYS = {"console": "notifier_console_events", "telegram": "notifier_telegram_events"}
 
 # Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
@@ -321,6 +329,45 @@ def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
     return value
 
 
+def _validate_notifier_key(key: str, value: Any, path: Path) -> list[str]:
+    """Список каналов уведомлений: непустой, без повторов, из известных."""
+    if not value:
+        raise ConfigError(
+            f"{path}: [notifier] channels не может быть пустым: "
+            f"укажите хотя бы один канал из {sorted(_ALLOWED_NOTIFIER_VALUES)}"
+        )
+    if len(set(value)) != len(value):
+        duplicates = sorted({item for item in value if value.count(item) > 1})
+        raise ConfigError(f"{path}: [notifier] channels повторяет каналы: {duplicates}")
+    unknown = sorted(set(value) - _ALLOWED_NOTIFIER_VALUES)
+    if unknown:
+        raise ConfigError(
+            f"{path}: [notifier] channels: неизвестные каналы {unknown}; "
+            f"доступны: {sorted(_ALLOWED_NOTIFIER_VALUES)}"
+        )
+    return list(value)
+
+
+def _validate_notifier_events(key: str, value: Any, path: Path) -> list[str]:
+    """Список типов событий канала: непустой, без повторов, из каталога."""
+    where = "notifier.console" if key.endswith("console_events") else "notifier.telegram"
+    if not value:
+        raise ConfigError(
+            f"{path}: [{where}] events не может быть пустым: "
+            f"укажите хотя бы один тип из каталога"
+        )
+    if len(set(value)) != len(value):
+        duplicates = sorted({item for item in value if value.count(item) > 1})
+        raise ConfigError(f"{path}: [{where}] events повторяет типы: {duplicates}")
+    unknown = sorted(set(value) - set(EVENT_TYPE_NAMES))
+    if unknown:
+        raise ConfigError(
+            f"{path}: [{where}] events: неизвестные типы {unknown}; "
+            f"допустимые: {sorted(EVENT_TYPE_NAMES)}"
+        )
+    return list(value)
+
+
 def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
     """Проверка типов и допустимых значений ключей конфигурации."""
     cleaned: dict[str, Any] = {}
@@ -331,11 +378,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [{key}] ожидается {_type_name(expected)}, "
                 f"получено {type(value).__name__}"
             )
-        if key == "notifier" and value not in _ALLOWED_NOTIFIER_VALUES:
-            raise ConfigError(
-                f"{path}: [notifier] channel должен быть одним из "
-                f"{sorted(_ALLOWED_NOTIFIER_VALUES)}, получено {value!r}"
-            )
+        if key in _NOTIFIER_CHANNELS_KEYS:
+            cleaned[key] = _validate_notifier_key(key, value, path)
+            continue
+        if key in _NOTIFIER_EVENTS_KEYS:
+            cleaned[key] = _validate_notifier_events(key, value, path)
+            continue
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
             continue
@@ -455,6 +503,53 @@ def validate_triple_screen_hierarchy(
                 ) from exc
 
 
+def _parse_notifier_subsection(name: str, value: Any, path: Path) -> str:
+    """Подсекция ``[notifier.<канал>]``: только ключ ``events``."""
+    target = _NOTIFIER_EVENT_KEYS.get(name)
+    if target is None:
+        raise ConfigError(
+            f"{path}: [notifier.{name}] неизвестный канал; "
+            f"допустимы: {sorted(_NOTIFIER_EVENT_KEYS)}"
+        )
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path}: [notifier.{name}] должна быть таблицей")
+    unknown = set(value) - {"events"}
+    if unknown:
+        raise ConfigError(
+            f"{path}: [notifier.{name}] незнакомые ключи {sorted(unknown)}; "
+            f"допустимые: ['events']"
+        )
+    if "events" not in value:
+        raise ConfigError(f"{path}: [notifier.{name}] обязателен ключ events")
+    return target
+
+
+def _normalize_notifier_channels(flat: dict[str, Any], path: Path) -> None:
+    """Совместимость: старый ``channel = "telegram"`` равносилен ``channels``.
+
+    Разрешение выполняется на уровне одного файла: так явное значение в
+    ``robot.toml`` перекрывает вшитый дефолт, а два ключа рядом — конфликт.
+    """
+    if "notifier" not in flat:
+        return
+    legacy = flat.pop("notifier")
+    if "notifier_channels" in flat:
+        raise ConfigError(
+            f"{path}: [notifier] задан и channels, и channel; оставьте что-то одно"
+        )
+    if legacy not in _ALLOWED_NOTIFIER_VALUES:
+        raise ConfigError(
+            f"{path}: [notifier] channel должен быть одним из "
+            f"{sorted(_ALLOWED_NOTIFIER_VALUES)}, получено {legacy!r}"
+        )
+    get_logger(__name__).warning(
+        "[notifier] channel=%r устарел: используйте channels=[%r].",
+        legacy,
+        legacy,
+    )
+    flat["notifier_channels"] = [legacy]
+
+
 def _parse(path: Path) -> dict[str, Any]:
     """Чтение одного TOML-файла в «плоские» ключи конфигурации."""
     try:
@@ -474,6 +569,9 @@ def _parse(path: Path) -> dict[str, Any]:
             raise ConfigError(f"{path}: секция [{section}] должна быть таблицей")
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
+            if section == "notifier" and isinstance(value, dict):
+                flat[_parse_notifier_subsection(key, value, path)] = value.get("events")
+                continue
             if key == "filter" and section == "strategies":
                 flat["triple_screen_params"] = _parse_triple_screen_section(value, path)
                 continue
@@ -484,6 +582,7 @@ def _parse(path: Path) -> dict[str, Any]:
                     f"допустимые: {', '.join(sorted(allowed_keys))}"
                 )
             flat[target] = value
+    _normalize_notifier_channels(flat, path)
     return _validate(flat, path)
 
 

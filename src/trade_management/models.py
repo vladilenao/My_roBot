@@ -1,11 +1,13 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Iterator, Mapping
 
 from src.trade_management.actions import TradeAction
+
+R_PRECISION = Decimal("0.01")
 
 
 def _freeze(value: object) -> object:
@@ -86,6 +88,28 @@ class TradePlan:
             raise ValueError("BUY stop must be below entry")
         if self.side == "SELL" and self.stop_price <= self.reference_entry:
             raise ValueError("SELL stop must be above entry")
+
+    @property
+    def risk_per_unit(self) -> Decimal:
+        """Distance from the reference entry to the protective stop."""
+        return abs(self.reference_entry - self.stop_price)
+
+    @property
+    def expected_r(self) -> Decimal:
+        """Expected result in risk units: target shares divided by the risk.
+
+        It is a property of the plan itself, so it is computed here rather than
+        by whatever layer happens to display the plan.
+        """
+        if not self.targets or self.risk_per_unit == 0:
+            return Decimal("0")
+        total = Decimal("0")
+        for target in self.targets:
+            move = target.price - self.reference_entry
+            if self.side == "SELL":
+                move = -move
+            total += target.share * (move / self.risk_per_unit)
+        return total.quantize(R_PRECISION, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)

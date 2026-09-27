@@ -1,8 +1,9 @@
-"""Преобразование исключений в пользовательские уведомления.
+"""Определение того, стоит ли уведомлять пользователя об ошибке.
 
 Технические дампы исключений пользователю не показываются: они остаются
-в журнале ``bot_debug.log`` (там работает ``log.exception``). Отсюда же
-берётся текст для Telegram-уведомления.
+в журнале ``bot_debug.log`` (там работает ``log.exception``). Текст уведомления
+собирает шаблон канала — здесь живёт только признак «пользователю это не
+показываем».
 
 Преходящие ошибки (исчерпание лимита запросов к API) не уведомляют
 пользователя отдельным сообщением — они учитываются счётчиком ошибок
@@ -11,25 +12,14 @@
 
 from __future__ import annotations
 
-_RATE_LIMIT_MARKERS = (
-    "RESOURCE_EXHAUSTED",
-    "resource_exhausted",
-)
+_RATE_LIMIT_MARKER = "resourceexhausted"
 
 
-def _is_rate_limit(exc: Exception) -> bool:
-    return any(marker in str(exc) for marker in _RATE_LIMIT_MARKERS)
+def is_rate_limit(exc: Exception) -> bool:
+    """Признак исчерпания лимита запросов к API.
 
-
-def user_error_message(exc: Exception, operation: str) -> str | None:
-    """Возвращает текст для пользователя или ``None``, если уведомлять не нужно.
-
-    ``operation`` — человекочитаемое название операции, например
-    «обновление данных SBER (15m)» или «анализ NG-9.26 (1h, flat_triangle)».
+    Текст ошибки сверяется без учёта регистра и подчёркиваний: в зависимости от
+    слоя приходит и ``RESOURCE_EXHAUSTED``, и ``ResourceExhausted``, и проигнорировать
+    один из них — значит засыпать пользователя уведомлениями о лимите.
     """
-    if _is_rate_limit(exc):
-        return None
-    return (
-        f"❗ Сбой: {operation}. Робот продолжает работу. "
-        "Подробности — в bot_debug.log рядом с роботом."
-    )
+    return _RATE_LIMIT_MARKER in str(exc).replace("_", "").casefold()

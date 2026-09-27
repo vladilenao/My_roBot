@@ -9,7 +9,9 @@
 
 Смежные документы: [profiles.md](profiles.md) — как профили выбирают уровни,
 стоп и цели; [storage-and-audit.md](storage-and-audit.md) — как устроено
-хранение, экспорт и аудит; [../database.md](../database.md) — схема БД.
+хранение, экспорт и аудит; [../database.md](../database.md) — схема БД;
+[../notification/events.md](../notification/events.md) — шина уведомлений: какие
+события о чём сообщают и кто их публикует.
 
 Живое состояние базы смотрится утилитой `tools/show_state.py` (раздел 5).
 

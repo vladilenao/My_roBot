@@ -262,6 +262,26 @@ class TestSelectFromList:
         result = _select_from_list(client, entries, "share")
         assert len(result) == 2
 
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", return_value="NGU6")
+    def test_manual_ticker_keeps_short_contract_name(self, mock_input, mock_find):
+        client = _mock_client()
+        entries = [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+        result = _select_from_list(client, entries, "future")
+
+        assert result == [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("builtins.input", return_value="SiZ6")
+    def test_manual_ticker_outside_list_keeps_plain_tuple(self, mock_input, mock_find):
+        client = _mock_client()
+        entries = [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+        result = _select_from_list(client, entries, "future")
+
+        assert result == [("SIZ6", "SIZ6", "future")]
+
     @patch("builtins.input", return_value="")
     def test_empty_input_returns_empty(self, mock_input):
         client = _mock_client()

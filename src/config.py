@@ -112,8 +112,10 @@ CATCH_UP_BARS = _CONFIG["tick_catch_up_bars"]
 DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
 DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 
-# Канал уведомлений: "telegram" | "console"
-NOTIFIER = _CONFIG["notifier"]
+# Каналы уведомлений в порядке конфигурации: "console" | "telegram"
+NOTIFIER_CHANNELS: tuple[str, ...] = tuple(_CONFIG["notifier_channels"])
+NOTIFIER_CONSOLE_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_console_events"])
+NOTIFIER_TELEGRAM_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_telegram_events"])
 
 def _checked_timeframe(value: str, where: str) -> str:
     """Таймфрейм привязки/тикера обязан быть ключом TIMEFRAMES (иначе ConfigError)."""
@@ -253,7 +255,8 @@ def trading_enabled() -> bool:
     """Признак активного торгового режима (наличие секции `[trading]` после слияния конфигов).
 
     В дефолтной сборке секция всегда есть → торговый режим активен. Отсутствие
-    всех ключей (старый robot.toml без дефолтов) оставляет `NotifyOnlyExecutionPort`.
+    всех ключей (старый robot.toml без дефолтов) оставляет робота в режиме
+    NotifyOnly: заявки не создаются, идут только уведомления.
     """
     return any(
         key in _CONFIG

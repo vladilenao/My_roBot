@@ -8,13 +8,19 @@ from uuid import uuid4
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
+from src.events.event import Event
 from src.logging_setup import correlation_id_var, get_logger
-from src.notifier.errors import user_error_message
+from src.notifier.errors import is_rate_limit
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
 
 log = get_logger(__name__)
+
+_DECISION_OUTCOMES = {
+    SignalType.BUY: "signal_buy",
+    SignalType.SELL: "signal_sell",
+}
 
 
 class _OperationError(Exception):
@@ -60,11 +66,10 @@ class TradingBot:
     def __init__(
         self,
         instruments,
-        notifier,
+        bus,
         strategy_map: dict[str, object],
         data_cache,
         timeline,
-        execution,
         strategy_factory=get_strategy,
         share_strategies: dict[str, list[Assignment]] | None = None,
         future_strategies: dict[str, list[Assignment]] | None = None,
@@ -73,17 +78,15 @@ class TradingBot:
         tick_timeout_secs: float = 65.0,
         context_cache=None,
         signal_filter=None,
-        risk_manager=None,
         post_tick=None,
         trade_manager=None,
         action_executor=None,
         protection_timeframe: str = "1m",
     ) -> None:
-        self._notifier = notifier
+        self._bus = bus
         self._strategy_map = strategy_map
         self._data_cache = data_cache
         self._timeline = timeline
-        self._execution = execution
         self._strategy_factory = strategy_factory
         self._share_strategies = share_strategies or {}
         self._future_strategies = future_strategies or {}
@@ -92,7 +95,6 @@ class TradingBot:
         self._tick_timeout_secs = tick_timeout_secs
         self._context_cache = context_cache
         self._signal_filter = signal_filter
-        self._risk_manager = risk_manager
         self._post_tick = post_tick
         self._trade_manager = trade_manager
         self._action_executor = action_executor
@@ -354,11 +356,10 @@ class TradingBot:
         )
         if admission.plan is not None:
             quantity = admission.actions[0].quantity if admission.actions else 0
-            self._execution.report_entry_accepted(
+            self._publish_signal(
                 admission.plan,
                 candidate.instrument,
                 quantity=quantity,
-                filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
             )
         self._dispatch_management_actions(
@@ -370,10 +371,10 @@ class TradingBot:
             candidate.timeframe,
         )
         for reason in admission.rejections:
-            self._execution.report_rejection(
+            self._publish_rejection(
                 candidate.decision,
                 candidate.instrument,
-                reason_message=reason.message,
+                reason=reason.message,
                 filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
             )
@@ -415,7 +416,11 @@ class TradingBot:
                 )
                 if candidate.signal_type is SignalType.HOLD:
                     continue
-            executor = self._action_executor or self._execution
+            executor = self._action_executor
+            if executor is None:
+                raise TypeError(
+                    "action executor is required: orders are delivered through the outbox"
+                )
             submit = getattr(executor, "submit", None)
             if submit is None:
                 raise TypeError("action executor must support submit(action, now)")
@@ -443,14 +448,92 @@ class TradingBot:
     # ── читаемое имя инструмента для логов (короткое «NG-10.26», не тикер и не label) ──
     @staticmethod
     def _display_name(instrument: Instrument) -> str:
-        return instrument.short_name or instrument.ticker
+        return instrument.short_name or "контракт не указан"
 
-    # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
+    # ── ПУНКТ 4.2.3-4.2.4: доставка через шину на каждом тике ──
     def _emit(self, instrument: Instrument, name: str, decision, *, filter_profile: str = "", filtered_out: bool = False, timeframe: str = "") -> None:
-        self._execution.execute(
-            decision, instrument,
-            filter_profile=filter_profile, filtered_out=filtered_out,
+        self._publish_decision(
+            decision,
+            instrument,
+            filter_profile=filter_profile,
+            filtered_out=filtered_out,
             timeframe=timeframe,
+        )
+
+    def _publish_decision(
+        self,
+        decision,
+        instrument: Instrument,
+        *,
+        filter_profile: str = "",
+        filtered_out: bool = False,
+        timeframe: str = "",
+    ) -> None:
+        """Publish the strategy outcome; the channel decides how it reads."""
+        if filtered_out:
+            outcome = "filtered"
+        else:
+            outcome = _DECISION_OUTCOMES.get(decision.signal_type, "no_signal")
+        self._bus.publish(
+            Event.decision(
+                self._display_name(instrument),
+                outcome=outcome,
+                side=decision.signal_type.name,
+                price=decision.price,
+                strategy=decision.strategy_name or "",
+                filter_profile=filter_profile,
+                filtered_out=filtered_out,
+                bar_time=decision.bar_time,
+                timeframe=timeframe,
+                event_id=decision.event_id or "",
+            )
+        )
+
+    def _publish_signal(
+        self,
+        plan,
+        instrument: Instrument,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+    ) -> None:
+        """Publish the admitted plan: it is queued, not yet executed."""
+        self._bus.publish(
+            Event.signal(
+                self._display_name(instrument),
+                side=plan.side,
+                quantity=quantity,
+                entry=plan.reference_entry,
+                stop=plan.stop_price,
+                targets=tuple(target.price for target in plan.targets),
+                expected_r=plan.expected_r,
+                strategy=plan.profile.name,
+                timeframe=timeframe or plan.timeframe,
+                trade_id=plan.trade_id,
+            )
+        )
+
+    def _publish_rejection(
+        self,
+        decision,
+        instrument: Instrument,
+        *,
+        reason: str,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        """Publish why the plan was not admitted."""
+        self._bus.publish(
+            Event.rejected(
+                self._display_name(instrument),
+                reason=reason,
+                side=decision.signal_type.name,
+                price=decision.price,
+                strategy=decision.strategy_name or "",
+                filter_profile=filter_profile,
+                bar_time=decision.bar_time,
+                timeframe=timeframe,
+            )
         )
 
     # ── диспетчеризация привязок по типу инструмента ──
@@ -519,24 +602,18 @@ class TradingBot:
         self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
-        message = (
-            f"💓 Сердцебиение: тиков работы — {self._tick_count}, "
-            f"ошибок за период — {self._errors_in_period}."
+        self._bus.publish(
+            Event.heartbeat(
+                tick_count=self._tick_count,
+                error_count=self._errors_in_period,
+            )
         )
-        try:
-            self._notifier.notify(message)
-        except Exception:
-            log.exception("Не удалось доставить сердцебиение.")
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
 
     def _report_error(self, exc: Exception, operation: str = "обработка тика") -> None:
         self._errors_in_period += 1
         log.exception("Ошибка тика (%s): %s", operation, exc)
-        message = user_error_message(exc, operation)
-        if message is None:
+        if is_rate_limit(exc):
             return
-        try:
-            self._notifier.notify(message)
-        except Exception:
-            log.exception("Не удалось уведомить об ошибке робота.")
+        self._bus.publish(Event.error(operation=operation))

@@ -111,6 +111,11 @@ def _validate_instruments(client, entries, inst_type, validation_pause_secs=0):
 
 
 def _select_from_list(client, entries, inst_type, validation_pause_secs=0):
+    """Выбрать инструменты из выведенного списка.
+
+    Тикер, введённый руками, сопоставляется с уже выкачанным списком: иначе в
+    уведомления уехал бы сырой биржевой тикер вместо короткого имени `NG-10.26`.
+    """
     if not entries:
         print("  Нет доступных инструментов.")
         return []
@@ -141,7 +146,14 @@ def _select_from_list(client, entries, inst_type, validation_pause_secs=0):
                 print(f"  ⚠ Номер {part} вне диапазона (1-{len(entries)})")
         else:
             ticker = part.upper()
-            selected_entries.append((ticker, ticker, inst_type))
+            known = next(
+                (
+                    item for item in entries
+                    if isinstance(item, tuple) and len(item) >= 3 and str(item[1]).upper() == ticker
+                ),
+                None,
+            )
+            selected_entries.append(known if known is not None else (ticker, ticker, inst_type))
 
     if not selected_entries:
         return []

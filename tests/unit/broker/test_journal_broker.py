@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.broker import JournalBroker
+from src.events.types import EventType
 from src.portfolio import ContractMeta, OrderStatus, PositionManager, Signal
 from src.trade_journal import OpType, TradeJournal
 
@@ -218,7 +219,7 @@ class TestOverRiskAndFifo:
         close = [e for e in rows if e.op == OpType.EXIT.value and e.side == "SELL"][0]
         assert close.reason == "over_risk"
         types = {e.type for e in broker.drain_events()}
-        assert "over_risk" in types
+        assert EventType.RISK_LIMIT_HIT in types
         assert any(r.status is OrderStatus.FILLED for r in results)
 
     def test_fifo_cancel_of_non_over_risk_order(self, tmp_path):
@@ -299,13 +300,50 @@ class TestDisplayNames:
         row = broker.journal.events()[0]
         assert row.contract == "NG-10.26" and row.op == OpType.ORDER.value
 
-    def test_messages_use_short_names(self, tmp_path):
+    def test_events_use_short_names(self, tmp_path):
         broker = self._broker_with_names(tmp_path)
         broker.place_order(_signal(), NG_META, NOW)
         broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": NG_META})
-        messages = " | ".join(e.message for e in broker.drain_events())
-        assert "NG-10.26" in messages
-        assert "NG " not in messages.replace("NG-10.26", "")
+        events = broker.drain_events()
+        assert [e.type for e in events] == [
+            EventType.ORDER_ACCEPTED,
+            EventType.TRADE_OPENED,
+            EventType.PROTECTION_ARMED,
+        ]
+        assert {e.instrument for e in events} == {"NG-10.26"}
+
+    def test_add_event_carries_structured_fields_and_short_name(self, tmp_path):
+        from src.broker import Order
+        from src.portfolio import Position
+
+        broker = self._broker_with_names(tmp_path)
+        broker._contracts["NG"] = NG_META
+        position = Position(
+            position_id="NG-123", ticker="NG", side="BUY", qty=4, avg_price=100.0,
+            stop_price=98.0, take_profit=None, ts_entry=NOW,
+        )
+        broker.manager.positions["NG-123"] = position
+
+        results = broker._execute_entry(
+            Order(
+                order_id=99, position_id="NG-123", ticker="NG", side="BUY", qty=2,
+                limit_price=101.0, stop_price=99.0, take_profit=None, timeframe="1h",
+                ts_order=NOW, deadline=NOW + timedelta(hours=1), contract="NG",
+                risk_pct=2.0, risk_rub=200.0, source="test",
+            ),
+            NOW,
+        )
+
+        added = [e for e in broker.drain_events() if e.type is EventType.POSITION_ADDED]
+
+        assert [r.status for r in results] == [OrderStatus.FILLED]
+        assert len(added) == 1
+        assert added[0].instrument == "NG-10.26"
+        assert added[0].payload["side"] == "BUY"
+        assert added[0].payload["quantity"] == 2
+        assert added[0].payload["price"] == 101.0
+        assert added[0].trade_id == "NG-123"
+        assert position.qty == 6
 
     def test_name_replacement_after_contract_missing(self, tmp_path):
         """A raw exchange ticker is never shown when no short name is known."""

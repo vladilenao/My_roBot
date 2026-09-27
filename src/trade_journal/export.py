@@ -532,7 +532,12 @@ ORDER BY positions.trade_id
             return "RAW"
 
     def _display_contract(self, ticker: str) -> str:
-        return self._names.get(ticker) or ticker
+        """Короткое имя контракта; без известного имени — «контракт не указан».
+
+        Сырой биржевой тикер пользователю не показывается нигде, включая журнал
+        и ``trade_summary.csv`` (правило именования в ``openspec/config.yaml``).
+        """
+        return self._names.get(ticker) or "контракт не указан"
 
     @staticmethod
     def _strategy_tf(trade_id: object) -> str:

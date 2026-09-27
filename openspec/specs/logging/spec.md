@@ -117,8 +117,6 @@ src
 ├── decision
 │    ├── filter               → src.decision.filter
 │    └── risk                 → src.decision.risk
-├── execution
-│    └── port                 → src.execution.port
 ├── notifier
 │    ├── console              → src.notifier.console
 │    └── telegram             → src.notifier.telegram
@@ -138,7 +136,6 @@ src
 | Рыночная структура | `src.market_structure` | `DEBUG` | Свинги, Фибо, гармоника |
 | Стратегии | `src.strategies` | `DEBUG` | Сигналы, индикаторы, решения |
 | Решения | `src.decision` | `DEBUG` | Фильтр, риск-менеджмент |
-| Исполнение | `src.execution` | `INFO` | Вызов порта (веха) |
 | Планировщик | `src.scheduler` | `WARNING` | Только задержки, таймауты |
 | Нотификатор | `src.notifier` | `WARNING` | Только ошибки доставки |
 
@@ -273,12 +270,6 @@ src
 |---|---|
 | **DEBUG** | SignalFilter: сигнал до/после фильтрации, направление тренда, заблокирован ли |
 | **DEBUG** | RiskManager: сигнал, цена, stop_loss (уровень + метка/fallback), take_profit (уровень + метка/fallback) |
-
-#### Модуль: `src/execution/port.py`
-
-| Уровень | Что логируется |
-|---|---|
-| **INFO** | Решение доставлено: тикер, тип сигнала, цена |
 
 ### Requirement: Конфигурация в robot.toml
 Секция `[logging]` файла `robot.toml` ДОЛЖНА содержать ключи: `service_uid` (строка, UUIDv4), `file` (строка, имя файла), `level` (строка, уровень DEBUG/WARNING/INFO), `max_bytes` (целое, байты), `backup_count` (целое, количество ротаций). При отсутствии секции используются вшитые дефолты.

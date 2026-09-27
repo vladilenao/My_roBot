@@ -24,6 +24,7 @@ from src.trade_management.audit import (
     CalculationTraceRepository,
     MeasuredValue,
     TraceLinks,
+    TraceOutcome,
     calculation_trace,
 )
 from src.trade_management.models import (
@@ -557,7 +558,23 @@ class TradeManager:
             )
         plan = replace(plan, timeframe=timeframe or "")
         quantity, risk_amount = self._size_open_quantity(plan, meta)
+        budget = self._budget_base()
         if quantity <= 0:
+            self._traces.record(calculation_trace(
+                "portfolio.position_sizing",
+                inputs={
+                    "risk_budget": MeasuredValue(
+                        budget * self._risk_limits.per_trade / Decimal("100"), "RUB"
+                    ),
+                    "candidate_quantity": MeasuredValue(quantity, "contracts"),
+                    "risk_amount": MeasuredValue(risk_amount, "RUB"),
+                },
+                result=MeasuredValue(quantity, "contracts"),
+                outcome=TraceOutcome.REJECTED,
+                reason="risk-limit-rejects-entry",
+                formula="no quantity satisfies risk, exposure, and margin limits",
+                links=TraceLinks(assignment_id=assignment.id, signal_id=plan.signal_id),
+            ))
             return SignalAdmission(
                 rejections=(rejection_reason("zero-quantity"),),
             )
@@ -580,7 +597,6 @@ class TradeManager:
             risk_amount=risk_amount,
             margin_amount=go * quantity,
         )
-        budget = self._budget_base()
         sizing_trace = calculation_trace(
             "portfolio.position_sizing",
             inputs={

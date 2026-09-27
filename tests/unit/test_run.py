@@ -4,7 +4,6 @@ import pandas as pd
 import pytest
 
 import run
-from src.execution import NotifyOnlyExecutionPort
 from src.instruments import Instrument
 from src.portfolio import ContractMeta
 
@@ -72,19 +71,18 @@ class TestLoadContractsMetadata:
 
 class TestRuntimeComposition:
     def test_notify_only_never_initializes_storage_or_broker(self):
-        notifier = MagicMock()
         with patch("run.trading_enabled", return_value=False), patch(
             "src.trade_journal.storage.Storage"
         ) as storage, patch("src.broker.create_addressable_journal_broker") as broker:
-            runtime = run._build_runtime([], notifier, MagicMock())
+            runtime = run._build_runtime([], MagicMock(), MagicMock())
 
-        assert isinstance(runtime.execution, NotifyOnlyExecutionPort)
         assert runtime.trade_manager is None
+        assert runtime.post_tick is None
+        assert not hasattr(runtime, "execution")
         storage.assert_not_called()
         broker.assert_not_called()
 
     def test_simulation_uses_sqlite_and_addressed_broker_without_legacy_adapter(self):
-        notifier = MagicMock()
         broker = MagicMock()
         broker.drain_events.return_value = []
         manager = MagicMock()
@@ -99,7 +97,7 @@ class TestRuntimeComposition:
         ) as manager_cls, patch("run._load_contracts_metadata", return_value={}), patch(
             "run.print_contract_metadata"
         ), patch("run._risk_limits") as limits:
-            runtime = run._build_runtime([], notifier, MagicMock())
+            runtime = run._build_runtime([], MagicMock(), MagicMock())
 
         storage_cls.assert_called_once_with(
             run.runtime_dir() / run.DATABASE_FILE,
@@ -128,11 +126,10 @@ class TestRuntimeComposition:
         manager.restore.assert_called_once_with()
         limits.assert_called_once_with()
         assert runtime.trade_manager is manager
-        assert runtime.risk_manager.__class__.__name__ == "PortfolioRiskManager"
-        assert isinstance(runtime.execution, NotifyOnlyExecutionPort)
+        assert not hasattr(runtime, "risk_manager")
+        assert not hasattr(runtime, "execution")
 
     def test_build_runtime_normalizes_selector_tuples_before_consumers(self):
-        notifier = MagicMock()
         broker = MagicMock()
         broker.drain_events.return_value = []
         broker.drain_addressed_events.return_value = []
@@ -150,7 +147,7 @@ class TestRuntimeComposition:
         ), patch("run._load_contracts_metadata", return_value={}), patch(
             "run.print_contract_metadata"
         ), patch("run._risk_limits"):
-            runtime = run._build_runtime([SELECTOR_NG], notifier, cache)
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock())
 
         storage.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
         broker.set_names.assert_called_once_with({"NGV6": "NG-10.26"})

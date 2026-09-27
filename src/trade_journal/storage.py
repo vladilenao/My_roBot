@@ -191,9 +191,14 @@ class Storage:
         The same mapping is persisted so that tools opening the database without
         a running bot can render short contract names.  The persisted map is not
         part of any projection, so saving it does not raise an export revision.
+
+        Persisted names win for contracts missing from ``names``, so a run that
+        selects a subset of instruments keeps short names for older trades
+        instead of falling back to "контракт не указан".
         """
+        merged = {**self.instrument_names(), **dict(names)}
         if self._exporter is not None:
-            self._exporter.set_names(names)
+            self._exporter.set_names(merged)
         self._save_instrument_names(names)
         self.export()
 

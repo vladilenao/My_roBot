@@ -15,7 +15,9 @@ def _defaults():
         "tick_timeout_secs": 65,
         "instrument_type": "future",
         "ticker": "NGU6",
-        "notifier": "console",
+        "notifier_channels": ["console"],
+        "notifier_console_events": ["decision"],
+        "notifier_telegram_events": ["signal"],
         "share_strategies": {"SBER": {"strategies": ["macd_rsi_stoch"], "timeframe": None}},
         "future_strategies": {
             "NG": {"strategies": ["macd_rsi_stoch"], "timeframe": None},
@@ -165,9 +167,96 @@ def test_unknown_section_raises_config_error(tmp_path):
         load_config(_defaults(), config_file=bad)
 
 
-def test_invalid_notifier_channel_raises_config_error(tmp_path):
+def test_invalid_legacy_notifier_channel_raises_config_error(tmp_path):
     bad = tmp_path / "robot.toml"
     bad.write_text("[notifier]\nchannel = \"sms\"\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_unknown_channel_in_channels_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text("[notifier]\nchannels = [\"sms\"]\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_empty_channels_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text("[notifier]\nchannels = []\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_duplicate_channel_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text("[notifier]\nchannels = [\"console\", \"console\"]\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_legacy_channel_becomes_single_element_channels(tmp_path):
+    legacy = tmp_path / "robot.toml"
+    legacy.write_text("[notifier]\nchannel = \"telegram\"\n", encoding="utf-8")
+
+    config = load_config(_defaults(), config_file=legacy)
+
+    assert config["notifier_channels"] == ["telegram"]
+    assert "notifier" not in config
+
+
+def test_legacy_channel_and_channels_together_raise_config_error(tmp_path):
+    both = tmp_path / "robot.toml"
+    both.write_text(
+        "[notifier]\nchannel = \"telegram\"\nchannels = [\"console\"]\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=both)
+
+
+def test_per_channel_events_are_parsed(tmp_path):
+    ok = tmp_path / "robot.toml"
+    ok.write_text(
+        "[notifier]\nchannels = [\"console\", \"telegram\"]\n\n"
+        "[notifier.console]\nevents = [\"decision\", \"signal\"]\n\n"
+        "[notifier.telegram]\nevents = [\"trade_closed\"]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(_defaults(), config_file=ok)
+
+    assert config["notifier_channels"] == ["console", "telegram"]
+    assert config["notifier_console_events"] == ["decision", "signal"]
+    assert config["notifier_telegram_events"] == ["trade_closed"]
+
+
+def test_unknown_event_type_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text(
+        "[notifier]\nchannels = [\"console\"]\n\n[notifier.console]\nevents = [\"nope\"]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_missing_events_key_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text("[notifier]\nchannels = [\"console\"]\n\n[notifier.console]\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_unknown_notifier_subsection_raises_config_error(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text("[notifier]\nchannels = [\"console\"]\n\n[notifier.sms]\nevents = [\"signal\"]\n", encoding="utf-8")
 
     with pytest.raises(ConfigError):
         load_config(_defaults(), config_file=bad)

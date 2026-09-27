@@ -28,7 +28,7 @@
 - **Исполнение адресное и отделено от решений.** Команды несут
   `trade_id`/`command_id`/`state_revision`; брокер исполняет строго указанную сделку.
   В торговом режиме под портом — свечной симулятор на базе 1m-баров; в безопасном
-  режиме — `NotifyOnlyExecutionPort` (только уведомления, без портфельных резервов).
+  режиме торговый контур не создаётся вовсе, остаются только уведомления.
 
 ## Модули и их ответственность
 
@@ -43,9 +43,10 @@
 | `trade_management` | `models.py`, `actions.py`, `manager.py`, `state.py`, `audit.py`, `profiles/`, `opposite_signals.py` | **Управление сделкой**: `TradePlan`/`TradeState`/`TargetPlan`, адресные команды, `TradeManager` (фазы, маршрутизация, допуск), чистые переходы фаз, `CalculationTrace`, четыре профиля (`levels_rr`, `atr_trend`, `ma_cloud`, `pattern_targets`). |
 | `decision` | `filter.py`, `filters/` | Пост-фильтр **входных** кандидатов (`raw`, `basic_levels`, `triple_screen`); выходы и сокращения фильтр не проходят. |
 | `portfolio` | `models.py`, `account.py`, `manager.py`, `risk.py` | Позиции/счёт/резервы и чистая математика портфельного риска: `PortfolioRiskManager` (лимиты сделки/инструмента/групп/портфеля, максимальный дополнительный объём, направленное SHORT-расстояние), `RiskLimits`, `RiskTrade`. |
-| `broker` | `port.py`, `journal_broker.py` | Контракт `BrokerPort`/`ExecutionEvent` и адресный свечной симулятор (`fill`/`partial`/`ack`/`reject`/`cancel`, защита, перенос стопов, идемпотентность). |
+| `broker` | `port.py`, `events.py`, `journal_broker.py` | Контракт `BrokerPort`/`ExecutionEvent`, структурный `BrokerEvent` для уведомлений и адресный свечной симулятор (`fill`/`partial`/`ack`/`reject`/`cancel`, защита, перенос стопов, идемпотентность). |
 | `trade_journal` | `schema.py`, `storage.py`, `reducer.py`, `export.py` | SQLite (`user_version`, FK, WAL, единый unit-of-work), транзакционный `ExecutionReducer` (позиции/счёт/резервы/цели/события), `CsvExporter` (атомарный экспорт двух CSV с `export_revision`) и `AuditExporter` (ротируемый `trade_audit.log`). |
-| `notifier` | `base.py`, `console.py`, `telegram.py` | Доставка уведомлений (консоль / Telegram), формат плана и событий, короткие имена контрактов. |
+| `events` | `types.py`, `event.py`, `bus.py`, `schema.py` | Шина событий: закрытый каталог из 19 типов, неизменяемое `Event`, синхронный раздающий `EventBus` (доставка «не более одного раза», ошибка подписчика изолируется), форма `payload` по типам. |
+| `notifier` | `channel.py`, `console.py`, `telegram.py`, `templates/`, `factory.py`, `errors.py` | Каналы доставки: порт `Channel` (`supported_types` + `handle`), консоль, Telegram с bounded-очередью и одним daemon-потоком, шаблоны текстов внутри каналов, фабрика по конфигурации, признак «ошибку не показываем пользователю». Подробности — в [docs/notification/events.md](docs/notification/events.md). |
 | `scheduler` | `timing.py` | `MultiTimeframeScheduler` — координатор сеток активных ТФ (тик = ближайшая граница любого ТФ); `CandleScheduler` — математика одной сетки. |
 | `config.py` | — | Параметры из `robot.toml` (внешнего или вшитого `default.toml`) и токены из `.env`. |
 | `config_loader.py` | — | Загрузка и валидация TOML: приоритет внешний `robot.toml` → вшитый `default.toml` → дефолты; явные связки (`id`/`management`/`priority`), четыре профиля, лимиты, `database_file`/`audit_file`; неизвестные ключи/несовместимости → `ConfigError` с файлом и ключом. |
@@ -77,10 +78,13 @@ run.py  (композиция зависимостей)
                      │
               ┌──────┼─────────────┐
               v      v             v
-      CsvExporter  AuditExporter  notifier (пользователю)
+      CsvExporter  AuditExporter
      journal.csv /  trade_audit.log
      positions.csv
-```
+
+События исполнения публикует брокер после подтверждённого исхода: только он знает
+PnL, баланс и идентификатор заявки. Журнал состояния уведомлений не публикует —
+иначе строка задвоилась бы.
 
 Ключевые точки порядка на тике: защита на 1m всегда раньше новых входов с медленных
 ТФ; сопровождение открытых сделок раньше оценки новых входных сигналов по той же

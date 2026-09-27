@@ -134,16 +134,6 @@ class ProtectiveOrder:
 
 
 @dataclass(frozen=True)
-class BrokerEvent:
-    """Событие исполнителя (заявка, сделка, отмена, снимок) для уведомлений."""
-
-    type: str
-    ts: datetime
-    position_id: str
-    message: str
-
-
-@dataclass(frozen=True)
 class OrderResult:
     """Результат операции исполнителя без привязки к движению рынка."""
 
@@ -158,7 +148,6 @@ class OrderResult:
     reason: str
     message: str
     ts_order: datetime
-    events: tuple[BrokerEvent, ...] = ()
 
 
 @dataclass(frozen=True)

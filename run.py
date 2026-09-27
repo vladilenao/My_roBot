@@ -48,11 +48,13 @@ from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
-from src.execution import NotifyOnlyExecutionPort
+from src.events.bus import EventBus
+from src.events.event import Event
+from src.events.types import EventType
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
-from src.notifier import get_notifier
+from src.notifier import build_channels, close_channels
 from src.scheduler.timing import MultiTimeframeScheduler
 
 log = get_logger(__name__)
@@ -70,7 +72,9 @@ def main():
     )
     log.info("Робот v%s запущен", __version__)
     instruments = select_instruments(validation_pause_secs=DATA_REFRESH_MIN_INTERVAL) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-    notifier = get_notifier()
+    channels = build_channels()
+    bus = EventBus()
+    bus.subscribe_all(channels)
     timeline = MultiTimeframeScheduler(
         timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS,
         catch_up_bars=CATCH_UP_BARS,
@@ -89,15 +93,20 @@ def main():
         provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
     )
 
-    runtime = _build_runtime(instruments, notifier, data_cache)
+    try:
+        runtime = _build_runtime(instruments, data_cache, bus)
+        _run_bot(instruments, bus, runtime, data_cache, timeline)
+    finally:
+        close_channels(channels)
 
+
+def _run_bot(instruments, bus, runtime, data_cache, timeline) -> None:
     TradingBot(
         instruments=instruments,
-        notifier=notifier,
+        bus=bus,
         strategy_map=_strategy_map(),
         data_cache=data_cache,
         timeline=timeline,
-        execution=runtime.execution,
         share_strategies=SHARE_STRATEGIES,
         future_strategies=FUTURE_STRATEGIES,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
@@ -109,7 +118,6 @@ def main():
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        risk_manager=runtime.risk_manager,
         post_tick=runtime.post_tick,
         trade_manager=runtime.trade_manager,
         action_executor=runtime.action_executor,
@@ -117,16 +125,13 @@ def main():
 
 
 class _Runtime:
-    def __init__(self, execution, post_tick=None, trade_manager=None, risk_manager=None,
-                 action_executor=None) -> None:
-        self.execution = execution
+    def __init__(self, post_tick=None, trade_manager=None, action_executor=None) -> None:
         self.post_tick = post_tick
         self.trade_manager = trade_manager
-        self.risk_manager = risk_manager
         self.action_executor = action_executor
 
 
-def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
+def _build_runtime(instruments, data_cache, bus) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
     Neither mode constructs an exchange adapter. The only broker selected here is
@@ -138,10 +143,9 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
     ]
     if not trading_enabled():
         log.info("Торговый режим выключен — NotifyOnly.")
-        return _Runtime(NotifyOnlyExecutionPort(notifier))
+        return _Runtime()
 
     from src.broker import create_addressable_journal_broker
-    from src.portfolio import PortfolioRiskManager
     from src.trade_journal.storage import Storage
     from src.trade_management.manager import TradeManager
 
@@ -164,7 +168,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         )
     except Exception as exc:
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
-        return _Runtime(NotifyOnlyExecutionPort(notifier))
+        return _Runtime()
 
     risk_limits = _risk_limits()
     trade_manager = TradeManager(
@@ -181,7 +185,6 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
     )
     trade_manager.restore()
     action_executor = _OutboxExecutor(trade_manager)
-    risk_manager = PortfolioRiskManager()
     contracts = _load_contracts_metadata(instruments)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
@@ -224,7 +227,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
             if prices:
                 broker.track_bar(max(bar_times), prices, contracts)
             for event in broker.drain_events():
-                notifier.notify_event(event.type, event.position_id, event.message)
+                bus.publish(_broker_event(event))
             for event in broker.drain_addressed_events():
                 try:
                     trade_manager.consume(event)
@@ -236,10 +239,8 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 
     return _Runtime(
-        NotifyOnlyExecutionPort(notifier),
         post_tick=on_bar,
         trade_manager=trade_manager,
-        risk_manager=risk_manager,
         action_executor=action_executor,
     )
 
@@ -258,6 +259,27 @@ class _OutboxExecutor:
             dispatch(now)
         except Exception as exc:
             log.warning("Сбой доставки команд исполнению: %s", exc)
+
+
+def _broker_event(event) -> Event:
+    """Publish one structured executor fact without a single word of wording.
+
+    Clearing is a portfolio-wide snapshot rather than a trade outcome, so it
+    carries neither a trade nor a contract name and has its own constructor.
+    """
+    if event.type is EventType.CLEARING_DONE:
+        return Event.clearing_done(
+            balance=event.payload.get("balance"),
+            positions=event.payload.get("positions", 0),
+            bar_time=event.ts,
+        )
+    return Event.broker_event(
+        event.type,
+        trade_id=event.trade_id,
+        instrument=event.instrument,
+        bar_time=event.ts,
+        **event.payload,
+    )
 
 
 def _risk_limits():
@@ -280,7 +302,12 @@ def _instrument_ticker(instrument) -> str | None:
 
 
 def _instrument_names(instruments) -> dict[str, str]:
-    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов."""
+    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов.
+
+    В карту попадают только настоящие короткие имена: тикер и полный label
+    пользователю не показываются, для неизвестного контракта остаётся
+    ``контракт не указан``.
+    """
     names: dict[str, str] = {}
     for instrument in instruments:
         ticker = _instrument_ticker(instrument)
@@ -289,8 +316,9 @@ def _instrument_names(instruments) -> dict[str, str]:
         if isinstance(instrument, (tuple, list)):
             short = instrument[3] if len(instrument) > 3 else None
         else:
-            short = getattr(instrument, "short_name", None) or getattr(instrument, "label", None)
-        names[ticker] = short or ticker
+            short = getattr(instrument, "short_name", None)
+        if short:
+            names[ticker] = short
     return names
 
 

@@ -14,7 +14,12 @@ class Instrument:
 
 
 def normalize_instrument(item) -> Instrument:
-    """2-кортеж (ticker, type) | 3-кортеж (label, ticker, type) | 4-кортеж (label, ticker, type, short_name)."""
+    """2-кортеж (ticker, type) | 3-кортеж (label, ticker, type) | 4-кортеж (label, ticker, type, short_name).
+
+    Без короткого имени инструмента ``short_name`` остаётся ``None``: тикер не
+    является коротким именем, и подставлять его в пользовательский текст запрещено
+    правилом именования (``openspec/config.yaml``).
+    """
     if len(item) == 4:
         label, ticker, instrument_type, short_name = item
     elif len(item) == 3:
@@ -34,5 +39,5 @@ def normalize_instrument(item) -> Instrument:
         label=label,
         ticker=ticker,
         instrument_type=instrument_type,
-        short_name=short_name or ticker,
+        short_name=short_name or None,
     )

@@ -1,3 +1,4 @@
+import inspect
 from unittest.mock import MagicMock, patch
 from dataclasses import replace
 from datetime import timedelta
@@ -9,7 +10,10 @@ import pandas as pd
 import pytest
 
 from src.bot import TradingBot
+from src.events import ALL_EVENT_TYPES, Event, EventBus, EventType
 from src.instruments import Instrument
+from src.notifier.channel import Channel
+from src.notifier.templates import render
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, MoveStop, ReduceTrade
 from src.trade_management.models import RejectionReason, SignalAdmission
@@ -97,34 +101,13 @@ class FakeCache:
         )
 
 
-class RecordingExecution:
-    def __init__(self):
-        self.decisions = []
-        self.calls = []
-        self.rejections = []
+def _of_type(channel, event_type):
+    """Events of one catalogue type as published to the bus."""
+    return [event for event in channel.events if event.type is event_type]
 
-    def execute(self, decision, instrument, *, filter_profile="", filtered_out=False, timeframe=""):
-        self.decisions.append((decision, instrument))
-        self.calls.append(
-            {
-                "filter_profile": filter_profile,
-                "filtered_out": filtered_out,
-                "timeframe": timeframe,
-            }
-        )
 
-    def report_rejection(
-        self, decision, instrument, *, reason_message="", filter_profile="", timeframe=""
-    ):
-        self.rejections.append(
-            {
-                "decision": decision,
-                "instrument": instrument,
-                "reason_message": reason_message,
-                "filter_profile": filter_profile,
-                "timeframe": timeframe,
-            }
-        )
+def _decisions(channel):
+    return _of_type(channel, EventType.DECISION)
 
 
 class PollingTimeline:
@@ -202,29 +185,39 @@ class NeverPublishCache(FakeCache):
         return False
 
 
-class RecordingNotifier:
-    def __init__(self):
-        self.messages = []
+class RecordingChannel(Channel):
+    """Подписчик шины, который запоминает события и их текст."""
 
-    def notify(self, message):
-        self.messages.append(message)
+    name = "recording"
+    supported_types = ALL_EVENT_TYPES
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[Event] = []
+        self.messages: list[str] = []
+        self.bus = EventBus()
+        self.bus.subscribe(self)
+
+    def handle(self, event: Event) -> None:
+        self.events.append(event)
+        text = render(event)
+        if text is not None:
+            self.messages.append(text)
 
 
-def _make_bot(timeline, cache, execution, notifier, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, risk_manager=None, strategy_map=None, trade_manager=None, action_executor=None):
+def _make_bot(timeline, cache, bus, strategy, share=None, future=None, factory=None, heartbeat=None, context_cache=None, signal_filter=None, strategy_map=None, trade_manager=None, action_executor=None):
     return TradingBot(
         instruments=[],  # replace below
-        notifier=notifier,
+        bus=bus,
         strategy_map=strategy_map or {"macd_rsi_stoch": object(), "flat_triangle": object()},
         data_cache=cache,
         timeline=timeline,
-        execution=execution,
         strategy_factory=factory or (lambda name, config: strategy),
         share_strategies=share or {},
         future_strategies=future or {},
         heartbeat_every_ticks=heartbeat,
         context_cache=context_cache,
         signal_filter=signal_filter,
-        risk_manager=risk_manager,
         trade_manager=trade_manager,
         action_executor=action_executor,
     )
@@ -248,8 +241,8 @@ class TestTradingBot:
             bot = _make_bot(
                 timeline=FakeTimeline(),
                 cache=FakeCache(frames={"AAA": _df(), "ZZZ": _df()}),
-                execution=RecordingExecution(),
-                notifier=RecordingNotifier(),
+
+                bus=RecordingChannel().bus,
                 strategy=_make_strategy(),
                 share=assignments,
                 trade_manager=trade_manager,
@@ -281,8 +274,8 @@ class TestTradingBot:
         signal_filter = MagicMock()
         action_executor = MagicMock()
         bot = _make_bot(
-            timeline=FakeTimeline(), cache=FakeCache(), execution=RecordingExecution(),
-            notifier=RecordingNotifier(), strategy=_make_strategy(), signal_filter=signal_filter,
+            timeline=FakeTimeline(), cache=FakeCache(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(), signal_filter=signal_filter,
         )
         bot._action_executor = action_executor
 
@@ -298,8 +291,8 @@ class TestTradingBot:
         signal_filter.apply.return_value = Decision(SignalType.BUY, 100.5)
         action_executor = MagicMock()
         bot = _make_bot(
-            timeline=FakeTimeline(), cache=FakeCache(), execution=RecordingExecution(),
-            notifier=RecordingNotifier(), strategy=_make_strategy(), signal_filter=signal_filter,
+            timeline=FakeTimeline(), cache=FakeCache(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(), signal_filter=signal_filter,
         )
         bot._action_executor = action_executor
 
@@ -315,12 +308,11 @@ class TestTradingBot:
         trade_manager = MagicMock()
         trade_manager.manage.return_value = ()
         trade_manager.actions_for_signal.return_value = SignalAdmission()
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=_make_strategy(decision=Decision(SignalType.HOLD, 100.5)),
             share={"SBER": _assign("macd_rsi_stoch")},
             trade_manager=trade_manager,
@@ -330,10 +322,10 @@ class TestTradingBot:
         bot.run()
 
         assert trade_manager.actions_for_signal.call_count == 1
-        assert len(execution.decisions) == 1
-        assert execution.calls[0]["timeframe"] == "1h"
-        assert execution.calls[0]["filter_profile"] == "basic_levels"
-        assert execution.rejections == []
+        assert len(_decisions(channel)) == 1
+        assert _decisions(channel)[0].timeframe == "1h"
+        assert _decisions(channel)[0].get("filter_profile") == "basic_levels"
+        assert _of_type(channel, EventType.REJECTED) == []
 
     def test_unadmitted_signal_reported_to_port(self):
         trade_manager = MagicMock()
@@ -341,12 +333,11 @@ class TestTradingBot:
         trade_manager.actions_for_signal.return_value = SignalAdmission(
             rejections=(RejectionReason(code="zero-quantity", message="Размер позиции ниже минимального"),),
         )
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=_make_strategy(decision=Decision(SignalType.BUY, 100.5)),
             share={"SBER": _assign("macd_rsi_stoch")},
             trade_manager=trade_manager,
@@ -355,9 +346,10 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.rejections) == 1
-        assert execution.rejections[0]["reason_message"] == "Размер позиции ниже минимального"
-        assert len(execution.decisions) == 1
+        rejections = _of_type(channel, EventType.REJECTED)
+        assert len(rejections) == 1
+        assert rejections[0].get("reason") == "Размер позиции ниже минимального"
+        assert len(_decisions(channel)) == 1
 
     def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
         signal_filter = MagicMock()
@@ -369,7 +361,7 @@ class TestTradingBot:
         )
         bot = _make_bot(
             timeline=FakeTimeline(), cache=FakeCache(frames={"SBER": _df()}),
-            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")}, context_cache=MagicMock(),
             signal_filter=signal_filter, trade_manager=trade_manager,
             action_executor=action_executor,
@@ -393,7 +385,7 @@ class TestTradingBot:
                 ("SBER", "1m"): _df(),
                 ("SBER", "1h"): _df(),
             }),
-            execution=RecordingExecution(), notifier=RecordingNotifier(),
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(decision=Decision(SignalType.HOLD, 100.5)),
             share={"SBER": _assign("macd_rsi_stoch")}, trade_manager=trade_manager,
         )
@@ -412,7 +404,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(timeframes=("1m",)),
             cache=FakeCache(frames={("SBER", "1m"): _df()}),
-            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(),
             share={}, trade_manager=trade_manager,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -434,7 +426,7 @@ class TestTradingBot:
                 ("SBER", "1m"): _df(),
                 ("SBER", "1h"): _df(),
             }),
-            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=strategy,
+            bus=RecordingChannel().bus, strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")}, trade_manager=trade_manager,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -448,7 +440,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(timeframes=("1m",)),
             cache=FakeCache(frames={("SBER", "1m"): pd.DataFrame()}),
-            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=_make_strategy(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(),
             share={}, trade_manager=trade_manager,
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -462,7 +454,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(timeframes=("1m",)),
             cache=FakeCache(frames={("SBER", "1m"): _df()}),
-            execution=RecordingExecution(), notifier=RecordingNotifier(), strategy=strategy,
+            bus=RecordingChannel().bus, strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", timeframe="1h")}, trade_manager=MagicMock(),
         )
         bot._instruments = [_inst("SBER", "SBER", "share")]
@@ -475,8 +467,8 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("no_such_strategy")},
         )
@@ -491,8 +483,8 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"EDU6": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(),
             future={"ED": _assign("harmonic_abcd")},
         )
@@ -505,32 +497,31 @@ class TestTradingBot:
 
     def test_future_uses_base_code(self):
         strategy = _make_strategy()
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"NGU6": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             future={"NG": _assign("macd_rsi_stoch")},
         )
-        bot._instruments = [_inst("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        bot._instruments = [
+            Instrument("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
+        ]
 
         bot.run()
 
-        assert len(execution.decisions) == 1
-        label = bot._instruments[0].label
-        assert execution.decisions[0][1].label == label
+        assert len(_decisions(channel)) == 1
+        assert _decisions(channel)[0].instrument == "NG-9.26"
         assert strategy.decide.call_args.kwargs["timeframe"] == "1h"
 
     def test_share_uses_exact_ticker(self):
         strategy = _make_strategy()
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -538,16 +529,15 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
 
     def test_delivers_signal_on_every_tick(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=2),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -555,7 +545,7 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 2
+        assert len(_decisions(channel)) == 2
 
     def test_delivers_on_signal_change(self):
         strategy = MagicMock()
@@ -564,12 +554,11 @@ class TestTradingBot:
             Decision(SignalType.HOLD, 100.5),
             Decision(SignalType.BUY, 100.5),
         ]
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=2),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -577,7 +566,7 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 2
+        assert len(_decisions(channel)) == 2
 
     def test_delivers_on_price_change_with_same_signal(self):
         strategy = MagicMock()
@@ -586,12 +575,11 @@ class TestTradingBot:
             Decision(SignalType.HOLD, 100.5),
             Decision(SignalType.HOLD, 101.0),
         ]
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=2),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -599,19 +587,18 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 2
+        assert len(_decisions(channel)) == 2
 
     def test_strategy_failure_does_not_block_next(self):
         failing = _make_strategy()
         failing.compute.side_effect = ValueError("boom")
         working = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         factory = MagicMock(side_effect=[failing, working])
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"MUZ6": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=failing,
             future={"MU": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=factory,
@@ -624,13 +611,12 @@ class TestTradingBot:
 
     def test_bound_strategy_in_map_is_built(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         factory = MagicMock(return_value=strategy)
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             strategy_map={
                 "macd_rsi_stoch": object(),
@@ -646,14 +632,15 @@ class TestTradingBot:
 
         assert any(call.args[0] == "harmonic_abcd" for call in factory.call_args_list)
         assert bot._strategy_cache[("harmonic_abcd", "1h")] is strategy
-        assert len(execution.decisions) == 3
+        assert len(_decisions(channel)) == 3
 
     def test_tick_error_notifies_trader(self):
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"SBER": _df()}, refresh_error=RuntimeError("boom")),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -661,14 +648,15 @@ class TestTradingBot:
 
         bot.run()
 
-        assert any("bot_debug.log" in m for m in bot._notifier.messages)
+        assert any("bot_debug.log" in m for m in channel.messages)
 
     def test_error_message_does_not_leak_technical_details(self):
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"SBER": _df()}, refresh_error=RuntimeError("boom")),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -676,18 +664,19 @@ class TestTradingBot:
 
         bot.run()
 
-        notified = [m for m in bot._notifier.messages if "Сбой" in m]
+        notified = [m for m in channel.messages if "Сбой" in m]
         assert len(notified) == 1
         assert "boom" not in notified[0]
         assert "обновление свечей таймфрейма 1h" in notified[0]
         assert "bot_debug.log" in notified[0]
 
     def test_rate_limit_error_is_not_notified(self):
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"SBER": _df()}, refresh_error=RuntimeError("RESOURCE_EXHAUSTED 8")),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -695,7 +684,7 @@ class TestTradingBot:
 
         bot.run()
 
-        assert not any("Сбой" in m for m in bot._notifier.messages)
+        assert not any("Сбой" in m for m in channel.messages)
         assert bot._errors_in_period == 1
 
     def test_loop_pause_after_rate_limit_respects_reset(self):
@@ -706,8 +695,8 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1, fallback=30),
             cache=FlakyReadyCache(),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -727,8 +716,8 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1, fallback=30),
             cache=FlakyReadyCache(),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -740,11 +729,12 @@ class TestTradingBot:
         assert mock_sleep.call_args[0][0] == 30  # не длиннее fallback (наименьший активный ТФ)
 
     def test_heartbeat_every_n_ticks(self):
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=5),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=2,
@@ -753,16 +743,17 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in bot._notifier.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
         assert len(heartbeats) == 2
         assert "тиков работы — 4" in heartbeats[-1]
 
     def test_heartbeat_not_on_every_tick_when_interval_large(self):
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=4),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=5,
@@ -771,10 +762,11 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in bot._notifier.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
         assert heartbeats == []
 
     def test_heartbeat_includes_error_count_and_resets(self):
+        channel = RecordingChannel()
         class FailOnceCache:
             def __init__(self):
                 self.calls = 0
@@ -793,8 +785,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(ticks=2),
             cache=FailOnceCache(),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=1,
@@ -803,7 +794,7 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in bot._notifier.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
         # ошибка не роняет тик: tick 1 выполнился со счётчиком ошибок, tick 2 — сброс
         assert len(heartbeats) == 2
         assert "ошибок за период — 1" in heartbeats[0]
@@ -811,13 +802,12 @@ class TestTradingBot:
 
     def test_tick_held_until_fresh_bar_published(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         cache = LateBarCache(publish_after=3, frames={"SBER": _df()})
         bot = _make_bot(
             timeline=PollingTimeline(ticks=1),
             cache=cache,
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -826,17 +816,16 @@ class TestTradingBot:
         bot.run()
 
         assert cache.checks >= 3
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
 
     def test_timeout_without_fresh_bar_skips_processing(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         cache = NeverPublishCache(frames={"SBER": _df()})
         bot = _make_bot(
             timeline=TimeoutTimeline(ticks=1),
             cache=cache,
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -844,18 +833,17 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 0
+        assert len(_decisions(channel)) == 0
         assert strategy.compute.called is False
 
     def test_bootstrap_first_tick_runs_immediately_mid_period(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         timeline = FakeTimeline(ticks=1)
         bot = _make_bot(
             timeline=timeline,
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -863,18 +851,17 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
         assert timeline.wait_boundaries == [False, True]
 
     def test_bootstrap_mid_period_does_not_force_refresh(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         cache = FakeCache(frames={"SBER": _df()})
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=cache,
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -882,17 +869,16 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
         assert not any(cache.refresh_forces)
 
     def test_decision_bar_time_is_candle_close(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -900,17 +886,15 @@ class TestTradingBot:
 
         bot.run()
 
-        decision = execution.decisions[0][0]
-        assert decision.bar_time == pd.Timestamp("2024-01-01 10:00")
+        assert _decisions(channel)[0].bar_time == pd.Timestamp("2024-01-01 10:00")
 
     def test_decision_event_id_is_canonical_with_msk_bar_time(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -918,22 +902,20 @@ class TestTradingBot:
 
         bot.run()
 
-        decision = execution.decisions[0][0]
-        assert decision.event_id == (
+        assert _decisions(channel)[0].get("event_id") == (
             "test-basic_levels-1h-0-macd_rsi_stoch:SBER:1h:"
             "2024-01-01T13:00:00:BUY"
         )
 
     def test_bootstrap_waits_for_fresh_bar_on_boundary_launch(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         cache = LateBarCache(publish_after=3, frames={"SBER": _df()})
         timeline = PollingTimeline(ticks=1)
         bot = _make_bot(
             timeline=timeline,
             cache=cache,
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -942,10 +924,11 @@ class TestTradingBot:
         bot.run()
 
         assert cache.checks >= 3
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
         assert timeline.wait_boundaries == [False, True]
 
     def test_bootstrap_retries_after_error_then_aligns_to_boundary(self):
+        channel = RecordingChannel()
         class FailOnceRefresh:
             def __init__(self):
                 self.calls = 0
@@ -964,13 +947,12 @@ class TestTradingBot:
                 return _df()
 
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         timeline = FakeTimeline(ticks=3)
         bot = _make_bot(
             timeline=timeline,
             cache=FailOnceRefresh(),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
         )
@@ -978,11 +960,12 @@ class TestTradingBot:
 
         bot.run()
 
-        assert len(execution.decisions) == 2
-        assert any("bot_debug.log" in m for m in bot._notifier.messages)
+        assert len(_decisions(channel)) == 2
+        assert any("bot_debug.log" in m for m in channel.messages)
         assert timeline.wait_boundaries == [False, False, True, True]
 
     def test_empty_tick_skips_process_and_heartbeat(self):
+        channel = RecordingChannel()
         class FlagCache(FakeCache):
             def __init__(self, frames=None):
                 super().__init__(frames=frames)
@@ -992,13 +975,12 @@ class TestTradingBot:
                 return self.flag
 
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         cache = FlagCache(frames={"SBER": _df()})
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=cache,
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
             heartbeat=1,
@@ -1007,22 +989,21 @@ class TestTradingBot:
 
         cache.flag = False
         bot._tick(set())  # пустой тик: ни у одного ТФ свеча не закрылась
-        assert len(execution.decisions) == 0
-        assert not any("Сердцебиение" in m for m in bot._notifier.messages)
+        assert len(_decisions(channel)) == 0
+        assert not any("Сердцебиение" in m for m in channel.messages)
 
         cache.flag = True
         bot._tick({"1h"})
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
 
     def test_market_context_computed_once_per_instrument(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         context_cache = MagicMock()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=lambda name, config: strategy,
@@ -1036,13 +1017,12 @@ class TestTradingBot:
 
     def test_strategies_built_once_not_per_tick(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         factory = MagicMock(return_value=strategy)
         bot = _make_bot(
             timeline=FakeTimeline(ticks=3),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
             factory=factory,
@@ -1053,20 +1033,19 @@ class TestTradingBot:
 
         # фабрика вызывается только при построении кэша (по разу на пару имя×ТФ), не на каждый тик
         assert factory.call_count == len(bot._strategy_cache)
-        assert len(execution.decisions) == 3
+        assert len(_decisions(channel)) == 3
 
     def test_fatal_runtime_error_in_strategy_reports_globally(self):
         failing = _make_strategy()
         failing.compute.side_effect = RuntimeError("boom")
         working = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         factory = MagicMock(side_effect=[failing, working])
-        notifier = RecordingNotifier()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(ticks=1),
             cache=FakeCache(frames={"MUZ6": _df()}),
-            execution=execution,
-            notifier=notifier,
+            bus=channel.bus,
             strategy=failing,
             future={"MU": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=factory,
@@ -1076,46 +1055,22 @@ class TestTradingBot:
         bot.run()
 
         # фатальная ошибка не скрывается локально — всплывает и обрабатывается как ошибка робота
-        assert any("bot_debug.log" in m for m in notifier.messages)
+        assert any("bot_debug.log" in m for m in channel.messages)
         # в тексте уведомления названы инструмент, таймфрейм и стратегия
-        assert any("анализ" in m and "macd_rsi_stoch" in m for m in notifier.messages)
+        assert any("анализ" in m and "macd_rsi_stoch" in m for m in channel.messages)
         # _analyze прерван на первой стратегии — вторая в том же тике не выполнилась
         assert working.compute.called is False
 
-    def test_legacy_risk_manager_is_not_applied_to_entry_events(self):
-        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
-        risk = MagicMock()
-        risk.apply.side_effect = RuntimeError("risk boom")
-        notifier = RecordingNotifier()
-        context_cache = MagicMock()
-        context_cache.get_context.return_value = object()
-        bot = _make_bot(
-            timeline=FakeTimeline(ticks=1),
-            cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=notifier,
-            strategy=strategy,
-            share={"SBER": _assign("macd_rsi_stoch")},
-            context_cache=context_cache,
-            risk_manager=risk,
-        )
-        bot._instruments = [_inst("SBER", "SBER", "share")]
-
-        bot.run()
-
-        risk.apply.assert_not_called()
-        assert not notifier.messages
-        assert len(execution.decisions) == 1
+    def test_trading_bot_takes_no_portfolio_risk_manager(self):
+        assert "risk_manager" not in inspect.signature(TradingBot.__init__).parameters
 
     def test_duplicate_strategy_with_distinct_profiles_runs_both(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", profile="raw") + _assign("macd_rsi_stoch")},
         )
@@ -1124,16 +1079,16 @@ class TestTradingBot:
         bot.run()
 
         # обе привязки обрабатываются как независимые задачи с общим инстансом
-        assert len(execution.decisions) == 2
-        assert [c["filter_profile"] for c in execution.calls] == ["raw", "basic_levels"]
+        assert len(_decisions(channel)) == 2
+        assert [event.get("filter_profile") for event in _decisions(channel)] == ["raw", "basic_levels"]
         assert strategy.decide.call_count == 2
 
     def test_unknown_filter_profile_fails_fast(self):
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=_make_strategy(),
             share={"SBER": _assign("macd_rsi_stoch", profile="no_such_profile")},
         )
@@ -1146,7 +1101,7 @@ class TestTradingBot:
 
     def test_filtered_out_detected_and_passed_to_port(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         signal_filter = MagicMock()
         signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels", instrument="", timeframe="": replace(
             decision, signal_type=SignalType.HOLD
@@ -1156,8 +1111,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch")},
             context_cache=context_cache,
@@ -1171,12 +1125,12 @@ class TestTradingBot:
         assert signal_filter.apply.call_args.kwargs["profile_name"] == "basic_levels"
         assert signal_filter.apply.call_args.kwargs["instrument"] is bot._instruments[0]
         assert signal_filter.apply.call_args.kwargs["timeframe"] == "1h"
-        assert execution.calls[0]["filtered_out"] is True
-        assert execution.calls[0]["filter_profile"] == "basic_levels"
+        assert _decisions(channel)[0].get("filtered_out") is True
+        assert _decisions(channel)[0].get("filter_profile") == "basic_levels"
 
     def test_passing_signal_is_not_marked_filtered_out(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         signal_filter = MagicMock()
         signal_filter.apply.side_effect = lambda decision, ctx, profile_name="basic_levels", instrument="", timeframe="": decision
         context_cache = MagicMock()
@@ -1184,8 +1138,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", profile="raw")},
             context_cache=context_cache,
@@ -1196,12 +1149,12 @@ class TestTradingBot:
         bot.run()
 
         assert signal_filter.apply.call_args.kwargs["profile_name"] == "raw"
-        assert execution.calls[0]["filtered_out"] is False
-        assert execution.calls[0]["filter_profile"] == "raw"
+        assert _decisions(channel)[0].get("filtered_out") is False
+        assert _decisions(channel)[0].get("filter_profile") == "raw"
 
     def test_only_crossed_timeframe_is_processed(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
 
         class Ready15mTimeline(FakeTimeline):
             def wait_until_bar_published(self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True):
@@ -1214,8 +1167,7 @@ class TestTradingBot:
         bot = _make_bot(
             timeline=Ready15mTimeline(timeframes=("15m", "1h")),
             cache=FakeCache(frames={("SBER", "15m"): _df(), ("SBER", "1h"): _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", timeframe="15m") + _assign("flat_triangle", timeframe="1h")},
         )
@@ -1224,20 +1176,19 @@ class TestTradingBot:
         bot.run()
 
         # обработана только 15m-привязка, с её ТФ в decide и в порте
-        assert len(execution.decisions) == 1
+        assert len(_decisions(channel)) == 1
         assert strategy.decide.call_args.kwargs["timeframe"] == "15m"
-        assert execution.calls[0]["timeframe"] == "15m"
+        assert _decisions(channel)[0].timeframe == "15m"
 
     def test_duplicate_strategy_on_different_timeframes_gets_separate_instances(self):
         inst_15m = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         inst_1h = _make_strategy(decision=Decision(SignalType.HOLD, 100.5))
-        execution = RecordingExecution()
+        channel = RecordingChannel()
         factory = MagicMock(side_effect=[inst_15m, inst_1h])
         bot = _make_bot(
             timeline=FakeTimeline(timeframes=("15m", "1h")),
             cache=FakeCache(frames={("SBER", "15m"): _df(), ("SBER", "1h"): _df()}),
-            execution=execution,
-            notifier=RecordingNotifier(),
+            bus=channel.bus,
             strategy=inst_15m,
             factory=factory,
             share={"SBER": _assign("macd_rsi_stoch", timeframe="15m") + _assign("macd_rsi_stoch", timeframe="1h")},
@@ -1252,7 +1203,7 @@ class TestTradingBot:
         assert bot._strategy_cache[("macd_rsi_stoch", "1h")] is inst_1h
         assert inst_15m.decide.call_args.kwargs["timeframe"] == "15m"
         assert inst_1h.decide.call_args.kwargs["timeframe"] == "1h"
-        assert len(execution.decisions) == 2
+        assert len(_decisions(channel)) == 2
 
 
 def _ta_frame():
@@ -1279,8 +1230,8 @@ class TestAnalysisLogging:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"NGV6": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=strategy,
             share=share,
             future=future or {"NG": _assign("macd_rsi_stoch")},
@@ -1338,8 +1289,8 @@ class TestAnalysisLogging:
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"NGV6": _df()}),
-            execution=RecordingExecution(),
-            notifier=RecordingNotifier(),
+
+            bus=RecordingChannel().bus,
             strategy=strategy,
             future={"NG": _assign("macd_rsi_stoch")},
             context_cache=context_cache,

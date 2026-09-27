@@ -7,10 +7,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Optional
 
+from src.broker.events import BrokerEvent
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.events.types import EventType
 from src.logging_setup import get_logger
 from src.portfolio import (
-    BrokerEvent,
     ContractMeta,
     OrderResult,
     OrderStatus,
@@ -41,6 +42,8 @@ from src.trade_management.models import TradePlan
 
 UTC = timezone.utc
 _MSK = timezone(timedelta(hours=3))
+
+_CLOSE_REASONS = ("protective", "over_risk", "signal", "reverse")
 
 log = get_logger(__name__)
 
@@ -470,11 +473,15 @@ class JournalBroker(BrokerPort):
         self._orders[order_id] = order
         self.manager.register_order(self._pending(order))
         display = self._display(ticker)
-        self._emit(
-            "order",
+        self._publish_event(
+            EventType.ORDER_ACCEPTED,
             now,
-            signal.position_id,
-            f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} принята (id={order_id})",
+            trade_id=signal.position_id,
+            instrument=display,
+            side=signal.side,
+            quantity=signal.qty,
+            price=signal.entry_price,
+            order_id=order_id,
         )
         return OrderResult(
             order_id=order_id,
@@ -498,7 +505,13 @@ class JournalBroker(BrokerPort):
         self._write_terminal(order, reason, now := datetime.now(UTC).replace(microsecond=0))
         self._orders.pop(order_id, None)
         self.manager.drop_order(order_id)
-        self._emit("cancel", now, order.position_id, f"Заявка {order_id} отменена ({reason})")
+        self._publish_event(
+            EventType.TRADE_CANCELLED,
+            now,
+            trade_id=order.position_id,
+            order_id=order_id,
+            reason=reason,
+        )
         return OrderResult(
             order_id=order_id,
             status=OrderStatus.CANCELLED,
@@ -669,11 +682,13 @@ class JournalBroker(BrokerPort):
                     trade, now, filled, Decimal(str(target.price)), kind="tp", target_id=target.target_id
                 )
                 self._addressed_events.append(event)
-                self._emit(
-                    "fill",
+                self._publish_event(
+                    EventType.TARGET_HIT,
                     now,
-                    trade.plan.trade_id,
-                    f"Цель {filled} {self._display(trade.plan.instrument_id)} по {target.price}",
+                    trade_id=trade.plan.trade_id,
+                    instrument=self._display(trade.plan.instrument_id),
+                    quantity=filled,
+                    price=target.price,
                 )
                 if position.qty == 0:
                     self.manager.positions.pop(trade.plan.trade_id, None)
@@ -698,11 +713,13 @@ class JournalBroker(BrokerPort):
         trade.revision += 1
         event = self._pv_fill(trade, now, quantity, price, kind="stop")
         self._addressed_events.append(event)
-        self._emit(
-            "fill",
+        self._publish_event(
+            EventType.STOP_HIT,
             now,
-            trade.plan.trade_id,
-            f"Защитный стоп {quantity} {self._display(trade.plan.instrument_id)} по {price}",
+            trade_id=trade.plan.trade_id,
+            instrument=self._display(trade.plan.instrument_id),
+            quantity=quantity,
+            price=price,
         )
         return True
 
@@ -735,11 +752,11 @@ class JournalBroker(BrokerPort):
             max_risk_pct=self.manager.max_risk_pct,
         )
         self.manager.account.clear()
-        self._emit(
-            "clear",
+        self._publish_event(
+            EventType.CLEARING_DONE,
             now,
-            "",
-            f"Клиринг: снимок баланса {self.manager.account.balance:g} руб, открыто позиций: {len(open_positions)}",
+            balance=self.manager.account.balance,
+            positions=len(open_positions),
         )
         return results
 
@@ -805,7 +822,16 @@ class JournalBroker(BrokerPort):
             notes=_notes(signal.timeframe, source=signal.source),
         )
         self.journal.append(event)
-        self._emit("order", now, signal.position_id, f"Сделка {signal.side} {display} отклонена ({reason})")
+        self._publish_event(
+            EventType.ORDER_REJECTED,
+            now,
+            trade_id=signal.position_id,
+            instrument=display,
+            side=signal.side,
+            quantity=signal.qty or 0,
+            price=signal.entry_price,
+            reason=reason,
+        )
         return OrderResult(
             order_id=event.id,
             status=OrderStatus.CANCELLED,
@@ -905,7 +931,13 @@ class JournalBroker(BrokerPort):
         self._write_terminal(order, "ttl", now)
         self._orders.pop(order_id, None)
         self.manager.drop_order(order_id)
-        self._emit("cancel", now, order.position_id, f"Заявка {order_id} истекла по TTL")
+        self._publish_event(
+            EventType.TRADE_CANCELLED,
+            now,
+            trade_id=order.position_id,
+            order_id=order_id,
+            reason="ttl",
+        )
         return OrderResult(
             order_id=order_id,
             status=OrderStatus.EXPIRED,
@@ -956,16 +988,44 @@ class JournalBroker(BrokerPort):
         )
         self.journal.append(event)
         if is_add:
-            self._emit("add", now, order.position_id, f"Добор {order.side} {order.qty} {self._display(order.ticker)} по {order.limit_price}")
+            self._publish_event(
+                EventType.POSITION_ADDED,
+                now,
+                trade_id=order.position_id,
+                instrument=self._display(order.ticker),
+                side=order.side,
+                quantity=order.qty,
+                price=order.limit_price,
+            )
         self._orders.pop(order.order_id, None)
         self.manager.drop_order(order.order_id)
         display = self._display(order.ticker)
         if not is_add:
-            self._emit("fill", now, order.position_id, f"Вход {order.side} {order.qty} {display} по {order.limit_price}")
+            self._publish_event(
+                EventType.TRADE_OPENED,
+                now,
+                trade_id=order.position_id,
+                instrument=display,
+                side=order.side,
+                quantity=order.qty,
+                price=order.limit_price,
+            )
         if pos.protective is not None:
-            self._emit("protective", now, order.position_id, f"Защитный стоп {order.stop_price} / ТП {order.take_profit} установлен")
+            self._publish_event(
+                EventType.PROTECTION_ARMED,
+                now,
+                trade_id=order.position_id,
+                instrument=display,
+                stop=order.stop_price,
+                take_profit=order.take_profit,
+            )
         if over_risk:
-            self._emit("over_risk", now, order.position_id, "Лимит перекоса достигнут — позиция закрывается контр-сделкой")
+            self._publish_event(
+                EventType.RISK_LIMIT_HIT,
+                now,
+                trade_id=order.position_id,
+                instrument=display,
+            )
 
         result = OrderResult(
             order_id=order.order_id,
@@ -1019,14 +1079,16 @@ class JournalBroker(BrokerPort):
         )
         self.journal.append(event)
         display = self._display(pos.ticker)
-        self._emit("fill", now, pos.position_id, f"Закрытие {closed_qty} {display} по {exit_price} (PnL {pnl:g})")
-        if reason in ("protective", "over_risk", "signal", "reverse"):
-            self._emit(
-                reason,
-                now,
-                pos.position_id,
-                f"Закрытие позиции {display} {closed_qty} шт: PnL {pnl:g} руб",
-            )
+        self._publish_event(
+            EventType.TRADE_CLOSED,
+            now,
+            trade_id=pos.position_id,
+            instrument=display,
+            quantity=closed_qty,
+            price=exit_price,
+            pnl=pnl,
+            reason=reason if reason in _CLOSE_REASONS else None,
+        )
         side = pos.side
         pos.reduce(closed_qty)
         if pos.qty == 0:
@@ -1093,8 +1155,30 @@ class JournalBroker(BrokerPort):
             ttl=_ttl_for(order.timeframe),
         )
 
-    def _emit(self, etype: str, now: datetime, position_id: str, message: str) -> None:
-        self._events.append(BrokerEvent(type=etype, ts=now, position_id=position_id, message=message))
+    def _publish_event(
+        self,
+        event_type: EventType,
+        now: datetime,
+        *,
+        trade_id: str = "",
+        instrument: str = "",
+        **payload,
+    ) -> None:
+        """Publish a structured executor fact; wording belongs to the channel template.
+
+        The call site picks the catalogue type because only it knows whether the
+        fill opened a trade, hit a target, hit a stop or closed a position.
+        """
+        self._events.append(
+            BrokerEvent(
+                type=event_type,
+                ts=now,
+                trade_id=trade_id,
+                instrument=instrument,
+                payload=payload,
+            )
+        )
+
 
     def _noop_result(self, message: str) -> OrderResult:
         now = datetime.now(UTC).replace(microsecond=0)
