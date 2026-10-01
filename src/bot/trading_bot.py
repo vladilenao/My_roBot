@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from uuid import uuid4
 
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
+from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
 from src.events.event import Event
 from src.logging_setup import correlation_id_var, get_logger
 from src.notifier.errors import is_rate_limit
+from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
@@ -82,11 +84,13 @@ class TradingBot:
         trade_manager=None,
         action_executor=None,
         protection_timeframe: str = "1m",
+        run=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
         self._data_cache = data_cache
         self._timeline = timeline
+        self._run = run if run is not None else LiveRunSession()
         self._strategy_factory = strategy_factory
         self._share_strategies = share_strategies or {}
         self._future_strategies = future_strategies or {}
@@ -117,7 +121,7 @@ class TradingBot:
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча активного ТФ» ──
     def _loop(self) -> None:
         first = True
-        while True:
+        while not self._run.should_stop():
             try:
                 if first:
                     ready_tfs = self._bootstrap()
@@ -141,6 +145,7 @@ class TradingBot:
                     time.sleep(delay)
                 else:
                     time.sleep(self._timeline.fallback_secs())
+        log.info("Прогон завершён: %s", self._run.stop_reason())
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
@@ -176,6 +181,9 @@ class TradingBot:
                     self._data_cache.refresh_if_new_candle(tf)
                 except Exception as exc:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
+            self._data_cache.close_tick()
+            if getattr(self._data_cache, "data_exhausted", False):
+                self._run.mark_data_exhausted()
             if not ready_tfs:
                 return
             # Protection is simulated from closed base bars before any strategy
@@ -424,7 +432,7 @@ class TradingBot:
             submit = getattr(executor, "submit", None)
             if submit is None:
                 raise TypeError("action executor must support submit(action, now)")
-            submit(action, datetime.now(timezone.utc).replace(microsecond=0))
+            submit(action, as_aware(self._timeline.now()).replace(microsecond=0))
 
     # ── компактная сводка индикаторов по итоговому бару (для отладки) ──
     @staticmethod

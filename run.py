@@ -5,7 +5,10 @@ from src.market_context import (
 )
 
 from src import __version__
+from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+import sys
 
 from src.decision import SignalFilter
 from src.bot import TradingBot
@@ -42,7 +45,22 @@ from src.config import (
     CONTRACT_EXPIRY_BLOCK_DAYS,
     trading_enabled,
     runtime_dir,
+    run_dir_name,
+    HIST_DIR,
 )
+from src.api.emulator_client import EmulatorClientProvider
+from src.bot.run_session import build_run_session
+from src.data.timeutil import to_aware_utc, to_naive
+from src.history.preflight import active_pairs, run_preflight, smallest_period
+from src.history.report import (
+    REPORT_TXT,
+    RunMetrics,
+    collect_result,
+    completion_line,
+    crash_line,
+    write_report,
+)
+from src.scheduler.clock import HistoricalClock
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
@@ -59,9 +77,213 @@ from src.scheduler.timing import MultiTimeframeScheduler
 
 log = get_logger(__name__)
 
+MODE_LIVE = "live"
+MODE_HISTORY = "history"
+HISTORY_DEFAULT_PAUSE = 1.0
+MOMENT_FORMAT = "%Y-%m-%d %H:%M"
 
-def main():
-    state_dir = runtime_dir()
+
+class RunConfigurationError(Exception):
+    """Прогон не запускается: ответы оператора не задают рабочий диапазон."""
+
+
+def ask_mode(no_prompt: bool = False) -> str:
+    """Режим прогона. ``--no-prompt`` — боевая торговля без единого вопроса."""
+    if no_prompt:
+        return MODE_LIVE
+    print("=== Режим работы ===")
+    print("  1. Боевая торговля (реальный брокер, текущее время)")
+    print("  2. Историческая торговля (локальный эмулятор данных, заданный диапазон)")
+    while True:
+        answer = input("Выбор режима (1/2): ").strip()
+        if answer == "1":
+            return MODE_LIVE
+        if answer == "2":
+            return MODE_HISTORY
+        print("Нужен ответ 1 или 2.")
+
+
+def ask_history_range() -> tuple[datetime, datetime, float]:
+    """Границы исторического прогона и пауза между тиками в секундах."""
+    start = _ask_moment("Начало диапазона")
+    end = _ask_moment("Конец диапазона (не входит в прогон)")
+    pause = _ask_pause()
+    return validate_range(start, end, pause)
+
+
+def _ask_moment(prompt: str) -> datetime:
+    while True:
+        raw = input(f"{prompt} (ГГГГ-ММ-ДД ЧЧ:ММ): ").strip()
+        try:
+            return parse_moment(raw)
+        except ValueError as exc:
+            print(str(exc))
+
+
+def _ask_pause() -> float:
+    while True:
+        raw = input(f"Пауза между тиками, с (Enter — {HISTORY_DEFAULT_PAUSE:g}): ").strip()
+        if not raw:
+            return HISTORY_DEFAULT_PAUSE
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Пауза должна быть числом секунд.")
+            continue
+        if value < 0:
+            print("Пауза не может быть отрицательной.")
+            continue
+        return value
+
+
+def parse_moment(raw: str) -> datetime:
+    """Момент из строки оператора: без зоны — UTC, с зоной — приводим к UTC."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Пустая дата — введите момент в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"Не разобрана дата «{text}» — нужен формат ГГГГ-ММ-ДД ЧЧ:ММ."
+        ) from None
+    return to_naive(to_aware_utc(moment))
+
+
+def validate_range(start: datetime, end: datetime, pause: float) -> tuple[datetime, datetime, float]:
+    if to_naive(start) >= to_naive(end):
+        raise RunConfigurationError(
+            f"Начало диапазона ({start:%Y-%m-%d %H:%M}) должно быть раньше конца "
+            f"({end:%Y-%m-%d %H:%M}). Прогон не запущен."
+        )
+    return to_naive(start), to_naive(end), float(pause)
+
+
+def describe_scale(start: datetime, end: datetime, pause: float, timeframes=None) -> str:
+    """Оценка объёма прогона: тики, реальное время и каталог состояния."""
+    step = smallest_period(timeframes or (sorted(set(ACTIVE_TIMEFRAMES) | {"1m"})))
+    ticks = int((to_naive(end) - to_naive(start)).total_seconds() // step.total_seconds())
+    if pause:
+        waiting = f"Оценка реального времени при паузе {pause:g} с: {_duration(timedelta(seconds=ticks * pause))}"
+    else:
+        waiting = "Ожидание между тиками: нет (прогон без пауз, длительность определяется обработкой)"
+    return (
+        f"=== Масштаб прогона ===\n"
+        f"Шаг тика:        {step}\n"
+        f"Обработано тиков: {ticks}\n"
+        f"{waiting}\n"
+        f"Каталог состояния: {state_dir_for(start, end)}"
+    )
+
+
+def _duration(delta: timedelta) -> str:
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
+
+
+def state_dir_for(start: datetime, end: datetime, started_at: datetime | None = None) -> Path:
+    """Каталог состояния исторического прогона — отдельный от боевого."""
+    return runtime_dir(Path(HIST_DIR)) / run_dir_name(
+        to_naive(start), to_naive(end), to_naive(started_at or datetime.now())
+    )
+
+
+def main(no_prompt: bool = False):
+    try:
+        mode = ask_mode(no_prompt)
+        if mode == MODE_HISTORY:
+            start, end, pause = ask_history_range()
+            print(describe_scale(start, end, pause))
+        else:
+            start = end = pause = None
+    except (RunConfigurationError, ValueError) as exc:
+        print(str(exc))
+        return 1
+
+    if mode == MODE_HISTORY:
+        return _run_history(start, end, pause)
+    return _run_live()
+
+
+def _run_live():
+    return _launch(
+        state_dir=runtime_dir(),
+        client_provider=None,
+        clock=None,
+        session=build_run_session(MODE_LIVE),
+        channel_names=None,
+    )
+
+
+def _run_history(start, end, pause):
+    clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+    return _launch(
+        state_dir=state_dir_for(start, end),
+        client_provider=EmulatorClientProvider(),
+        clock=clock,
+        session=build_run_session(MODE_HISTORY, clock),
+        channel_names=[],
+        history=True,
+    )
+
+
+def _timeframes() -> list[str]:
+    return sorted(set(ACTIVE_TIMEFRAMES) | {"1m"})
+
+
+def _warmup_bars() -> int:
+    """Сколько баров прогрева требуют активные стратегии — проверка границ."""
+    from src.strategies.registry import get_strategy
+
+    needed = 1
+    for assignments in (SHARE_STRATEGIES, FUTURE_STRATEGIES):
+        for group in assignments.values():
+            for assignment in group:
+                config = _strategy_map().get(assignment.strategy)
+                if config is None:
+                    continue
+                try:
+                    needed = max(
+                        needed, get_strategy(assignment.strategy, config).required_history()
+                    )
+                except Exception as exc:  # noqa: BLE001 — стратегию проверит бот при старте
+                    log.debug("Прогрев для %s не посчитан: %s", assignment.strategy, exc)
+    return needed
+
+
+def _source_ping(client_provider):
+    """Проверка живости источника: у эмулятора есть ``/health``, у T-API нет."""
+    client_context = getattr(client_provider, "client_context", None)
+    if client_context is None:
+        return None
+
+    def ping() -> None:
+        with client_context() as client:
+            probe = getattr(client, "ping", None)
+            if probe is not None:
+                probe()
+
+    return ping
+
+
+def _launch(
+    *,
+    state_dir,
+    client_provider,
+    clock,
+    session,
+    channel_names,
+    history: bool = False,
+) -> int:
+    """Единая сборка прогона: различаются только источник, часы и каталог.
+
+    Всё остальное — кэш, планировщик, стратегии, исполнение и журнал — собирается
+    одинаково, поэтому исторический прогон идёт по тому же конвейеру, что и боевой.
+    """
     state_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
@@ -71,21 +293,30 @@ def main():
         backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
-    instruments = select_instruments(validation_pause_secs=DATA_REFRESH_MIN_INTERVAL) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-    channels = build_channels()
+    instruments = select_instruments(
+        validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
+        client_provider=client_provider,
+        market_now=None if clock is None else clock.now(),
+    ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+    instruments = [normalize_instrument(item) for item in instruments]
+    channels = build_channels(channel_names)
     bus = EventBus()
     bus.subscribe_all(channels)
     timeline = MultiTimeframeScheduler(
-        timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS,
+        timeframes=_timeframes(),
+        sleep_secs=SLEEP_SECONDS if clock is None else clock.pause_secs,
         catch_up_bars=CATCH_UP_BARS,
+        clock=clock,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
         timeline=timeline,
         token=TINKOFF_TOKEN,
-        data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL,
-        data_backfill_window_seconds=DATA_BACKFILL_WINDOW_SECONDS,
+        data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL if clock is None else 0.0,
+        data_backfill_window_seconds=None if clock is not None else DATA_BACKFILL_WINDOW_SECONDS,
         freshness_tolerance_bars=CATCH_UP_BARS,
+        clock=clock,
+        client_provider=client_provider,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -93,14 +324,58 @@ def main():
         provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
     )
 
+    storage = None
     try:
-        runtime = _build_runtime(instruments, data_cache, bus)
-        _run_bot(instruments, bus, runtime, data_cache, timeline)
+        if history:
+            report = run_preflight(
+                active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+                start=session.start,
+                end=session.end,
+                warmup_bars=_warmup_bars(),
+                load_candles=load_candles,
+                client_provider=client_provider,
+                clock=clock,
+                ping=_source_ping(client_provider),
+            )
+            if not report.ok:
+                print(report.message())
+                return 2
+        runtime = _build_runtime(
+            instruments, data_cache, bus, state_dir, clock=clock, session=session,
+            client_provider=client_provider,
+        )
+        storage = runtime.storage
+        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
     finally:
+        if history:
+            _finish_history(storage, session, data_cache, timeline, state_dir)
         close_channels(channels)
+    return 0
 
 
-def _run_bot(instruments, bus, runtime, data_cache, timeline) -> None:
+def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
+    """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
+    if storage is None:
+        return
+    reason = session.stop_reason()
+    crashed = not reason
+    metrics = RunMetrics(
+        start=session.start,
+        end=session.end,
+        ticks=session.ticks_done(),
+        missed_bars=data_cache.missed_bars,
+        stop_reason=reason or "остановлено оператором",
+        market_now=to_naive(timeline.now()),
+        crashed=crashed,
+    )
+    write_report(
+        state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
+    )
+    print(crash_line(metrics) if crashed else completion_line(state_dir / REPORT_TXT))
+
+
+
+def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> None:
     TradingBot(
         instruments=instruments,
         bus=bus,
@@ -121,22 +396,27 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline) -> None:
         post_tick=runtime.post_tick,
         trade_manager=runtime.trade_manager,
         action_executor=runtime.action_executor,
+        run=session,
     ).run()
 
 
 class _Runtime:
-    def __init__(self, post_tick=None, trade_manager=None, action_executor=None) -> None:
+    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None) -> None:
         self.post_tick = post_tick
         self.trade_manager = trade_manager
         self.action_executor = action_executor
+        self.storage = storage
 
 
-def _build_runtime(instruments, data_cache, bus) -> _Runtime:
+def _build_runtime(
+    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None
+) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
     Neither mode constructs an exchange adapter. The only broker selected here is
     the addressed candle simulator, and durable trade state is restored from
-    SQLite rather than either legacy CSV projection.
+    SQLite rather than either legacy CSV projection. ``state_dir`` — каталог
+    состояния прогона: общий для боевого режима, отдельный у исторического.
     """
     instruments = [
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
@@ -150,7 +430,6 @@ def _build_runtime(instruments, data_cache, bus) -> _Runtime:
     from src.trade_management.manager import TradeManager
 
     try:
-        state_dir = runtime_dir()
         state_dir.mkdir(parents=True, exist_ok=True)
         storage = Storage(
             state_dir / DATABASE_FILE,
@@ -160,6 +439,7 @@ def _build_runtime(instruments, data_cache, bus) -> _Runtime:
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
             initial_deposit=str(INITIAL_DEPOSIT),
+            clock=clock,
         )
         broker = create_addressable_journal_broker(
             INITIAL_DEPOSIT,
@@ -180,12 +460,14 @@ def _build_runtime(instruments, data_cache, bus) -> _Runtime:
         max_qty=RISK_LIMITS.get("max_qty"),
         commission=RISK_LIMITS.get("commission"),
         slippage=RISK_LIMITS.get("slippage"),
+        slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
         contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
         signal_filter=SignalFilter(),
+        clock=clock,
     )
     trade_manager.restore()
     action_executor = _OutboxExecutor(trade_manager)
-    contracts = _load_contracts_metadata(instruments)
+    contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
     storage.set_names(_instrument_names(instruments))
@@ -242,6 +524,7 @@ def _build_runtime(instruments, data_cache, bus) -> _Runtime:
         post_tick=on_bar,
         trade_manager=trade_manager,
         action_executor=action_executor,
+        storage=storage,
     )
 
 
@@ -322,25 +605,77 @@ def _instrument_names(instruments) -> dict[str, str]:
     return names
 
 
-def _load_contracts_metadata(instruments):
-    """Кэш метаданных контрактов из API Тильды; при сбое — пустой кэш (входы отклоняются)."""
-    if not TINKOFF_TOKEN:
+def _load_contracts_metadata(instruments, client_provider=None):
+    """Кэш метаданных контрактов из источника данных прогона.
+
+    Акции и фьючерсы грузятся по-разному: у фьючерса есть шаг, стоимость шага,
+    ГО и дата экспирации, у акции — шаг цены и размер лота (цена лота выводится
+    как ``шаг × лот``, ГО отсутствует). Без метаданных входы отклоняются с
+    причиной `no-contract-metadata`, поэтому инструменты без метаданных
+    перечисляются в лог явно. При сбое — частичный кэш: без него потерян ровно
+    тот инструмент, чьи метаданные не прочитались.
+    """
+    by_type: dict[str, set[str]] = {}
+    for instrument in instruments:
+        ticker = _instrument_ticker(instrument)
+        if not ticker:
+            continue
+        by_type.setdefault(_instrument_type(instrument), set()).add(ticker)
+    if not by_type:
+        return {}
+
+    from src.api.instruments import load_futures_contracts, load_share_contracts
+
+    try:
+        context = (
+            client_provider.client_context() if client_provider is not None else None
+        ) or _token_client_context()
+    except Exception as exc:
+        log.warning("Не удалось открыть клиент источника (%s) — входы отклонятся.", exc)
+        return {}
+    if context is None:
         log.warning("Нет TINKOFF_TOKEN — метаданные контрактов недоступны.")
         return {}
-    tickers = {t for t in (_instrument_ticker(i) for i in instruments) if t}
-    if not tickers:
-        return {}
-    try:
-        from src.api.client import client_context
-        from src.api.instruments import load_futures_contracts
 
-        with client_context() as client:
-            contracts = load_futures_contracts(client, tickers=tickers)
-        log.info("Метаданные контрактов загружены: %s", sorted(contracts))
-        return contracts
-    except Exception as exc:
-        log.warning("Не удалось загрузить метаданные контрактов (%s) — входы отклонятся.", exc)
-        return {}
+    contracts: dict[str, object] = {}
+    loaders = {"future": load_futures_contracts, "share": load_share_contracts}
+    with context as client:
+        for instrument_type, tickers in by_type.items():
+            loader = loaders.get(instrument_type)
+            if loader is None:
+                log.warning(
+                    "Метаданные для типа %s не поддерживаются: %s — входы отклонятся.",
+                    instrument_type, sorted(tickers),
+                )
+                continue
+            try:
+                contracts.update(loader(client, tickers=tickers))
+            except Exception as exc:
+                log.warning(
+                    "Не удалось загрузить метаданные %s (%s) — входы по ним отклонятся.",
+                    sorted(tickers), exc,
+                )
+    known = set(contracts)
+    missing = sorted(t for ts in by_type.values() for t in ts if t not in known)
+    if missing:
+        log.warning("Нет метаданных контрактов для: %s — входы отклонятся.", missing)
+    log.info("Метаданные контрактов загружены: %s", sorted(contracts))
+    return contracts
+
+
+def _token_client_context():
+    """Контекст клиента Тильды; без токена возвращается ``None``."""
+    if not TINKOFF_TOKEN:
+        return None
+    from src.api.client import client_context
+
+    return client_context()
+
+
+def _instrument_type(instrument) -> str:
+    if isinstance(instrument, (tuple, list)):
+        return str(instrument[2]) if len(instrument) > 2 else ""
+    return str(getattr(instrument, "instrument_type", "") or "")
 
 
 def print_contract_metadata(contracts) -> None:
@@ -366,4 +701,4 @@ def _strategy_map():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)

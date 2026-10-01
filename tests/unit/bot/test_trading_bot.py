@@ -1,7 +1,7 @@
 import inspect
 from unittest.mock import MagicMock, patch
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import logging
@@ -52,12 +52,16 @@ def _make_strategy(name="macd_rsi_stoch", decision=None):
 class FakeTimeline:
     """Фейк координатора сеток: тики 1..ticks, далее KeyboardInterrupt."""
 
-    def __init__(self, ticks=1, fallback=1.0, timeframes=("1h",)):
+    def __init__(self, ticks=1, fallback=1.0, timeframes=("1h",), now=datetime(2024, 1, 1, 0, 0)):
         self.ticks = ticks
         self.fallback = fallback
         self.timeframes = tuple(timeframes)
         self.wait_calls = 0
         self.wait_boundaries = []
+        self._now = now
+
+    def now(self):
+        return self._now
 
     def wait_until_bar_published(
         self, bar_ready, poll_secs=1.0, timeout_secs=65.0, wait_boundary=True
@@ -90,6 +94,9 @@ class FakeCache:
         self.refresh_forces.append(force)
         if self.refresh_error:
             raise self.refresh_error
+
+    def close_tick(self):
+        self.closed_ticks = getattr(self, "closed_ticks", 0) + 1
 
     def has_fresh_closed_bar(self, timeframe, now=None):
         return True
@@ -776,6 +783,9 @@ class TestTradingBot:
                 if self.calls == 1:
                     raise RuntimeError("boom")
 
+            def close_tick(self):
+                pass
+
             def has_fresh_closed_bar(self, timeframe, now=None):
                 return True
 
@@ -939,6 +949,9 @@ class TestTradingBot:
                 if self.calls == 1:
                     raise RuntimeError("boom")
                 self.ready = True
+
+            def close_tick(self):
+                pass
 
             def has_fresh_closed_bar(self, timeframe, now=None):
                 return self.ready

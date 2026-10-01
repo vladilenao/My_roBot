@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -376,3 +376,34 @@ class TestCatchUp:
 
         assert ready == {"1m"}
         assert s._pending == {"15m": _utc(2024, 1, 1, 10, 15)}
+
+
+class TestVirtualClockTicks:
+    """Выравнивание тиков виртуального времени с барами диапазона."""
+
+    def _timeline(self):
+        from src.scheduler.clock import HistoricalClock
+
+        clock = HistoricalClock(
+            datetime(2024, 1, 1, 10, 0), datetime(2024, 1, 1, 10, 10), timedelta(minutes=1), 0.0
+        )
+        return MultiTimeframeScheduler(["1m"], clock=clock), clock
+
+    def test_first_tick_is_one_step_after_start(self):
+        timeline, clock = self._timeline()
+
+        timeline.wait_until_bar_published(lambda tf: True, wait_boundary=False)
+
+        assert clock.now() == datetime(2024, 1, 1, 10, 1)
+
+    def test_ticks_cover_whole_range(self):
+        timeline, clock = self._timeline()
+        seen = []
+
+        while not clock.finished:
+            timeline.wait_until_bar_published(lambda tf: True)
+            seen.append(clock.now())
+
+        assert seen[0] == datetime(2024, 1, 1, 10, 1)
+        assert seen[-1] == datetime(2024, 1, 1, 10, 10)
+        assert len(seen) == 10

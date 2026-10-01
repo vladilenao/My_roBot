@@ -392,7 +392,7 @@ class TestTradeIdStaysInternal:
 
 
 class TestContractNameRule:
-    def _bot(self, short_name: str | None) -> tuple[TradingBot, Recorder]:
+    def _bot(self, short_name: str | None, ticker: str = "NGV6", inst_type: str = "futures") -> tuple[TradingBot, Recorder]:
         recorder = Recorder()
         bus = EventBus()
         bus.subscribe(recorder)
@@ -401,7 +401,7 @@ class TestContractNameRule:
             decide=lambda *args, **kwargs: Decision(SignalType.BUY, 100.5),
         )
         bot = TradingBot(
-            instruments=[("NG (Природный газ) — NG-9.26", "NGV6", "futures", short_name)],
+            instruments=[("NG (Природный газ) — NG-9.26", ticker, inst_type, short_name)],
             bus=bus,
             strategy_map={"macd_rsi_stoch": object()},
             data_cache=None,
@@ -421,6 +421,19 @@ class TestContractNameRule:
         assert event.instrument == "контракт не указан"
         text = recorder.texts()[0]
         assert "контракт не указан" in text
+
+    def test_share_is_named_by_its_ticker(self):
+        bot, recorder = self._bot(None, ticker="SBER", inst_type="share")
+
+        bot._publish_decision(
+            Decision(SignalType.BUY, 100.5), bot._instruments[0], timeframe="15m"
+        )
+
+        event = recorder.events[0]
+        assert event.instrument == "SBER"
+        text = recorder.texts()[0]
+        assert "SBER" in text
+        assert "контракт не указан" not in text
         assert "NGV6" not in text
         assert "NG (Природный" not in text
 

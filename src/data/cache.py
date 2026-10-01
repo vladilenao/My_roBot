@@ -10,6 +10,12 @@ from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 
+# Сколько тиков подряд без единого нового закрытого бара — конец доступных
+# данных. Один такой тик внутри диапазона считается пропуском и прогон идёт
+# дальше: отличить «дырку» от «данных больше нет» можно только следующим тиком.
+# Считается раз в рыночный тик, а не раз в вызов на таймфрейм (см. `close_tick`).
+CONSECUTIVE_EMPTY_TICKS_BEFORE_END = 2
+
 
 def _naive(dt) -> pd.Timestamp:
     """Делегирует единому helper: приводит время к tz-naive pandas.Timestamp (UTC без пояса).
@@ -27,12 +33,22 @@ class MarketDataCache:
     только готовые (закрытые) свечи и при появлении нового закрытого бара
     инкрементально дозагружает новые бары поверх кэша. Кадры разных таймфреймов
     одного инструмента хранятся и обновляются независимо.
+
+    На виртуальных часах (исторический прогон) повторные принудительные
+    загрузки и паузы между ними отключены: отсутствие бара на текущем рыночном
+    моменте означает конец доступных данных, а не задержку публикации.
     """
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0) -> None:
+    #: Конец доступных данных: устанавливается, когда новые бары перестали приходить.
+    data_exhausted: bool = False
+
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
+        self._clock = clock
+        self._history = bool(getattr(clock, "is_virtual", False))
+        self._client_provider = client_provider
         self._data_refresh_min_interval = data_refresh_min_interval  # мин. пауза между API-дозагрузками
         self._data_backfill_window_seconds = data_backfill_window_seconds  # окно инкр. дозагрузки (bounded backfill)
         self._freshness_tolerance_bars = freshness_tolerance_bars  # терпимость готовности ТФ (в барах), 0 = жёсткий AND
@@ -43,9 +59,30 @@ class MarketDataCache:
         self._last_loaded: dict[tuple, pd.Timestamp] = {}
         self._observed: dict[tuple, pd.Timestamp] = {}
         self._uids: dict[tuple, str] = {}
+        self._seen: dict[tuple, pd.Timestamp | None] = {}
+        self._missed_bars = 0
+        self._empty_ticks = 0
+        self._tick_progressed = 0
+        self._tick_expected: set[str] = set()
+
+    @property
+    def missed_bars(self) -> int:
+        """Сколько ожидаемых баров внутри диапазона не появилось (для отчёта)."""
+        return self._missed_bars
 
     def _key(self, instrument, timeframe: str) -> tuple:
         return (instrument.ticker, instrument.instrument_type, timeframe)
+
+    def _source_kwargs(self) -> dict:
+        """Аргументы источника данных для загрузчика.
+
+        Боевой режим ничего не добавляет: загрузчик сам берёт системное время и
+        провайдер по умолчанию. Исторический прогон передаёт свой источник и
+        виртуальные часы, иначе границы дозагрузки считались бы от «сейчас».
+        """
+        if not self._history:
+            return {}
+        return {"client_provider": self._client_provider, "clock": self._clock}
 
     def _load(self, instrument, timeframe: str, start_date=None) -> pd.DataFrame:
         key = self._key(instrument, timeframe)
@@ -58,6 +95,7 @@ class MarketDataCache:
             end_date=None,
             token=self._token,
             instrument_id=self._uids.get(key),
+            **self._source_kwargs(),
         )
         if instrument_id is not None:
             self._uids[key] = instrument_id
@@ -90,18 +128,19 @@ class MarketDataCache:
         if frame is None or frame.empty:
             return
         now = _naive(self._timeline.now())
-        if self._retry_after is not None:
-            if now < self._retry_after:
+        if not self._history:
+            if self._retry_after is not None:
+                if now < self._retry_after:
+                    return
+                self._retry_after = None
+            if self._throttled(now):
                 return
-            self._retry_after = None
-        if self._throttled(now):
-            return
         last_dt = self._last_loaded.get(key)
         start = self._incremental_start(last_dt, now)
         try:
             new_df = self._load(self._instruments[key], timeframe, start_date=start)
         except Exception as exc:
-            if "resource_exhausted" in str(exc).lower():
+            if not self._history and "resource_exhausted" in str(exc).lower():
                 log.warning("Rate limit при дозагрузке %s: %s", key, exc)
                 self._retry_after = self._pause_after_rate_limit(exc, now)
                 return
@@ -111,6 +150,7 @@ class MarketDataCache:
         closed = self._closed_only(merged, timeframe)
         if not closed.empty:
             self._last_loaded[key] = _naive(closed["datetime"].max())
+            self._note_new_bar(key, closed)
 
     def refresh_if_new_candle(self, timeframe: str, now=None, force: bool = False) -> None:
         """Инкрементально дозагружает новые закрытые бары таймфрейма, если граница сместилась.
@@ -129,7 +169,9 @@ class MarketDataCache:
         grid = self._timeline.grid(timeframe)
         now = _naive(now or self._timeline.now())
         boundary = _naive(grid.current_candle_start(now))
-        if self._retry_after is not None:
+        if self._history and self.data_exhausted:
+            return
+        if not self._history and self._retry_after is not None:
             if now < self._retry_after:
                 return
             self._retry_after = None
@@ -147,8 +189,9 @@ class MarketDataCache:
             staleness = _naive(closed["datetime"].max()) if not closed.empty else pd.Timestamp.min
             candidates.append((staleness, key))
         candidates.sort(key=lambda item: (item[0], item[1]))
+        progressed = 0
         for _, key in candidates:
-            if self._throttled(now):
+            if not self._history and self._throttled(now):
                 return
             frame = self._frames[key]
             last_dt = self._last_loaded.get(key)
@@ -156,7 +199,7 @@ class MarketDataCache:
             try:
                 new_df = self._load(self._instruments[key], timeframe, start_date=start)
             except Exception as exc:
-                if "resource_exhausted" in str(exc).lower():
+                if not self._history and "resource_exhausted" in str(exc).lower():
                     log.warning("Rate limit при дозагрузке %s: %s", key, exc)
                     self._retry_after = self._pause_after_rate_limit(exc, now)
                     return
@@ -166,6 +209,41 @@ class MarketDataCache:
             closed = self._closed_only(merged, timeframe)
             self._last_loaded[key] = _naive(closed["datetime"].max()) if not closed.empty else last_dt
             self._observed[key] = boundary
+            if self._note_new_bar(key, closed):
+                progressed += 1
+        if self._history:
+            self._collect_tick(timeframe, progressed, len(candidates))
+
+    def _collect_tick(self, timeframe: str, progressed: int, expected: int) -> None:
+        """Копит итог текущего рыночного тика по всем таймфреймам.
+
+        ``refresh_if_new_candle`` вызывается по разу на каждый готовый
+        таймфрейм, поэтому итог тика нельзя фиксировать на каждом вызове: два
+        старших таймфрейма, у которых на этом тике и не должно было быть нового
+        бара, объявили бы конец данных уже на первом тике. Решение принимает
+        ``close_tick`` один раз на тик, когда известен итог целиком.
+
+        Таймфрейм учитывается в ``expected`` один раз за тик: повторный вызов с
+        ``force`` для того же ТФ не должен удваивать ожидаемое число баров.
+        """
+        self._tick_progressed += progressed
+        if expected:
+            self._tick_expected.add(timeframe)
+
+    def close_tick(self) -> None:
+        """Закрывает учёт рыночного тика: одна запись в счётчики прогона за тик.
+
+        Тик, в котором ни один таймфрейм не ждал нового бара, ничего не говорит о
+        доступности данных и в счётчики не попадает.
+        """
+        if not self._history:
+            return
+        progressed, expected = self._tick_progressed, len(self._tick_expected)
+        self._tick_progressed = 0
+        self._tick_expected.clear()
+        if not expected:
+            return
+        self._register_tick(progressed, expected)
 
     def has_fresh_closed_bar(self, timeframe: str, now=None) -> bool:
         """Появился ли свежий закрытый бар таймфрейма в загруженных кэшах.
@@ -256,13 +334,40 @@ class MarketDataCache:
 
         Разносит стартовые/восстановительные загрузки кадров, чтобы не выжигать
         лимит запросов. ``_load`` по-прежнему обновляет ``_last_api_attempt``.
+        На виртуальных часах пауза между загрузками не нужна: данных прошлого
+        периода не требует дожидаться публикации.
         """
+        if self._history:
+            return
         if not self._data_refresh_min_interval or self._last_api_attempt is None:
             return
         elapsed = (_naive(self._timeline.now()) - self._last_api_attempt).total_seconds()
         remaining = self._data_refresh_min_interval - elapsed
         if remaining > 0:
             time.sleep(remaining)
+
+    def _note_new_bar(self, key: tuple, closed: pd.DataFrame) -> bool:
+        """Отмечает появление нового закрытого бара пары. ``True`` — бар новый."""
+        last = _naive(closed["datetime"].max()) if not closed.empty else None
+        previous = self._seen.get(key)
+        self._seen[key] = last
+        return last is not None and (previous is None or last > previous)
+
+    def _register_tick(self, progressed: int, expected: int) -> None:
+        """Учёт тика исторического прогона: прогресс, пропуски и конец данных."""
+        if progressed:
+            self._empty_ticks = 0
+            self._missed_bars += max(0, expected - progressed)
+            return
+        self._empty_ticks += 1
+        if self._empty_ticks >= CONSECUTIVE_EMPTY_TICKS_BEFORE_END:
+            self.data_exhausted = True
+            log.info(
+                "Новые бары не появились %d тиков подряд — конец доступных данных.",
+                self._empty_ticks,
+            )
+            return
+        self._missed_bars += expected
 
     def _closed_only(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         grid = self._timeline.grid(timeframe)

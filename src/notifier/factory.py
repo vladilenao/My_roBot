@@ -15,12 +15,18 @@ from src.notifier.telegram import TelegramChannel
 log = get_logger(__name__)
 
 
-def build_channels() -> list[Channel]:
-    """Собрать каналы, объявленные в конфигурации, в порядке конфигурации."""
+def build_channels(names=None) -> list[Channel]:
+    """Собрать каналы уведомлений, в порядке конфигурации.
+
+    ``names=None`` читает каналы конфигурации. Явный ``names=[]`` собирает
+    пустой список: так исторический прогон отключает уведомления, не заходя
+    внутрь фабрики. Непустой список по-прежнему обязателен в боевом режиме.
+    """
     from src import config
 
+    wanted = config.NOTIFIER_CHANNELS if names is None else list(names)
     channels: list[Channel] = []
-    for name in config.NOTIFIER_CHANNELS:
+    for name in wanted:
         if name == "console":
             events = config.NOTIFIER_CONSOLE_EVENTS
             channels.append(
@@ -45,7 +51,7 @@ def build_channels() -> list[Channel]:
                 f"Неизвестный канал уведомлений '{name}'. "
                 f"Доступны: console, telegram"
             )
-    if not channels:
+    if not channels and names is None:
         raise ValueError("Не выбран ни один канал уведомлений: укажите [notifier] channels")
     return channels
 

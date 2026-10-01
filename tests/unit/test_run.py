@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 import run
-from src.instruments import Instrument
+from src.instruments import Instrument, normalize_instrument
 from src.portfolio import ContractMeta
 
 
@@ -19,6 +19,7 @@ def _fake_client():
 def fake_instrument():
     class Instr:
         ticker = "NGV6"
+        instrument_type = "future"
 
     return Instr()
 
@@ -57,10 +58,15 @@ class TestLoadContractsMetadata:
         assert run._instrument_ticker(SELECTOR_NG[:1]) == "NG (Природный газ) — NG-10.26"
         assert run._instrument_ticker(None) is None
 
-    def test_empty_without_token(self):
+    def test_empty_without_token(self, fake_instrument):
+        with patch("run.TINKOFF_TOKEN", ""), patch("run.log") as log:
+            assert run._load_contracts_metadata([fake_instrument]) == {}
+        log.warning.assert_called_once()
+
+    def test_no_instruments_skips_source_entirely(self):
         with patch("run.TINKOFF_TOKEN", ""), patch("run.log") as log:
             assert run._load_contracts_metadata([]) == {}
-        log.warning.assert_called_once()
+        log.warning.assert_not_called()
 
     def test_exception_falls_back_to_empty(self, fake_instrument):
         with patch("src.api.client.client_context", side_effect=RuntimeError("boom")), patch(
@@ -69,12 +75,139 @@ class TestLoadContractsMetadata:
             assert run._load_contracts_metadata([fake_instrument]) == {}
 
 
+    def test_share_and_future_metadata_are_merged(self):
+        fake_client = _fake_client()
+        with patch("src.api.client.client_context", return_value=fake_client), patch(
+            "src.api.instruments.load_futures_contracts",
+            return_value={"NGV6": ContractMeta("NGV6", 0.001, 8.4, 100, 100)},
+        ) as futures, patch(
+            "src.api.instruments.load_share_contracts",
+            return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
+        ) as shares, patch("run.TINKOFF_TOKEN", "t"):
+            contracts = run._load_contracts_metadata(
+                [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
+            )
+
+        futures.assert_called_once_with(fake_client, tickers={"NGV6"})
+        shares.assert_called_once_with(fake_client, tickers={"SBER"})
+        assert set(contracts) == {"NGV6", "SBER"}
+        assert contracts["SBER"].price_step == 0.01
+        assert contracts["SBER"].step_cost == 1.0
+        assert contracts["SBER"].go_buy == 0.0
+
+    def test_missing_metadata_is_reported(self, caplog):
+        fake_client = _fake_client()
+        with patch("src.api.client.client_context", return_value=fake_client), patch(
+            "src.api.instruments.load_futures_contracts", return_value={}
+        ), patch("src.api.instruments.load_share_contracts", return_value={}), patch(
+            "run.TINKOFF_TOKEN", "t"
+        ):
+            contracts = run._load_contracts_metadata(
+                [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
+            )
+
+        assert contracts == {}
+        assert "SBER" in caplog.text
+        assert "NGV6" in caplog.text
+
+    def test_one_failing_type_keeps_other_metadata(self):
+        fake_client = _fake_client()
+        with patch("src.api.client.client_context", return_value=fake_client), patch(
+            "src.api.instruments.load_futures_contracts",
+            return_value={"NGV6": ContractMeta("NGV6", 0.001, 8.4, 100, 100)},
+        ), patch(
+            "src.api.instruments.load_share_contracts",
+            side_effect=RuntimeError("каталог акций недоступен"),
+        ), patch("run.TINKOFF_TOKEN", "t"):
+            contracts = run._load_contracts_metadata(
+                [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
+            )
+
+        assert set(contracts) == {"NGV6"}
+
+    def test_history_source_is_used_instead_of_token(self):
+        fake_client = _fake_client()
+        provider = MagicMock()
+        provider.client_context.return_value = fake_client
+        with patch("src.api.instruments.load_share_contracts", return_value={}) as shares:
+            run._load_contracts_metadata(
+                [("Сбербанк", "SBER", "share", "SBER")], client_provider=provider
+            )
+
+        shares.assert_called_once_with(fake_client, tickers={"SBER"})
+
+
+class TestHistoryMetadataWithoutToken:
+    """Исторический режим не должен требовать `TINKOFF_TOKEN`."""
+
+    def _provider(self, fake_client):
+        provider = MagicMock()
+        provider.client_context.return_value = fake_client
+        return provider
+
+    def test_futures_and_shares_load_with_no_token(self):
+        fake_client = _fake_client()
+        provider = self._provider(fake_client)
+        with patch("run.TINKOFF_TOKEN", None), patch(
+            "src.api.instruments.load_futures_contracts",
+            return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
+        ) as futures, patch(
+            "src.api.instruments.load_share_contracts",
+            return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
+        ) as shares, patch(
+            "run._token_client_context",
+            side_effect=AssertionError("токен не должен быть нужен"),
+        ):
+            contracts = run._load_contracts_metadata(
+                [("Фьючерс", "SiH5", "future", "Si-6.25"),
+                 ("Сбербанк", "SBER", "share", "SBER")],
+                client_provider=provider,
+            )
+
+        futures.assert_called_once_with(fake_client, tickers={"SiH5"})
+        shares.assert_called_once_with(fake_client, tickers={"SBER"})
+        assert set(contracts) == {"SiH5", "SBER"}
+        assert contracts["SiH5"].go_buy == 12345.67
+
+    def test_entries_not_rejected_for_missing_metadata(self, caplog):
+        fake_client = _fake_client()
+        provider = self._provider(fake_client)
+        with patch("run.TINKOFF_TOKEN", None), patch(
+            "src.api.instruments.load_futures_contracts",
+            return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
+        ), patch(
+            "src.api.instruments.load_share_contracts",
+            return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
+        ):
+            contracts = run._load_contracts_metadata(
+                [("Фьючерс", "SiH5", "future", "Si-6.25"),
+                 ("Сбербанк", "SBER", "share", "SBER")],
+                client_provider=provider,
+            )
+
+        assert "no-contract-metadata" not in caplog.text
+        assert "входы отклонятся" not in caplog.text
+        assert set(contracts) == {"SiH5", "SBER"}
+
+    def test_no_token_warning_absent_when_provider_available(self, caplog):
+        fake_client = _fake_client()
+        provider = self._provider(fake_client)
+        with patch("run.TINKOFF_TOKEN", None), patch(
+            "src.api.instruments.load_futures_contracts", return_value={}
+        ), patch("src.api.instruments.load_share_contracts", return_value={}):
+            run._load_contracts_metadata(
+                [("Фьючерс", "SiH5", "future", "Si-6.25")], client_provider=provider
+            )
+
+        assert "TINKOFF_TOKEN" not in caplog.text
+
+
 class TestRuntimeComposition:
     def test_notify_only_never_initializes_storage_or_broker(self):
         with patch("run.trading_enabled", return_value=False), patch(
             "src.trade_journal.storage.Storage"
         ) as storage, patch("src.broker.create_addressable_journal_broker") as broker:
-            runtime = run._build_runtime([], MagicMock(), MagicMock())
+            runtime = run._build_runtime([], MagicMock(), MagicMock(), run.runtime_dir())
 
         assert runtime.trade_manager is None
         assert runtime.post_tick is None
@@ -97,7 +230,7 @@ class TestRuntimeComposition:
         ) as manager_cls, patch("run._load_contracts_metadata", return_value={}), patch(
             "run.print_contract_metadata"
         ), patch("run._risk_limits") as limits:
-            runtime = run._build_runtime([], MagicMock(), MagicMock())
+            runtime = run._build_runtime([], MagicMock(), MagicMock(), run.runtime_dir())
 
         storage_cls.assert_called_once_with(
             run.runtime_dir() / run.DATABASE_FILE,
@@ -107,6 +240,7 @@ class TestRuntimeComposition:
             audit_max_bytes=run.AUDIT_MAX_BYTES,
             audit_backup_count=run.AUDIT_BACKUP_COUNT,
             initial_deposit=str(run.INITIAL_DEPOSIT),
+            clock=None,
         )
         broker_factory.assert_called_once_with(
             run.INITIAL_DEPOSIT, run.CLEARING_TIMES, contract_names={}
@@ -120,7 +254,9 @@ class TestRuntimeComposition:
             max_qty=run.RISK_LIMITS.get("max_qty"),
             commission=run.RISK_LIMITS.get("commission"),
             slippage=run.RISK_LIMITS.get("slippage"),
+            slippage_tolerance=run.RISK_LIMITS.get("slippage_tolerance"),
             contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
+            clock=None,
             signal_filter=ANY,
         )
         manager.restore.assert_called_once_with()
@@ -147,7 +283,7 @@ class TestRuntimeComposition:
         ), patch("run._load_contracts_metadata", return_value={}), patch(
             "run.print_contract_metadata"
         ), patch("run._risk_limits"):
-            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock())
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
 
         storage.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
         broker.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
@@ -159,3 +295,20 @@ class TestRuntimeComposition:
         assert instrument.ticker == "NGV6"
         assert instrument.short_name == "NG-10.26"
         broker.track_bar.assert_called_once()
+
+
+class TestInstrumentNames:
+    def test_share_named_by_ticker(self):
+        names = run._instrument_names(
+            [normalize_instrument(("SBER", "SBER", "share")), normalize_instrument(("GAZP", "GAZP", "share"))]
+        )
+
+        assert names == {"SBER": "SBER", "GAZP": "GAZP"}
+
+    def test_future_keeps_contract_name(self):
+        instruments = [
+            normalize_instrument(("NG (Природный газ) — NG-9.26", "NGV6", "future", "NG-9.26")),
+            normalize_instrument(("NG (Природный газ) — NG-10.26", "NGV7", "future")),
+        ]
+
+        assert run._instrument_names(instruments) == {"NGV6": "NG-9.26"}

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable, Iterable
 
 import pandas as pd
 
 from src.logging_setup import get_logger
+from src.scheduler.clock import Clock, as_clock, system_now
 
 log = get_logger(__name__)
 
@@ -61,18 +62,18 @@ class CandleScheduler:
 
     Границы считаются по календарной сетке таймфрейма в UTC, а не от момента
     запуска. ``clock`` инжектируется для возможности подстановки фиктивного
-    времени в тестах.
+    времени в тестах и виртуальных часов исторического прогона.
     """
 
     def __init__(
         self,
         timeframe: str,
         sleep_secs: float = 3600.0,
-        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+        clock: Clock | Callable[[], datetime] = system_now,
     ) -> None:
         self._timeframe = timeframe
         self._fallback = sleep_secs
-        self._clock = clock
+        self._clock = as_clock(clock)
         try:
             self._unit, self._step = _PERIODS[timeframe]
         except KeyError:
@@ -83,7 +84,11 @@ class CandleScheduler:
 
     def now(self) -> datetime:
         """Текущее рыночное время (UTC)."""
-        return self._clock()
+        return self._clock.now()
+
+    @property
+    def clock(self) -> Clock:
+        return self._clock
 
     @property
     def timeframe(self) -> str:
@@ -113,6 +118,9 @@ class CandleScheduler:
 
     def wait_until_candle_close(self) -> datetime:
         """Блокирующе ждёт до границы закрытия текущей свечи, возвращает границу."""
+        if self._clock.is_virtual:
+            self._clock.advance()
+            return self.now()
         target = self.next_candle_close()
         delay = (target - self.now()).total_seconds()
         if delay > 0:
@@ -137,7 +145,20 @@ class CandleScheduler:
         При ``wait_boundary=False`` ожидание границы пропускается: сразу начинается
         ограниченный опрос появившегося закрытого бара (используется на первом тике
         при запуске, когда граница уже пройдена или ещё не наступила).
+
+        На виртуальных часах исторического прогона граница не ждётся: время
+        сдвигается на шаг, а готовность бара проверяется однократно — данные
+        прошлого периода не публикуются с задержкой. Шаг делается и на первом
+        тике (``wait_boundary=False``), поэтому выравнивание тиков и баров в
+        историческом прогоне такое же, как в боевом режиме.
         """
+        if self._clock.is_virtual:
+            # Каждый тик виртуального времени — шаг вперёд, включая первый:
+            # так первым обрабатывается бар, открывшийся в начале диапазона,
+            # а последним — бар, открывшийся за шаг до конца.
+            self._clock.advance()
+            bar_ready()
+            return
         if wait_boundary:
             target = self.next_candle_close()
             delay = (target - self.now()).total_seconds()
@@ -220,15 +241,13 @@ class MultiTimeframeScheduler:
         self,
         timeframes: Iterable[str],
         sleep_secs: float = 3600.0,
-        clock: Callable[[], datetime] | None = None,
+        clock: Clock | Callable[[], datetime] | None = None,
         catch_up_bars: int = 0,
     ) -> None:
         unique = tuple(dict.fromkeys(timeframes))
         if not unique:
             raise ValueError("Нужен хотя бы один активный таймфрейм")
-        self._clock = clock or (
-            lambda: datetime.now(timezone.utc).replace(tzinfo=None)
-        )
+        self._clock = as_clock(clock)
         self._grids = {
             tf: CandleScheduler(tf, sleep_secs=sleep_secs, clock=self._clock)
             for tf in unique
@@ -241,7 +260,11 @@ class MultiTimeframeScheduler:
 
     def now(self) -> datetime:
         """Текущее рыночное время (UTC)."""
-        return self._clock()
+        return self._clock.now()
+
+    @property
+    def clock(self) -> Clock:
+        return self._clock
 
     @property
     def timeframes(self) -> tuple[str, ...]:
@@ -300,7 +323,18 @@ class MultiTimeframeScheduler:
         не теряется: он остаётся кандидатом на последующих тиках и повторно
         опрашивается, пока не появится или не истечёт горизонт догона
         (``catch_up_bars × период ТФ``).
+
+        На виртуальных часах исторического прогона ожидание границы заменяется
+        шагом рыночного времени, а готовность баров проверяется однократно. Шаг
+        делается и на первом тике, поэтому первым обрабатывается бар, открывшийся
+        в начале диапазона, а последним — открывшийся за шаг до конца.
         """
+        if self._clock.is_virtual:
+            self._clock.advance()
+            candidates = self._candidates(self.now(), wait_boundary)
+            self._last_tick = self.now()
+            self._pending = {}
+            return {tf for tf in candidates if bar_ready(tf)}
         if wait_boundary:
             target = self.next_boundary()
             delay = (target - self.now()).total_seconds()

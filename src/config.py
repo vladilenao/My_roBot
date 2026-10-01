@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import cast
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
+import pandas as pd
 
 from src.config_loader import (
     ConfigError,
@@ -225,15 +226,39 @@ LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
 DATA_DIR = _CONFIG.get("data_dir", "data")
 
 
-def runtime_dir() -> Path:
-    """Абсолютный каталог состояния робота: ``app_dir()/data_dir``.
+# Корневой каталог прогонов исторического режима (состояние каждого прогона —
+# в отдельном подкаталоге, чтобы прогоны не смешивали прибыль и убыток).
+HIST_DIR = _CONFIG.get("hist_dir", "HIST")
+
+# Исторический режим: адрес локального Historical Broker API Emulator.
+HISTORICAL_API_URL = _CONFIG.get("historical_api_url", "http://127.0.0.1:8100")
+
+
+def runtime_dir(base: Path | None = None) -> Path:
+    """Абсолютный каталог состояния робота: ``base`` либо ``app_dir()/data_dir``.
 
     В dev это ``<корень проекта>/data``, в PyInstaller-сборке — ``data`` рядом
-    с исполняемым файлом. Каталог не создаётся здесь: создание выполняет тот,
-    кто открывает первые файлы (``run.main``).
+    с исполняемым файлом. Исторический прогон передаёт свой каталог ``base``.
+    Каталог не создаётся здесь: создание выполняет тот, кто открывает первые
+    файлы (``run.main``).
     """
+    if base is not None:
+        root = Path(base)
+        return root if root.is_absolute() else app_dir() / root
     path = Path(DATA_DIR)
     return path if path.is_absolute() else app_dir() / path
+
+
+def run_dir_name(start, end, started_at) -> str:
+    """Имя каталога прогона: границы диапазона и время запуска прогона."""
+    return "-".join(
+        _stamp(moment) for moment in (started_at, start, end)
+    )
+
+
+def _stamp(moment) -> str:
+    """Компактная метка момента, безопасная для имени каталога."""
+    return pd.Timestamp(moment).strftime("%Y%m%dT%H%M%S")
 
 # Торговая секция [trading]: SQLite-backed candle simulation.
 # При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.
