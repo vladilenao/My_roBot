@@ -3,9 +3,10 @@ import time
 from t_tech.invest import InstrumentStatus
 
 from src.api.client import client_context
-from src.api.instruments import find_working_instrument
+from src.api.instruments import find_working_instrument_with_name
 from src.api.retry import _is_rate_limited, api_call_with_retry, rate_limit_reset_secs
 from src.data.timeutil import to_naive
+from src.instruments.model import SHARE_INSTRUMENT_TYPE
 
 
 RTS_STOCK_TICKERS = [
@@ -32,8 +33,8 @@ def _format_futures_display(contract_name, base_name, label):
     return f"{base_name} ({label}) — {contract_name}"
 
 
-def fetch_active_futures(client):
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+def fetch_active_futures(client, market_now=None):
+    now = market_now if market_now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now + FUTURES_TTL
     resp = api_call_with_retry(
         client.instruments.futures, instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
@@ -76,7 +77,7 @@ def _ask_choice(prompt, options):
         print(f"Неверный ввод. Допустимые варианты: {allowed}")
 
 
-def _validate_instruments(client, entries, inst_type, validation_pause_secs=0):
+def _validate_instruments(client, entries, inst_type, validation_pause_secs=0, market_now=None):
     valid = []
     first = True
     for entry in entries:
@@ -90,8 +91,15 @@ def _validate_instruments(client, entries, inst_type, validation_pause_secs=0):
             display_name = entry
             ticker = entry
             short_name = None
+        if not short_name and inst_type == SHARE_INSTRUMENT_TYPE:
+            # У акции нет биржевого кода контракта: тикер акции и есть
+            # короткое имя, скрывать его пользователю незачем.
+            short_name = ticker
         try:
-            find_working_instrument(client, ticker, inst_type)
+            _, from_catalog = find_working_instrument_with_name(
+                client, ticker, inst_type, market_now=market_now
+            )
+            short_name = short_name or from_catalog
             if short_name:
                 valid.append((display_name, ticker, inst_type, short_name))
             else:
@@ -110,7 +118,7 @@ def _validate_instruments(client, entries, inst_type, validation_pause_secs=0):
     return valid
 
 
-def _select_from_list(client, entries, inst_type, validation_pause_secs=0):
+def _select_from_list(client, entries, inst_type, validation_pause_secs=0, market_now=None):
     """Выбрать инструменты из выведенного списка.
 
     Тикер, введённый руками, сопоставляется с уже выкачанным списком: иначе в
@@ -159,7 +167,7 @@ def _select_from_list(client, entries, inst_type, validation_pause_secs=0):
         return []
 
     print()
-    return _validate_instruments(client, selected_entries, inst_type, validation_pause_secs)
+    return _validate_instruments(client, selected_entries, inst_type, validation_pause_secs, market_now)
 
 
 def _deduplicate(instruments):
@@ -180,11 +188,19 @@ def _show_current(instruments):
             print(f"  - {item[0]} ({item[2]})")
 
 
-def select_instruments(validation_pause_secs=0):
+def select_instruments(validation_pause_secs=0, client_provider=None, market_now=None):
+    """Интерактивный выбор инструментов через клиента источника данных прогона.
+
+    ``client_provider`` — порт источника (исторический прогон отдаёт свой
+    клиент), ``market_now`` — рыночный момент для окна экспирации и валидации.
+    """
     instruments = []
     print("=== Выбор торговых инструментов ===\n")
 
-    with client_context() as client:
+    context = (
+        client_provider.client_context() if client_provider is not None else client_context()
+    )
+    with context as client:
         while True:
             print("Выберите тип инструментов:")
             print("  1. Акции (индекс РТС)")
@@ -193,20 +209,20 @@ def select_instruments(validation_pause_secs=0):
 
             if choice == "1":
                 stock_entries = [(t, t, "share") for t in RTS_STOCK_TICKERS]
-                found = _select_from_list(client, stock_entries, "share", validation_pause_secs)
+                found = _select_from_list(client, stock_entries, "share", validation_pause_secs, market_now)
                 instruments.extend(found)
                 instruments = _deduplicate(instruments)
             else:
                 print("\nЗагрузка фьючерсов из API...")
                 try:
-                    futures = fetch_active_futures(client)
+                    futures = fetch_active_futures(client, market_now)
                 except Exception as e:
                     print(f"  Ошибка загрузки фьючерсов: {e}")
                     futures = []
                 if not futures:
                     print("  Нет фьючерсов с экспирацией в ближайшие 6 месяцев.")
                 else:
-                    found = _select_from_list(client, futures, "future", validation_pause_secs)
+                    found = _select_from_list(client, futures, "future", validation_pause_secs, market_now)
                     instruments.extend(found)
                     instruments = _deduplicate(instruments)
 
@@ -220,7 +236,7 @@ def select_instruments(validation_pause_secs=0):
 
     if not instruments:
         print("\nНеобходимо выбрать хотя бы один инструмент.")
-        return select_instruments()
+        return select_instruments(validation_pause_secs, client_provider, market_now)
 
     print(f"\nИтого выбрано: {len(instruments)}")
     for item in instruments:

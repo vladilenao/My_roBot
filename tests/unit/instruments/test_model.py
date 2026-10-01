@@ -19,7 +19,7 @@ class TestNormalizeInstrument:
         assert inst.short_name == "NG-9.26"
 
     def test_four_tuple_without_short_name_never_falls_back_to_ticker(self):
-        inst = normalize_instrument(("SBER", "SBER", "share", None))
+        inst = normalize_instrument(("NG (Природный газ) — NG-9.26", "NGU6", "future", None))
         assert inst.short_name is None
 
     def test_two_tuple_fallback_label(self):
@@ -27,7 +27,23 @@ class TestNormalizeInstrument:
         assert inst.ticker == "GAZP"
         assert inst.instrument_type == "share"
         assert inst.label == "GAZP share"
+        assert inst.short_name == "GAZP"
+
+    def test_share_without_short_name_uses_ticker(self):
+        inst = normalize_instrument(("SBER", "SBER", "share"))
+        assert inst.short_name == "SBER"
+
+    def test_share_explicit_short_name_wins(self):
+        inst = normalize_instrument(("Сбербанк", "SBER", "share", "Сбербанк"))
+        assert inst.short_name == "Сбербанк"
+
+    def test_future_never_uses_ticker_as_short_name(self):
+        inst = normalize_instrument(("NG (Природный газ) — NG-9.26", "NGU6", "future"))
         assert inst.short_name is None
+
+    @pytest.mark.parametrize("instrument_type", ["future", "etf", "currency"])
+    def test_contract_instruments_never_use_ticker(self, instrument_type):
+        assert normalize_instrument(("BRK6", "BRK6", instrument_type)).short_name is None
 
     def test_instrument_is_frozen_dataclass(self):
         inst = normalize_instrument(("SBER", "SBER", "share"))

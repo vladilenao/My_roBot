@@ -19,7 +19,7 @@ fallback_ticker = "NGU6"
 [notifier]
 # Каналы доставки уведомлений в порядке подписки: "console" | "telegram".
 # Старый ключ channel = "telegram" поддерживается как channels = ["telegram"].
-channels = ["console"]
+channels = ["console","telegram"]
 
 [notifier.console]
 # Консоль — источник истины: по умолчанию весь каталог событий.
@@ -44,6 +44,119 @@ strategies = [
     { id = "share-sber-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
     { id = "share-sber-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-sber-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.GAZP]
+strategies = [
+    { id = "share-gazp-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-gazp-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-gazp-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-gazp-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.LKOH]
+strategies = [
+    { id = "share-lkoh-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-lkoh-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-lkoh-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-lkoh-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.GMKN]
+strategies = [
+    { id = "share-gmkn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-gmkn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-gmkn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-gmkn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.ROSN]
+strategies = [
+    { id = "share-rosn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-rosn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-rosn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-rosn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+
+[strategies.share.NVTK]
+strategies = [
+    { id = "share-nvtk-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-nvtk-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-nvtk-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-nvtk-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.YDEX]
+strategies = [
+    { id = "share-ydex-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-ydex-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-ydex-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-ydex-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.TCSG]
+strategies = [
+    { id = "share-tcsg-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-tcsg-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-tcsg-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-tcsg-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.VTBR]
+strategies = [
+    { id = "share-vtbr-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-vtbr-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-vtbr-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-vtbr-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.MTSS]
+strategies = [
+    { id = "share-mtss-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-mtss-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-mtss-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-mtss-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.PHOR]
+strategies = [
+    { id = "share-phor-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-phor-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-phor-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-phor-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.ALRS]
+strategies = [
+    { id = "share-alrs-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-alrs-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-alrs-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-alrs-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.MOEX]
+strategies = [
+    { id = "share-moex-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-moex-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-moex-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-moex-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.PLZL]
+strategies = [
+    { id = "share-plzl-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-plzl-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-plzl-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-plzl-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
+]
+
+[strategies.share.TATN]
+strategies = [
+    { id = "share-tatn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
+    { id = "share-tatn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-tatn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "share-tatn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.future.NG]
