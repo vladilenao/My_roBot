@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -39,12 +39,15 @@ class TargetPlan:
     target_id: str
     price: Decimal
     share: Decimal
+    initial_step: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:
         if not self.target_id:
             raise ValueError("target_id is required")
         if self.price <= 0:
             raise ValueError("target price must be positive")
+        if self.initial_step < 0:
+            raise ValueError("target initial step must not be negative")
         if not Decimal("0") < self.share <= Decimal("1"):
             raise ValueError("target share must be in (0, 1]")
 
@@ -88,6 +91,22 @@ class TradePlan:
             raise ValueError("BUY stop must be below entry")
         if self.side == "SELL" and self.stop_price <= self.reference_entry:
             raise ValueError("SELL stop must be above entry")
+        object.__setattr__(self, "targets", self._with_initial_steps())
+
+    def _with_initial_steps(self) -> tuple[TargetPlan, ...]:
+        """Freeze each target's distance from the entry as the step it may keep.
+
+        Targets built before this field existed carry no step, so it is read
+        back from the prices the plan already records. Deriving it here rather
+        than in each profile means a new profile cannot forget to record one.
+        """
+        direction = Decimal("1") if self.side == "BUY" else Decimal("-1")
+        return tuple(
+            replace(target, initial_step=direction * (target.price - self.reference_entry))
+            if target.initial_step == 0
+            else target
+            for target in self.targets
+        )
 
     @property
     def risk_per_unit(self) -> Decimal:
@@ -110,6 +129,31 @@ class TradePlan:
                 move = -move
             total += target.share * (move / self.risk_per_unit)
         return total.quantize(R_PRECISION, rounding=ROUND_HALF_UP)
+
+
+def rebase_on_average(plan: TradePlan, average_price: Decimal) -> TradePlan:
+    """Rebase a plan onto the price the entry actually filled at.
+
+    The planned distances are kept rather than the planned prices: the entry
+    gap consumes part of the stop distance before the trade even exists, so a
+    plan kept at the signal price would quote targets and a stop that no longer
+    correspond to the risk actually taken. Both the simulator and the journal
+    call this on the same inputs, which is what keeps them in agreement. It is
+    idempotent: re-running it on an already rebased plan reproduces the same
+    prices, because the step is fixed at plan time and the prices are derived
+    from it rather than from each other.
+    """
+    direction = Decimal("1") if plan.side == "BUY" else Decimal("-1")
+    targets = tuple(
+        replace(target, price=average_price + direction * target.initial_step)
+        for target in plan.targets
+    )
+    return replace(
+        plan,
+        reference_entry=average_price,
+        stop_price=average_price - direction * plan.risk_per_unit,
+        targets=targets,
+    )
 
 
 @dataclass(frozen=True)
@@ -182,10 +226,14 @@ _REJECTION_MESSAGES = {
     "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",
     "admission-error": "Ошибка при допуске сигнала",
     "risk-or-margin-budget": "не хватает лимитов риска или гарантийного обеспечения",
+    "risk-budget": "не хватает лимита риска для входа",
+    "margin-committed-by-pending-orders": "маржа занята незаполненными заявками",
+    "margin-budget": "не хватает бюджета гарантийного обеспечения",
     "insufficient-history": "Недостаточно истории для расчёта",
     "missing-structure": "Нет подтверждённой структуры",
     "missing-pattern-context": "Нет подтверждённых ориентиров формации",
     "target-not-ahead": "Цель не впереди входа",
+    "gap-entry": "вход по цене, ушедшей от сигнальной",
 }
 
 

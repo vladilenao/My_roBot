@@ -351,3 +351,56 @@ class TestDisplayNames:
         broker.place_order(_signal(), NG_META, NOW)
         row = broker.journal.events()[0]
         assert row.contract == "контракт не указан"
+
+
+class TestShareMeta:
+    """Акция: шаг цены и размер лота вместо ГО и стоимости шага фьючерса."""
+
+    SBER_META = ContractMeta(
+        ticker="SBER", price_step=0.01, step_cost=1.0, go_buy=0.0, go_sell=0.0
+    )
+
+    def _share_signal(self, **kw):
+        return _signal(
+            position_id="SBER-1",
+            ticker="SBER",
+            entry_price=300.0,
+            stop_price=297.0,
+            qty=10,
+            **kw,
+        )
+
+    def test_entry_fills_with_share_meta(self, tmp_path):
+        broker = _broker(tmp_path)
+        broker.place_order(self._share_signal(), self.SBER_META, NOW)
+        results = broker.track_bar(
+            NOW + timedelta(minutes=1), _bars({"SBER": (299.0, 301.0, 300.0)}),
+            {"SBER": self.SBER_META},
+        )
+
+        assert len(broker.manager.positions) == 1
+        assert any(r.status is OrderStatus.FILLED for r in results)
+
+    def test_pnl_uses_lot_size(self, tmp_path):
+        """Движение цены на 1 ₽ по акции в лоте 100 = 100 ₽ на контракт."""
+        broker = _broker(tmp_path)
+        broker.place_order(self._share_signal(), self.SBER_META, NOW)
+        broker.track_bar(
+            NOW + timedelta(minutes=1), _bars({"SBER": (299.0, 301.0, 300.0)}),
+            {"SBER": self.SBER_META},
+        )
+        results = broker.track_bar(
+            NOW + timedelta(minutes=2), _bars({"SBER": (296.0, 299.0, 297.0)}),
+            {"SBER": self.SBER_META},
+        )
+
+        # qty=10 лотов по 100 акций: цена 300 → 297 = -3 ₽ на акцию,
+        # -3 / 0.01 * 1.0 = -300 ₽ на лот, × 10 = -3000 ₽, комиссия 0.1% = 3 ₽
+        closes = [r for r in results if r.status is OrderStatus.FILLED]
+        assert closes and closes[0].reason == "protective"
+        assert broker.manager.account.realized_total == pytest.approx(-3003.0)
+        close_row = [
+            e for e in broker.journal.events() if e.op == OpType.EXIT.value
+        ][0]
+        assert float(close_row.pnl_part) == pytest.approx(-3003.0)
+        assert float(close_row.fee) == pytest.approx(3.0)

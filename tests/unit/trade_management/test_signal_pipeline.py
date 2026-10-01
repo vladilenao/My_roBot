@@ -349,6 +349,47 @@ def test_actions_for_signal_rejects_without_contract_metadata(tmp_path):
         assert admission.rejections[0].message
 
 
+SHARE_META = ContractMeta(
+    ticker="SBER", price_step=0.01, step_cost=1.0, go_buy=0.0, go_sell=0.0,
+    expiration_date=None,
+)
+SHARE_INSTRUMENT = SimpleNamespace(ticker="SBER", short_name="SBER")
+
+
+def test_actions_for_signal_admits_share_entry_with_lot_sizing(tmp_path):
+    """Акция проходит допуск: `step_cost / price_step` = цена лота, размер = риск / риск на лот."""
+    assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                                 management="levels_rr", filter_profile="basic_levels",
+                                 priority=0, timeframe="15m")
+    decision = Decision(signal_type=SignalType.BUY, price=300.0, bar_time=BAR0,
+                        event_id="signal-1", available_at=BAR0, timeframe="15m")
+    broker = _FillBroker(SHARE_META)
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=100)
+        actions = manager.actions_for_signal(
+            assignment, decision, SHARE_INSTRUMENT, _frame([300.0] * 25),
+            _context(price=300.0, levels=(SRLevel(297.0, SRType.SUPPORT, 2, "s1"),)),
+            timeframe="15m",
+        )
+
+        assert len(actions) == 1
+        opening = actions[0]
+        assert isinstance(opening, OpenTrade)
+        # цена лота = step_cost / price_step = 1.0 / 0.01 = 100 ₽;
+        # риск сделки 2% от 100000 = 2000 ₽, стоп 3 ₽ -> 300 ₽ на лот -> 6 лотов
+        assert SHARE_META.step_cost / SHARE_META.price_step == 100
+        assert opening.quantity == 6
+        assert storage.connection.execute(
+            "SELECT phase FROM trades WHERE trade_id = ?", (opening.trade_id,)
+        ).fetchone()[0] == "ENTRY_PENDING"
+
+        manager.dispatch(BAR0)
+        assert storage.connection.execute(
+            "SELECT phase FROM trades WHERE trade_id = ?", (opening.trade_id,)
+        ).fetchone()[0] == "OPEN"
+
+
 def test_actions_for_signal_rejects_duplicate_signal(tmp_path):
     assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
                                  management="levels_rr", filter_profile="basic_levels",
@@ -434,7 +475,7 @@ def test_submit_plan_returns_false_for_existing_trade_id(tmp_path):
         ).fetchone()[0] == 1
 
 
-def test_actions_for_signal_rejects_zero_quantity(tmp_path):
+def test_actions_for_signal_rejects_exhausted_risk_budget(tmp_path):
     assignment = SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
                                  management="levels_rr", filter_profile="basic_levels",
                                  priority=0, timeframe="15m")
@@ -452,4 +493,6 @@ def test_actions_for_signal_rejects_zero_quantity(tmp_path):
             _context(levels=(SRLevel(97.0, SRType.SUPPORT, 2, "s1"),)), timeframe="15m",
         )
         assert len(admission) == 0
-        assert [reason.code for reason in admission.rejections] == ["zero-quantity"]
+        # Нулевой бюджет риска — это исчерпанный лимит риска, а не общий отказ размера.
+        assert [reason.code for reason in admission.rejections] == ["risk-budget"]
+        assert admission.rejections[0].message == "не хватает лимита риска для входа"

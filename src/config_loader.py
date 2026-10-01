@@ -129,7 +129,7 @@ _PROFILE_KEYS = {
     "ma_cloud": {"type", "ma_fast_period", "ma_slow_period", "buffer_ticks", "max_adds", "add_fraction"},
     "pattern_targets": {"type", "buffer_ticks", "fractions_to_D", "shares", "max_adds", "add_fraction"},
 }
-_RISK_LIMIT_KEYS = {"trade_pct", "instrument_pct", "portfolio_pct", "groups", "max_qty", "commission", "slippage"}
+_RISK_LIMIT_KEYS = {"trade_pct", "instrument_pct", "portfolio_pct", "groups", "max_qty", "commission", "slippage", "slippage_tolerance"}
 _PATTERN_STRATEGIES = {"harmonic_abcd"}
 
 
@@ -314,7 +314,7 @@ def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
     unknown = set(value) - _RISK_LIMIT_KEYS
     if unknown:
         raise ConfigError(f"{path}: [trading.risk_limits] незнакомые ключи {sorted(unknown)}")
-    for key in ("trade_pct", "instrument_pct", "portfolio_pct", "commission", "slippage"):
+    for key in ("trade_pct", "instrument_pct", "portfolio_pct", "commission", "slippage", "slippage_tolerance"):
         if key in value:
             _finite_number(value[key], f"[trading.risk_limits] {key}", path, positive=key.endswith("_pct"), non_negative=not key.endswith("_pct"))
     if "max_qty" in value and (isinstance(value["max_qty"], bool) or not isinstance(value["max_qty"], int) or value["max_qty"] <= 0):

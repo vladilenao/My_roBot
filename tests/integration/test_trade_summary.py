@@ -115,15 +115,20 @@ def test_trade_summary_keeps_plan_volume_and_exit_sequence(tmp_path):
         "Trade ID", "Контракт", "Направление", "Статус", "Время входа", "Время выхода",
         "Длительность", "План входа", "План стопа", "План TP1", "Начальный объем", "Добрано",
         "Макс. объем", "Средняя входа", "Выходы", "Средняя выхода", "Финальная причина",
-        "Сценарий выхода", "Gross PnL", "Комиссия", "Net PnL", "Ед. PnL", "Initial Risk",
-        "Result", "MAE", "MFE",
+        "Сценарий выхода", "Gross PnL", "Комиссия", "Net PnL", "Ед. PnL", "Плановый риск",
+        "Initial Risk", "Result", "MAE", "MFE",
     }
     assert row["Статус"] == "закрыта"
     assert row["Начальный объем"] == "5"
     assert row["Добрано"] == "3"
     assert row["Макс. объем"] == "8"
     assert row["Выходы"] == "TP1: 2 @104.00; STOP: 6 @98.00"
-    assert row["Initial Risk"] == "500.00"
+    assert row["Плановый риск"] == "500.00"
+    # Without a step cost there is no way to price the risk in rubles, and the
+    # card says so rather than scoring bare price points as money.
+    assert row["Initial Risk"] == ""
+    assert row["Result"] == ""
+    assert row["MAE"] == ""
     assert row["Ед. PnL"] == "RAW"
     assert row["Комиссия"] == "-38.00"
     assert row["Net PnL"] == "-45.00"
@@ -161,5 +166,7 @@ def test_trade_summary_marks_ruble_and_raw_epoch_rows(tmp_path):
     assert by_trade["BR-10.26-20260918-00144"]["Ед. PnL"] == "RAW"
     assert by_trade["BR-10.26-20260918-00145"]["Ед. PnL"] == "RUB"
     assert by_trade["BR-10.26-20260918-00145"]["Net PnL"] == "-45.00"
-    assert by_trade["BR-10.26-20260918-00145"]["Initial Risk"] == "500.00"
-    assert by_trade["BR-10.26-20260918-00145"]["Result"] == "-0.09"
+    assert by_trade["BR-10.26-20260918-00145"]["Плановый риск"] == "500.00"
+    # risk per unit 2 points, step 8.4 RUB over a 10-point step, on the peak of 8 contracts
+    assert by_trade["BR-10.26-20260918-00145"]["Initial Risk"] == "13.44"
+    assert by_trade["BR-10.26-20260918-00145"]["Result"] == "-3.35"

@@ -54,7 +54,10 @@ def test_profiles_complete_entry_add_partial_stop_restart_and_close_in_sqlite(tm
     database = tmp_path / f"{name}.sqlite3"
 
     with Storage(database) as storage:
-        manager = TradeManager(storage, SimulatedBroker(), initial_balance=Decimal("10000"))
+        # The stub broker fills adds far from the signal price on purpose; this
+        # scenario is about the profile lifecycle, so the entry gap guard is stood down.
+        manager = TradeManager(storage, SimulatedBroker(), initial_balance=Decimal("10000"),
+                               slippage_tolerance=Decimal("1"))
         manager.submit_plan(plan, OpenTrade(f"{name}:open", plan.trade_id, 0, "entry", 2))
         manager.dispatch(NOW)
 
@@ -92,7 +95,7 @@ def test_profiles_complete_entry_add_partial_stop_restart_and_close_in_sqlite(tm
 
     # Recovery is exclusively from the temporary SQLite database.
     with Storage(database) as storage:
-        manager = TradeManager(storage, SimulatedBroker())
+        manager = TradeManager(storage, SimulatedBroker(), slippage_tolerance=Decimal("1"))
         recovered = _state(manager)
         assert recovered.state.quantity == 2
         assert recovered.state.confirmed_stop is not None

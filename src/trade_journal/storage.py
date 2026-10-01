@@ -5,13 +5,14 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 from pathlib import Path
 from decimal import Decimal
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
 
 from src.trade_journal.schema import initialize_schema
+from src.scheduler.clock import Clock, as_aware, as_clock
 from src.trade_journal.export import AuditExporter, CsvExporter
 from src.trade_management.models import (
     ProfileSnapshot,
@@ -118,6 +119,7 @@ class Storage:
         audit_max_bytes: int = 10_485_760,
         audit_backup_count: int = 5,
         initial_deposit: str | None = None,
+        clock: Clock | Callable[[], datetime] | None = None,
     ) -> None:
         if (journal_path is None) != (positions_path is None):
             raise ValueError("journal and positions export paths must be configured together")
@@ -129,6 +131,7 @@ class Storage:
         if audit_path is not None and Path(database).resolve() == Path(audit_path).resolve():
             raise ValueError("database path must not match audit export path")
         self.connection = connect(database, initial_deposit=initial_deposit)
+        self._clock = as_clock(clock)
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
             CsvExporter(self.connection, Path(journal_path), Path(positions_path))
@@ -157,6 +160,10 @@ class Storage:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def _now(self) -> datetime:
+        """Рыночный момент записи: виртуальные часы прогона либо системные часы."""
+        return as_aware(self._clock.now())
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -260,7 +267,7 @@ class Storage:
             key=lambda candidate: (-candidate.priority, candidate.assignment_id,
                                    candidate.instrument_id, candidate.signal_id),
         ))
-        now = (created_at or datetime.now(timezone.utc)).isoformat()
+        now = (created_at or self._now()).isoformat()
         with self.transaction() as connection:
             active_reservations = connection.execute(
                 "SELECT risk_amount, margin_amount FROM reservations WHERE status = 'ACTIVE'"
@@ -349,7 +356,7 @@ class Storage:
         """
         if not assignment_id or not signal_id:
             raise ValueError("assignment_id and signal_id are required")
-        now = (processed_at or datetime.now(timezone.utc)).isoformat()
+        now = (processed_at or self._now()).isoformat()
         with self.transaction() as connection:
             inserted = connection.execute(
                 "INSERT INTO processed_signals (assignment_id, signal_id, trade_id, processed_at) "
@@ -399,7 +406,7 @@ class Storage:
             return bool(connection.execute(
                 "UPDATE outbox SET status = 'SENT', sent_at = ? "
                 "WHERE command_id = ? AND status = 'CLAIMED'",
-                ((sent_at or datetime.now(timezone.utc)).isoformat(), command_id),
+                ((sent_at or self._now()).isoformat(), command_id),
             ).rowcount)
 
     def requeue_claimed_outbox(self) -> int:
@@ -442,6 +449,21 @@ class Storage:
             for row in cursor.fetchall()
         )
 
+    def load_trade(self, trade_id: str, *, include_terminal: bool = False) -> RecoveredTrade | None:
+        """Load one trade without re-registering it anywhere.
+
+        ``load_trades`` is the recovery path and re-publishes plans to the
+        broker; this one is for reading state in place, where the broker's copy
+        is already the newer of the two.
+        """
+        query = "SELECT * FROM trades WHERE trade_id = ?"
+        if not include_terminal:
+            query += " AND phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR')"
+        cursor = self.connection.execute(query, (trade_id,))
+        columns = tuple(column[0] for column in cursor.description)
+        row = cursor.fetchone()
+        return None if row is None else self._load_trade(dict(zip(columns, row, strict=True)))
+
     def _load_trade(self, trade: dict[str, object]) -> RecoveredTrade:
         try:
             plan_data = json.loads(trade["plan_json"])
@@ -464,6 +486,10 @@ class Storage:
                 target["target_id"]: target["share"]
                 for target in plan_data["targets"]
             }
+            target_steps = {
+                target["target_id"]: target.get("initial_step")
+                for target in plan_data["targets"]
+            }
             plan = TradePlan(
                 trade_id=trade["trade_id"],
                 assignment_id=trade["assignment_id"],
@@ -473,7 +499,10 @@ class Storage:
                 reference_entry=Decimal(plan_data["reference_entry"]),
                 stop_price=Decimal(plan_data["stop_price"]),
                 targets=tuple(
-                    TargetPlan(target_id, Decimal(price), Decimal(target_shares[target_id]))
+                    TargetPlan(
+                        target_id, Decimal(price), Decimal(target_shares[target_id]),
+                        Decimal(target_steps[target_id] or "0"),
+                    )
                     for target_id, price, _, _ in targets
                 ),
                 profile=ProfileSnapshot(
@@ -532,15 +561,15 @@ class Storage:
             target_filled={target_id: filled for target_id, _, _, filled in targets},
         )
 
-    @staticmethod
     def _enqueue(
+        self,
         connection: sqlite3.Connection,
         command_id: str,
         trade_id: str,
         payload: Mapping[str, object],
         created_at: datetime | None,
     ) -> bool:
-        now = (created_at or datetime.now(timezone.utc)).isoformat()
+        now = (created_at or self._now()).isoformat()
         return bool(connection.execute(
             "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at) "
             "VALUES (?, ?, ?, 'PENDING', ?) ON CONFLICT (command_id) DO NOTHING",

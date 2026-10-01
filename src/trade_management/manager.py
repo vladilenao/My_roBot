@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict, replace
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Callable, Mapping
 from uuid import uuid4
@@ -13,12 +13,18 @@ from uuid import uuid4
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.logging_setup import get_logger
 from src.portfolio.risk import PortfolioRiskManager, RiskLimits, RiskTrade
+from src.scheduler.clock import Clock, as_aware, as_clock
 from src.scheduler.timing import tf_period_minutes
 from src.strategies.contracts import SignalType
 from src.trade_journal.reducer import ExecutionReducer
 from src.trade_journal.storage import RecoveredTrade, ReservationCandidate, Storage
 from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
+)
+from src.trade_management.errors import (
+    InvalidStopBoundaryError,
+    ReservationRejected,
+    TradeManagementException,
 )
 from src.trade_management.audit import (
     CalculationTraceRepository,
@@ -28,7 +34,7 @@ from src.trade_management.audit import (
     calculation_trace,
 )
 from src.trade_management.models import (
-    SignalAdmission, TradePhase, TradePlan, rejection_message, rejection_reason,
+    SignalAdmission, TradePhase, TradePlan, rebase_on_average, rejection_message, rejection_reason,
 )
 from src.trade_management.opposite_signals import handle_raw_opposite_signal
 from src.trade_management.pipeline import (
@@ -51,6 +57,28 @@ _DEFAULT_RISK_LIMITS = RiskLimits(
     per_group={},
     portfolio=Decimal("10"),
 )
+STOP_BOUNDARY_REASON = "stop_loss_beyond_market_boundary"
+GAP_ENTRY_REASON = "gap-entry"
+DEFAULT_SLIPPAGE_TOLERANCE = Decimal("0.005")
+BUDGET_REJECTION_CODES = frozenset(
+    {"risk-budget", "margin-committed-by-pending-orders", "margin-budget"}
+)
+
+
+@dataclass(frozen=True)
+class _Sizing:
+    """Результат расчёта размера входа и причина отказа бюджета, если он есть."""
+
+    quantity: int
+    risk_amount: Decimal
+    code: str | None
+    candidate_quantity: int
+    per_unit_risk: Decimal
+    go: Decimal
+    used_risk: Decimal
+    used_margin: Decimal
+    risk_budget: Decimal
+    margin_budget: Decimal
 
 
 def _is_opposite(side: str, signal_type: SignalType) -> bool:
@@ -70,6 +98,11 @@ def _expires_within(meta, now: datetime, block_days: int) -> bool:
     if expiration_date is None:
         return False
     return (expiration_date - now).total_seconds() <= block_days * 86400
+
+
+def plan_reference_entry(plan_json: str) -> Decimal:
+    """Planned entry price of a stored plan, as recorded in its immutable json."""
+    return Decimal(str(json.loads(plan_json)["reference_entry"]))
 
 
 def _entry_ttl_seconds(timeframe: str) -> int:
@@ -107,11 +140,14 @@ class TradeManager:
         max_qty: int | None = None,
         commission: Decimal | float | str | None = None,
         slippage: Decimal | float | str | None = None,
+        slippage_tolerance: Decimal | float | str | None = None,
         signal_filter: object | None = None,
         contract_expiry_block_days: int = 2,
+        clock: Clock | Callable[[], datetime] | None = None,
     ) -> None:
         self._storage = storage
         self._broker = broker
+        self._clock = as_clock(clock)
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
         self._post_fill_check = post_fill_check
@@ -120,6 +156,9 @@ class TradeManager:
         self._max_qty = max_qty if isinstance(max_qty, int) and max_qty > 0 else 10
         self._commission = Decimal(str(commission)) if commission is not None else Decimal("0")
         self._slippage = Decimal(str(slippage)) if slippage is not None else Decimal("0")
+        self._slippage_tolerance = (
+            Decimal(str(slippage_tolerance)) if slippage_tolerance is not None else DEFAULT_SLIPPAGE_TOLERANCE
+        )
         self._signal_filter = signal_filter
         self._risk = PortfolioRiskManager()
         self._traces = CalculationTraceRepository(storage)
@@ -209,11 +248,78 @@ class TradeManager:
             register(plan)
         return True
 
+    def _assert_stop_within_market(
+        self, action: TradeAction, market_close: Decimal | float | None
+    ) -> None:
+        """Reject a protective stop that already lies beyond the market.
+
+        A stop past the market for a long (above ``close``) or a short (below
+        ``close``) fills at once at a worse price than the stop itself, so it
+        converts the intended protection into a realised loss. The rejection is
+        recorded on its own transaction and only then raised: a trace written
+        inside the rolled-back step transaction would not survive the rollback.
+
+        Without a market price (empty frame, no candles for the instrument) the
+        check is skipped fail-safe and logged, so a missing feed can never
+        freeze emergency protection.
+        """
+        if not isinstance(action, MoveStop):
+            return
+        if market_close is None:
+            log.warning(
+                "submit_action %s: нет цены рынка, граница стопа не проверена",
+                action.trade_id,
+            )
+            return
+        row = self._storage.connection.execute(
+            "SELECT side FROM trades WHERE trade_id = ?", (action.trade_id,)
+        ).fetchone()
+        if row is None:
+            return
+        side, = row
+        close = Decimal(str(market_close))
+        stop = action.stop_price
+        beyond_market = stop >= close if side == "BUY" else stop <= close
+        if not beyond_market:
+            return
+        self._traces.record(
+            calculation_trace(
+                "management.stop-boundary",
+                inputs={
+                    "side": MeasuredValue(side, "side"),
+                    "stop_price": MeasuredValue(stop, "price"),
+                    "market_close": MeasuredValue(close, "price"),
+                },
+                result=MeasuredValue(False, "rejected"),
+                reason=STOP_BOUNDARY_REASON,
+                formula="long: stop < market_close; short: stop > market_close",
+                links=TraceLinks(trade_id=action.trade_id),
+                outcome=TraceOutcome.REJECTED,
+            )
+        )
+        raise InvalidStopBoundaryError(
+            f"stop {stop} beyond market {close} for {action.trade_id}"
+        )
+
     def submit_action(
-        self, action: TradeAction, *, assignment_id: str | None = None, trace=None
+        self,
+        action: TradeAction,
+        *,
+        assignment_id: str | None = None,
+        trace=None,
+        market_close: Decimal | float | None = None,
     ) -> bool:
-        """Validate and durably queue one management action before broker delivery."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Validate and durably queue one management action before broker delivery.
+
+        ``market_close`` is the last known market price of the instrument. For a
+        protective stop it must lie on the position side of the market; a stop
+        already beyond the market would fill immediately at a worse price and
+        amplify the loss it is meant to contain. The check runs before the
+        step transaction so the rejection trace commits on its own and nothing
+        is left half-written.
+        """
+        self._assert_stop_within_market(action, market_close)
+        now = as_aware(self._clock.now()).isoformat()
         with self._storage.transaction() as connection:
             row = connection.execute(
                 "SELECT assignment_id, phase, state_revision FROM trades WHERE trade_id = ?", (action.trade_id,)
@@ -238,21 +344,133 @@ class TradeManager:
                 self._traces.record_in_transaction(connection, trace)
         return True
 
-    def _record_slippage_stub(self, decision, instrument, timeframe) -> None:
-        trace = calculation_trace(
-            "execution.slippage_guard",
-            inputs={
-                "requested_price": MeasuredValue(decision.price, "price"),
-                "allowed_slippage": MeasuredValue(self._slippage, "RUB"),
-                "instrument": MeasuredValue(instrument.ticker, "instrument-id"),
-                "timeframe": MeasuredValue(timeframe, "timeframe"),
-            },
-            result=MeasuredValue(True, "accepted"),
-            reason="stub-accepted-no-enforcement",
-            formula="observation-only slippage guard stub",
-            links=TraceLinks(signal_id=decision.event_id),
+    def _entry_gap(self, event: ExecutionEvent) -> tuple[str, Decimal, Decimal, int] | None:
+        """Adverse entry deviation in price units, or ``None`` when not applicable.
+
+        Reads the confirmed average price of the position rather than the fill
+        price of the event: an averaged add-to-trade must be judged as a whole,
+        because a single cheap leg does not cancel an expensive one.
+        """
+        if event.trade_id is None or event.status is not ExecutionStatus.FILL:
+            return None
+        cursor = self._storage.connection.execute(
+            "SELECT o.action_type, t.side, t.plan_json, t.state_revision, p.average_price "
+            "FROM orders o JOIN trades t ON t.trade_id = o.trade_id "
+            "JOIN positions p ON p.trade_id = t.trade_id WHERE o.command_id = ?",
+            (event.command_id,),
         )
-        self._traces.record(trace)
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        record = dict(zip((column[0] for column in cursor.description), row, strict=True))
+        if str(record["action_type"]).upper().split(":", 1)[0] not in {"OPEN", "ADD"}:
+            return None
+        if record["average_price"] is None:
+            return None
+        reference = Decimal(str(plan_reference_entry(record["plan_json"])))
+        average = Decimal(str(record["average_price"]))
+        side = str(record["side"]).upper()
+        adverse = average - reference if side == "BUY" else reference - average
+        if adverse <= 0:
+            return None
+        return side, reference, average, int(record["state_revision"])
+
+    def _rebase_open_targets(self, event: ExecutionEvent) -> None:
+        """Restate unfilled targets and the stop on the confirmed average price.
+
+        The planned prices stay in ``plan_json``: they are what the trade was
+        admitted on and what the journal replays. Only live facts move, and
+        only for targets that have not traded yet, so a filled target keeps the
+        price it actually executed at.
+        """
+        if event.trade_id is None:
+            return
+        cursor = self._storage.connection.execute(
+            "SELECT o.action_type, t.plan_json, t.trade_id, t.side, p.average_price "
+            "FROM orders o JOIN trades t ON t.trade_id = o.trade_id "
+            "JOIN positions p ON p.trade_id = t.trade_id WHERE o.command_id = ?",
+            (event.command_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return
+        record = dict(zip((column[0] for column in cursor.description), row, strict=True))
+        if str(record["action_type"]).upper().split(":", 1)[0] not in {"OPEN", "ADD"}:
+            return
+        if record["average_price"] is None:
+            return
+        recovered = self._storage.load_trade(event.trade_id, include_terminal=True)
+        if recovered is None:
+            return
+        rebased = rebase_on_average(recovered.plan, Decimal(str(record["average_price"])))
+        now = as_aware(self._clock.now()).isoformat()
+        with self._storage.transaction() as connection:
+            for target in rebased.targets:
+                connection.execute(
+                    "UPDATE targets SET price = ? WHERE trade_id = ? AND target_id = ? "
+                    "AND filled_quantity = 0",
+                    (str(target.price), event.trade_id, target.target_id),
+                )
+            connection.execute(
+                "UPDATE protection SET confirmed_stop = ?, updated_at = ? WHERE trade_id = ?",
+                (str(rebased.stop_price), now, event.trade_id),
+            )
+        log.info(
+            "цели и стоп %s пересчитаны от средней %s", event.trade_id, record["average_price"],
+        )
+
+    def _enforce_entry_slippage_guard(self, event: ExecutionEvent) -> None:
+        """Reject an entry filled beyond tolerance from the price of its signal.
+
+        A gap against the position hurts twice: the stop distance planned from
+        the signal is already spent by the fill, so the trade starts with more
+        risk than was admitted and sized for. The deviation is measured on the
+        confirmed average price, the rejection is recorded durably, and the
+        position is queued to be closed at market instead of being held.
+        """
+        measured = self._entry_gap(event)
+        if measured is None:
+            return
+        side, reference, average, revision = measured
+        allowed = reference * self._slippage_tolerance
+        deviation = (average - reference) if side == "BUY" else (reference - average)
+        if deviation <= allowed:
+            return
+        log.warning(
+            "вход %s вне допуска: цена %s против сигнальной %s (%s)",
+            event.trade_id, average, reference, GAP_ENTRY_REASON,
+        )
+        self._traces.record(
+            calculation_trace(
+                "execution.slippage_guard",
+                inputs={
+                    "signal_price": MeasuredValue(reference, "price"),
+                    "filled_price": MeasuredValue(average, "price"),
+                    "side": MeasuredValue(side, "side"),
+                    "tolerance": MeasuredValue(self._slippage_tolerance, "fraction"),
+                },
+                result=MeasuredValue(deviation, "price"),
+                outcome=TraceOutcome.REJECTED,
+                reason=GAP_ENTRY_REASON,
+                formula="|filled - signal| / signal, неблагоприятное направление",
+                links=TraceLinks(trade_id=event.trade_id),
+            )
+        )
+        self.submit_action(
+            CloseTrade(
+                command_id=f"{event.trade_id}:{GAP_ENTRY_REASON}:{event.command_id}",
+                trade_id=event.trade_id,
+                state_revision=revision,
+                reason=GAP_ENTRY_REASON,
+            )
+        )
+        now = as_aware(self._clock.now()).isoformat()
+        with self._storage.transaction() as connection:
+            connection.execute(
+                "UPDATE trades SET phase = 'REJECTED', state_revision = state_revision + 1, updated_at = ? "
+                "WHERE trade_id = ? AND phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR')",
+                (now, event.trade_id),
+            )
 
     def dispatch(self, now: datetime, *, limit: int = 100) -> tuple[ExecutionEvent, ...]:
         """Deliver persisted outbox commands and immediately consume their outcomes."""
@@ -272,6 +490,9 @@ class TradeManager:
             return False
         if event.status is ExecutionStatus.ACK:
             self._confirm_stop(event)
+        if event.status is ExecutionStatus.FILL:
+            self._enforce_entry_slippage_guard(event)
+            self._rebase_open_targets(event)
         if event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL} and self._post_fill_check:
             for action in self._post_fill_check(event):
                 self.submit_action(action)
@@ -302,7 +523,7 @@ class TradeManager:
             return SignalAdmission(
                 rejections=(rejection_reason("no-contract-metadata"),),
             )
-        if _expires_within(meta, datetime.now(timezone.utc).replace(tzinfo=None), self._contract_expiry_block_days):
+        if _expires_within(meta, self._clock.now(), self._contract_expiry_block_days):
             log.info("actions_for_signal %s: вход отклонён — близкая экспирация", instrument.ticker)
             return SignalAdmission(
                 rejections=(rejection_reason("contract-expiring"),),
@@ -321,6 +542,11 @@ class TradeManager:
                     "admission-error",
                     message="Ошибка при допуске сигнала: Ошибка на уровне БД: нарушение целостности данных",
                 ),),
+            )
+        except ReservationRejected as rejected:
+            log.info("actions_for_signal %s: резервирование отклонено — %s", instrument.ticker, rejected.code)
+            return SignalAdmission(
+                rejections=(rejection_reason(rejected.code),),
             )
         except Exception as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -342,7 +568,7 @@ class TradeManager:
         now: datetime | None = None,
     ) -> tuple[TradeAction, ...]:
         """Protect each live trade of the instrument from the provided frame."""
-        now = now or datetime.now(timezone.utc)
+        now = now or as_aware(self._clock.now())
         contract = getattr(self._broker, "contract_for", None)
         meta = contract(instrument.ticker) if callable(contract) else None
         if meta is None:
@@ -377,9 +603,14 @@ class TradeManager:
                 if isinstance(action, AddToTrade):
                     continue
                 try:
-                    if self.submit_action(action, assignment_id=plan.assignment_id, trace=management_trace):
+                    if self.submit_action(
+                        action,
+                        assignment_id=plan.assignment_id,
+                        trace=management_trace,
+                        market_close=market.get("close"),
+                    ):
                         results.append(action)
-                except ValueError as exc:
+                except (ValueError, TradeManagementException) as exc:
                     log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(results)
 
@@ -505,11 +736,15 @@ class TradeManager:
                 action for action in management_result.actions
                 if isinstance(action, AddToTrade)
             )
-        self._record_slippage_stub(decision, instrument, timeframe)
         submitted: list[TradeAction] = []
         for action in actions:
             try:
-                if self.submit_action(action, assignment_id=assignment.id, trace=management_trace):
+                if self.submit_action(
+                    action,
+                    assignment_id=assignment.id,
+                    trace=management_trace,
+                    market_close=market.get("close"),
+                ):
                     submitted.append(action)
             except (ValueError, KeyError, TypeError) as exc:
                 log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
@@ -557,9 +792,20 @@ class TradeManager:
                 rejections=(rejection_reason(code),),
             )
         plan = replace(plan, timeframe=timeframe or "")
-        quantity, risk_amount = self._size_open_quantity(plan, meta)
+        sizing = self._size_open_quantity(plan, meta)
+        quantity, risk_amount = sizing.quantity, sizing.risk_amount
         budget = self._budget_base()
         if quantity <= 0:
+            if sizing.code in BUDGET_REJECTION_CODES:
+                self._log_budget_rejection(
+                    sizing.code,
+                    used_risk=sizing.used_risk,
+                    candidate_risk=sizing.per_unit_risk * sizing.candidate_quantity,
+                    risk_budget=sizing.risk_budget,
+                    used_margin=sizing.used_margin,
+                    candidate_margin=sizing.go * sizing.candidate_quantity,
+                    margin_budget=sizing.margin_budget,
+                )
             self._traces.record(calculation_trace(
                 "portfolio.position_sizing",
                 inputs={
@@ -571,12 +817,12 @@ class TradeManager:
                 },
                 result=MeasuredValue(quantity, "contracts"),
                 outcome=TraceOutcome.REJECTED,
-                reason="risk-limit-rejects-entry",
+                reason=sizing.code or "risk-limit-rejects-entry",
                 formula="no quantity satisfies risk, exposure, and margin limits",
                 links=TraceLinks(assignment_id=assignment.id, signal_id=plan.signal_id),
             ))
             return SignalAdmission(
-                rejections=(rejection_reason("zero-quantity"),),
+                rejections=(rejection_reason(sizing.code or "zero-quantity"),),
             )
         action = OpenTrade(
             command_id=f"{plan.trade_id}:entry",
@@ -625,20 +871,31 @@ class TradeManager:
             rejections=(rejection_reason("duplicate-signal"),),
         )
 
-    def _size_open_quantity(self, plan: TradePlan, meta) -> tuple[int, Decimal]:
-        """Size a fresh entry within per-trade/instrument/portfolio risk and margin."""
+    def _size_open_quantity(self, plan: TradePlan, meta) -> _Sizing:
+        """Size a fresh entry within risk and margin available after committed reserves.
+
+        Свободный бюджет считается за вычетом сумм ACTIVE-резервов, поэтому
+        расчётный объём по построению помещается в резервирование; если
+        свободного бюджета не хватает даже на минимальный вход, размер равен
+        нулю, а код причины называет исчерпанный бюджет.
+        """
         value_per_point = Decimal(str(meta.step_cost)) / Decimal(str(meta.price_step))
         direction = Decimal("1") if plan.side == "BUY" else Decimal("-1")
         per_unit_risk = direction * (plan.reference_entry - plan.stop_price) * value_per_point
-        if per_unit_risk <= 0:
-            return 0, Decimal("0")
         budget = self._budget_base()
-        existing = self._risk_trades()
         go = Decimal(str(meta.go_buy if plan.side == "BUY" else meta.go_sell))
+        used_risk, used_margin = self._committed_budget()
+        risk_budget = budget * self._risk_limits.per_trade / Decimal("100")
+        free_risk = risk_budget - used_risk
+        free_margin = budget - used_margin
+        if per_unit_risk <= 0:
+            return _Sizing(0, Decimal("0"), "zero-quantity", 0, per_unit_risk, go,
+                           used_risk, used_margin, risk_budget, budget)
+        existing = self._risk_trades()
         limits = self._risk_limits
 
-        def allowed(quantity: int) -> bool:
-            if go > 0 and go * quantity > budget:
+        def risk_allowed(quantity: int) -> bool:
+            if per_unit_risk * quantity > free_risk:
                 return False
             candidate = RiskTrade(
                 trade_id=plan.trade_id,
@@ -656,6 +913,28 @@ class TradeManager:
                 trades=existing + (candidate,),
             ).allowed
 
+        def margin_allowed(quantity: int) -> bool:
+            return go <= 0 or go * quantity <= free_margin
+
+        def allowed(quantity: int) -> bool:
+            return risk_allowed(quantity) and margin_allowed(quantity)
+
+        quantity = self._largest_allowed(allowed)
+        if quantity > 0:
+            return _Sizing(quantity, per_unit_risk * quantity, None, quantity, per_unit_risk,
+                           go, used_risk, used_margin, risk_budget, budget)
+        risk_quantity = self._largest_allowed(risk_allowed)
+        if risk_quantity > 0:
+            code = "margin-committed-by-pending-orders" if used_margin > 0 else "margin-budget"
+        elif per_unit_risk > free_risk:
+            code = "risk-budget"
+        else:
+            code = "zero-quantity"
+        candidate_quantity = risk_quantity or 1
+        return _Sizing(0, Decimal("0"), code, candidate_quantity, per_unit_risk, go,
+                       used_risk, used_margin, risk_budget, budget)
+
+    def _largest_allowed(self, allowed: Callable[[int], bool]) -> int:
         low, high = 0, self._max_qty
         while low < high:
             candidate_qty = (low + high + 1) // 2
@@ -663,9 +942,37 @@ class TradeManager:
                 low = candidate_qty
             else:
                 high = candidate_qty - 1
-        if low <= 0:
-            return 0, Decimal("0")
-        return low, per_unit_risk * low
+        return low
+
+    def _committed_budget(self) -> tuple[Decimal, Decimal]:
+        return self._active_reservation_totals(self._storage.connection)
+
+    @staticmethod
+    def _active_reservation_totals(connection) -> tuple[Decimal, Decimal]:
+        rows = connection.execute(
+            "SELECT risk_amount, margin_amount FROM reservations WHERE status = 'ACTIVE'"
+        ).fetchall()
+        used_risk = sum((Decimal(row[0]) for row in rows), Decimal("0"))
+        used_margin = sum((Decimal(row[1]) for row in rows), Decimal("0"))
+        return used_risk, used_margin
+
+    @staticmethod
+    def _log_budget_rejection(
+        code: str | None,
+        *,
+        used_risk: Decimal,
+        candidate_risk: Decimal,
+        risk_budget: Decimal,
+        used_margin: Decimal,
+        candidate_margin: Decimal,
+        margin_budget: Decimal,
+    ) -> None:
+        log.info(
+            "отказ резервирования входа: code=%s used_risk=%s candidate_risk=%s "
+            "risk_budget=%s used_margin=%s candidate_margin=%s margin_budget=%s",
+            code, used_risk, candidate_risk, risk_budget,
+            used_margin, candidate_margin, margin_budget,
+        )
 
     def _budget_base(self) -> Decimal:
         row = self._storage.connection.execute(
@@ -764,13 +1071,32 @@ class TradeManager:
             return
         if risk_budget is None or margin_budget is None:
             raise ValueError("reservation requires risk and margin budgets")
-        rows = connection.execute(
-            "SELECT risk_amount, margin_amount FROM reservations WHERE status = 'ACTIVE'"
-        ).fetchall()
-        used_risk = sum((Decimal(row[0]) for row in rows), Decimal("0"))
-        used_margin = sum((Decimal(row[1]) for row in rows), Decimal("0"))
-        if used_risk + candidate.risk_amount > risk_budget or used_margin + candidate.margin_amount > margin_budget:
-            raise ValueError("risk-or-margin-budget")
+        used_risk, used_margin = self._active_reservation_totals(connection)
+        if used_risk + candidate.risk_amount > risk_budget:
+            code = "risk-budget"
+        elif used_margin + candidate.margin_amount > margin_budget:
+            code = "margin-committed-by-pending-orders" if used_margin > 0 else "margin-budget"
+        else:
+            code = None
+        if code is not None:
+            self._log_budget_rejection(
+                code,
+                used_risk=used_risk,
+                candidate_risk=candidate.risk_amount,
+                risk_budget=risk_budget,
+                used_margin=used_margin,
+                candidate_margin=candidate.margin_amount,
+                margin_budget=margin_budget,
+            )
+            raise ReservationRejected(
+                code,
+                used_risk=used_risk,
+                candidate_risk=candidate.risk_amount,
+                risk_budget=risk_budget,
+                used_margin=used_margin,
+                candidate_margin=candidate.margin_amount,
+                margin_budget=margin_budget,
+            )
         connection.execute(
             "INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
             (candidate.reservation_id, candidate.trade_id, candidate.order_id,
@@ -813,7 +1139,11 @@ def _profile_payload(plan: TradePlan) -> dict[str, object]:
 def _plan_payload(plan: TradePlan) -> dict[str, object]:
     return {
         "reference_entry": str(plan.reference_entry), "stop_price": str(plan.stop_price),
-        "targets": [{"target_id": target.target_id, "share": str(target.share)} for target in plan.targets],
+        "targets": [
+            {"target_id": target.target_id, "share": str(target.share),
+             "initial_step": str(target.initial_step)}
+            for target in plan.targets
+        ],
         "timeframe": plan.timeframe,
     }
 

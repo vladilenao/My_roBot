@@ -11,6 +11,7 @@ from src.broker.events import BrokerEvent
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.events.types import EventType
 from src.logging_setup import get_logger
+from src.scheduler.clock import Clock, as_clock
 from src.portfolio import (
     ContractMeta,
     OrderResult,
@@ -38,7 +39,7 @@ from src.trade_management.actions import (
     ReduceTrade,
     TradeAction,
 )
-from src.trade_management.models import TradePlan
+from src.trade_management.models import TradePlan, rebase_on_average
 
 UTC = timezone.utc
 _MSK = timezone(timedelta(hours=3))
@@ -130,6 +131,19 @@ def _pnl(side: str, avg: float, exit_price: float, qty: int, contract: ContractM
     return round(delta * qty * (-1 if side == "SELL" else 1), 2)
 
 
+def _bar_extremes(bar: tuple[float, float, float, float] | None) -> dict[str, Decimal]:
+    """Full range of the bar a fill happened on, for excursion metrics.
+
+    Only a bar the position was actually held through carries information about
+    how far it went against the trade. Outside a bar the fields stay empty
+    rather than being filled with the fill price, which would make a trade that
+    never dipped look as if it did.
+    """
+    if bar is None:
+        return {}
+    return {"market_low": Decimal(str(bar[1])), "market_high": Decimal(str(bar[2]))}
+
+
 def _naive_utc(value: datetime) -> datetime:
     """Приводит время к единой базе naive UTC для сравнения активации заявок.
 
@@ -165,9 +179,11 @@ class JournalBroker(BrokerPort):
         manager: PositionManager,
         clearing_times_msk: list[str],
         contract_names: Optional[Mapping[str, str]] = None,
+        clock: Optional[Clock] = None,
     ):
         self.journal = journal
         self.manager = manager
+        self._clock = as_clock(clock)
         self.clearing_times_msk = list(clearing_times_msk)
         self._orders: dict[int, Order] = {}
         self._events: deque[BrokerEvent] = deque()
@@ -190,6 +206,11 @@ class JournalBroker(BrokerPort):
         """Register the immutable details required to execute a trade command."""
         existing = self._addressed_trades.get(plan.trade_id)
         if existing is not None and existing.plan != plan:
+            if existing.entry_quantity:
+                # The position is live here and its prices are quoted from the
+                # average it actually holds; the durable plan is the one it was
+                # admitted on. Neither is wrong, so the live view wins.
+                return
             raise ValueError(f"trade {plan.trade_id!r} is already registered with another plan")
         self._addressed_trades.setdefault(plan.trade_id, AddressedTrade(plan))
 
@@ -263,7 +284,8 @@ class JournalBroker(BrokerPort):
         return event
 
     def _execute_action(
-        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
+        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None,
+        bar: tuple[float, float, float, float] | None = None,
     ) -> ExecutionEvent:
         plan = trade.plan
         position = self.manager.positions.get(action.trade_id)
@@ -300,11 +322,15 @@ class JournalBroker(BrokerPort):
             else:
                 price = fill_price or plan.reference_entry
                 position.apply_fill(float(price), quantity)
+            # A fill sets the average the position is actually held at, so the
+            # targets and stop that follow it must be quoted from that average
+            # rather than from the price the trade was admitted on.
+            trade.plan = rebase_on_average(trade.plan, Decimal(str(position.avg_price)))
             trade.entry_quantity += quantity
             # The initial stop is active only after the entry fill is confirmed.
-            trade.confirmed_stop = plan.stop_price
+            trade.confirmed_stop = trade.plan.stop_price
             trade.revision += 1
-            return self._command_fill(action, now, quantity, price)
+            return self._command_fill(action, now, quantity, price, bar)
         if isinstance(action, (ReduceTrade, CloseTrade)):
             if position is None or position.qty == 0:
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
@@ -326,7 +352,7 @@ class JournalBroker(BrokerPort):
             price = fill_price or next(
                 (target.price for target in plan.targets if target.target_id == target_id), plan.reference_entry
             )
-            return self._command_fill(action, now, quantity, price)
+            return self._command_fill(action, now, quantity, price, bar)
         return self._command_outcome(action, now, ExecutionStatus.REJECT, "unsupported-command")
 
     @staticmethod
@@ -354,15 +380,20 @@ class JournalBroker(BrokerPort):
         )
 
     @staticmethod
-    def _command_fill(action: TradeAction, now: datetime, quantity: int, price: Decimal) -> ExecutionEvent:
+    def _command_fill(
+        action: TradeAction, now: datetime, quantity: int, price: Decimal,
+        bar: tuple[float, float, float, float] | None = None,
+    ) -> ExecutionEvent:
         return ExecutionEvent(
             execution_id=f"{action.command_id}:fill", order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=ExecutionStatus.FILL,
             filled_quantity=quantity, price=price, fee=Decimal("0"), timestamp=now, reason=action.reason,
+            **_bar_extremes(bar),
         )
 
     def _pv_fill(self, trade: AddressedTrade, now: datetime, quantity: int, price: Decimal, *,
-                 kind: str, target_id: str | None = None) -> ExecutionEvent:
+                 kind: str, target_id: str | None = None,
+                 bar: tuple[float, float, float, float] | None = None) -> ExecutionEvent:
         """Исполнение защитного закрытия с детерминированным (сделка, бар) id.
 
         ``kind`` — ``stop`` (стоп) либо ``tp`` (исполненная цель). Идентификаторы
@@ -379,6 +410,7 @@ class JournalBroker(BrokerPort):
             trade_id=trade.plan.trade_id, status=ExecutionStatus.FILL, filled_quantity=quantity,
             price=price, fee=Decimal("0"), timestamp=now,
             reason=f"tp:{target_id}" if kind == "tp" else "protective",
+            **_bar_extremes(bar),
         )
 
     def set_names(self, names: Optional[Mapping[str, str]]) -> None:
@@ -412,7 +444,7 @@ class JournalBroker(BrokerPort):
                 risk_rub=restored.risk_rub,
             )
         for pos in self.manager.positions.values():
-            ts = pos.ts_entry or datetime.now(UTC).replace(microsecond=0)
+            ts = pos.ts_entry or self._clock.now().replace(microsecond=0)
             pos.protective = self._protective_for(pos, ts)
 
     def contract_for(self, ticker: str) -> Optional[ContractMeta]:
@@ -502,7 +534,7 @@ class JournalBroker(BrokerPort):
         if order is None or order.status != OrderStatus.NEW:
             return self._noop_result(f"Заявка {order_id} не найдена или не активна")
         order.status = OrderStatus.CANCELLED
-        self._write_terminal(order, reason, now := datetime.now(UTC).replace(microsecond=0))
+        self._write_terminal(order, reason, now := self._clock.now().replace(microsecond=0))
         self._orders.pop(order_id, None)
         self.manager.drop_order(order_id)
         self._publish_event(
@@ -633,8 +665,9 @@ class JournalBroker(BrokerPort):
             if trade is None or trade.plan.instrument_id not in active_tickers:
                 continue
             open_price = Decimal(str(ohlc[trade.plan.instrument_id][0]))
+            bar = ohlc[trade.plan.instrument_id]
             if isinstance(action, (OpenTrade, AddToTrade)):
-                event = self._execute_scheduled(trade, action, now, open_price)
+                event = self._execute_scheduled(trade, action, now, open_price, bar)
                 if event.status not in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
                     continue
                 trade.opened_bar = now
@@ -642,16 +675,17 @@ class JournalBroker(BrokerPort):
                 # targets cannot use high/low that occurred before that fill.
                 self._process_addressed_stop(trade, now, ohlc[trade.plan.instrument_id])
             elif isinstance(action, (CloseTrade, ReduceTrade)):
-                self._execute_scheduled(trade, action, now, open_price)
+                self._execute_scheduled(trade, action, now, open_price, bar)
 
     def _execute_scheduled(
-        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None
+        self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None,
+        bar: tuple[float, float, float, float] | None = None,
     ) -> ExecutionEvent:
         if not isinstance(action, MoveStop) and action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
             self._addressed_events.append(event)
             return event
-        event = self._execute_action(trade, action, now, fill_price)
+        event = self._execute_action(trade, action, now, fill_price, bar=bar)
         self._addressed_events.append(event)
         return event
 
@@ -679,7 +713,8 @@ class JournalBroker(BrokerPort):
                 trade.target_filled[target.target_id] += filled
                 trade.revision += 1
                 event = self._pv_fill(
-                    trade, now, filled, Decimal(str(target.price)), kind="tp", target_id=target.target_id
+                    trade, now, filled, Decimal(str(target.price)), kind="tp",
+                    target_id=target.target_id, bar=bar,
                 )
                 self._addressed_events.append(event)
                 self._publish_event(
@@ -711,7 +746,7 @@ class JournalBroker(BrokerPort):
         trade.confirmed_stop = None
         trade.last_stop_fill = price
         trade.revision += 1
-        event = self._pv_fill(trade, now, quantity, price, kind="stop")
+        event = self._pv_fill(trade, now, quantity, price, kind="stop", bar=bar)
         self._addressed_events.append(event)
         self._publish_event(
             EventType.STOP_HIT,
@@ -1181,7 +1216,7 @@ class JournalBroker(BrokerPort):
 
 
     def _noop_result(self, message: str) -> OrderResult:
-        now = datetime.now(UTC).replace(microsecond=0)
+        now = self._clock.now().replace(microsecond=0)
         return OrderResult(
             order_id=0,
             status=OrderStatus.NONE,

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from src.broker.port import ExecutionEvent, ExecutionStatus
+from src.logging_setup import get_logger
 from src.trade_journal.storage import Storage
 from src.trade_management.audit import CalculationTrace, CalculationTraceRepository, MeasuredValue, TraceLinks, calculation_trace
 
@@ -14,6 +15,26 @@ from src.trade_management.audit import CalculationTrace, CalculationTraceReposit
 _INCREASE_ACTIONS = {"OPEN", "ADD"}
 _REDUCE_ACTIONS = {"REDUCE", "CLOSE", "TARGET", "STOP"}
 _TERMINAL_PHASES = ("CLOSED", "CANCELLED", "REJECTED", "ERROR")
+log = get_logger(__name__)
+_WARNED_STEP_MISSING: set[str] = set()
+
+
+def _warn_missing_step(trade_id: str) -> None:
+    """Say once that a trade cannot be priced in rubles.
+
+    Without the contract's step the money behind a fill is unknowable, so the
+    row stays marked as unusable for ruble metrics rather than quietly scored
+    in bare price points. The metadata snapshot is deliberately not read here:
+    event reduction has to stay reproducible from the journal alone.
+    """
+    if trade_id in _WARNED_STEP_MISSING:
+        return
+    _WARNED_STEP_MISSING.add(trade_id)
+    log.warning(
+        "сделка %s без шага цены и стоимости шага: рублёвые метрики недоступны", trade_id,
+    )
+
+
 def _decimal(value: str | Decimal) -> Decimal:
     return Decimal(value)
 
@@ -191,6 +212,8 @@ class ExecutionReducer:
                     step_cost=Decimal(str(trade_row[2])) if trade_row[2] is not None else None,
                 )
                 self._traces.record_in_transaction(connection, fill_trace)
+                if trade_row[1] is None or trade_row[2] is None:
+                    _warn_missing_step(event.trade_id)
                 total_filled = order["filled_quantity"] + event.filled_quantity
                 if total_filled > order["quantity"]:
                     raise ValueError("filled quantity exceeds order quantity")
@@ -441,8 +464,13 @@ class ExecutionReducer:
         if filled > target["planned_quantity"]:
             raise ValueError("target fill exceeds planned quantity")
         connection.execute(
-            "UPDATE targets SET filled_quantity=?, status=? WHERE target_id=?",
-            (filled, "FILLED" if filled == target["planned_quantity"] else "PARTIAL", target_id),
+            "UPDATE targets SET filled_quantity=?, status=? WHERE target_id=? AND trade_id=?",
+            (
+                filled,
+                "FILLED" if filled == target["planned_quantity"] else "PARTIAL",
+                target_id,
+                trade_id,
+            ),
         )
 
     @staticmethod

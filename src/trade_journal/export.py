@@ -32,7 +32,7 @@ POSITIONS_COLUMNS = (
     "trade_id", "contract", "direction", "status", "entry_at", "exit_at", "duration",
     "planned_entry", "planned_stop", "planned_tp1", "initial_quantity", "added_quantity",
     "max_quantity", "average_entry", "exits", "average_exit", "final_reason", "exit_scenario",
-    "gross_pnl", "fees", "net_pnl", "pnl_units", "initial_risk", "result_r", "mae_r", "mfe_r",
+    "gross_pnl", "fees", "net_pnl", "pnl_units", "planned_risk", "initial_risk", "result_r", "mae_r", "mfe_r",
 )
 
 # Человекочитаемые русскоязычные заголовки CSV-проекций. Позиции соответствуют
@@ -74,6 +74,7 @@ POSITIONS_HEADERS = (
     "Комиссия",
     "Net PnL",
     "Ед. PnL",
+    "Плановый риск",
     "Initial Risk",
     "Result",
     "MAE",
@@ -314,6 +315,10 @@ ORDER BY positions.trade_id
         average_entry = entry_value / entry_total if entry_total else None
         average_exit = exit_value / exit_total if exit_total else None
         initial_risk = self._initial_risk(trade_id)
+        point_value = self._point_value(row.get("price_step"), row.get("step_cost"))
+        realized_risk = self._realized_initial_risk(
+            plan, average_entry, point_value, max_qty,
+        )
         gross = Decimal(str(row.get("realized_pnl") or "0"))
         fees = Decimal(str(row.get("fees") or "0"))
         net = gross - fees
@@ -342,10 +347,17 @@ ORDER BY positions.trade_id
             "fees": self._money(-fees),
             "net_pnl": self._money(net),
             "pnl_units": units,
-            "initial_risk": self._money(initial_risk) if initial_risk is not None else "",
-            "result_r": self._ratio(net, initial_risk),
-            "mae_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=True),
-            "mfe_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=False),
+            "planned_risk": self._money(initial_risk) if initial_risk is not None else "",
+            "initial_risk": self._money(realized_risk) if realized_risk is not None else "",
+            "result_r": self._ratio(net, realized_risk),
+            "mae_r": self._extreme_r(
+                trade_id, average_entry, realized_risk, side, adverse=True,
+                point_value=point_value, max_qty=max_qty,
+            ),
+            "mfe_r": self._extreme_r(
+                trade_id, average_entry, realized_risk, side, adverse=False,
+                point_value=point_value, max_qty=max_qty,
+            ),
         }
 
     def _fills(self, trade_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -417,12 +429,22 @@ ORDER BY positions.trade_id
         return format(value / divisor, ".2f") if divisor and divisor != 0 else ""
 
     def _extreme_r(
-        self, trade_id: str, entry: Decimal | None, risk: Decimal | None, side: str, *, adverse: bool
+        self, trade_id: str, entry: Decimal | None, risk: Decimal | None, side: str, *, adverse: bool,
+        point_value: Decimal | None, max_qty: int,
     ) -> str:
-        if entry is None or not risk or risk == 0:
+        """How far the position went against or with the trade, in initial risk.
+
+        The excursion is measured in money, not in price points: a point on one
+        contract is worth its own step cost, so comparing a raw price distance
+        between two different instruments means nothing.
+        """
+        if entry is None or not risk or risk == 0 or not point_value or max_qty <= 0:
             return ""
         values: list[Decimal] = []
-        for row in self._rows("SELECT payload_json FROM events WHERE trade_id = ? ORDER BY event_seq", (trade_id,)):
+        for row in self._rows(
+            "SELECT payload_json FROM events WHERE trade_id = ? "
+            "AND event_type IN ('FILL', 'PARTIAL') ORDER BY event_seq", (trade_id,),
+        ):
             payload = self._payload(row["payload_json"])
             for key in (("low", "price") if adverse else ("high", "price")):
                 if payload.get(key) is not None:
@@ -433,7 +455,30 @@ ORDER BY positions.trade_id
         favorable = (max(values) - entry) if side == "BUY" else (entry - min(values))
         unfavorable = (min(values) - entry) if side == "BUY" else (entry - max(values))
         result = unfavorable if adverse else favorable
-        return format(result / risk, ".2f")
+        return format(abs(result) * point_value * max_qty / risk, ".2f")
+
+    def _realized_initial_risk(
+        self, plan: Mapping[str, object], average_entry: Decimal | None,
+        point_value: Decimal | None, max_qty: int,
+    ) -> Decimal | None:
+        """Money at risk from the price actually paid to the stop set for it.
+
+        The stop distance the plan admitted is kept, but it is re-measured from
+        the average the position actually holds: a gapped entry pays a different
+        price and is judged against its own stop rather than the one it was
+        admitted on. Returns ``None`` when the contract's step cost is unknown,
+        which keeps a comparison across instruments honest instead of scoring a
+        price distance in one contract's points against another's rubles.
+        """
+        if average_entry is None or not point_value or max_qty <= 0:
+            return None
+        try:
+            distance = abs(Decimal(str(plan["reference_entry"])) - Decimal(str(plan["stop_price"])))
+        except (KeyError, TypeError, InvalidOperation):
+            return None
+        if distance == 0:
+            return None
+        return distance * point_value * max_qty
 
     def _rows(self, query: str, parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
         cursor = self._connection.execute(query, parameters)
@@ -520,6 +565,17 @@ ORDER BY positions.trade_id
         except InvalidOperation:
             return str(text)
         return format(value.quantize(Decimal("0.01")), "f")
+
+    @staticmethod
+    def _point_value(price_step: object, step_cost: object) -> Decimal | None:
+        """Rubles one price step is worth, or ``None`` when the snapshot lacks it."""
+        if price_step in (None, "") or step_cost in (None, ""):
+            return None
+        try:
+            step = Decimal(str(price_step))
+        except InvalidOperation:
+            return None
+        return (Decimal(str(step_cost)) / step) if step != 0 else None
 
     @staticmethod
     def _pnl_units(price_step: object, step_cost: object) -> str:
