@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 logs/
 data/
+HIST/
 .idea/
 .vscode/
 build/
