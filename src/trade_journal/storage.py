@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -15,12 +15,18 @@ from src.trade_journal.schema import initialize_schema
 from src.scheduler.clock import Clock, as_aware, as_clock
 from src.trade_journal.export import AuditExporter, CsvExporter
 from src.trade_management.models import (
+    CURRENT_ALGORITHM,
+    LEGACY_ALGORITHM,
+    CostSnapshot,
+    PlanEconomics,
     ProfileSnapshot,
+    StopBasis,
     TargetPlan,
     TradePhase,
     TradePlan,
     TradeState,
 )
+from src.trade_management.actions import TradeAction, action_from_payload
 from src.trade_management.audit import (
     CalculationTrace,
     CalculationTraceRepository,
@@ -45,6 +51,24 @@ class OutboxCommand:
 
 
 @dataclass(frozen=True)
+class PendingIncrease:
+    action: TradeAction
+    submitted_at: datetime
+
+
+@dataclass(frozen=True)
+class PendingStop:
+    action: TradeAction
+    submitted_at: datetime
+
+
+@dataclass(frozen=True)
+class PendingExit:
+    action: TradeAction
+    submitted_at: datetime
+
+
+@dataclass(frozen=True)
 class RecoveredTrade:
     """The complete persisted management state for one trade."""
 
@@ -53,6 +77,12 @@ class RecoveredTrade:
     entry_ack_at: datetime | None = None
     entry_quantity: int | None = None
     target_filled: Mapping[str, int] | None = None
+    pending_increases: tuple[PendingIncrease, ...] = ()
+    pending_stops: tuple[PendingStop, ...] = ()
+    pending_exits: tuple[PendingExit, ...] = ()
+    last_increase_at: datetime | None = None
+    last_increase_price: Decimal | None = None
+    last_observed_bar: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +164,7 @@ class Storage:
         self._clock = as_clock(clock)
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
-            CsvExporter(self.connection, Path(journal_path), Path(positions_path))
+            CsvExporter(self.connection, Path(journal_path), Path(positions_path), names=self.instrument_names())
             if journal_path is not None else None
         )
         self._audit_exporter = (
@@ -478,7 +508,7 @@ class Storage:
                 (trade["trade_id"],),
             ).fetchone()
             position = self.connection.execute(
-                "SELECT quantity, average_price FROM positions WHERE trade_id = ?",
+                "SELECT quantity, average_price, realized_pnl, fees FROM positions WHERE trade_id = ?",
                 (trade["trade_id"],),
             ).fetchone()
 
@@ -490,6 +520,9 @@ class Storage:
                 target["target_id"]: target.get("initial_step")
                 for target in plan_data["targets"]
             }
+            target_data = {t["target_id"]: t for t in plan_data["targets"]}
+            version = plan_data.get("algorithm_version", LEGACY_ALGORITHM)
+            costs = plan_data.get("cost_snapshot")
             plan = TradePlan(
                 trade_id=trade["trade_id"],
                 assignment_id=trade["assignment_id"],
@@ -500,8 +533,9 @@ class Storage:
                 stop_price=Decimal(plan_data["stop_price"]),
                 targets=tuple(
                     TargetPlan(
-                        target_id, Decimal(price), Decimal(target_shares[target_id]),
+                        target_id, Decimal(target_data[target_id].get("price", price) if version == CURRENT_ALGORITHM else price), Decimal(target_shares[target_id]),
                         Decimal(target_steps[target_id] or "0"),
+                        target_data[target_id].get("price_basis", "r"),
                     )
                     for target_id, price, _, _ in targets
                 ),
@@ -512,9 +546,23 @@ class Storage:
                 ),
                 created_at=datetime.fromisoformat(trade["created_at"]),
                 timeframe=str(plan_data.get("timeframe", "")),
+                stop_basis=_stop_basis_from_payload(plan_data.get("stop_basis")),
+                economics=_economics_from_payload(plan_data.get("economics")),
+                algorithm_version=version,
+                entry_order_type=plan_data.get("entry_order_type", "market"),
+                requested_quantity=plan_data.get("requested_quantity"),
+                price_step=None if plan_data.get("price_step") is None else Decimal(plan_data["price_step"]),
+                cost_snapshot=None if costs is None else CostSnapshot(Decimal(costs["commission"]), Decimal(costs["slippage"])),
+                admission_snapshot=plan_data.get("admission_snapshot", {}),
             )
-            quantity, average_price = position if position is not None else (0, None)
+            quantity, average_price, gross, fees = position if position is not None else (0, None, "0", "0")
             confirmed_stop, pending_stop = protection if protection is not None else (None, None)
+            measurement = self.connection.execute(
+                "SELECT initial_stop_distance,max_quantity FROM trade_measurements WHERE trade_id=?", (trade["trade_id"],),
+            ).fetchone()
+            unknown_fees = self.connection.execute(
+                "SELECT 1 FROM fills WHERE trade_id=? AND fee_source='unknown' LIMIT 1", (trade["trade_id"],),
+            ).fetchone()
             state = TradeState(
                 trade_id=trade["trade_id"],
                 phase=TradePhase(trade["phase"]),
@@ -524,13 +572,25 @@ class Storage:
                 completed_target_ids=frozenset(
                     target_id for target_id, _, status, _ in targets if status == "FILLED"
                 ),
-                add_count=int(profile_state.get("add_count", 0)),
+                add_count=max(int(profile_state.get("add_count", 0)), self.connection.execute(
+                    "SELECT COUNT(DISTINCT f.order_id) FROM fills f JOIN orders o ON o.order_id=f.order_id "
+                    "WHERE f.trade_id=? AND o.action_type='ADD'", (trade["trade_id"],)).fetchone()[0]),
                 trailing_extreme=(
                     Decimal(profile_state["trailing_extreme"])
                     if profile_state.get("trailing_extreme") is not None else None
                 ),
                 confirmed_stop=Decimal(confirmed_stop) if confirmed_stop is not None else None,
                 pending_stop=Decimal(pending_stop) if pending_stop is not None else None,
+                target_prices={target_id: Decimal(price) for target_id, price, _, _ in targets},
+                initial_stop_distance=(
+                    Decimal(measurement[0]) if measurement and measurement[0] is not None
+                    else Decimal(str(profile_state["initial_stop_distance"])) if profile_state.get("initial_stop_distance") is not None
+                    else None
+                ),
+                max_quantity=measurement[1] if measurement else int(profile_state.get("max_quantity", quantity)),
+                realized_pnl=Decimal(gross), fees=Decimal(fees), fees_known=unknown_fees is None,
+                trailing_active=bool(profile_state.get("trailing_active", False)),
+                adds_disabled=bool(profile_state.get("adds_disabled", False)),
             )
             entry_ack_at = None
             entry_quantity = self.connection.execute(
@@ -551,6 +611,45 @@ class Storage:
                     ack = None
                 if ack is not None and ack.tzinfo is not None:
                     entry_ack_at = ack
+            pending = []
+            for payload, remaining, ack_at, created_at in self.connection.execute(
+                "SELECT b.payload_json, o.quantity-o.filled_quantity, "
+                "(SELECT e.occurred_at FROM events e WHERE e.command_id=o.command_id "
+                "AND e.event_type='ACK' ORDER BY e.event_seq LIMIT 1), b.created_at "
+                "FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+                "WHERE o.trade_id=? AND o.action_type IN ('OPEN','ADD') "
+                "AND o.status IN ('ACK','PARTIAL') AND b.status='SENT' "
+                "AND o.quantity>o.filled_quantity ORDER BY o.created_at,o.order_id",
+                (trade["trade_id"],),
+            ):
+                action = replace(action_from_payload(json.loads(payload)), quantity=remaining)
+                pending.append(PendingIncrease(action, datetime.fromisoformat(ack_at or created_at)))
+            pending_stops = []
+            for payload, ack_at, created_at in self.connection.execute(
+                "SELECT b.payload_json, (SELECT e.occurred_at FROM events e WHERE e.command_id=o.command_id "
+                "AND e.event_type='ACK' ORDER BY e.event_seq LIMIT 1), b.created_at "
+                "FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+                "JOIN protection s ON s.pending_command_id=o.command_id "
+                "WHERE o.trade_id=? AND o.action_type='MOVESTOP' AND o.status='ACK' AND b.status='SENT'",
+                (trade["trade_id"],),
+            ):
+                pending_stops.append(PendingStop(action_from_payload(json.loads(payload)), datetime.fromisoformat(ack_at or created_at)))
+            last_increase = self.connection.execute(
+                "SELECT f.executed_at,f.price FROM fills f JOIN orders o ON o.order_id=f.order_id "
+                "WHERE f.trade_id=? AND o.action_type IN ('OPEN','ADD') ORDER BY f.executed_at DESC,f.rowid DESC LIMIT 1",
+                (trade["trade_id"],),
+            ).fetchone()
+            pending_exits = []
+            for payload, ack_at, created_at in self.connection.execute(
+                "SELECT b.payload_json, (SELECT e.occurred_at FROM events e WHERE e.command_id=o.command_id "
+                "AND e.event_type='ACK' ORDER BY e.event_seq LIMIT 1), b.created_at "
+                "FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+                "WHERE o.trade_id=? AND o.action_type IN ('CLOSE','REDUCE') AND o.status='ACK' AND b.status='SENT'",
+                (trade["trade_id"],),
+            ):
+                pending_exits.append(PendingExit(action_from_payload(json.loads(payload)), datetime.fromisoformat(ack_at or created_at)))
+            last_bar = self.connection.execute("SELECT bar_id FROM trade_market_observations WHERE trade_id=? AND timeframe='1m' ORDER BY bar_id DESC LIMIT 1",
+                                               (trade["trade_id"],)).fetchone()
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError(f"cannot recover trade {trade['trade_id']!r} from SQLite") from error
         return RecoveredTrade(
@@ -559,6 +658,12 @@ class Storage:
             entry_ack_at=entry_ack_at,
             entry_quantity=entry_quantity,
             target_filled={target_id: filled for target_id, _, _, filled in targets},
+            pending_increases=tuple(pending),
+            pending_stops=tuple(pending_stops),
+            pending_exits=tuple(pending_exits),
+            last_increase_at=datetime.fromisoformat(last_increase[0]) if last_increase else None,
+            last_increase_price=Decimal(last_increase[1]) if last_increase else None,
+            last_observed_bar=datetime.fromisoformat(last_bar[0]) if last_bar else None,
         )
 
     def _enqueue(
@@ -579,3 +684,29 @@ class Storage:
 
 def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _stop_basis_from_payload(value: object) -> StopBasis:
+    """Основание выбора стопа из журнала; неизвестное или отсутствующее — структурное."""
+    try:
+        return StopBasis(str(value))
+    except ValueError:
+        return StopBasis.STRUCTURAL
+
+
+def _economics_from_payload(value: object) -> PlanEconomics | None:
+    """Денежное представление плана из журнала; у старых сделок его не было."""
+    if not isinstance(value, dict):
+        return None
+    ratio = value.get("payoff_ratio")
+    return PlanEconomics(
+        quantity=int(value["quantity"]),
+        risk_amount=Decimal(value["risk_amount"]),
+        reward_amount=None if value.get("reward_amount") is None else Decimal(value["reward_amount"]),
+        costs_amount=Decimal(value["costs_amount"]),
+        payoff_ratio=None if ratio is None else Decimal(str(ratio)),
+        fixed_reward_amount=None if value.get("fixed_reward_amount") is None else Decimal(str(value["fixed_reward_amount"])),
+        fixed_quantity=int(value.get("fixed_quantity", 0)),
+        target_quantities=value.get("target_quantities", {}),
+        slippage_amount=Decimal(str(value.get("slippage_amount", "0"))),
+    )

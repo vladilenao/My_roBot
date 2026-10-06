@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from src.events.event import Event
@@ -59,3 +60,34 @@ def header_parts(event: Event, marker: str, tz_offset_hours: float) -> list[str]
             strategy_block += f" [{filter_profile}]"
         parts.append(strategy_block)
     return parts
+
+
+def budget_text(event: Event) -> str:
+    """Budget values are a projection of supplied facts, never a fresh admission."""
+    if event.get("risk_state") == "unknown":
+        available = f"; общий лимит {price(event.get('portfolio_pct'))}%" if event.get("portfolio_pct") is not None else ""
+        return f"risk-state-unknown: общий риск неизвестен — {event.get('unknown_reason') or 'неполные данные портфеля'}{available}; свободный бюджет неизвестен"
+    if event.get("risk_budget") is None:
+        return ""
+    text = (f"общий бюджет {price(event.get('portfolio_pct'))}% от базы {price(event.get('budget_base'))} ₽: "
+            f"лимит {price(event.get('risk_budget'))} ₽, открытый риск {price(event.get('open_risk'))} ₽, "
+            f"ожидающие резервы {price(event.get('pending_risk'))} ₽, свободно {price(event.get('free_risk'))} ₽")
+    if event.get("risk_excess") is not None and event.get("risk_excess") > Decimal(0):
+        text += f", превышение {price(event.get('risk_excess'))} ₽"
+    return text
+
+
+def financial_text(event: Event) -> str:
+    if event.get("gross_pnl") is None:
+        return ""
+    units = "₽" if event.get("pnl_units") == "RUB" else "RAW"
+    source = event.get("fee_source")
+    fee = (f"комиссия исполнения {price(event.get('fee'))} ₽ ({'оценка' if source == 'configured' else 'брокер'})"
+           if source in {"configured", "broker"} else "комиссия исполнения неизвестна")
+    text = (f"{fee}; по сделке gross {price(event.get('gross_pnl'))} {units}, "
+            f"учётный net {price(event.get('net_pnl'))} {units}")
+    if event.get("fees_known"):
+        text += f", накопленные комиссии {price(event.get('fees_total'))} ₽"
+    else:
+        text += " (издержки частично неизвестны)"
+    return text

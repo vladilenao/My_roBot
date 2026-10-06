@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
-from src.trade_journal.schema import SCHEMA_SQL, SCHEMA_VERSION
+from src.trade_journal.schema import SCHEMA_V9_SQL, SCHEMA_VERSION
 from src.trade_journal.storage import Storage
 from src.trade_management.actions import OpenTrade
 from src.trade_management.manager import TradeManager
@@ -79,7 +79,7 @@ def _open_v6_database(path):
     """БД с текущим наполнением таблиц и целями v6 (глобальный target_id PK)."""
     connection = sqlite3.connect(path)
     with connection:
-        connection.executescript(SCHEMA_SQL)
+        connection.executescript(SCHEMA_V9_SQL)
         connection.execute("ALTER TABLE trades DROP COLUMN price_step")
         connection.execute("ALTER TABLE trades DROP COLUMN step_cost")
         connection.execute("DROP TABLE instrument_names")

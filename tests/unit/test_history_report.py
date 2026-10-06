@@ -82,6 +82,9 @@ def _metrics(**kw) -> RunMetrics:
         end=END,
         ticks=120,
         missed_bars=2,
+        gaps=1,
+        longest_gap_seconds=6600.0,
+        covered=True,
         stop_reason="диапазон [2023-06-01 10:00 — 2023-06-01 12:00) обработан полностью",
         market_now=END,
     )
@@ -165,6 +168,8 @@ class TestWriteReport:
         assert "Диапазон:        2023-06-01 10:00 — 2023-06-01 12:00" in text
         assert "Обработано тиков: 120" in text
         assert "Пропущено баров: 2" in text
+        assert "Разрывов данных: 1 (самый длинный 1 ч 50 м)" in text
+        assert "Охват диапазона: диапазон 2023-06-01 10:00 — 2023-06-01 12:00 обработан полностью" in text
         assert "Итог (P&L - комиссии): 8.00" in text
         assert "Комиссии:         2.00" in text
         assert "Реализованный P&L: 10.00" in text
@@ -180,6 +185,9 @@ class TestWriteReport:
         assert payload["range"] == {"start": "2023-06-01 10:00", "end": "2023-06-01 12:00"}
         assert payload["ticks"] == 120
         assert payload["missed_bars"] == 2
+        assert payload["gaps"] == 1
+        assert payload["longest_gap_seconds"] == 6600.0
+        assert payload["covered"] is True
         assert payload["crashed"] is False
         assert payload["stop_reason"].startswith("диапазон")
         assert payload["result"]["net_pnl"] == "8.00"
@@ -198,6 +206,80 @@ class TestWriteReport:
         assert payload["crashed"] is True
         assert payload["market_now"] == "2023-06-01 10:00"
         assert "Рыночный момент: 2023-06-01 10:00" in txt.read_text(encoding="utf-8")
+
+    def test_incomplete_coverage_is_stated_with_shortfall(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        metrics = _metrics(
+            ticks=57,
+            covered=False,
+            stop_reason=(
+                "данные закончились на 2023-06-01 11:00, "
+                "до конца диапазона (2023-06-01 12:00) прогон не дошёл"
+            ),
+            market_now=START + timedelta(hours=1),
+        )
+
+        txt, js = write_report(tmp_path, metrics, collect_result(storage))
+        text = txt.read_text(encoding="utf-8")
+
+        assert "покрыт 2023-06-01 10:00 — 2023-06-01 11:00" in text
+        assert "до конца диапазона (2023-06-01 12:00) не дойдено" in text
+        assert __import__("json").loads(js.read_text(encoding="utf-8"))["covered"] is False
+
+    def test_checked_horizon_block_when_search_was_limited(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        metrics = _metrics(
+            covered=False,
+            ticks=15,
+            stop_reason=(
+                "следующий бар не найден в проверенном горизонте "
+                "[2023-06-01 10:15 — 2023-06-01 10:22]"
+            ),
+            market_now=START + timedelta(minutes=15),
+            horizon_start=START + timedelta(minutes=15),
+            horizon_end=START + timedelta(minutes=22),
+            horizon_limited=True,
+        )
+
+        txt, js = write_report(tmp_path, metrics, collect_result(storage))
+        text = txt.read_text(encoding="utf-8")
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Проверенный горизонт: 2023-06-01 10:15 — 2023-06-01 10:22" in text
+        assert "ограничен семью сутками" in text
+        assert payload["checked_horizon"] == {
+            "start": "2023-06-01 10:15",
+            "end": "2023-06-01 10:22",
+            "limited": True,
+        }
+
+    def test_no_horizon_block_when_range_is_covered(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, js = write_report(tmp_path, _metrics(), collect_result(storage))
+        text = txt.read_text(encoding="utf-8")
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Проверенный горизонт" not in text
+        assert payload["checked_horizon"] is None
+
+    def test_gap_line_without_gaps(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, _ = write_report(
+            tmp_path, _metrics(gaps=0, longest_gap_seconds=0.0), collect_result(storage)
+        )
+
+        assert "Разрывов данных: 0 (самый длинный 0 м)" in txt.read_text(encoding="utf-8")
+
+    def test_longest_gap_formatted_in_hours_and_minutes(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, _ = write_report(
+            tmp_path, _metrics(longest_gap_seconds=7860.0), collect_result(storage)
+        )
+
+        assert "самый длинный 2 ч 11 м" in txt.read_text(encoding="utf-8")
 
     def test_open_positions_listed_in_text(self, tmp_path):
         storage = Storage(tmp_path / "trades.sqlite3", initial_deposit="100000")

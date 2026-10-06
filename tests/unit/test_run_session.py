@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from src.bot.run_session import (
@@ -9,6 +10,7 @@ from src.bot.run_session import (
     RunSession,
     build_run_session,
 )
+from src.data.cache import DataExhaustion, DataGap
 from src.scheduler.clock import HistoricalClock, SystemClock
 
 
@@ -91,7 +93,10 @@ class TestHistoricalRunSessionStopsOnDataEnd:
         session.mark_data_exhausted()
 
         assert session.should_stop() is True
-        assert session.stop_reason() == "данные закончились на 2024-01-01 09:15"
+        assert session.stop_reason() == (
+            "данные закончились на 2024-01-01 09:15, "
+            "до конца диапазона (2024-01-01 10:00) прогон не дошёл"
+        )
 
     def test_first_signal_wins(self):
         session = _session()
@@ -100,7 +105,7 @@ class TestHistoricalRunSessionStopsOnDataEnd:
         for _ in range(3):
             session._clock.advance()
 
-        assert session.stop_reason() == "данные закончились на 2024-01-01 09:05"
+        assert session.stop_reason().startswith("данные закончились на 2024-01-01 09:05")
 
     def test_marking_twice_keeps_first_moment(self):
         session = _session()
@@ -108,7 +113,136 @@ class TestHistoricalRunSessionStopsOnDataEnd:
         session._clock.advance()
         session.mark_data_exhausted()
 
-        assert session.stop_reason() == "данные закончились на 2024-01-01 09:00"
+        assert session.stop_reason().startswith("данные закончились на 2024-01-01 09:00")
+
+    def _exhaustion(self, horizon_end="2024-01-01 10:00", limited=False):
+        return DataExhaustion(
+            at=pd.Timestamp("2024-01-01 09:15"),
+            horizon_start=pd.Timestamp("2024-01-01 09:15"),
+            horizon_end=pd.Timestamp(horizon_end),
+            range_end=pd.Timestamp("2024-01-01 10:00"),
+            horizon_limited=limited,
+        )
+
+    def test_stop_reason_reports_horizon_checked_to_range_end(self):
+        session = _session()
+        for _ in range(3):
+            session._clock.advance()
+        session.mark_data_exhausted(self._exhaustion())
+
+        assert session.stop_reason() == (
+            "данные закончились на 2024-01-01 09:15; "
+            "проверен весь остаток диапазона [2024-01-01 09:15 — 2024-01-01 10:00], "
+            "до конца диапазона (2024-01-01 10:00) прогон не дошёл"
+        )
+
+    def test_stop_reason_reports_horizon_limited_by_lookahead(self):
+        session = _session()
+        for _ in range(3):
+            session._clock.advance()
+        session.mark_data_exhausted(
+            self._exhaustion(horizon_end="2024-01-01 09:22", limited=True)
+        )
+
+        reason = session.stop_reason()
+
+        assert (
+            "следующий бар не найден в проверенном горизонте "
+            "[2024-01-01 09:15 — 2024-01-01 09:22]" in reason
+        )
+        assert "их отсутствие не утверждается" in reason
+        assert "диапазон обработан не полностью" in reason
+        assert "2024-01-01 10:00" in reason
+
+    def test_exhaustion_is_exposed_for_the_report(self):
+        session = _session()
+        assert session.exhaustion is None
+
+        exhaustion = self._exhaustion()
+        session.mark_data_exhausted(exhaustion)
+        session.mark_data_exhausted(self._exhaustion(horizon_end="2024-01-01 10:00"))
+
+        assert session.exhaustion is exhaustion
+
+
+class TestHistoricalRunSessionCrossesDataGap:
+    """Разрыв в данных — не конец прогона: часы переводятся на следующий бар."""
+
+    def _gap(self, resume="2024-01-01 09:40"):
+        return DataGap(
+            since=pd.Timestamp("2024-01-01 09:12"),
+            resume=pd.Timestamp(resume),
+            missed=28,
+            span=pd.Timedelta(minutes=28),
+        )
+
+    def test_market_time_moves_to_next_available_bar(self):
+        session = _session()
+        for _ in range(3):
+            session._clock.advance()
+
+        session.mark_data_gap(self._gap())
+
+        assert session.market_now() == pd.Timestamp("2024-01-01 09:40")
+
+    def test_gap_does_not_stop_the_run(self):
+        session = _session()
+        session._clock.advance()
+
+        session.mark_data_gap(self._gap())
+
+        assert session.should_stop() is False
+        assert session.stop_reason() == ""
+
+    def test_jump_never_crosses_range_end(self):
+        session = _session()
+        session._clock.advance()
+
+        session.mark_data_gap(self._gap(resume="2024-01-01 23:00"))
+
+        assert session.market_now() == pd.Timestamp("2024-01-01 10:00")
+        assert session.should_stop() is True
+        assert "обработан полностью" in session.stop_reason()
+
+    def test_full_coverage_reported_only_at_range_end(self):
+        session = _session()
+        assert session.covered is False
+        session._clock.advance()
+        assert session.covered is False
+
+        session.mark_data_gap(self._gap())
+
+        assert session.covered is False
+
+    def test_full_range_is_covered_when_clock_reached_end(self):
+        session = _session()
+        for _ in range(12):
+            session._clock.advance()
+
+        assert session.covered is True
+
+    def test_exhausted_run_is_not_covered(self):
+        session = _session()
+        for _ in range(12):
+            session._clock.advance()
+        session.mark_data_exhausted()
+
+        assert session.covered is False
+
+    def test_jumps_are_counted(self):
+        session = _session()
+        session._clock.advance()
+        session.mark_data_gap(self._gap())
+        session.mark_data_gap(self._gap(resume="2024-01-01 09:50"))
+
+        assert session.gaps_jumped == 2
+
+    def test_live_session_ignores_gap(self):
+        session = LiveRunSession(clock=lambda: datetime(2024, 1, 1, 9, 0))
+
+        session.mark_data_gap(self._gap())
+
+        assert session.should_stop() is False
 
 
 class TestBuildRunSession:

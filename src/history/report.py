@@ -42,17 +42,36 @@ def _plain(value) -> str:
     return f"{Decimal(str(value)):.2f}"
 
 
+def _span(seconds) -> str:
+    """Длительность по-русски, минутной гранулярностью: ``2 ч 11 м``, ``45 м``."""
+    total = max(0, int(round(float(seconds or 0) / 60.0)))
+    hours, minutes = divmod(total, 60)
+    if hours and minutes:
+        return f"{hours} ч {minutes} м"
+    if hours:
+        return f"{hours} ч"
+    return f"{minutes} м"
+
+
 @dataclass
 class RunMetrics:
-    """Счётчики прогона: границы, тики, пропуски и причина завершения."""
+    """Счётчики прогона: границы, тики, пропуски, разрывы и причина завершения."""
 
     start: datetime | None = None
     end: datetime | None = None
     ticks: int = 0
     missed_bars: int = 0
+    gaps: int = 0
+    longest_gap_seconds: float = 0.0
+    covered: bool = False
     stop_reason: str = ""
     market_now: datetime | None = None
     crashed: bool = False
+    #: Границы реально проверенного горизонта поиска следующего бара — только
+    #: когда прогон остановился из-за данных, иначе остаются None.
+    horizon_start: datetime | None = None
+    horizon_end: datetime | None = None
+    horizon_limited: bool = False
 
 
 @dataclass
@@ -108,12 +127,34 @@ def collect_result(storage, short_names: dict[str, str] | None = None) -> RunRes
 
 
 def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
-    return [
+    coverage = (
+        f"диапазон {_stamp(metrics.start)} — {_stamp(metrics.end)} обработан полностью"
+        if metrics.covered
+        else (
+            f"покрыт {_stamp(metrics.start)} — {_stamp(metrics.market_now)}, "
+            f"до конца диапазона ({_stamp(metrics.end)}) не дойдено"
+        )
+    )
+    head = [
         "Исторический прогон торгового робота",
         "=" * 38,
         f"Диапазон:        {_stamp(metrics.start)} — {_stamp(metrics.end)}",
+        f"Охват диапазона: {coverage}",
+    ]
+    if metrics.horizon_start is not None and metrics.horizon_end is not None:
+        head.append(
+            f"Проверенный горизонт: {_stamp(metrics.horizon_start)} — "
+            f"{_stamp(metrics.horizon_end)}"
+        )
+        if metrics.horizon_limited:
+            head.append(
+                "Горизонт поиска ограничен семью сутками: после него данные "
+                "не проверялись и их отсутствие не утверждается."
+            )
+    return head + [
         f"Обработано тиков: {metrics.ticks}",
         f"Пропущено баров: {metrics.missed_bars}",
+        f"Разрывов данных: {metrics.gaps} (самый длинный {_span(metrics.longest_gap_seconds)})",
         f"Завершение:      {metrics.stop_reason or 'не указано'}",
         f"Рыночный момент: {_stamp(metrics.market_now)}",
         "",
@@ -149,11 +190,23 @@ def write_report(
 
     payload = {
         "range": {"start": _stamp(metrics.start), "end": _stamp(metrics.end)},
+        "covered": metrics.covered,
         "ticks": metrics.ticks,
         "missed_bars": metrics.missed_bars,
+        "gaps": metrics.gaps,
+        "longest_gap_seconds": round(float(metrics.longest_gap_seconds or 0.0), 3),
         "stop_reason": metrics.stop_reason,
         "market_now": _stamp(metrics.market_now),
         "crashed": metrics.crashed,
+        "checked_horizon": (
+            {
+                "start": _stamp(metrics.horizon_start),
+                "end": _stamp(metrics.horizon_end),
+                "limited": bool(metrics.horizon_limited),
+            }
+            if metrics.horizon_start is not None and metrics.horizon_end is not None
+            else None
+        ),
         "result": result.to_json(),
         "journal": origin,
     }

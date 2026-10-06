@@ -35,9 +35,9 @@ class StateUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class Limits:
-    per_trade_pct: Decimal
-    per_instrument_pct: Decimal
     portfolio_pct: Decimal
+    commission: Decimal = Decimal("1.5")
+    slippage: Decimal = Decimal("1")
 
 
 def load_limits() -> Limits:
@@ -45,9 +45,9 @@ def load_limits() -> Limits:
     from src.config import RISK_LIMITS
 
     return Limits(
-        per_trade_pct=Decimal(str(RISK_LIMITS["trade_pct"])),
-        per_instrument_pct=Decimal(str(RISK_LIMITS["instrument_pct"])),
         portfolio_pct=Decimal(str(RISK_LIMITS["portfolio_pct"])),
+        commission=Decimal(str(RISK_LIMITS["commission"])),
+        slippage=Decimal(str(RISK_LIMITS["slippage"])),
     )
 
 
@@ -143,10 +143,10 @@ def open_readonly(database: Path) -> sqlite3.Connection:
             "Запустите робота и повторите либо откройте копию базы."
         ) from error
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version < 9:
+    if version < 9 or version > 10:
         connection.close()
         raise StateUnavailable(
-            f"схема базы версии {version}, отчёту нужна версия 9.\n"
+            f"схема базы версии {version}, отчёт поддерживает версии 9–10.\n"
             "Запустите робот один раз на обновлённом коде — он обновит базу и запишет имена контрактов."
         )
     return connection
@@ -159,60 +159,132 @@ def read_names(connection: sqlite3.Connection) -> dict[str, str]:
 
 def contract_label(ticker: str, names: dict[str, str]) -> str:
     """Показать короткое имя; сырой тикер пользователю не выводится."""
-    return names.get(ticker, "имя не записано")
+    return names.get(ticker, "контракт не указан")
 
 
-def collect_account(connection: sqlite3.Connection) -> tuple[Decimal, Decimal]:
+def _decimal(value, *, positive=False, signed=False) -> Decimal | None:
+    """Unknown/invalid amounts stay unknown; zero is a distinct valid fact."""
+    try:
+        result = Decimal(str(value))
+        if not result.is_finite() or (positive and result <= 0) or (not signed and result < 0):
+            return None
+        return result
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+
+
+def collect_account(connection: sqlite3.Connection) -> tuple[Decimal | None, Decimal | None]:
     row = connection.execute("SELECT balance, equity FROM account WHERE account_id = 1").fetchone()
     if row is None:
-        return Decimal("0"), Decimal("0")
-    return Decimal(row[0] or "0"), Decimal(row[1] or "0")
+        return None, None
+    return _decimal(row[0], signed=True), _decimal(row[1], signed=True)
 
 
-def collect_reservation_totals(connection: sqlite3.Connection) -> tuple[Decimal, Decimal]:
-    row = connection.execute(
-        "SELECT COALESCE(SUM(risk_amount), '0'), COALESCE(SUM(margin_amount), '0') "
+def collect_reservation_totals(connection: sqlite3.Connection):
+    rows = connection.execute(
+        "SELECT risk_amount, margin_amount "
         "FROM reservations WHERE status = 'ACTIVE'"
-    ).fetchone()
-    return Decimal(row[0]), Decimal(row[1])
+    ).fetchall()
+    totals, known = [Decimal(0), Decimal(0)], [True, True]
+    for row in rows:
+        for index, value in enumerate(row):
+            amount = _decimal(value)
+            if amount is None:
+                known[index] = False
+            else:
+                totals[index] += amount
+    return (*totals, *known)
+
+
+@dataclass(frozen=True)
+class Exposure:
+    rows: tuple[tuple[str, ...], ...]
+    known_risk: Decimal
+    known_margin: Decimal
+    unknown_risk: tuple[str, ...]
+    unknown_margin: tuple[str, ...]
 
 
 def collect_open_trades(
-    connection: sqlite3.Connection, names: dict[str, str]
-) -> tuple[tuple[str, ...], ...]:
+    connection: sqlite3.Connection, names: dict[str, str], limits: Limits
+) -> Exposure:
+    from src.portfolio.risk import PortfolioRiskManager, RiskTrade
+
     placeholders = ", ".join("?" * len(TERMINAL_PHASES))
     rows = connection.execute(
         f"""
-        SELECT t.instrument_id, t.side, t.phase, p.quantity, p.average_price,
-               pr.confirmed_stop, pr.pending_stop, t.price_step, t.step_cost
+        SELECT t.trade_id, t.instrument_id, t.side, t.phase, p.quantity, p.average_price,
+               pr.confirmed_stop, pr.pending_stop, t.price_step, t.step_cost, t.plan_json
         FROM trades t
         LEFT JOIN positions p ON p.trade_id = t.trade_id
         LEFT JOIN protection pr ON pr.trade_id = t.trade_id
-        WHERE t.phase NOT IN ({placeholders})
+        WHERE t.phase NOT IN ({placeholders}) OR p.quantity > 0
         ORDER BY t.created_at
         """,
         TERMINAL_PHASES,
     ).fetchall()
-    result = []
-    for instrument, side, phase, quantity, average, confirmed, pending, step, cost in rows:
-        stop = confirmed or pending
-        risk = None
-        if average and stop and step and cost:
-            step_value, cost_value = Decimal(step), Decimal(cost)
-            if step_value > 0 and cost_value > 0:
-                risk = abs(Decimal(average) - Decimal(stop)) / step_value * cost_value * Decimal(quantity or 0)
+    result, unknown_risk, unknown_margin = [], [], []
+    open_risk, open_margin = Decimal(0), Decimal(0)
+    for trade_id, instrument, side, phase, quantity, average, confirmed, pending, step, cost, payload in rows:
+        label = contract_label(instrument, names)
+        price_risk, future, risk, source = None, None, None, "—"
+        try:
+            plan = json.loads(payload)
+            if not isinstance(plan, dict):
+                raise ValueError("plan is not an object")
+        except (ValueError, TypeError):
+            plan = None
+        if quantity is None and phase not in {"PLANNED", "ENTRY_PENDING"}:
+            unknown_risk.append(f"{label}: неизвестен объём позиции")
+            unknown_margin.append(f"{label}: неизвестен объём позиции")
+        elif quantity and quantity > 0:
+            average_value, stop_value = _decimal(average, positive=True), _decimal(confirmed, positive=True)
+            step_value, cost_value = _decimal(step, positive=True), _decimal(cost, positive=True)
+            if None not in (average_value, stop_value, step_value, cost_value) and side in {"BUY", "SELL"}:
+                direction = Decimal(1) if side == "BUY" else Decimal(-1)
+                price_risk = max(Decimal(0), direction*(average_value-stop_value)/step_value*cost_value*quantity)
+            snapshot = plan.get("cost_snapshot") if plan is not None else None
+            if snapshot is None and plan is not None and plan.get("algorithm_version", "legacy-v1") == "legacy-v1":
+                rate, allowance = limits.commission, limits.slippage
+                source = "оценка будущих legacy-затрат"
+            elif isinstance(snapshot, dict):
+                rate, allowance = _decimal(snapshot.get("commission")), _decimal(snapshot.get("slippage"))
+                source = "сохранённый снимок расходов"
+            else:
+                rate, allowance = None, None
+            if rate is not None and allowance is not None:
+                future = (rate+allowance/2)*quantity
+            if price_risk is not None and future is not None:
+                factual = RiskTrade(trade_id, instrument, frozenset(), side, quantity,
+                    average_value, stop_value, step_value, cost_value,
+                    expected_exit_cost=rate*quantity, slippage_allowance=allowance/2*quantity)
+                risk = PortfolioRiskManager.trade_risk(factual).remaining_loss
+                open_risk += risk
+            else:
+                open_risk += (price_risk if price_risk is not None else Decimal(0)) + (future if future is not None else Decimal(0))
+                unknown_risk.append(f"{label}: неизвестны подтверждённый стоп, денежные факторы или будущие расходы")
+            admission = plan.get("admission_snapshot") if plan is not None else None
+            go = _decimal(admission.get("go_per_contract")) if isinstance(admission, dict) else None
+            if go is None:
+                unknown_margin.append(f"{label}: неизвестно ГО открытого остатка")
+            else:
+                open_margin += go*quantity
         result.append(
             (
-                contract_label(instrument, names),
+                label,
                 "ПОКУПКА" if side == "BUY" else "ПРОДАЖА",
                 phase,
                 str(quantity or 0),
                 format_price(average),
-                format_price(stop) + ("" if confirmed else " (ожидается)"),
+                format_price(confirmed),
+                format_price(pending) + (" (ожидается)" if pending is not None else ""),
+                format_money(price_risk),
+                format_money(future),
                 format_money(risk),
+                source,
             )
         )
-    return tuple(result)
+    return Exposure(tuple(result), open_risk, open_margin, tuple(unknown_risk), tuple(unknown_margin))
 
 
 def collect_reservations(
@@ -234,8 +306,8 @@ def collect_reservations(
         result.append(
             (
                 contract_label(instrument, names),
-                format_money(Decimal(risk)),
-                format_money(Decimal(margin)),
+                format_money(_decimal(risk)),
+                format_money(_decimal(margin)),
                 format_moment(created),
                 format_age(created, now),
                 "СИРОТА: сделка " + phase if orphaned else "",
@@ -283,16 +355,30 @@ def build_report(
     now: datetime,
     rejection_limit: int,
 ) -> str:
+    # SAVEPOINT also works inside a caller-owned read transaction. All actual
+    # report inputs, including names, are read after this snapshot starts.
+    connection.execute("SAVEPOINT state_report")
+    try:
+        return _build_report(connection, read_names(connection), limits, now, rejection_limit)
+    finally:
+        connection.execute("RELEASE state_report")
+
+
+def _build_report(connection, names, limits, now, rejection_limit):
     balance, equity = collect_account(connection)
-    budget_base = min(balance, equity)
-    used_risk, used_margin = collect_reservation_totals(connection)
-    risk_budget = budget_base * limits.per_trade_pct / Decimal(100)
-    open_trades = collect_open_trades(connection, names)
+    budget_base = max(Decimal(0), min(balance, equity)) if balance is not None and equity is not None else None
+    pending_risk, pending_margin, pending_risk_known, pending_margin_known = collect_reservation_totals(connection)
+    risk_budget = budget_base*limits.portfolio_pct/100 if budget_base is not None else None
+    exposure = collect_open_trades(connection, names, limits)
+    used_risk = exposure.known_risk+pending_risk if not exposure.unknown_risk and pending_risk_known else None
+    used_margin = exposure.known_margin+pending_margin if not exposure.unknown_margin and pending_margin_known else None
+    free = max(Decimal(0), risk_budget-used_risk) if risk_budget is not None and used_risk is not None else None
+    excess = max(Decimal(0), used_risk-risk_budget) if risk_budget is not None and used_risk is not None else None
     reservations = collect_reservations(connection, names, now)
     rejections = collect_broker_rejections(connection, names, rejection_limit)
 
     lines: list[str] = []
-    lines.append(f"Состояние журнала сделов · снимок {format_moment(now)} МСК")
+    lines.append(f"Состояние журнала сделок · снимок {format_moment(now)} МСК")
     if not names:
         lines.append(
             "Имена контрактов не записаны: запустите робот на обновлённом коде, "
@@ -304,26 +390,42 @@ def build_report(
     lines.append(f"  Баланс {format_money(balance)} ₽ · Эквити {format_money(equity)} ₽")
     lines.append(f"  База бюджета (минимум баланса и эквити): {format_money(budget_base)} ₽")
     lines.append(
-        f"  Риск на сделку: {format_money(used_risk)} / {format_money(risk_budget)} ₽ "
-        f"({percent(used_risk, risk_budget)}) — лимит {format_percent_value(limits.per_trade_pct)}"
+        f"  Общий риск портфеля: {format_money(used_risk)} / {format_money(risk_budget)} ₽ "
+        f"— общий лимит {format_percent_value(limits.portfolio_pct)}"
     )
+    lines.append(f"  Открытый риск с будущими расходами: {format_money(exposure.known_risk) if not exposure.unknown_risk else 'неизвестен'} ₽")
+    lines.append(f"  Незаполненные резервы риска: {format_money(pending_risk) if pending_risk_known else 'неизвестны'} ₽")
+    lines.append(f"  Свободный риск: {format_money(free)} ₽ · Превышение: {format_money(excess)} ₽")
+    if used_risk is None or budget_base is None:
+        lines.append(f"  risk-state-unknown: известная часть занятого риска {format_money(exposure.known_risk+pending_risk)} ₽; достоверный свободный бюджет неизвестен")
+        lines.extend("  " + reason for reason in exposure.unknown_risk)
+        if not pending_risk_known:
+            lines.append("  Неизвестны суммы ACTIVE-резервов риска")
+        if budget_base is None:
+            lines.append("  Неизвестны баланс или эквити счёта")
+    if free is None or excess or limits.portfolio_pct == 0:
+        lines.append("  Новые входы/доборы запрещены; бюджетное закрытие позиций не выполняется")
     lines.append(
         f"  Гарантийное обеспечение: {format_money(used_margin)} / {format_money(budget_base)} ₽ "
-        f"({percent(used_margin, budget_base)})"
+        "— фактические открытые остатки и незаполненные резервы"
     )
     lines.append(
-        f"  Лимиты конфигурации: на инструмент {format_percent_value(limits.per_instrument_pct)}, "
-        f"по портфелю {format_percent_value(limits.portfolio_pct)}"
+        f"  Известное ГО открытых остатков: {format_money(exposure.known_margin)} ₽ · "
+        f"ГО незаполненных резервов: {format_money(pending_margin) if pending_margin_known else 'неизвестно'} ₽"
     )
-    lines.append("  Занятость посчитана по всем резервам ACTIVE, как считает резервирование.")
+    lines.extend("  " + reason for reason in exposure.unknown_margin)
+    if not pending_margin_known:
+        lines.append("  Неизвестны суммы ГО ACTIVE-резервов")
+    if used_margin is None:
+        lines.append("  Полное обеспечение неизвестно; достоверный допуск увеличений по ГО не подтверждён")
     lines.append("")
 
     lines.append("СДЕЛКИ В РАБОТЕ")
     lines.extend(
         "  " + line
         for line in render_table(
-            ("Контракт", "Сторона", "Фаза", "Объём", "Средняя", "Стоп", "Риск, ₽"),
-            open_trades,
+            ("Контракт", "Сторона", "Фаза", "Объём", "Средняя", "Стоп", "Pending-стоп", "До стопа, ₽", "Выход, ₽", "Риск, ₽", "Расходы"),
+            exposure.rows,
         )
     )
     lines.append("")
@@ -348,8 +450,8 @@ def build_report(
     )
     lines.append("")
     lines.append(
-        "Отказы на допуске (по лимиту риска или правилам профиля) в базе не "
-        "сохраняются — их видно в логе робота и в сообщениях."
+        "Расчёты допуска и причины неизвестности доступны в аудите; "
+        "исторические комиссии в отчёте не переоцениваются."
     )
     return "\n".join(lines)
 

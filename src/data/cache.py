@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from datetime import timedelta
 
 import pandas as pd
 
@@ -10,11 +12,26 @@ from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 
-# Сколько тиков подряд без единого нового закрытого бара — конец доступных
-# данных. Один такой тик внутри диапазона считается пропуском и прогон идёт
-# дальше: отличить «дырку» от «данных больше нет» можно только следующим тиком.
-# Считается раз в рыночный тик, а не раз в вызов на таймфрейм (см. `close_tick`).
+# Сколько тиков подряд без единого нового закрытого бара — кандидат в разрыв
+# данных. Дальше решает поиск следующего имеющегося бара: нашёлся — это пауза в
+# данных и прогон идёт дальше, не нашёлся — конец доступных данных. Считается
+# раз в рыночный тик, а не раз в вызов на таймфрейм (см. `close_tick`).
 CONSECUTIVE_EMPTY_TICKS_BEFORE_END = 2
+
+# Насколько далеко от текущего рыночного момента искать следующий имеющийся бар.
+# Верхняя граница для пауз между сессиями, выходных и праздников; разрыв длиннее
+# недели — это уже обрыв среза, и такой прогон честно останавливается с недобором.
+GAP_SEARCH_LOOKAHEAD = timedelta(days=7)
+
+
+def _naive_series(stamps: pd.Series) -> pd.Series:
+    """Векторный аналог ``_naive`` для целой колонки ``datetime``.
+
+    Часовой пояс срезается, если он есть; naive-колонка возвращается как есть.
+    """
+    if isinstance(stamps.dtype, pd.DatetimeTZDtype):
+        return stamps.dt.tz_localize(None)
+    return stamps
 
 
 def _naive(dt) -> pd.Timestamp:
@@ -24,6 +41,43 @@ def _naive(dt) -> pd.Timestamp:
     но при возможном рецидиве aware-времени гарантирует целостность сравнений.
     """
     return to_naive(dt)
+
+
+@dataclass
+class DataGap:
+    """Разрыв в данных: промежуток рыночного времени без ожидаемых баров.
+
+    ``since`` — рыночный момент, с которого прогона ждёт бар, которого нет;
+    ``resume`` — момент ближайшего имеющегося бара, с которого данные возобновляются;
+    ``missed`` — сколько баров мельчайшего активного таймфрейма пропало за разрыв;
+    ``span`` — длительность промежутка отсутствия баров (от баром после последнего
+    имеющегося до следующего имеющегося), в отчёт идёт максимум этих значений.
+    """
+
+    since: pd.Timestamp
+    resume: pd.Timestamp
+    missed: int
+    span: pd.Timedelta = pd.Timedelta(0)
+    last_bar: pd.Timestamp | None = None
+    empty_ticks: int = 0
+
+
+@dataclass
+class DataExhaustion:
+    """Что именно не нашёл кэш, объявив конец доступных данных.
+
+    ``at`` — рыночный момент, с которого искали бар; ``horizon_start`` и
+    ``horizon_end`` — границы реально проверенного окна поиска
+    ``[at, min(at + 7 суток, конец диапазона)]``. ``horizon_limited`` равен
+    ``True``, когда поиск оборван семью сутками раньше конца диапазона: в этом
+    случае кэш НЕ утверждает, что баров после проверенного участка нет.
+    """
+
+    at: pd.Timestamp
+    horizon_start: pd.Timestamp
+    horizon_end: pd.Timestamp
+    range_end: pd.Timestamp | None = None
+    horizon_limited: bool = False
 
 
 class MarketDataCache:
@@ -36,11 +90,20 @@ class MarketDataCache:
 
     На виртуальных часах (исторический прогон) повторные принудительные
     загрузки и паузы между ними отключены: отсутствие бара на текущем рыночном
-    моменте означает конец доступных данных, а не задержку публикации.
+    моменте не означает конец доступных данных — это разрыв в данных (перерыв
+    между сессиями, выходной, праздник). Такой разрыв кэш находит поиском
+    следующего имеющегося бара и сообщает прогону вместе со статистикой
+    (количество разрывов, пропущенные бары, самый длинный разрыв). Конец данных
+    сигнализируется только когда следующего бара нет.
     """
 
-    #: Конец доступных данных: устанавливается, когда новые бары перестали приходить.
+    #: Конец доступных данных: устанавливается, когда новые бары перестали приходить
+    #: и следующего имеющегося бара в горизонте поиска нет.
     data_exhausted: bool = False
+
+    #: Границы проверенного горизонта поиска в момент объявления конца данных;
+    #: ``None``, пока данных не объявлено конец.
+    data_exhaustion: DataExhaustion | None = None
 
     def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None) -> None:
         self._loader = loader
@@ -61,6 +124,10 @@ class MarketDataCache:
         self._uids: dict[tuple, str] = {}
         self._seen: dict[tuple, pd.Timestamp | None] = {}
         self._missed_bars = 0
+        self._gaps = 0
+        self._longest_gap = pd.Timedelta(0)
+        self._gap: DataGap | None = None  # открытый разрыв (данные ещё не возобновились)
+        self._pending_gap: DataGap | None = None  # найденный разрыв, ждущий перевода рыночного времени
         self._empty_ticks = 0
         self._tick_progressed = 0
         self._tick_expected: set[str] = set()
@@ -69,6 +136,25 @@ class MarketDataCache:
     def missed_bars(self) -> int:
         """Сколько ожидаемых баров внутри диапазона не появилось (для отчёта)."""
         return self._missed_bars
+
+    @property
+    def gaps(self) -> int:
+        """Сколько разрывов в данных пережил прогон (для отчёта)."""
+        return self._gaps
+
+    @property
+    def longest_gap(self) -> pd.Timedelta:
+        """Длительность самого длинного разрыва в данных (для отчёта)."""
+        return self._longest_gap
+
+    def take_pending_gap(self) -> DataGap | None:
+        """Забирает найденный разрыв, если он есть, и снимает его с учёта.
+
+        Разрыв приходит сюда один раз: кэш сообщает прогону момент следующего
+        имеющегося бара, а рыночным временем распоряжается уже сессия прогона.
+        """
+        gap, self._pending_gap = self._pending_gap, None
+        return gap
 
     def _key(self, instrument, timeframe: str) -> tuple:
         return (instrument.ticker, instrument.instrument_type, timeframe)
@@ -84,7 +170,14 @@ class MarketDataCache:
             return {}
         return {"client_provider": self._client_provider, "clock": self._clock}
 
-    def _load(self, instrument, timeframe: str, start_date=None) -> pd.DataFrame:
+    def _load(self, instrument, timeframe: str, start_date=None, end_date=None) -> pd.DataFrame:
+        """Дозагрузка кадра по окну ``[start_date, end_date)``.
+
+        Обычная дозагрузка ``end_date`` не задаёт: в историческом прогоне загрузчик
+        сам ограничивает срез текущим рыночным моментом. Явное ``end_date`` нужно
+        только поиску следующего бара за разрывом — там окно ограничено горизонтом
+        поиска, а не рыночным временем.
+        """
         key = self._key(instrument, timeframe)
         self._last_api_attempt = _naive(self._timeline.now())
         df, instrument_id = self._loader(
@@ -92,7 +185,7 @@ class MarketDataCache:
             instrument_type=instrument.instrument_type,
             timeframe=timeframe,
             start_date=start_date,
-            end_date=None,
+            end_date=end_date,
             token=self._token,
             instrument_id=self._uids.get(key),
             **self._source_kwargs(),
@@ -354,20 +447,214 @@ class MarketDataCache:
         return last is not None and (previous is None or last > previous)
 
     def _register_tick(self, progressed: int, expected: int) -> None:
-        """Учёт тика исторического прогона: прогресс, пропуски и конец данных."""
+        """Учёт тика исторического прогона: прогресс, разрывы и конец данных.
+
+        Тик без прогресса не обрывает прогон сам по себе: копящийся счётчик
+        превращается в разрыв данных, и кэш ищет следующий имеющийся бар. Бар
+        найден — разрыв уходит прогону (рыночное время переводит сессия
+        прогона), бар не найден — сигнализируется конец доступных данных. Если
+        источник не ответил, конец данных не фиксируется и поиск повторяется.
+        """
         if progressed:
             self._empty_ticks = 0
-            self._missed_bars += max(0, expected - progressed)
+            if self._gap is not None:
+                self._close_gap(self._last_closed_bar())
+            else:
+                self._missed_bars += max(0, expected - progressed)
             return
         self._empty_ticks += 1
-        if self._empty_ticks >= CONSECUTIVE_EMPTY_TICKS_BEFORE_END:
-            self.data_exhausted = True
-            log.info(
-                "Новые бары не появились %d тиков подряд — конец доступных данных.",
-                self._empty_ticks,
+        if self._gap is None:
+            now = _naive(self._timeline.now())
+            self._gap = DataGap(
+                since=now,
+                resume=now,
+                missed=0,
+                last_bar=self._last_closed_bar(),
+                empty_ticks=self._empty_ticks,
             )
+        self._gap.empty_ticks = self._empty_ticks
+        if self._empty_ticks < CONSECUTIVE_EMPTY_TICKS_BEFORE_END:
             return
-        self._missed_bars += expected
+        self._resolve_gap()
+
+    def _resolve_gap(self) -> None:
+        """Разбирает накопленный счётчик тиков без прогресса: разрыв или конец данных."""
+        gap = self._gap
+        if gap is None:  # pragma: no cover - защита от вызова без открытого разрыва
+            return
+        now = _naive(self._timeline.now())
+        resume, source_failed = self._find_next_bar(now)
+        if source_failed:
+            # Источник не ответил: конец данных не фиксируется, потому что
+            # отсутствие ответа ничего не говорит о наличии баров. Разрыв остаётся
+            # открытым, и поиск повторяется на следующих тиках.
+            return
+        self._gap = None
+        if resume is None:
+            horizon_end = self._gap_search_ceiling(now)
+            range_end = self._history_range_end()
+            limited = range_end is None or horizon_end < range_end
+            self.data_exhausted = True
+            self.data_exhaustion = DataExhaustion(
+                at=now,
+                horizon_start=now,
+                horizon_end=horizon_end,
+                range_end=None if range_end is None else _naive(range_end),
+                horizon_limited=limited,
+            )
+            if limited:
+                log.info(
+                    "Следующего бара нет в проверенном горизонте %s — %s: поиск ограничен семью сутками, "
+                    "отсутствие баров после него не утверждается — конец доступных данных.",
+                    now, horizon_end,
+                )
+            else:
+                log.info(
+                    "Новые бары не появились %d тиков подряд, следующего бара до %s нет — конец доступных данных.",
+                    gap.empty_ticks,
+                    horizon_end,
+                )
+            return
+        gap.resume = resume
+        gap.missed = self._bars_between(gap.last_bar, resume)
+        gap.span = self._gap_span(gap, resume)
+        self._missed_bars += gap.missed
+        self._gaps += 1
+        self._longest_gap = max(self._longest_gap, gap.span)
+        self._pending_gap = gap
+        self._empty_ticks = 0
+        log.info(
+            "Разрыв данных с %s: пропущено баров %d, следующий имеющийся бар %s.",
+            gap.since, gap.missed, resume,
+        )
+
+    def _close_gap(self, resume) -> None:
+        """Данные возобновились без перевода часов: разрыв закрыт, пропуски посчитаны."""
+        gap, self._gap = self._gap, None
+        if gap is None or resume is None:
+            return
+        gap.resume = _naive(resume)
+        gap.missed = self._bars_between(gap.last_bar, gap.resume)
+        gap.span = self._gap_span(gap, gap.resume)
+        self._missed_bars += gap.missed
+        self._gaps += 1
+        self._longest_gap = max(self._longest_gap, gap.span)
+        log.info(
+            "Разрыв данных с %s закрыт: пропущено баров %d, данные возобновились с %s.",
+            gap.since, gap.missed, gap.resume,
+        )
+
+    def _gap_span(self, gap: DataGap, resume) -> pd.Timedelta:
+        """Длительность промежутка, на котором баров не было.
+
+        Считается от бара, следующего за последним имеющимся, до следующего
+        имеющегося: так длительность совпадает с подсчётом разрывов в
+        предварительной проверке (пропущенные бары, а не расстояние между
+        соседними барами).
+        """
+        timeframe = self._driver_timeframe()
+        if gap.last_bar is not None and timeframe is not None:
+            period = pd.Timedelta(seconds=self._tf_period_secs(timeframe))
+            return max(pd.Timedelta(0), _naive(resume) - (_naive(gap.last_bar) + period))
+        return max(pd.Timedelta(0), _naive(resume) - _naive(gap.since))
+
+    def _find_next_bar(self, now) -> tuple[pd.Timestamp | None, bool]:
+        """Ищет ближайший имеющийся закрытый бар мельчайшего активного ТФ после ``now``.
+
+        Один запрос на каждый кадр мельчайшего таймфрейма в окне
+        ``[now, min(now + 7 суток, конец диапазона)]``. Границы окна источник
+        трактует включительно, поэтому кандидаты отбираются строго вручную: бар на
+        текущем рыночном моменте ещё не закрыт, а бар за верхней границей поиска
+        уже за горизонтом. Кадры старших таймфреймов не опрашиваются: их бары
+        внутри разрыва тоже отсутствуют, и ответ они не изменят.
+
+        Возвращает пару ``(момент следующего бара, не ответил ли источник)``:
+        молчание источника не должно выдаваться за конец доступных данных.
+        """
+        timeframe = self._driver_timeframe()
+        if timeframe is None:
+            return None, False
+        ceiling = self._gap_search_ceiling(now)
+        if ceiling <= now:
+            return None, False
+        best: pd.Timestamp | None = None
+        failed = False
+        for key, frame in list(self._frames.items()):
+            if key[2] != timeframe or frame is None or frame.empty:
+                continue
+            try:
+                probe = self._load(
+                    self._instruments[key],
+                    timeframe,
+                    start_date=now,
+                    end_date=ceiling,
+                )
+            except Exception as exc:
+                log.warning("Не удалось найти следующий бар для %s: %s", key, exc)
+                failed = True
+                continue
+            if probe is None or probe.empty or "datetime" not in probe.columns:
+                continue
+            stamps = _naive_series(probe["datetime"])
+            later = stamps[(stamps > now) & (stamps <= ceiling)]
+            if later.empty:
+                continue
+            candidate = later.min()
+            if best is None or candidate < best:
+                best = candidate
+        if best is None and failed:
+            return None, True
+        return best, False
+
+    def _history_range_end(self):
+        """Правая граница диапазона прогона (у истории она есть всегда)."""
+        return getattr(self._clock, "end", None) or getattr(self._timeline, "end", None)
+
+    def _gap_search_ceiling(self, now) -> pd.Timestamp:
+        """Верхняя граница поиска следующего бара: 7 суток, но не за концом диапазона."""
+        ceiling = _naive(now) + GAP_SEARCH_LOOKAHEAD
+        end = self._history_range_end()
+        if end is not None:
+            ceiling = min(ceiling, _naive(end))
+        return ceiling
+
+    def _driver_timeframe(self) -> str | None:
+        """Мельчайший активный таймфрейм: по нему считаются тик прогона и пропуски."""
+        timeframes = {key[2] for key in self._frames}
+        if not timeframes:
+            return None
+        now = self._timeline.now()
+        return min(timeframes, key=lambda tf: self._tf_period_secs(tf, now))
+
+    def _last_closed_bar(self, timeframe: str | None = None) -> pd.Timestamp | None:
+        """Момент последнего закрытого бара мельчайшего активного ТФ по всем его кадрам."""
+        target = timeframe or self._driver_timeframe()
+        if target is None:
+            return None
+        last: pd.Timestamp | None = None
+        for key, frame in self._frames.items():
+            if key[2] != target or frame is None or frame.empty:
+                continue
+            closed = self._closed_only(frame, target)
+            if closed.empty:
+                continue
+            candidate = _naive(closed["datetime"].max())
+            if last is None or candidate > last:
+                last = candidate
+        return last
+
+    def _bars_between(self, start, end) -> int:
+        """Сколько баров мельчайшего активного ТФ пропало между двумя имеющимися барами."""
+        if start is None or end is None:
+            return 0
+        timeframe = self._driver_timeframe()
+        if timeframe is None:
+            return 0
+        period = self._tf_period_secs(timeframe)
+        if period <= 0:
+            return 0
+        slots = (_naive(end) - _naive(start)).total_seconds() / period
+        return max(0, int(slots) - 1)
 
     def _closed_only(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         grid = self._timeline.grid(timeframe)

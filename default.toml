@@ -176,6 +176,43 @@ strategies = [
     { id = "future-br-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "15m", priority = 10 },
 ]
 
+
+[strategies.future.RTS]
+timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
+strategies = [
+
+    { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-rts-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-rts-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+]
+
+[strategies.future.SBRF]
+timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
+strategies = [
+
+    { id = "future-sbrf-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-sbrf-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-sbrf-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+]
+
+[strategies.future.GOLD]
+timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
+strategies = [
+
+    { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-gold-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-gold-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+]
+
+
+[strategies.future.SILV]
+timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
+strategies = [
+
+    { id = "future-silv-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-silv-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-silv-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+]
 # Сценарий сравнения привязок: SI — один инструмент, один ТФ (5m), две
 # привязки ma_cloud_rsi_macd с разными профилями фильтрации (raw / triple_screen).
 # Сценарий пришёл на смену дубликату имени стратегии на 1h (перекрёстный ТФ
@@ -228,23 +265,36 @@ audit_backup_count = 5                                # число храним�
 
 [trading]
 initial_deposit = 100000                              # стартовый капитал счёта (в валюте счёта), база для risk-лимитов
-max_risk_pct = 2.0                                    # максимальный риск на одну сделку, % от капитала (легаси-лимит)
+max_risk_pct = 2.0                                    # совместимость legacy API; допуск использует единый risk_limits.portfolio_pct
 database_file = "trades.sqlite3"                      # durable-журнал сделок (SQLite) внутри runtime-каталога
 journal_file = "trade_event.csv"                      # append-only лента сделок (CSV-проекция журнала)
 positions_file = "trade_summary.csv"                  # карточки открытых позиций (CSV-проекция журнала)
 clearing_times = ["14:05", "19:00"]                   # времена дневного клиринга (МСК): исполнение сделок приостановлено
 contract_expiry_block_days = 2                        # порог экспирации фьючерсов: вход запрещён и сделки закрываются за N календарных суток до экспирации
 
+# Фильтр разрешённых направлений входов по типам инструментов (опционально).
+# Каждый ключ — тип инструмента, значение — список направлений long и/или short.
+# Секция и незаданные в ней типы означают «разрешены обе стороны»; поведение
+# по умолчанию без секции не меняется. Раскомментируйте и настройте при
+# необходимости, например:
+# [trading.directions]
+#   future = ["long", "short"]     # фьючерсы: и лонг, и шорт
+#   share  = ["long"]              # акции: только лонг
+
 [trading.risk_limits]
-trade_pct = 2.0         # макс. риск одной сделки, % от текущего баланса (stop-убыток + комиссии)
-instrument_pct = 4.0    # макс. суммарный риск по всем позициям одного инструмента, %
-portfolio_pct = 6.0     # макс. совокупный риск по всему портфелю, %
+portfolio_pct = 2.0     # единый риск всех открытых остатков и pending-входов, % от min(balance, equity)
+# Старые trade_pct, instrument_pct и groups нужно удалить из robot.toml:
+# отдельные процентные квоты заменены единым portfolio_pct, молчаливой миграции нет.
 max_qty = 10            # верхняя граница размера входа: не более такого числа контрактов на сделку
-commission = 0.0        # комиссия за сделку в валюте счёта (учитывается в расчёте безубытка)
-slippage = 0.0          # допустимое проскальзывание в валюте счёта (учитывается в расчёте безубытка)
+commission = 1.5        # ₽ на контракт за одну сторону; оценка круга = 2 × commission
+slippage = 1.0          # ₽ на контракт за полный круг; запас пополам на вход и выход
 slippage_tolerance = 0.005  # допуск гэпа на входе, доля от цены сигнала: вход исполняется по цене,
                            # ушедшей от сигнальной дальше этой доли — позиция признаётся аварийной
-groups = { energy = 4.0, currency = 4.0 }  # лимиты риска по группам инструментов, % от капитала
+min_trade_risk_pct = 0.0   # минимальный риск сделки, % от баланса: вход с меньшим риском
+                           # (например, из-за нехватки бюджета) отклоняется, а не урезается молча
+min_risk_cost_ratio = 2.0 # минимум риска до стопа / оценки круговых издержек; 0 выключает
+min_net_payoff = 1.5      # минимум чистой плановой прибыли / риска полного выхода; 0 выключает
+max_slippage_r = 0.25     # максимум запаса проскальзывания / риска; 0 выключает ограничение
 
 # Профили управления открытой позицией. Привязка происходит в [strategies.*] через
 # ключ management; параметры читаются на этапе планирования и каждого mengement-такта.
@@ -254,17 +304,26 @@ buffer_ticks = 1    # отступ стопа от S/R в шагах цены
 target_R = [1.0, 2.0]     # тейки в долях риска (R): 1.0×R и 2.0×R от точки входа
 shares = [0.5, 0.5]       # доля позиции, закрываемая на каждом тейке (сумма ≤ 1)
 max_adds = 0              # максимум докуток (пирамидинга) на прибыльном движении
+min_be_r = 1.5            # BE после TP1 только при текущем продвижении не меньше 1.5 исходных R
+min_stop_atr = 1.5        # общая геометрия стопа (одна и та же во всех профилях, см. комментарий ниже)
+min_stop_ticks = 10
+stop_beyond_bar = 1.0
+max_stop_atr = 6.0
 
 [trade_management.profiles.atr_trend]
 type = "atr_trend"  # профиль: стоп по ATR, фиксация TP1, далее трейлинг остатка
 atr_period = 14       # период ATR (прогрев индикатором; фрейм должен быть длиннее)
 initial_k = 2.0       # начальный стоп = K × ATR от точки входа
 trail_k = 2.0         # трейлинг-стоп = K × ATR от экстремума движения
-tp1_R = 1.0           # первый тейк в долях риска (R)
-tp1_share = 0.5       # доля позиции, закрываемая на TP1 (остаток уходит в трейлинг)
+target_R = [1.0, 2.0] # возрастающая лестница целей в исходных R
+shares = [0.25, 0.25] # целые floor-доли на целях; остаток продолжает трейлинг
 max_adds = 2          # максимум докуток в фазе пирамидинга (до срабатывания TP1)
 add_fraction = 0.5    # размер докутки как доля от текущего объёма позиции
 advance_R = 0.5       # минимальное продвижение цены (в R) от последнего входа для докутки
+min_stop_atr = 1.5        # общая геометрия стопа: собственная формула профиля (initial_k × ATR)
+min_stop_ticks = 10      # подчиняется тому же полу, что и остальные профили
+stop_beyond_bar = 1.0
+max_stop_atr = 6.0
 
 [trade_management.profiles.ma_cloud]
 type = "ma_cloud"      # профиль: стоп по облаку скользящих средних, частичный выход и ретест-докутка
@@ -273,10 +332,26 @@ ma_slow_period = 40    # медленная MA (нижняя граница об
 buffer_ticks = 1       # отступ стопа от границы облака в шагах цены
 max_adds = 2           # максимум докуток на возврате цены к облаку
 add_fraction = 0.5     # размер докутки как доля от текущего объёма позиции
+min_stop_atr = 1.5        # общая геометрия стопа: стоп за границей облака тоже ограничен волатильностью
+min_stop_ticks = 10
+stop_beyond_bar = 1.0
+max_stop_atr = 6.0
 
 [trade_management.profiles.pattern_targets]
 type = "pattern_targets"  # профиль: цели AB=CD (паттерн гармоники), стоп за точкой C
+min_be_r = 1.5            # порог текущего продвижения для BE всей сделки после TP1
 buffer_ticks = 1          # отступ стопа от точки C в шагах цены
 fractions_to_D = [0.5, 1.0]  # доли расстояния до цели D: 0.5 — мидпоинт, 1.0 — сама D
 shares = [0.5, 0.5]          # доля позиции, закрываемая на каждой из двух целей
 max_adds = 0
+min_stop_atr = 1.5        # общая геометрия стопа: стоп за точкой C тоже расширяется до волатильности,
+min_stop_ticks = 10      # но цели мидпоинта и D остаются на своих абсолютных ценах
+stop_beyond_bar = 1.0
+max_stop_atr = 6.0
+
+# Общая геометрия стопа применяется в одной точке планирования ко всем профилям:
+# пол = max(min_stop_atr × ATR, min_stop_ticks × tick, stop_beyond_bar × диапазон бара),
+# потолок = max_stop_atr × ATR. Значения подобраны по реальным барам NG 15m:
+# медианный ATR(14) ≈ 0.009 (9 тиков), медианный диапазон бара ≈ 0.008 (8 тиков),
+# поэтому пол в 10 тиков держит стоп шире медианного бара, а потолок в 6 × ATR
+# на реальном корпусе не срабатывает ни разу и остаётся страховкой.

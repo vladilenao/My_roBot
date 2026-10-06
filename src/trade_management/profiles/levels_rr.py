@@ -13,9 +13,11 @@ from src.trade_management.profiles.base import (
     ProfileResult,
     TradeManagementProfile,
     shared_management_rules,
+    shared_planning_rules,
 )
 from src.trade_management.profiles.rules import (
     cost_aware_break_even,
+    economics_break_even,
     add_quantity,
     initial_stop,
     initial_target,
@@ -30,6 +32,7 @@ class LevelsRrProfile(TradeManagementProfile):
 
     NAME = "levels_rr"
 
+    @shared_planning_rules
     def plan(self, context: PlanningContext) -> TradePlan | ProfileResult:
         side = _side(context.signal.signal_type)
         if side is None:
@@ -61,18 +64,18 @@ class LevelsRrProfile(TradeManagementProfile):
         )
         shares = _shares(context.profile.parameters.get("shares", ("0.5", "0.5")), len(target_rs))
         risk = entry - stop if side == "BUY" else stop - entry
-        targets = tuple(
-            TargetPlan(
-                f"tp-{index}",
-                initial_target(
-                    entry + risk * multiple if side == "BUY" else entry - risk * multiple,
-                    step,
-                    side,
-                ),
-                share,
+        try:
+            targets = tuple(
+                TargetPlan(
+                    f"tp-{index}",
+                    entry if context.market.get("algorithm_version") == "economics-v2" else
+                    initial_target(entry + risk * multiple if side == "BUY" else entry - risk * multiple, step, side),
+                    share,
+                )
+                for index, (multiple, share) in enumerate(zip(target_rs, shares), start=1)
             )
-            for index, (multiple, share) in enumerate(zip(target_rs, shares), start=1)
-        )
+        except ValueError:
+            return ProfileResult(state={"reason": "target-not-ahead"})
         return TradePlan(
             trade_id=context.trade_id,
             assignment_id=context.assignment_id,
@@ -91,6 +94,8 @@ class LevelsRrProfile(TradeManagementProfile):
         add = self._add(context)
         if "tp-1" not in context.state.completed_target_ids:
             return ProfileResult(actions=add)
+        if context.plan.algorithm_version == "legacy-v1" and context.market.get("legacy_costs_known") is False:
+            return ProfileResult(actions=add, state={"be_skip_reason": "legacy-cost-policy-unknown"})
 
         current_stop = context.state.confirmed_stop or context.plan.stop_price
         quantity = context.state.quantity
@@ -98,16 +103,21 @@ class LevelsRrProfile(TradeManagementProfile):
         if quantity <= 0 or average_price is None:
             return ProfileResult()
 
-        break_even = cost_aware_break_even(
-            average_price,
-            context.plan.side,
-            _market_value(context.market, "price_step"),
-            _market_value(context.market, "step_cost"),
-            quantity,
-            entry_cost=context.market.get("entry_cost", Decimal("0")),
-            exit_cost=context.market.get("exit_cost", Decimal("0")),
-            slippage_cost=context.market.get("slippage_cost", Decimal("0")),
-        )
+        if context.plan.algorithm_version == "economics-v2":
+            break_even, skipped = economics_break_even(context.plan, context.state, context.market)
+            if break_even is None:
+                return ProfileResult(actions=add, state={"be_skip_reason": skipped})
+        else:
+            break_even = cost_aware_break_even(
+                average_price,
+                context.plan.side,
+                _market_value(context.market, "price_step"),
+                _market_value(context.market, "step_cost"),
+                quantity,
+                entry_cost=context.market.get("entry_cost", Decimal("0")),
+                exit_cost=context.market.get("exit_cost", Decimal("0")),
+                slippage_cost=context.market.get("slippage_cost", Decimal("0")),
+            )
         improves = (
             break_even > current_stop
             if context.plan.side == "BUY"

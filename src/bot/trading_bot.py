@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from uuid import uuid4
@@ -183,7 +184,17 @@ class TradingBot:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             self._data_cache.close_tick()
             if getattr(self._data_cache, "data_exhausted", False):
-                self._run.mark_data_exhausted()
+                self._run.mark_data_exhausted(
+                    getattr(self._data_cache, "data_exhaustion", None)
+                )
+            gap = self._take_data_gap()
+            if gap is not None:
+                # Разрыв в данных: рыночное время переведено на следующий имеющийся
+                # бар, тик ничего не принёс, поэтому обработка бара на этом шаге
+                # не делается — следующий тик начнётся уже за разрывом.
+                self._run.mark_data_gap(gap)
+                self._timeline.reanchor()
+                return
             if not ready_tfs:
                 return
             # Protection is simulated from closed base bars before any strategy
@@ -208,6 +219,13 @@ class TradingBot:
             self._maybe_heartbeat()
         finally:
             correlation_id_var.set(None)
+
+    def _take_data_gap(self):
+        """Забирает найденный кэшем разрыв в данных (одноразово, ``None`` — разрыва нет)."""
+        take = getattr(self._data_cache, "take_pending_gap", None)
+        if not callable(take):
+            return None
+        return take()
 
     # ── ПУНКТ 2.1: готов ли свежий закрытый бар ТФ (для ожидания до появления) ──
     def _bar_is_ready(self, timeframe: str) -> bool:
@@ -362,6 +380,13 @@ class TradingBot:
             candidate.context,
             timeframe=candidate.timeframe,
         )
+        diagnostics = dict(admission.diagnostics)
+        if admission.rejections and not diagnostics:
+            provider = getattr(self._trade_manager, "portfolio_diagnostics", None)
+            if callable(provider):
+                details = provider()
+                if isinstance(details, Mapping):
+                    diagnostics = dict(details)
         if admission.plan is not None:
             quantity = admission.actions[0].quantity if admission.actions else 0
             self._publish_signal(
@@ -369,6 +394,7 @@ class TradingBot:
                 candidate.instrument,
                 quantity=quantity,
                 timeframe=candidate.timeframe,
+                diagnostics=diagnostics,
             )
         self._dispatch_management_actions(
             admission.actions,
@@ -383,6 +409,8 @@ class TradingBot:
                 candidate.decision,
                 candidate.instrument,
                 reason=reason.message,
+                code=reason.code,
+                diagnostics=diagnostics,
                 filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
             )
@@ -504,8 +532,10 @@ class TradingBot:
         *,
         quantity: int = 0,
         timeframe: str = "",
+        diagnostics=None,
     ) -> None:
         """Publish the admitted plan: it is queued, not yet executed."""
+        economics = plan.economics
         self._bus.publish(
             Event.signal(
                 self._display_name(instrument),
@@ -515,6 +545,15 @@ class TradingBot:
                 stop=plan.stop_price,
                 targets=tuple(target.price for target in plan.targets),
                 expected_r=plan.expected_r,
+                risk_amount=None if economics is None else economics.risk_amount,
+                reward_amount=None if economics is None else economics.reward_amount,
+                costs_amount=None if economics is None else economics.costs_amount,
+                payoff_ratio=None if economics is None else economics.payoff_ratio,
+                fixed_reward_amount=None if economics is None else economics.fixed_reward_amount,
+                fixed_quantity=None if economics is None else economics.fixed_quantity,
+                net_reward_amount=None if economics is None else economics.net_reward_amount,
+                algorithm_version=plan.algorithm_version,
+                diagnostics=diagnostics,
                 strategy=plan.profile.name,
                 timeframe=timeframe or plan.timeframe,
                 trade_id=plan.trade_id,
@@ -527,6 +566,8 @@ class TradingBot:
         instrument: Instrument,
         *,
         reason: str,
+        code: str = "",
+        diagnostics=None,
         filter_profile: str = "",
         timeframe: str = "",
     ) -> None:
@@ -535,6 +576,8 @@ class TradingBot:
             Event.rejected(
                 self._display_name(instrument),
                 reason=reason,
+                code=code,
+                diagnostics=diagnostics,
                 side=decision.signal_type.name,
                 price=decision.price,
                 strategy=decision.strategy_name or "",

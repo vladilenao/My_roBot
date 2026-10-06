@@ -233,7 +233,7 @@ def test_one_rejected_action_does_not_block_the_other_in_the_same_pass(tmp_path,
                 MoveStop("stop-good", context.plan.trade_id, state.state_revision,
                          "break-even", Decimal("103.5")),
             )
-            return ProfileResult(actions=actions, state=state), None
+            return ProfileResult(actions=actions), None
 
     monkeypatch.setitem(manager_module.PROFILE_CLASSES, "two_stop", TwoStopProfile)
     with Storage(tmp_path / "trades.sqlite3") as storage:

@@ -8,6 +8,7 @@ from src import __version__
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from shutil import rmtree
 import sys
 
 from src.decision import SignalFilter
@@ -43,6 +44,7 @@ from src.config import (
     AUDIT_BACKUP_COUNT,
     TRADE_MANAGEMENT_PROFILES,
     CONTRACT_EXPIRY_BLOCK_DAYS,
+    TRADING_DIRECTIONS,
     trading_enabled,
     runtime_dir,
     run_dir_name,
@@ -210,25 +212,41 @@ def main(no_prompt: bool = False):
 
 
 def _run_live():
-    return _launch(
+    code, _, _ = _launch(
         state_dir=runtime_dir(),
         client_provider=None,
         clock=None,
         session=build_run_session(MODE_LIVE),
         channel_names=None,
     )
+    return code
 
 
 def _run_history(start, end, pause):
-    clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
-    return _launch(
-        state_dir=state_dir_for(start, end),
-        client_provider=EmulatorClientProvider(),
-        clock=clock,
-        session=build_run_session(MODE_HISTORY, clock),
-        channel_names=[],
-        history=True,
-    )
+    """Прогон с повтором, если проверка сдвинула начало на первую доступную свечу.
+
+    Сдвиг меняет часы и каталог состояния, поэтому прогон собирается заново; уже
+    выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
+    второй раз. Повтор ровно один — границы для нового начала проверены.
+    """
+    instruments = None
+    for _ in range(2):
+        clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+        state_dir = state_dir_for(start, end)
+        code, shifted, instruments = _launch(
+            state_dir=state_dir,
+            client_provider=EmulatorClientProvider(),
+            clock=clock,
+            session=build_run_session(MODE_HISTORY, clock),
+            channel_names=[],
+            history=True,
+            instruments=instruments,
+        )
+        if shifted is None:
+            return code
+        rmtree(state_dir, ignore_errors=True)
+        start = shifted
+    return code
 
 
 def _timeframes() -> list[str]:
@@ -278,11 +296,17 @@ def _launch(
     session,
     channel_names,
     history: bool = False,
-) -> int:
+    instruments=None,
+) -> tuple[int, datetime | None, list]:
     """Единая сборка прогона: различаются только источник, часы и каталог.
 
     Всё остальное — кэш, планировщик, стратегии, исполнение и журнал — собирается
     одинаково, поэтому исторический прогон идёт по тому же конвейеру, что и боевой.
+
+    Возвращает код завершения, сдвиг начала и выбранные инструменты: если
+    проверка перенесла начало на первую доступную свечу, собранные часы и каталог
+    уже не годятся, а прогонать диапазон должен вызывающий — он же передаст
+    сюда ``instruments``, чтобы не спрашивать пользователя повторно.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(
@@ -293,12 +317,34 @@ def _launch(
         backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
-    instruments = select_instruments(
-        validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
-        client_provider=client_provider,
-        market_now=None if clock is None else clock.now(),
-    ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-    instruments = [normalize_instrument(item) for item in instruments]
+    if instruments is None:
+        instruments = select_instruments(
+            validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
+            client_provider=client_provider,
+            market_now=None if clock is None else clock.now(),
+        ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+        instruments = [normalize_instrument(item) for item in instruments]
+
+    if history:
+        report = run_preflight(
+            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            start=session.start,
+            end=session.end,
+            warmup_bars=_warmup_bars(),
+            load_candles=load_candles,
+            client_provider=client_provider,
+            clock=clock,
+            ping=_source_ping(client_provider),
+        )
+        if not report.ok:
+            print(report.message())
+            return 2, None, instruments
+        if report.start != session.start:
+            print(report.message())
+            return 3, report.start, instruments
+        if report.notes:
+            print(report.message())
+
     channels = build_channels(channel_names)
     bus = EventBus()
     bus.subscribe_all(channels)
@@ -326,20 +372,6 @@ def _launch(
 
     storage = None
     try:
-        if history:
-            report = run_preflight(
-                active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-                start=session.start,
-                end=session.end,
-                warmup_bars=_warmup_bars(),
-                load_candles=load_candles,
-                client_provider=client_provider,
-                clock=clock,
-                ping=_source_ping(client_provider),
-            )
-            if not report.ok:
-                print(report.message())
-                return 2
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
             client_provider=client_provider,
@@ -350,7 +382,7 @@ def _launch(
         if history:
             _finish_history(storage, session, data_cache, timeline, state_dir)
         close_channels(channels)
-    return 0
+    return 0, None, instruments
 
 
 def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
@@ -359,14 +391,22 @@ def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
         return
     reason = session.stop_reason()
     crashed = not reason
+    longest_gap = getattr(data_cache, "longest_gap", None)
+    exhaustion = getattr(session, "exhaustion", None)
     metrics = RunMetrics(
         start=session.start,
         end=session.end,
         ticks=session.ticks_done(),
         missed_bars=data_cache.missed_bars,
+        gaps=getattr(data_cache, "gaps", 0),
+        longest_gap_seconds=0.0 if longest_gap is None else longest_gap.total_seconds(),
+        covered=bool(getattr(session, "covered", False)),
         stop_reason=reason or "остановлено оператором",
         market_now=to_naive(timeline.now()),
         crashed=crashed,
+        horizon_start=None if exhaustion is None else exhaustion.horizon_start,
+        horizon_end=None if exhaustion is None else exhaustion.horizon_end,
+        horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -451,17 +491,40 @@ def _build_runtime(
         return _Runtime()
 
     risk_limits = _risk_limits()
+    names = _instrument_names(instruments)
+
+    def publish_execution(execution, details):
+        action = details["action_type"].split(":", 1)[0]
+        event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
+                      "STOP": EventType.STOP_HIT, "TARGET": EventType.TARGET_HIT,
+                      "REDUCE": EventType.TRADE_CLOSED, "CLOSE": EventType.TRADE_CLOSED}[action]
+        bus.publish(Event.broker_event(event_type, trade_id=execution.trade_id,
+            instrument=names.get(details["instrument_id"]) or "контракт не указан",
+            bar_time=execution.timestamp, quantity=execution.filled_quantity, price=execution.price,
+            fee=execution.fee, fee_source=str(execution.fee_source), reason=execution.reason,
+            execution_id=execution.execution_id, status=str(execution.status),
+            **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+                                           "requested_quantity", "selected_quantity", "limiting_constraint") if key in details}))
+
     trade_manager = TradeManager(
         storage,
         broker,
         initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+        budget_observer=lambda details: bus.publish(Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", **details)),
+        execution_observer=publish_execution,
         profiles_config=TRADE_MANAGEMENT_PROFILES,
         risk_limits=risk_limits,
         max_qty=RISK_LIMITS.get("max_qty"),
         commission=RISK_LIMITS.get("commission"),
         slippage=RISK_LIMITS.get("slippage"),
         slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
+        min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
+        portfolio_pct=RISK_LIMITS.get("portfolio_pct", 2),
+        min_risk_cost_ratio=RISK_LIMITS.get("min_risk_cost_ratio", 2),
+        min_net_payoff=RISK_LIMITS.get("min_net_payoff", 1.5),
+        max_slippage_r=RISK_LIMITS.get("max_slippage_r", 0.25),
         contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
+        direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
         clock=clock,
     )
@@ -478,6 +541,7 @@ def _build_runtime(
         try:
             prices = {}
             bar_times = []
+            instrument_bar_times = {}
             for instrument in instruments:
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -500,6 +564,7 @@ def _build_runtime(
                         float(frame["high"].iloc[-1]),
                         float(frame["close"].iloc[-1]),
                     )
+                    instrument_bar_times[instrument.ticker] = bar_time
                 except Exception as exc:
                     log.warning(
                         "Сбой обработки бара %s по %s: %s",
@@ -507,16 +572,21 @@ def _build_runtime(
                     )
                     continue
             if prices:
-                broker.track_bar(max(bar_times), prices, contracts)
-            for event in broker.drain_events():
-                bus.publish(_broker_event(event))
-            for event in broker.drain_addressed_events():
+                broker.track_bar(max(bar_times), prices, contracts, bar_times=instrument_bar_times)
+            addressed = list(broker.drain_addressed_events())
+            for event in addressed:
                 try:
                     trade_manager.consume(event)
                 except Exception as exc:
                     log.warning(
                         "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
                     )
+            addressed_ids = {event.trade_id for event in addressed}
+            for event in broker.drain_events():
+                if event.trade_id not in addressed_ids:
+                    bus.publish(_broker_event(event))
+            trade_manager.observe_bars(prices, instrument_bar_times)
+            trade_manager.mark_to_market({ticker: values[3] for ticker, values in prices.items()})
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 
@@ -570,10 +640,10 @@ def _risk_limits():
     from src.portfolio import RiskLimits
 
     return RiskLimits(
-        per_trade=Decimal(str(RISK_LIMITS["trade_pct"])),
-        per_instrument=Decimal(str(RISK_LIMITS["instrument_pct"])),
-        per_group={key: Decimal(str(value)) for key, value in RISK_LIMITS.get("groups", {}).items()},
-        portfolio=Decimal(str(RISK_LIMITS["portfolio_pct"])),
+        per_trade=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
+        per_instrument=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
+        per_group={},
+        portfolio=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
     )
 
 

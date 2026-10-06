@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.portfolio.models import ContractMeta
 from src.trade_journal.storage import Storage
 from src.trade_management.actions import CloseTrade, MoveStop, OpenTrade, ReduceTrade
 from src.trade_management.manager import TradeManager
@@ -20,6 +21,9 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 class SimulatedBroker(BrokerPort):
     """Synchronous deterministic executor used only by this SQLite integration test."""
+
+    def contract_for(self, instrument):
+        return ContractMeta(instrument, 1, 100, 0, 0)
 
     def submit(self, action, now):
         if isinstance(action, MoveStop):
@@ -56,15 +60,16 @@ def test_profiles_complete_entry_add_partial_stop_restart_and_close_in_sqlite(tm
     with Storage(database) as storage:
         # The stub broker fills adds far from the signal price on purpose; this
         # scenario is about the profile lifecycle, so the entry gap guard is stood down.
-        manager = TradeManager(storage, SimulatedBroker(), initial_balance=Decimal("10000"),
+        manager = TradeManager(storage, SimulatedBroker(), initial_balance=Decimal("100000"),
                                slippage_tolerance=Decimal("1"))
-        manager.submit_plan(plan, OpenTrade(f"{name}:open", plan.trade_id, 0, "entry", 2))
+        manager.submit_plan(plan, OpenTrade(f"{name}:open", plan.trade_id, 0, "entry", 2),
+                            price_step=Decimal(1), step_cost=Decimal(100))
         manager.dispatch(NOW)
 
         recovered = _state(manager)
         add = next(action for action in profile.manage(ManagementContext(plan, recovered.state, add_market)).actions
                    if action.__class__.__name__ == "AddToTrade")
-        manager.submit_action(add)
+        manager.submit_action(add, market_close=Decimal(add_market["add_signal_price"]))
         manager.dispatch(NOW)
 
         # Target allocation follows the actual entry and add fills, then one contract exits.

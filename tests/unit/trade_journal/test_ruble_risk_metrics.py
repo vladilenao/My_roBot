@@ -39,7 +39,7 @@ def _write_trade(
         (order_id, trade_id, cid, reference_entry, started, finished),
     )
     connection.execute(
-        "INSERT INTO fills VALUES (?, ?, ?, ?, ?, 2, ?, '0', ?)",
+        "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES (?, ?, ?, ?, ?, 2, ?, '0', ?)",
         (fill_id, order_id, trade_id, cid, event_id, reference_entry, started),
     )
     connection.execute(
@@ -68,9 +68,9 @@ def test_excursions_are_priced_through_the_contract_step(tmp_path):
     row = _card(tmp_path, lambda c: _write_trade(c, "t1"))
 
     # initial risk: 4 points * 100 RUB per point * 2 contracts
-    assert row["Initial Risk"] == "800.00"
-    assert row["MAE"] == "0.75"   # 3 points against a 4-point risk
-    assert row["MFE"] == "0.75"   # 3 points against a 4-point risk
+    assert row["Initial Risk (₽)"] == "800.00"
+    assert row["MAE (R)"] == "0.75"   # 3 points against a 4-point risk
+    assert row["MFE (R)"] == "0.75"   # 3 points against a 4-point risk
 
 
 def test_two_contracts_with_different_steps_give_comparable_r(tmp_path):
@@ -83,15 +83,16 @@ def test_two_contracts_with_different_steps_give_comparable_r(tmp_path):
     summary = tmp_path / "trade_summary.csv"
     with Storage(tmp_path / "trades.sqlite3", journal_path=tmp_path / "e.csv",
                  positions_path=summary) as storage:
+        storage.set_names({"CHEAP": "CHEAP", "RICH": "RICH"})
         with storage.transaction() as connection:
             build(connection)
     with summary.open(newline="", encoding="utf-8") as handle:
-        by_id = {r["Trade ID"]: r for r in csv.DictReader(handle)}
+        by_id = {r["Контракт"]: r for r in csv.DictReader(handle)}
 
     # both moved 3 points on a 4-point risk, on the same 2 contracts
-    assert by_id["cheap"]["MAE"] == "0.75"
-    assert by_id["rich"]["MAE"] == "0.75"
-    assert by_id["cheap"]["Initial Risk"] != by_id["rich"]["Initial Risk"]
+    assert by_id["CHEAP"]["MAE (R)"] == "0.75"
+    assert by_id["RICH"]["MAE (R)"] == "0.75"
+    assert by_id["CHEAP"]["Initial Risk (₽)"] != by_id["RICH"]["Initial Risk (₽)"]
 
 
 def test_peak_size_scales_the_risk_denominator(tmp_path):
@@ -104,7 +105,7 @@ def test_peak_size_scales_the_risk_denominator(tmp_path):
                            "'2026-09-18T07:10:00+00:00', NULL)")
         connection.execute("INSERT INTO orders VALUES ('o2', 't1', 'c2', 'ADD', 'FILLED', 3, 3, '100', "
                            "'2026-09-18T07:10:00+00:00', '2026-09-18T07:10:00+00:00')")
-        connection.execute("INSERT INTO fills VALUES ('f2', 'o2', 't1', 'c2', 'e2', 3, '100', '0', "
+        connection.execute("INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES ('f2', 'o2', 't1', 'c2', 'e2', 3, '100', '0', "
                            "'2026-09-18T07:10:00+00:00')")
         connection.execute("INSERT INTO events VALUES (NULL, 'e2', 't1', 'o2', 'c2', 'FILL', "
                            "'{\"price\": \"100\", \"low\": \"97\", \"high\": \"103\"}', "
@@ -112,9 +113,9 @@ def test_peak_size_scales_the_risk_denominator(tmp_path):
 
     row = _card(tmp_path, build)
 
-    assert row["Плановый риск"] == "500.00"     # unchanged reservation
-    assert row["Initial Risk"] == "2000.00"     # 4 points * 100 RUB * 5 contracts
-    assert row["MAE"] == "0.75"   # the peak scales both sides
+    assert row["Плановый риск (₽)"] == "500.00"     # unchanged reservation
+    assert row["Initial Risk (₽)"] == "2000.00"     # 4 points * 100 RUB * 5 contracts
+    assert row["MAE (R)"] == "0.75"   # the peak scales both sides
 
 
 def test_a_bar_without_an_execution_is_not_counted(tmp_path):
@@ -130,7 +131,7 @@ def test_a_bar_without_an_execution_is_not_counted(tmp_path):
     row = _card(tmp_path, build)
 
     # only the bar the fill happened on counts, so MAE stays at 3 points
-    assert row["MAE"] == "0.75"
+    assert row["MAE (R)"] == "0.75"
 
 
 def test_trade_without_step_is_marked_unusable(tmp_path):
@@ -138,11 +139,11 @@ def test_trade_without_step_is_marked_unusable(tmp_path):
     row = _card(tmp_path, lambda c: _write_trade(c, "t1", price_step=None))
 
     assert row["Ед. PnL"] == "RAW"
-    assert row["Initial Risk"] == ""
-    assert row["Result"] == ""
-    assert row["MAE"] == ""
-    assert row["MFE"] == ""
-    assert row["Плановый риск"] == "500.00"
+    assert row["Initial Risk (₽)"] == ""
+    assert row["Result (R)"] == ""
+    assert row["MAE (R)"] == ""
+    assert row["MFE (R)"] == ""
+    assert row["Плановый риск (₽)"] == "500.00"
 
 
 def test_missing_step_warns_once_per_trade_and_reads_no_metadata(monkeypatch, caplog):
@@ -170,6 +171,6 @@ def test_result_r_uses_the_realized_risk(tmp_path):
     row = _card(tmp_path, lambda c: _write_trade(c, "t1", realized="-400"))
 
     # the 500 RUB reservation is still reported separately and is not the denominator
-    assert row["Плановый риск"] == "500.00"
-    assert row["Initial Risk"] == "800.00"
-    assert row["Result"] == "-0.50"
+    assert row["Плановый риск (₽)"] == "500.00"
+    assert row["Initial Risk (₽)"] == "800.00"
+    assert row["Result (R)"] == "-0.50"

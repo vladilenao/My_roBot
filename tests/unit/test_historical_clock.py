@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import pytest
 
 from src.scheduler.clock import HistoricalClock
@@ -109,6 +110,77 @@ class TestHistoricalClockSequence:
         clock.advance()
 
         assert slept == []
+
+
+class TestHistoricalClockJump:
+    """Переход через разрыв в данных: время идёт к следующему имеющемуся бару."""
+
+    def test_jump_moves_market_time_to_next_bar(self):
+        clock = _clock(step_minutes=1, start="2024-01-01 09:00", end="2024-01-01 12:00")
+        for _ in range(5):
+            clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 1, 10, 30))
+
+        assert clock.now() == datetime(2024, 1, 1, 10, 30)
+
+    def test_jump_skips_empty_ticks(self):
+        clock = _clock(step_minutes=1, start="2024-01-01 09:00", end="2024-01-01 12:00")
+        clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 1, 11, 0))
+
+        assert clock.finished is False
+        assert clock.now() == datetime(2024, 1, 1, 11, 0)
+
+    def test_jump_never_goes_backwards(self):
+        clock = _clock(step_minutes=5, start="2024-01-01 09:00", end="2024-01-01 12:00")
+        clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 1, 8, 0))
+
+        assert clock.now() == datetime(2024, 1, 1, 9, 5)
+
+    def test_jump_past_end_stops_at_end(self):
+        clock = _clock(step_minutes=5, start="2024-01-01 09:00", end="2024-01-01 10:00")
+        clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 2, 9, 0))
+
+        assert clock.now() == clock.end
+        assert clock.finished is True
+
+    def test_jump_after_end_changes_nothing(self):
+        clock = _clock(step_minutes=5, start="2024-01-01 09:00", end="2024-01-01 10:00")
+        for _ in range(12):
+            clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 1, 9, 30))
+
+        assert clock.now() == clock.end
+
+    def test_jump_keeps_pause_rhythm(self):
+        slept = []
+        clock = _clock(
+            step_minutes=5,
+            start="2024-01-01 09:00",
+            end="2024-01-01 12:00",
+            pause=2.0,
+            sleeps=slept.append,
+        )
+        clock.advance()
+
+        clock.jump_to(datetime(2024, 1, 1, 10, 0))
+
+        assert slept == [2.0, 2.0]
+        assert clock.now() == datetime(2024, 1, 1, 10, 0)
+
+    def test_jump_accepts_aware_moment(self):
+        clock = _clock(step_minutes=1, start="2024-01-01 09:00", end="2024-01-01 12:00")
+
+        clock.jump_to(pd.Timestamp("2024-01-01 10:00", tz="UTC"))
+
+        assert clock.now() == datetime(2024, 1, 1, 10, 0)
 
 
 class TestHistoricalClockValidation:

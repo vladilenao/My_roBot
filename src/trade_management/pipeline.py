@@ -16,7 +16,7 @@ import pandas as pd
 from src.market_context.models import MarketContext
 from src.strategies.indicators.atr.indicator import AtrWilderIndicator
 from src.strategies.indicators.ma.indicator import MaCloudIndicator
-from src.trade_management.models import ProfileSnapshot
+from src.trade_management.models import CURRENT_ALGORITHM, ProfileSnapshot
 from src.trade_management.profiles.atr_trend import AtrTrendProfile
 from src.trade_management.profiles.levels_rr import LevelsRrProfile
 from src.trade_management.profiles.ma_cloud import MaCloudProfile
@@ -50,6 +50,7 @@ def build_management_market(
     signal: bool = True,
     commission: Decimal | float | str | None = None,
     slippage: Decimal | float | str | None = None,
+    admission_snapshot: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Assemble the local market view consumed by trade-management profiles.
 
@@ -62,14 +63,29 @@ def build_management_market(
     step_cost = _price(getattr(contract, "step_cost", None))
     decision_price = _price(price)
 
-    market: dict[str, object] = {"price_step": price_step, "step_cost": step_cost}
+    market: dict[str, object] = {
+        "price_step": price_step, "step_cost": step_cost,
+        "algorithm_version": CURRENT_ALGORITHM,
+        "admission_snapshot": dict(admission_snapshot) if admission_snapshot is not None else {
+            "portfolio_pct": Decimal("2"), "min_trade_risk_pct": Decimal("0"),
+            "min_risk_cost_ratio": Decimal("2"), "min_net_payoff": Decimal("1.5"),
+            "max_slippage_r": Decimal("0.25"),
+        },
+    }
     if frame is not None and len(frame):
         bar_time = frame["datetime"].iloc[-1]
         if hasattr(bar_time, "to_pydatetime"):
             bar_time = bar_time.to_pydatetime()
         market["close"] = _price(frame["close"].iloc[-1])
-        market["high"] = _price(frame["high"].iloc[-1])
-        market["low"] = _price(frame["low"].iloc[-1])
+        market["open"] = _price(frame["open"].iloc[-1])
+        bar_high = _price(frame["high"].iloc[-1])
+        bar_low = _price(frame["low"].iloc[-1])
+        market["high"] = bar_high
+        market["low"] = bar_low
+        # Диапазон последнего бара — нижняя граница стопа: стоп внутри диапазона
+        # бара означает, что защита сработает на обычном движении внутри него.
+        if bar_high is not None and bar_low is not None and bar_high >= bar_low:
+            market["bar_range"] = bar_high - bar_low
         market["bar_id"] = str(bar_time)
         market["created_at"] = bar_time if isinstance(bar_time, datetime) else None
 

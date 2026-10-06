@@ -13,6 +13,7 @@ from src.trade_management.profiles.base import (
     ProfileResult,
     TradeManagementProfile,
     shared_management_rules,
+    shared_planning_rules,
 )
 from src.trade_management.profiles.rules import (
     add_quantity,
@@ -28,6 +29,7 @@ class MaCloudProfile(TradeManagementProfile):
 
     NAME = "ma_cloud"
 
+    @shared_planning_rules
     def plan(self, context: PlanningContext) -> TradePlan | ProfileResult:
         side = _side(context.signal.signal_type)
         if side is None:

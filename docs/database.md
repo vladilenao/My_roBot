@@ -1,12 +1,11 @@
 # Схема БД (ER-диаграммы)
 
 Каноническая схема живёт в `src/trade_journal/schema.py` (текущая версия —
-`SCHEMA_VERSION = 9`). Данный файл — живое ER-описание той же схемы: обзорная
+`SCHEMA_VERSION = 10`). Данный файл — ER-описание той же схемы: обзорная
 карта связей и диаграммы по предметным областям с колонками и типами, а также
-комментарии о миграциях. Он сверяется с реальной схемой тестом
-`tests/unit/trade_journal/test_schema_doc_sync.py` (сверка: таблицы, колонки,
-`SCHEMA_VERSION`), поэтому при изменении БД его нужно править вместе со схемой,
-иначе тест упадёт.
+комментарии о миграциях. При изменении БД описание обновляется вместе со схемой;
+атомарность v9→v10 и сохранение фактов проверяет
+`tests/unit/trade_journal/test_schema_v10.py`.
 
 ## Обзор: карта связей между областями
 
@@ -24,6 +23,9 @@ erDiagram
     outbox["Исходящие команды (2)"]
     orders["Ордера (2)"]
     fills["Исполнения (2)"]
+    cost_adjustments["Уточнения комиссии (2)"]
+    trade_measurements["Первоначальная мера и полнота (1)"]
+    trade_market_observations["Наблюдения удержания (1)"]
     account["Счёт (3)"]
     reservations["Резервы средств (3)"]
     market_inputs["Входные данные рынка (4)"]
@@ -36,6 +38,9 @@ erDiagram
     trades ||--o{ outbox : "1 — 0..*"
     trades ||--o{ orders : "1 — 0..*"
     trades ||--o{ fills : "1 — 0..*"
+    fills ||--o{ cost_adjustments : "execution_id — уточнения"
+    trades ||--o| trade_measurements : "1 — 0..1"
+    trades ||--o{ trade_market_observations : "1 — 0..*"
     trades ||--o{ targets : "1 — 0..*"
     trades ||--o| protection : "1..1 — 0..1"
     trades ||--o{ reservations : "1 — 0..*"
@@ -64,12 +69,13 @@ erDiagram
 `UK` — уникальное ограничение/индекс. В комментарии к колонке: значение на
 русском, обязательность (`обяз.` / `может быть NULL`), `DEFAULT`, `CHECK`,
 поведение внешнего ключа `ON DELETE`. Порядок колонок в каждом блоке
-соответствует `CREATE TABLE` в `schema.py` (`SCHEMA_VERSION = 9`); типы —
+соответствует CREATE/ALTER в `schema.py` (`SCHEMA_VERSION = 10`); типы —
 `TEXT`/`INTEGER`. JSON-колонки перечислены с ссылкой `json-schemas.md#...` на
 структуру документа (см. [JSON-схемы](json-schemas.md)). Ограничений длины строк
 на уровне БД нет (все текстовые колонки `TEXT` без `LIMIT`/`VARCHAR(N)`).
 Составные первичные ключи:
-`targets (trade_id, target_id)` и `processed_signals (assignment_id, signal_id)`.
+`targets (trade_id, target_id)`, `processed_signals (assignment_id, signal_id)` и
+`trade_market_observations (trade_id, instrument_id, timeframe, bar_id)`.
 
 ## 1. Журнал сделок
 
@@ -128,6 +134,28 @@ erDiagram
         TEXT short_name "Короткое имя контракта для пользовательского вывода; обяз."
         TEXT updated_at "Дата изменения; обяз."
     }
+    trade_measurements["Первоначальная мера и полнота"] {
+        TEXT trade_id PK, FK "Сделка; ON DELETE CASCADE"
+        TEXT initial_stop_distance "D0 от первого входа/первоначальной защиты; может быть NULL"
+        INTEGER max_quantity "Максимальный подтверждённый объём Qmax; DEFAULT 0; CHECK >= 0"
+        TEXT coverage "complete|partial|unavailable; DEFAULT unavailable"
+        TEXT updated_at "Дата изменения; обяз."
+    }
+    trade_market_observations["Наблюдения удержания"] {
+        TEXT trade_id PK, FK "Сделка; часть PK; ON DELETE CASCADE"
+        TEXT instrument_id PK "Инструмент; часть PK"
+        TEXT timeframe PK "Таймфрейм или execution для отдельной цены; часть PK"
+        TEXT bar_id PK "Идентичность бара/fill; часть PK"
+        TEXT low "Гарантированно удержанный минимум; может быть NULL"
+        TEXT high "Гарантированно удержанный максимум; может быть NULL"
+        TEXT observed_price "Отдельная известная цена; может быть NULL"
+        TEXT owned_from "Начало владения; может быть NULL"
+        TEXT owned_to "Конец владения; может быть NULL"
+        TEXT coverage "complete|partial|unavailable; обяз."
+        TEXT observed_at "Время наблюдения; обяз."
+    }
+    trades ||--o| trade_measurements : "D0/Qmax"
+    trades ||--o{ trade_market_observations : "наблюдения"
 ```
 
 Связи `trades` с областями 2–5 (исполнение, счёт, аналитика, аудит) показаны на
@@ -170,9 +198,24 @@ erDiagram
         TEXT price "Цена исполнения; обяз."
         TEXT fee "Комиссия за исполнение; обяз.; DEFAULT 0"
         TEXT executed_at "Время исполнения; обяз."
+        TEXT fee_source "broker|configured|unknown; DEFAULT unknown"
+        TEXT reference_price "Опорная цена; может быть NULL"
+        TEXT reference_kind "Вид опоры; может быть NULL"
+        TEXT order_side "BUY|SELL; может быть NULL"
+        TEXT slippage_amount "Signed cash deviation; может быть NULL"
+        TEXT slippage_source "broker|simulated; может быть NULL"
+    }
+    cost_adjustments["Уточнения комиссии"] {
+        TEXT adjustment_id PK "Устойчивый ID уточнения; обяз."
+        TEXT execution_id FK "Исходный fill.execution_id; ON DELETE RESTRICT"
+        TEXT previous_fee "Прежняя каноническая комиссия; обяз."
+        TEXT new_fee "Абсолютная новая broker-сумма; обяз."
+        TEXT delta "Разница комиссий, может быть отрицательной; обяз."
+        TEXT occurred_at "Время уточнения; обяз."
     }
     outbox ||--o| orders : "1 — 0..1"
     orders ||--o{ fills : "1 — 0..*"
+    fills ||--o{ cost_adjustments : "адресное уточнение"
     orders ||--o{ fills : "1 — 0..* (command_id)"
 ```
 
@@ -309,11 +352,10 @@ v7→v8). По ним reducer считает PnL в рублях
 `initial_balance` (депозит робота), счёт пересобирается с этого значения
 (re-baseline учётного баланса).
 
-Плановый риск (`reservations.original_risk_amount`) и фактический риск
-(`|average_entry − stop_price| × step_cost / price_step × max_qty`) — разные
-величины: первый определяет размер позиции, второй оценивает уже исполненную.
-Они расходятся при гэпе входа, и именно это расхождение должно быть видно в
-карточке сделки, а не замаскировано общим числом. Подробнее —
+В economics-v2 плановый риск `plan_json.economics.risk_amount` — R до стопа,
+резерв содержит бюджетный R+C; фактический Initial Risk — D0×V×Qmax.
+Текущая нагрузка портфеля зависит от q и confirmed_stop, не от Initial Risk.
+Эти величины отделены в карточке и аудите. Подробнее —
 `docs/trade-management/trade-summary.md`.
 
 ## Версия 9: короткие имена контрактов в базе
@@ -334,11 +376,22 @@ v7→v8). По ним reducer считает PnL в рублях
 [signal-pipeline.md](trade-management/signal-pipeline.md) и в
 [storage-and-audit.md](trade-management/storage-and-audit.md).
 
+## Версия 10: издержки, первоначальная мера и наблюдения
+
+Миграция additive и атомарная через SAVEPOINT: сохраняет старые планы, счёт,
+fees, активные заявки/защиту/цели/резервы. Существующий RUB-счёт не переосновывается.
+У старых fills источник комиссии/опоры неизвестен; сегодняшние оценки не
+начисляются ретроспективно. Версия/политика новых планов — в plan_json.
+Cost adjustment однократно меняет delta комиссии, net и счёт, не gross/quantity.
+D0/Qmax не уменьшаются после BE/тейка. Бары удержания и известные цены сохраняются
+идемпотентно отдельно от raw диапазонов fill-баров. Старый reader отклоняет v10;
+read-only отчёт не мигрирует базу и явно показывает неизвестные риск/ГО.
+
 ## Как и когда обновлять
 
 1. Внёс изменение в `CREATE TABLE` / `SCHEMA_VERSION` в `schema.py`?
-2. Прогони `tests/unit/trade_journal/test_schema_doc_sync.py` — он сравнит
-   таблицы и колонки из этого файла с реальной схемой и укажет расхождения.
+2. Прогони тесты схемы/редьюсера в `tests/unit/trade_journal/`, включая
+   `test_schema_v10.py`, и сверь CREATE/ALTER с описанием колонок.
 3. Обнови обзорную карту и диаграмму соответствующей области — колонки, типы и
    связи.
 4. Оформи изменениe через OpenSpec-workflow (delta-спеки в

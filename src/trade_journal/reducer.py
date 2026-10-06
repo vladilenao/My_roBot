@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
-from src.broker.port import ExecutionEvent, ExecutionStatus
+from src.broker.port import ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
 from src.logging_setup import get_logger
 from src.trade_journal.storage import Storage
 from src.trade_management.audit import CalculationTrace, CalculationTraceRepository, MeasuredValue, TraceLinks, calculation_trace
+from src.trade_management.models import TargetPlan
+from src.trade_management.profiles.rules import allocate_target_quantities
+from src.trade_journal.observations import record_fill_price
 
 
 _INCREASE_ACTIONS = {"OPEN", "ADD"}
@@ -197,9 +200,19 @@ class ExecutionReducer:
             if filled:
                 position, account = self._states(connection, event.trade_id)
                 trade_row = connection.execute(
-                    "SELECT side, price_step, step_cost FROM trades WHERE trade_id = ?",
+                    "SELECT side, price_step, step_cost, plan_json FROM trades WHERE trade_id = ?",
                     (event.trade_id,),
                 ).fetchone()
+                plan_data = json.loads(trade_row[3])
+                cost_data = plan_data.get("cost_snapshot")
+                rate = None if cost_data is None else Decimal(str(cost_data["commission"]))
+                event = resolve_execution_fee(event, rate)
+                if event.reference_price is not None and event.order_side is not None and trade_row[1] is not None and trade_row[2] is not None:
+                    direction = Decimal(1) if event.order_side == "BUY" else Decimal(-1)
+                    event = replace(event, slippage_amount=(
+                        direction * (event.price - event.reference_price) / Decimal(str(trade_row[1]))
+                        * Decimal(str(trade_row[2])) * event.filled_quantity
+                    ))
                 next_position, next_account, fill_trace = apply_fill_with_trace(
                     position,
                     account,
@@ -219,21 +232,32 @@ class ExecutionReducer:
                     raise ValueError("filled quantity exceeds order quantity")
                 order_status = "FILLED" if total_filled == order["quantity"] else "PARTIAL"
                 self._write_states(connection, event.trade_id, next_position, next_account, now)
+                self._measure_position(connection, event.trade_id, position.quantity, next_position, plan_data, now)
                 connection.execute(
-                    "INSERT INTO fills (fill_id, order_id, trade_id, command_id, execution_id, quantity, price, fee, executed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO fills (fill_id, order_id, trade_id, command_id, execution_id, quantity, price, fee, executed_at, "
+                    "fee_source,reference_price,reference_kind,order_side,slippage_amount,slippage_source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (event.execution_id, order["order_id"], event.trade_id, event.command_id,
-                     event.execution_id, event.filled_quantity, _text(event.price), _text(event.fee), now),
+                      event.execution_id, event.filled_quantity, _text(event.price), _text(event.fee), now,
+                      str(event.fee_source), None if event.reference_price is None else _text(event.reference_price),
+                      event.reference_kind, event.order_side,
+                      None if event.slippage_amount is None else _text(event.slippage_amount), event.slippage_source),
                 )
                 connection.execute(
                     "UPDATE orders SET filled_quantity = ?, status = ?, updated_at = ? WHERE order_id = ?",
                     (total_filled, order_status, now, order["order_id"]),
                 )
+                if plan_data.get("algorithm_version") == "economics-v2":
+                    instrument = connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()[0]
+                    record_fill_price(connection, event, instrument)
                 self._update_reservation(connection, order, total_filled, now)
+                if action_type.upper().split(":", 1)[0] in _INCREASE_ACTIONS and plan_data.get("algorithm_version") == "economics-v2":
+                    self._sync_target_allocations(connection, event.trade_id)
                 self._update_target(connection, event.trade_id, action_type, event.filled_quantity)
                 self._update_phase(connection, event.trade_id, action_type, next_position.quantity)
                 self._release_reservations_if_terminal(connection, event.trade_id, now)
             else:
+                event = resolve_execution_fee(event, None)
                 order_status = status
                 connection.execute(
                     "UPDATE orders SET status = ?, updated_at = ? WHERE order_id = ?",
@@ -249,6 +273,88 @@ class ExecutionReducer:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (event.execution_id, event.trade_id, order["order_id"], event.command_id,
                  status, json.dumps(self._payload(event), sort_keys=True), now),
+            )
+        return True
+
+    @staticmethod
+    def _sync_target_allocations(connection, trade_id):
+        plan_json, profile_json = connection.execute("SELECT plan_json,profile_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+        data, profile = json.loads(plan_json), json.loads(profile_json)
+        targets = tuple(TargetPlan(t["target_id"], Decimal(t["price"]), Decimal(t["share"])) for t in data.get("targets", ()))
+        if not targets:
+            return
+        total = connection.execute("SELECT COALESCE(SUM(f.quantity),0) FROM fills f JOIN orders o ON o.order_id=f.order_id "
+                                   "WHERE f.trade_id=? AND o.action_type IN ('OPEN','ADD')", (trade_id,)).fetchone()[0]
+        allocations = allocate_target_quantities(total, targets, retain_remainder_for_trailing=profile["name"] == "atr_trend")
+        quantities = {a.target_id: a.quantity for a in allocations.targets}
+        for target_id, filled in connection.execute("SELECT target_id,filled_quantity FROM targets WHERE trade_id=?", (trade_id,)):
+            connection.execute("UPDATE targets SET planned_quantity=? WHERE trade_id=? AND target_id=?",
+                               (max(filled, quantities.get(target_id, 0)), trade_id, target_id))
+
+    @staticmethod
+    def _measure_position(connection, trade_id, previous_quantity, position, plan, now):
+        old = connection.execute("SELECT initial_stop_distance,max_quantity FROM trade_measurements WHERE trade_id=?",
+                                 (trade_id,)).fetchone()
+        distance = old[0] if old else None
+        maximum = max(previous_quantity, position.quantity, old[1] if old else 0)
+        if position.quantity > previous_quantity and plan.get("algorithm_version") == "economics-v2":
+            planned_distance = abs(Decimal(plan["reference_entry"]) - Decimal(plan["stop_price"]))
+            side = connection.execute("SELECT side FROM trades WHERE trade_id=?", (trade_id,)).fetchone()[0]
+            direction = Decimal(1) if side == "BUY" else Decimal(-1)
+            stop = position.average_price - direction * planned_distance
+            if plan.get("price_step") is not None:
+                step = Decimal(plan["price_step"])
+                stop = (stop/step).to_integral_value(rounding=ROUND_FLOOR if side == "BUY" else ROUND_CEILING)*step
+            confirmed = connection.execute("SELECT confirmed_stop FROM protection WHERE trade_id=?", (trade_id,)).fetchone()
+            initial_stop = Decimal(confirmed[0]) if confirmed and confirmed[0] is not None else stop
+            if confirmed and confirmed[0] is not None:
+                stop = max(stop, Decimal(confirmed[0])) if side == "BUY" else min(stop, Decimal(confirmed[0]))
+            connection.execute("UPDATE protection SET confirmed_stop=?,updated_at=? WHERE trade_id=?",
+                               (_text(stop), now, trade_id))
+            if previous_quantity == 0 and distance is None:
+                distance = _text(abs(position.average_price - initial_stop))
+        connection.execute(
+            "INSERT INTO trade_measurements(trade_id,initial_stop_distance,max_quantity,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(trade_id) DO UPDATE SET initial_stop_distance=excluded.initial_stop_distance, "
+            "max_quantity=excluded.max_quantity,updated_at=excluded.updated_at",
+            (trade_id, distance, maximum, now),
+        )
+
+    def apply_fee_adjustment(self, event: FeeAdjustment) -> bool:
+        """Уточнить абсолютную комиссию одного execution без повторного объёма/PnL."""
+        with self._storage.transaction() as connection:
+            previous = connection.execute(
+                "SELECT execution_id,new_fee FROM cost_adjustments WHERE adjustment_id=?", (event.adjustment_id,),
+            ).fetchone()
+            if previous:
+                if previous[0] != event.execution_id or Decimal(previous[1]) != event.new_fee:
+                    raise ValueError("conflicting repeated fee adjustment")
+                return False
+            row = connection.execute(
+                "SELECT trade_id,fee FROM fills WHERE execution_id=?", (event.execution_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown execution for fee adjustment")
+            trade_id, original_fee = row
+            delta = event.new_fee - Decimal(original_fee)
+            now = event.timestamp.isoformat()
+            connection.execute("INSERT INTO cost_adjustments VALUES(?,?,?,?,?,?)", (
+                event.adjustment_id, event.execution_id, original_fee, _text(event.new_fee), _text(delta), now,
+            ))
+            connection.execute("UPDATE fills SET fee=?,fee_source='broker' WHERE execution_id=?",
+                               (_text(event.new_fee), event.execution_id))
+            for table, key, identity in (("positions", "trade_id", trade_id), ("account", "account_id", 1)):
+                old = connection.execute(f"SELECT realized_pnl,fees FROM {table} WHERE {key}=?", (identity,)).fetchone()
+                fees = Decimal(old[1]) + delta
+                connection.execute(f"UPDATE {table} SET fees=?,net_realized_pnl=?,updated_at=? WHERE {key}=?",
+                                   (_text(fees), _text(Decimal(old[0]) - fees), now, identity))
+            balance, equity = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
+            connection.execute("UPDATE account SET balance=?,equity=? WHERE account_id=1",
+                               (_text(Decimal(balance) - delta), _text(Decimal(equity) - delta)))
+            connection.execute(
+                "INSERT INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                (f"fee-adjustment:{event.adjustment_id}", trade_id, "FEE_ADJUSTMENT",
+                 json.dumps({"execution_id": event.execution_id, "new_fee": _text(event.new_fee), "delta": _text(delta)}), now),
             )
         return True
 
@@ -488,8 +594,9 @@ class ExecutionReducer:
         else:
             return
         connection.execute(
-            "UPDATE trades SET phase = ?, state_revision = state_revision + 1 WHERE trade_id = ? AND phase != ?",
-            (phase, trade_id, phase),
+            "UPDATE trades SET phase = CASE WHEN phase='REDUCING' AND ? IN ('OPEN','ADD') "
+            "THEN 'REDUCING' ELSE ? END, state_revision = state_revision + 1 WHERE trade_id = ?",
+            (action, phase, trade_id),
         )
 
     @staticmethod
@@ -520,4 +627,9 @@ class ExecutionReducer:
             "reason": event.reason, "status": event.status.value, "quantity": event.filled_quantity,
             "low": _text(event.market_low) if event.market_low is not None else None,
             "high": _text(event.market_high) if event.market_high is not None else None,
+            "fee_source": str(event.fee_source),
+            "reference_price": None if event.reference_price is None else _text(event.reference_price),
+            "reference_kind": event.reference_kind, "order_side": event.order_side,
+            "slippage_amount": None if event.slippage_amount is None else _text(event.slippage_amount),
+            "slippage_source": event.slippage_source,
         }

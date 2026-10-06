@@ -12,7 +12,7 @@ from typing import Callable
 
 from src.events.event import Event
 from src.events.types import EventType
-from src.notifier.templates.common import amount, pnl_text, price
+from src.notifier.templates.common import amount, budget_text, financial_text, pnl_text, price
 
 PREFIXES = {
     EventType.ORDER_ACCEPTED: "📝 Ордер",
@@ -24,7 +24,7 @@ PREFIXES = {
     EventType.TRADE_CLOSED: "💰 Сделка",
     EventType.TRADE_CANCELLED: "❌ Отмена",
     EventType.CLEARING_DONE: "🏛 Клиринг",
-    EventType.RISK_LIMIT_HIT: "⚠️ Over-risk",
+    EventType.RISK_LIMIT_HIT: "⚠️ Риск",
     EventType.PROTECTION_ARMED: "🛡 Защита",
 }
 
@@ -47,7 +47,13 @@ def _trade_opened(event: Event) -> str:
 
 
 def _position_added(event: Event) -> str:
-    return f"Добор {event.get('side')} {event.get('quantity')} {event.instrument} по {amount(event.get('price'))}"
+    text = f"Добор {event.get('side')} {event.get('quantity')} {event.instrument} по {amount(event.get('price'))}"
+    if event.get("requested_quantity") is not None:
+        labels = {"risk": "риск", "margin": "ГО", "max-quantity": "предел количества", "profile": "профиль"}
+        constraint = event.get("limiting_constraint")
+        text += (f"; запрошено {event.get('requested_quantity')}, выбрано {event.get('selected_quantity')}"
+                 + (f", ограничение: {labels.get(constraint, constraint)}" if constraint else ""))
+    return text
 
 
 def _target_hit(event: Event) -> str:
@@ -59,6 +65,9 @@ def _stop_hit(event: Event) -> str:
 
 
 def _trade_closed(event: Event) -> str:
+    if event.get("gross_pnl") is not None:
+        return (f"Выход {event.get('quantity')} {event.instrument} по {amount(event.get('price'))}, "
+                f"остаток {event.get('quantity_remaining')}")
     pnl = pnl_text(event.get("pnl"))
     if event.get("reason"):
         return (
@@ -85,7 +94,8 @@ def _protection_armed(event: Event) -> str:
 
 
 def _risk_limit_hit(event: Event) -> str:
-    return "Лимит перекоса достигнут — позиция закрывается контр-сделкой"
+    budget = budget_text(event)
+    return f"{budget}; новые входы/доборы запрещены" if budget else "Лимит риска достигнут — требуется проверка общего бюджета"
 
 
 def _clearing_done(event: Event) -> str:
@@ -115,7 +125,9 @@ def render(event: Event, tz_offset_hours: float = 0.0) -> str | None:
     build = _TEXTS.get(event.type)
     if build is None:
         return None
-    return f"{PREFIXES.get(event.type, DEFAULT_PREFIX)}: {build(event)}"
+    text = f"{PREFIXES.get(event.type, DEFAULT_PREFIX)}: {build(event)}"
+    financial = financial_text(event)
+    return text + f"; {financial}" if financial else text
 
 
 def render_price(value) -> str:

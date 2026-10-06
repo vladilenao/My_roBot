@@ -362,6 +362,17 @@ class MultiTimeframeScheduler:
         )
         return ready
 
+    def reanchor(self) -> None:
+        """Пересобирает наблюдение за границами на текущем рыночном моменте.
+
+        Нужен после перехода рыночного времени через разрыв в данных: без него
+        старшие таймфреймы выглядели бы «только что пересечёнными» и ждали бы
+        баров, которых в разрыве не было и не будет.
+        """
+        now = self.now()
+        self._last_tick = now
+        self._pending = {}
+
     def _candidates(self, now: datetime, wait_boundary: bool) -> dict[str, datetime]:
         """ТФ-кандидаты тика с границами, которые ждём: pending + пройденные.
 

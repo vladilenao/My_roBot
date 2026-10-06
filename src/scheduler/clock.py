@@ -127,6 +127,21 @@ class HistoricalClock(Clock):
         if self._pause > 0:
             self._sleeper(self._pause)
 
+    def jump_to(self, moment) -> None:
+        """Перевод рыночного времени на момент следующего имеющегося бара.
+
+        Разрыв в данных (перерыв между сессиями, выходной, праздник) пропускается
+        целиком: тиков без прогресса за это время не набирается, иначе прогон
+        принял бы паузу за конец данных. Время двигается только вперёд и не за
+        правую границу диапазона — переход за конец равносилен завершению.
+        """
+        target = to_naive(moment).to_pydatetime()
+        if self._now >= self._end or target <= self._now:
+            return
+        self._now = min(target, self._end)
+        if self._pause > 0:
+            self._sleeper(self._pause)
+
     def ticks_total(self) -> int:
         """Сколько тиков (баров) укладывается в диапазон."""
         return int((self._end - self._start).total_seconds() // self._step.total_seconds())

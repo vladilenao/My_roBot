@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Mapping, Sequence
 
 from src.trade_management.actions import CancelEntry, CloseTrade, ReduceTrade, TradeAction
-from src.trade_management.models import TargetPlan, TradePhase, TradeState
+from src.trade_management.models import TargetPlan, TradePhase, TradePlan, TradeState
 
 
 LONG_SIDES = frozenset({"BUY", "LONG"})
@@ -41,7 +41,7 @@ def add_quantity(
     pending_increase: bool = False,
 ) -> int | None:
     """Return the permitted add size, or ``None`` when shared rules reject it."""
-    if pending_increase or state.phase is TradePhase.REDUCING or state.completed_target_ids:
+    if pending_increase or state.phase is TradePhase.REDUCING or state.completed_target_ids or state.adds_disabled:
         return None
     max_adds = _non_negative_int(parameters.get("max_adds", 0), "max_adds")
     if state.add_count >= max_adds:
@@ -250,3 +250,56 @@ def cost_aware_break_even(
     price_offset = costs * step / (tick_cost * quantity)
     raw_break_even = entry + price_offset if _is_long(side) else entry - price_offset
     return round_price(raw_break_even, step, "ceiling" if _is_long(side) else "floor")
+
+
+def whole_trade_break_even(
+    average_price: Decimal, side: str, price_step: Decimal, step_cost: Decimal, quantity: int,
+    *, realized_gross: Decimal, paid_fees: Decimal, expected_exit_cost: Decimal,
+) -> Decimal:
+    """Cover whole-trade G/F plus future remaining costs, all monetary totals."""
+    average = validate_price(average_price, "average_price")
+    step, cost = validate_price_step(price_step), validate_price(step_cost, "step_cost")
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise ValueError("quantity must be a positive integer")
+    gross = _decimal(realized_gross, "realized_gross")
+    fees, future = _decimal(paid_fees, "paid_fees"), _decimal(expected_exit_cost, "expected_exit_cost")
+    if fees < 0 or future < 0:
+        raise ValueError("fees and future costs cannot be negative")
+    offset = (fees+future-gross)*step/(cost*quantity)
+    raw = average+offset if _is_long(side) else average-offset
+    return round_price(raw, step, "ceiling" if _is_long(side) else "floor")
+
+
+def economics_break_even(plan: TradePlan, state: TradeState, market: Mapping[str, object]) -> tuple[Decimal | None, str | None]:
+    """Version-v2 BE eligibility and candidate; unknown inputs yield an audit skip."""
+    if "tp-1" not in state.completed_target_ids or state.quantity <= 0:
+        return None, "tp1-not-confirmed"
+    if not state.fees_known or plan.cost_snapshot is None:
+        return None, "costs-unknown"
+    if state.initial_stop_distance is None or state.average_price is None or state.confirmed_stop is None:
+        return None, "initial-risk-or-protection-unknown"
+    close = market.get("close")
+    if close is None:
+        return None, "market-unknown"
+    try:
+        close = validate_price(close, "close")
+    except ValueError:
+        return None, "market-unknown"
+    direction = Decimal(1) if plan.side == "BUY" else Decimal(-1)
+    threshold = Decimal(str(plan.profile.parameters.get("min_be_r", "1.5")))
+    if direction*(close-state.average_price) < threshold*state.initial_stop_distance:
+        return None, "below-min-be-r"
+    if market.get("price_step") is None or market.get("step_cost") is None:
+        return None, "monetary-factors-unknown"
+    try:
+        candidate = whole_trade_break_even(state.average_price, plan.side,
+            market["price_step"], market["step_cost"], state.quantity,
+            realized_gross=state.realized_pnl, paid_fees=state.fees,
+            expected_exit_cost=plan.cost_snapshot.future_exit*state.quantity)
+    except ValueError:
+        return None, "break-even-price-unusable"
+    if direction*(candidate-state.confirmed_stop) <= 0:
+        return None, "protection-not-improved"
+    if direction*(close-candidate) <= 0:
+        return None, "break-even-beyond-market"
+    return candidate, None

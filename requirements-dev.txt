@@ -5,3 +5,4 @@ pandas-ta-classic==0.6.52
 numba==0.67.0
 pytest==9.1.1
 matplotlib==3.11.0
+ruff==0.15.1

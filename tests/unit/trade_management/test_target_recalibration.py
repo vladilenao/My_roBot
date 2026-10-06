@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.portfolio.models import ContractMeta
 from src.trade_journal.storage import Storage
 from src.trade_management.actions import AddToTrade, OpenTrade
 from src.trade_management.manager import TradeManager
@@ -23,6 +24,9 @@ class PriceFillBroker(BrokerPort):
 
     def __init__(self, fills: list[Decimal]) -> None:
         self.fills = list(fills)
+
+    def contract_for(self, instrument):
+        return ContractMeta(instrument, 1, 1, 0, 0)
 
     def submit(self, action, now):
         fill = self.fills.pop(0) if self.fills else Decimal("100")
@@ -44,7 +48,8 @@ def _plan() -> TradePlan:
 def _manager(storage: Storage, fills: list[Decimal]) -> TradeManager:
     manager = TradeManager(storage, PriceFillBroker(fills), initial_balance=Decimal("1000"),
                            slippage_tolerance=Decimal("1"))
-    manager.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 1))
+    manager.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 1),
+                        price_step=Decimal(1), step_cost=Decimal(1))
     manager.dispatch(NOW)
     return manager
 
@@ -102,7 +107,7 @@ def test_second_add_does_not_compound_the_step(tmp_path):
     """Повторный пересчёт от новой средней не раздвигает сетку дальше."""
     with Storage(tmp_path / "trades.sqlite3") as storage:
         manager = _manager(storage, [Decimal("102"), Decimal("98")])
-        manager.submit_action(AddToTrade("add-1", "trade-1", 1, "add", 1))
+        manager.submit_action(AddToTrade("add-1", "trade-1", 1, "add", 1, "limit", Decimal("98")))
         manager.dispatch(NOW)
 
         # average is (102 + 98) / 2 = 100 — back to the signal price exactly
@@ -118,7 +123,7 @@ def test_filled_target_keeps_the_price_of_record(tmp_path):
             "UPDATE targets SET filled_quantity = 1, status = 'FILLED' WHERE target_id = 'tp-1'"
         )
         storage.connection.commit()
-        manager.submit_action(AddToTrade("add-1", "trade-1", 1, "add", 1))
+        manager.submit_action(AddToTrade("add-1", "trade-1", 1, "add", 1, "limit", Decimal("100")))
         manager.dispatch(NOW)
 
         prices = _target_prices(storage)

@@ -1,74 +1,78 @@
-# Trade Summary CSV
+# Карточка сделки: trade_summary.csv
 
-`trade_summary.csv` is a user-facing projection of SQLite trade state. It is
-recreated atomically with `trade_event.csv`; it is never read to restore a
-trade.
+Карточка — пользовательская проекция SQLite. `trade_event.csv` и
+`trade_summary.csv` строятся из одного read-only снимка, каждый файл заменяется
+атомарно. Восстановление использует SQLite, не CSV. Внутренние идентификаторы
+сделки, привязки, заявки и исполнения в пользовательские колонки не попадают.
 
-| Column | Source and calculation |
+| Колонка | Источник и смысл |
 | --- | --- |
-| `Trade ID` | Canonical trade identifier. |
-| `Контракт` | Short contract name from instrument metadata. |
-| `Направление` | `BUY` becomes `LONG`, `SELL` becomes `SHORT`. |
-| `Статус` | Russian label for the internal lifecycle code. |
-| `Время входа` / `Время выхода` | First entry and last exit fill, converted to MSK. |
-| `Длительность` | Exit time minus entry time; empty until the trade is closed. |
-| `План входа` / `План стопа` / `План TP1` | Immutable plan and first target, not execution prices. |
-| `Начальный объем` | Quantity of the first confirmed entry fill. |
-| `Добрано` | Quantity of all later confirmed entry fills. |
-| `Макс. объем` | Maximum open quantity while replaying fills chronologically. |
-| `Средняя входа` | Quantity-weighted price of all entry and add-on fills. |
-| `Выходы` | Chronological `REASON: quantity @price` list. |
-| `Средняя выхода` | Quantity-weighted price of all exit fills. |
-| `Финальная причина` / `Сценарий выхода` | Last remainder reason and ordered partial/remainder reason sequence. |
-| `Gross PnL` | Realized PnL before fees. |
-| `Комиссия` | All entry, add-on, and exit fees shown as a negative expense. |
-| `Net PnL` | Gross PnL plus the signed commission. |
-| `Плановый риск` | Risk the plan was admitted on: `reservations.original_risk_amount`. It is what sizing was allowed to spend, not what the trade ended up risking. |
-| `Initial Risk` | Risk actually carried: the stop distance from the average the position really holds, priced through the contract step. Empty when the step cost is unknown. |
-| `Result` | Net PnL divided by `Initial Risk`, in R; empty for missing or zero risk. |
-| `MAE` / `MFE` | Adverse/favorable excursion in R against `Initial Risk`. Empty when either side is unavailable. |
+| `Контракт` | Короткое имя (`NG-11.26`); для акции её тикер. Неизвестное имя — `контракт не указан`. |
+| `Направление` | LONG / SHORT. |
+| `Статус` | Русский lifecycle; после сокращения остатка — `частично закрыта`. |
+| `Время входа` / `Время выхода` | Первый вход и последний подтверждённый выход, в МСК. |
+| `Длительность` | Только для закрытой сделки. |
+| `План входа` / `План стопа` / `План TP1` | Неизменяемые первоначальные уровни, отдельно от фактической средней и защиты. |
+| `Начальный объем` / `Добрано` | Первый fill и последующие подтверждённые увеличения. |
+| `Макс. объем` | Qmax — максимальный подтверждённый открытый объём. |
+| `Средняя входа` | Взвешенная средняя всех входов/доборов данного снимка. |
+| `Выходы` / `Средняя выхода` | Причины, объёмы и цены выходов; взвешенная средняя выходных fill. |
+| `Финальная причина` / `Сценарий выхода` | Последний выход остатка и последовательность частичных/финального выхода. Итог не выдумывается для открытой сделки. |
+| `Gross PnL` | Сумма реализованного валового результата по actual price и средней до каждого выхода. |
+| `Комиссия` | Отрицательная сумма комиссий всех входов/доборов/выходов с адресными уточнениями. |
+| `Net PnL` | Gross плюс отрицательная комиссия; ценовое отклонение повторно не списывается. |
+| `Ед. PnL` | RUB по сохранённым денежным факторам; прежние RAW значения отдельны и несопоставимы с рублёвыми R. |
+| `Плановый риск (₽)` | R до планового стопа на допущенном Q, не резерв R+C. |
+| `Initial Risk (₽)` | Для economics-v2: D0×V×Qmax по фактическому первому входу/первоначальной подтверждённой защите. |
+| `Result (R)` | Учётный net / Initial Risk при известных совместимых RUB-факторах и ненулевом знаменателе. |
+| `MAE (R)` / `MFE (R)` | Направленные наблюдаемые экскурсии, делённые на тот же Initial Risk. |
+| `Полнота издержек` | Брокерские суммы, конфигурационная оценка, смешанные источники, частично известны или неизвестны. |
+| `Полнота экстремумов` | Полные доступные наблюдения, частичные либо нет наблюдений. |
+| `Определение экстремумов` | `holding-bars-v2` или `Fills-bounded Excursion Metrics` для legacy. |
+| `Версия алгоритма` | economics-v2 / legacy-v1. |
 
-`Плановый риск` and `Initial Risk` answer different questions and are kept apart
-on purpose. The planned figure is the reservation the trade was sized against, so
-it stays whatever the broker later charged. The realized figure is re-measured
-from the average the position actually holds: a gapped entry pays a different
-price and is judged against its own stop rather than the one it was admitted on.
-Dividing one by the other is what makes an unremarkable gap look like a disaster
-when it was planned for, and like a free lunch when it was not.
+До соответствующего факта неприменимые поля пусты; известный ноль отличается от
+неизвестного. Broker fee, включая ноль, имеет приоритет. Configured — оценка по
+сохранённому снимку сделки, не восстановленный тариф брокера. Старая неизвестная
+комиссия не подставляется из текущего файла настроек; legacy net не выдаётся за
+полную достоверную стоимость. Комиссия исполнения начисляется один раз,
+позднее уточнение меняет только delta комиссии, net и счёт.
 
-## Fills-bounded Excursion Metrics
+## Первоначальная мера и текущий риск — разные величины
 
-`MAE` and `MFE` are **fills-bounded**: they are measured only over the bars on
-which something actually executed. A bar that passed far below the position but
-never filled anything is not evidence that the position was ever that deep
-adverse — the trade could have closed before reaching it, or the level could
-have been touched between bars. Counting such bars would credit or blame the
-position for prices it never saw.
+Для новой версии D0 фиксируется по первому подтверждённому входу и первоначальной
+защите. Перенос стопа, BE, трейлинг и сокращение не меняют D0. Добор может
+увеличить Qmax: промежуточный денежный знаменатель растёт с подтверждённым объёмом.
+Нет первоначальной защиты/денежных факторов — фактическая мера неизвестна.
+Плановый риск остаётся отдельным аудитом. Legacy сохраняет прежнюю формулу с
+явным обозначением версии, а не подменяется новой мерой.
 
-Two consequences follow:
+Текущую портфельную нагрузку считают по оставшемуся q и confirmed_stop;
+Initial Risk нужен анализу исходной сделки. Формулы общего бюджета — в
+[portfolio-risk.md](portfolio-risk.md).
 
-- The entry bar counts. It is the bar the position was opened on, so its range
-  is the first thing the position was exposed to.
-- Fills-bounded is not the same as conservative. It reports the excursion the
-  executed price is known to have travelled, which is the part of the move that
-  was tradeable. Wider excursions would need every bar stored in the journal.
+## Наблюдаемые экскурсии holding-bars-v2
 
-Both figures are money, not price points. One point of `NG` is worth its own step
-cost, so a price distance is meaningless without it:
+`V=step_cost/price_step`, A — средняя всех подтверждённых входов данного снимка.
+Это нормализованная **ценовая экскурсия**, не фактический убыток всего портфеля
+на максимальном объёме в каждый момент.
 
+```text
+LONG:  MAE_price=max(0,A−min(low)); MFE_price=max(0,max(high)−A)
+SHORT: MAE_price=max(0,max(high)−A); MFE_price=max(0,A−min(low))
+amount = price_excursion × V × Qmax
+MAE(R) / MFE(R) = amount / (D0 × V × Qmax)
 ```
-point_value       = step_cost / price_step
-Initial Risk      = |average_entry − stop_price| × point_value × max_qty
-MAE / MFE         = |bar extreme − average_entry| × point_value × max_qty / Initial Risk
-```
 
-`max_qty` is the peak open quantity, so a trade that doubled in size is scored
-against the risk it was actually carrying when it got there. When `price_step`
-or `step_cost` is missing from the trade's snapshot the ruble figures are left
-empty and `Ед. PnL` reads `RAW`: raw price points are not added up across
-contracts that price a point differently. Recover the factors with
-`tools/backfill_contract_factors.py` rather than guessing them.
+В новой версии durable observations включают полностью удержанные бары без fill
+и отдельно известные цены исполнений. Полный диапазон входного/выходного бара
+не принадлежит сделке автоматически: intrabar-вход и неоднозначный окончательный
+выход дают partial. Выход на open исключает поздний high/low этого бара.
+Разрывы не интерполируются; неизвестное движение не заменяется нулём.
+Повтор бара/исполнения и рестарт не удваивают наблюдения.
 
-Internal lifecycle codes are `PLANNED`, `ENTRY_PENDING`, `OPEN`,
-`PARTIALLY_CLOSED`, `CLOSED`, `CANCELLED`, `REJECTED`, and `ERROR`. They are
-never written to this CSV; users see Russian labels instead.
+Полнота `complete` означает полный доступный наблюдаемый интервал по выбранным
+данным, а не знание всех микродвижений рынка. `partial` — наблюдаемая нижняя
+оценка при разрыве/неопределённой intrabar-последовательности; `unavailable` —
+нет наблюдений. Прежнее fills-bounded определение использует факты fill-баров и
+остаётся явно отличимым, отсутствующие старые бары не выдумываются.

@@ -1,14 +1,14 @@
 import csv
 import shutil
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Optional
 
 from src.broker.events import BrokerEvent
-from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
+from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeSource
 from src.events.types import EventType
 from src.logging_setup import get_logger
 from src.scheduler.clock import Clock, as_clock
@@ -38,6 +38,7 @@ from src.trade_management.actions import (
     OpenTrade,
     ReduceTrade,
     TradeAction,
+    EntryOrderType,
 )
 from src.trade_management.models import TradePlan, rebase_on_average
 
@@ -83,8 +84,13 @@ class AddressedTrade:
     entry_quantity: int = 0
     opened_bar: datetime | None = None
     last_stop_fill: Decimal | None = None
+    entry_command_id: str | None = None
+    average_price: Decimal | None = None
+    original_plan: TradePlan = field(init=False)
+    restored_increase_price: Decimal | None = None
 
     def __post_init__(self) -> None:
+        self.original_plan = self.plan
         if not self.target_filled:
             self.target_filled = {target.target_id: 0 for target in self.plan.targets}
 
@@ -194,6 +200,7 @@ class JournalBroker(BrokerPort):
         self._addressed_events: list[ExecutionEvent] = []
         self._addressed_trades: dict[str, AddressedTrade] = {}
         self._scheduled_actions: list[ScheduledAction] = []
+        self._processing_due: list[ScheduledAction] = []
         self._processed_addressed_bars: set[tuple[str, datetime]] = set()
         # Addressed SQLite runtime starts with no CSV-derived state. Legacy CSV
         # callers retain their explicit replay path below.
@@ -232,12 +239,24 @@ class JournalBroker(BrokerPort):
         if trade is None or trade.revision != 0 or trade.entry_quantity != 0:
             return
         if state.quantity <= 0 or state.average_price is None:
+            self._resume_pending_increases(trade, recovered)
             return
         active_stop = state.confirmed_stop or plan.stop_price
         trade.confirmed_stop = active_stop
         trade.entry_quantity = getattr(recovered, "entry_quantity", None) or state.quantity
         trade.revision = state.state_revision
         trade.opened_bar = None
+        if plan.algorithm_version == "economics-v2":
+            trade.opened_bar = getattr(recovered, "last_increase_at", None)
+            trade.restored_increase_price = getattr(recovered, "last_increase_price", None)
+            observed = getattr(recovered, "last_observed_bar", None)
+            if observed is not None:
+                self._processed_addressed_bars.add((plan.instrument_id, _naive_utc(observed)))
+        trade.average_price = state.average_price
+        trade.plan = rebase_on_average(plan, state.average_price)
+        trade.plan = replace(trade.plan, targets=tuple(
+            replace(t, price=state.target_prices.get(t.target_id, t.price)) for t in trade.plan.targets
+        ))
         for target_id, filled in (getattr(recovered, "target_filled", None) or {}).items():
             if target_id in trade.target_filled:
                 trade.target_filled[target_id] = filled
@@ -251,6 +270,29 @@ class JournalBroker(BrokerPort):
             take_profit=None,
             ts_entry=plan.created_at,
         )
+        self._resume_pending_increases(trade, recovered)
+        for pending in getattr(recovered, "pending_stops", ()):
+            if pending.action.command_id not in self._command_events:
+                self._scheduled_actions.append(ScheduledAction(pending.action, pending.submitted_at))
+                self._command_events[pending.action.command_id] = self._command_outcome(pending.action, pending.submitted_at, ExecutionStatus.ACK, "next-bar")
+                trade.pending_stop = pending.action.stop_price
+        for pending in getattr(recovered, "pending_exits", ()):
+            if pending.action.command_id not in self._command_events:
+                self._scheduled_actions.append(ScheduledAction(pending.action, pending.submitted_at))
+                self._command_events[pending.action.command_id] = self._command_outcome(pending.action, pending.submitted_at, ExecutionStatus.ACK, "next-bar")
+
+    def _resume_pending_increases(self, trade: AddressedTrade, recovered: object) -> None:
+        scheduled = {s.action.command_id for s in self._scheduled_actions}
+        for pending in getattr(recovered, "pending_increases", ()):
+            action = pending.action
+            if action.command_id in scheduled or action.command_id in self._command_events:
+                continue
+            if isinstance(action, OpenTrade):
+                trade.entry_command_id = action.command_id
+            self._scheduled_actions.append(ScheduledAction(action, pending.submitted_at))
+            self._command_events[action.command_id] = self._command_outcome(
+                action, pending.submitted_at, ExecutionStatus.ACK, "limit-waiting" if action.order_type is EntryOrderType.LIMIT else "next-bar",
+            )
 
     def trade_state(self, trade_id: str) -> AddressedTrade | None:
         """Return simulator state for tests and the orchestration boundary."""
@@ -271,11 +313,13 @@ class JournalBroker(BrokerPort):
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "unknown-trade")
         elif action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
+        elif isinstance(action, (OpenTrade, AddToTrade)) and trade.plan.algorithm_version == "economics-v2" and action.order_type is not EntryOrderType.LIMIT:
+            event = self._command_outcome(action, now, ExecutionStatus.REJECT, "limit-entry-required")
         elif isinstance(action, (OpenTrade, AddToTrade, MoveStop, CloseTrade)) or (
             isinstance(action, ReduceTrade) and action.target_id is None
         ):
-            if isinstance(action, MoveStop):
-                trade.revision += 1
+            if isinstance(action, OpenTrade):
+                trade.entry_command_id = action.command_id
             self._scheduled_actions.append(ScheduledAction(action, now))
             event = self._command_outcome(action, now, ExecutionStatus.ACK, "next-bar")
         else:
@@ -290,9 +334,13 @@ class JournalBroker(BrokerPort):
         plan = trade.plan
         position = self.manager.positions.get(action.trade_id)
         if isinstance(action, CancelEntry):
-            if position is not None and position.qty:
+            pending = [s for s in self._scheduled_actions if s.action.trade_id == action.trade_id
+                       and isinstance(s.action, (OpenTrade, AddToTrade))]
+            if position is not None and position.qty and not pending:
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-already-open")
-            trade.revision += 1
+            self._cancel_increases(trade, now, action.reason)
+            if position is None or not position.qty:
+                trade.revision += 1
             return self._command_outcome(action, now, ExecutionStatus.CANCEL, action.reason)
         if isinstance(action, MoveStop):
             if position is None or position.qty == 0:
@@ -302,12 +350,16 @@ class JournalBroker(BrokerPort):
             position.stop_price = float(action.stop_price)
             trade.confirmed_stop = action.stop_price
             trade.pending_stop = None
-            return self._command_outcome(action, now, ExecutionStatus.ACK, action.reason)
+            trade.revision += 1
+            return replace(self._command_outcome(action, now, ExecutionStatus.ACK, action.reason),
+                           execution_id=f"{action.command_id}:stop-active:{_naive_utc(now).isoformat()}")
         if isinstance(action, (OpenTrade, AddToTrade)):
             quantity = action.quantity
             if quantity <= 0:
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "quantity-non-positive")
-            if isinstance(action, OpenTrade) and position is not None and position.qty:
+            if isinstance(action, OpenTrade) and position is not None and position.qty and not (
+                action.order_type is EntryOrderType.LIMIT and trade.entry_command_id == action.command_id
+            ):
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-already-open")
             if isinstance(action, AddToTrade) and (position is None or position.qty == 0):
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
@@ -321,16 +373,34 @@ class JournalBroker(BrokerPort):
                 self.manager.positions[plan.trade_id] = position
             else:
                 price = fill_price or plan.reference_entry
+                previous_quantity = position.qty
                 position.apply_fill(float(price), quantity)
+                if trade.average_price is not None:
+                    trade.average_price = (trade.average_price * previous_quantity + price * quantity) / (previous_quantity + quantity)
             # A fill sets the average the position is actually held at, so the
             # targets and stop that follow it must be quoted from that average
             # rather than from the price the trade was admitted on.
-            trade.plan = rebase_on_average(trade.plan, Decimal(str(position.avg_price)))
+            if trade.average_price is None:
+                trade.average_price = price
+            rebased = rebase_on_average(trade.original_plan if plan.algorithm_version == "economics-v2" else trade.plan,
+                                       trade.average_price)
+            if plan.algorithm_version == "economics-v2":
+                previous_targets = {t.target_id: t for t in trade.plan.targets}
+                rebased = replace(rebased, targets=tuple(previous_targets[t.target_id]
+                    if trade.target_filled.get(t.target_id, 0) else t for t in rebased.targets))
+            trade.plan = rebased
             trade.entry_quantity += quantity
             # The initial stop is active only after the entry fill is confirmed.
-            trade.confirmed_stop = trade.plan.stop_price
+            trade.confirmed_stop = (
+                max(trade.confirmed_stop, trade.plan.stop_price) if plan.side == "BUY"
+                else min(trade.confirmed_stop, trade.plan.stop_price)
+            ) if trade.confirmed_stop is not None and plan.algorithm_version == "economics-v2" else trade.plan.stop_price
+            position.stop_price = float(trade.confirmed_stop)
             trade.revision += 1
-            return self._command_fill(action, now, quantity, price, bar)
+            event = self._command_fill(action, now, quantity, price, bar)
+            if action.order_type is EntryOrderType.LIMIT:
+                event = replace(event, execution_id=f"{action.command_id}:limit-fill:{_naive_utc(now).isoformat()}:{trade.entry_quantity}")
+            return event
         if isinstance(action, (ReduceTrade, CloseTrade)):
             if position is None or position.qty == 0:
                 return self._command_outcome(action, now, ExecutionStatus.REJECT, "trade-not-open")
@@ -359,6 +429,12 @@ class JournalBroker(BrokerPort):
     def _target_remaining(trade: AddressedTrade, target_id: str) -> int:
         """Allocate target shares from confirmed entries; the last target gets rounding remainder."""
         targets = trade.plan.targets
+        if trade.plan.algorithm_version == "economics-v2":
+            from src.trade_management.profiles.rules import allocate_target_quantities
+            allocations = allocate_target_quantities(trade.entry_quantity, targets,
+                retain_remainder_for_trailing=trade.plan.profile.name == "atr_trend")
+            planned = next((a.quantity for a in allocations.targets if a.target_id == target_id), 0)
+            return max(0, planned-trade.target_filled[target_id])
         allocated = 0
         for index, target in enumerate(targets):
             planned = (
@@ -377,22 +453,37 @@ class JournalBroker(BrokerPort):
             execution_id=f"{action.command_id}:{status.value}", order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=status,
             filled_quantity=0, price=None, fee=Decimal("0"), timestamp=now, reason=reason,
+            fee_source=FeeSource.UNKNOWN,
         )
 
-    @staticmethod
     def _command_fill(
-        action: TradeAction, now: datetime, quantity: int, price: Decimal,
+        self, action: TradeAction, now: datetime, quantity: int, price: Decimal,
         bar: tuple[float, float, float, float] | None = None,
     ) -> ExecutionEvent:
+        plan = self._addressed_trades[action.trade_id].plan
+        current = plan.algorithm_version == "economics-v2" and plan.cost_snapshot is not None
+        increase = isinstance(action, (OpenTrade, AddToTrade))
+        reference = action.limit_price if increase else getattr(action, "reference_price", None)
+        reference_kind = "signal" if increase else "market-exit"
+        if isinstance(action, ReduceTrade) and action.target_id is not None:
+            reference = next(t.price for t in plan.targets if t.target_id == action.target_id)
+            reference_kind = "target"
         return ExecutionEvent(
             execution_id=f"{action.command_id}:fill", order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=ExecutionStatus.FILL,
-            filled_quantity=quantity, price=price, fee=Decimal("0"), timestamp=now, reason=action.reason,
+            filled_quantity=quantity, price=price,
+            fee=plan.cost_snapshot.commission * quantity if current else Decimal(0),
+            fee_source=FeeSource.CONFIGURED if current else FeeSource.UNKNOWN,
+            timestamp=now, reason=action.reason,
+            reference_price=reference, reference_kind=reference_kind,
+            order_side=plan.side if increase else ("SELL" if plan.side == "BUY" else "BUY"),
+            slippage_source="simulated" if reference is not None else None,
             **_bar_extremes(bar),
         )
 
     def _pv_fill(self, trade: AddressedTrade, now: datetime, quantity: int, price: Decimal, *,
                  kind: str, target_id: str | None = None,
+                 reference_price: Decimal | None = None,
                  bar: tuple[float, float, float, float] | None = None) -> ExecutionEvent:
         """Исполнение защитного закрытия с детерминированным (сделка, бар) id.
 
@@ -408,7 +499,12 @@ class JournalBroker(BrokerPort):
         return ExecutionEvent(
             execution_id=f"{command_id}:fill", order_id=command_id, command_id=command_id,
             trade_id=trade.plan.trade_id, status=ExecutionStatus.FILL, filled_quantity=quantity,
-            price=price, fee=Decimal("0"), timestamp=now,
+            price=price,
+            fee=trade.plan.cost_snapshot.commission * quantity if trade.plan.algorithm_version == "economics-v2" else Decimal(0),
+            fee_source=FeeSource.CONFIGURED if trade.plan.algorithm_version == "economics-v2" else FeeSource.UNKNOWN,
+            reference_price=reference_price, reference_kind="stop" if kind == "stop" else "target",
+            order_side="SELL" if trade.plan.side == "BUY" else "BUY",
+            slippage_source="simulated" if reference_price is not None else None, timestamp=now,
             reason=f"tp:{target_id}" if kind == "tp" else "protective",
             **_bar_extremes(bar),
         )
@@ -563,6 +659,7 @@ class JournalBroker(BrokerPort):
         now: datetime,
         prices: Mapping[str, tuple[float, ...]],
         contracts: Mapping[str, ContractMeta],
+        *, bar_times: Mapping[str, datetime] | None = None,
     ) -> list[OrderResult]:
         self.set_contracts(contracts)
         results: list[OrderResult] = []
@@ -571,19 +668,13 @@ class JournalBroker(BrokerPort):
         highs = {ticker: values[2] for ticker, values in ohlc.items()}
         closes = {ticker: values[3] for ticker, values in ohlc.items()}
 
-        self._track_addressed_bars(now, ohlc)
+        self._track_addressed_bars(now, ohlc, bar_times=bar_times)
 
         cancel_pids = self.manager.track_bar(closes, dict(self._contracts))
         for pid in cancel_pids:
             order = next((o for o in self._orders.values() if o.position_id == pid and o.status == OrderStatus.NEW), None)
             if order is not None:
                 results.append(self.cancel_order(order.order_id, "risk_cap"))
-
-        for pos in list(self.manager.positions.values()):
-            if pos.position_id in self._addressed_trades:
-                continue
-            if pos.qty > 0 and pos.over_risk and pos.ticker in closes:
-                results.append(self.close_position(pos, closes[pos.ticker], now, "over_risk"))
 
         for pos in list(self.manager.positions.values()):
             if pos.position_id in self._addressed_trades:
@@ -626,74 +717,167 @@ class JournalBroker(BrokerPort):
         raise ValueError("bar must contain low/high/close or open/low/high/close")
 
     def _track_addressed_bars(
-        self, now: datetime, ohlc: Mapping[str, tuple[float, float, float, float]]
+        self, now: datetime, ohlc: Mapping[str, tuple[float, float, float, float]],
+        *, bar_times: Mapping[str, datetime] | None = None,
     ) -> None:
         """Process each addressed trade at most once for a closed OHLC bar."""
+        moments = {ticker: (bar_times or {}).get(ticker, now) for ticker in ohlc}
         active_tickers = {
             ticker for ticker in ohlc
-            if (ticker, now) not in self._processed_addressed_bars
+            if (ticker, _naive_utc(moments[ticker])) not in self._processed_addressed_bars
         }
         if not active_tickers:
             return
-        self._processed_addressed_bars.update((ticker, now) for ticker in active_tickers)
+        self._processed_addressed_bars.update((ticker, _naive_utc(moments[ticker])) for ticker in active_tickers)
 
         due, pending = [], []
         for scheduled in self._scheduled_actions:
             trade = self._addressed_trades.get(scheduled.action.trade_id)
-            if trade is not None and trade.plan.instrument_id in active_tickers and _naive_utc(scheduled.submitted_at) < _naive_utc(now):
+            is_limit = isinstance(scheduled.action, (OpenTrade, AddToTrade)) and scheduled.action.order_type is EntryOrderType.LIMIT
+            moment = moments.get(trade.plan.instrument_id, now) if trade else now
+            inclusive = is_limit or (trade is not None and trade.plan.algorithm_version == "economics-v2")
+            eligible = _naive_utc(scheduled.submitted_at) <= _naive_utc(moment) if inclusive else _naive_utc(scheduled.submitted_at) < _naive_utc(moment)
+            if trade is not None and trade.plan.instrument_id in active_tickers and eligible:
                 due.append(scheduled)
             else:
                 pending.append(scheduled)
         self._scheduled_actions = pending
+        self._processing_due = due
 
         # A confirmed stop amendment is active at this bar's open, before its range.
         for scheduled in due:
             if isinstance(scheduled.action, MoveStop):
                 trade = self._addressed_trades[scheduled.action.trade_id]
-                self._execute_scheduled(trade, scheduled.action, now)
+                self._execute_scheduled(trade, scheduled.action, moments[trade.plan.instrument_id])
+
+        # For v2, known open-time events precede later intrabar extrema. A gap
+        # through the active stop still wins at open; an exit cancels increases.
+        open_handled = set()
+        for trade in self._addressed_trades.values():
+            if trade.plan.algorithm_version == "economics-v2" and trade.plan.instrument_id in active_tickers:
+                opening = ohlc[trade.plan.instrument_id][0]
+                self._process_addressed_stop(trade, moments[trade.plan.instrument_id], (opening, opening, opening, opening))
+        for action_types in ((CloseTrade, ReduceTrade), (OpenTrade, AddToTrade)):
+            for scheduled in due:
+                action = scheduled.action
+                trade = self._addressed_trades[action.trade_id]
+                if trade.plan.algorithm_version != "economics-v2" or not isinstance(action, action_types):
+                    continue
+                moment, bar = moments[trade.plan.instrument_id], ohlc[trade.plan.instrument_id]
+                opening = Decimal(str(bar[0]))
+                if isinstance(action, (OpenTrade, AddToTrade)):
+                    if self._command_events.get(action.command_id) and self._command_events[action.command_id].status is ExecutionStatus.CANCEL:
+                        open_handled.add(action.command_id)
+                        continue
+                    if action.order_type is EntryOrderType.LIMIT:
+                        deadline = scheduled.submitted_at+timedelta(seconds=_ttl_for(trade.plan.timeframe) or 86400)
+                        if _naive_utc(moment) >= _naive_utc(deadline):
+                            continue
+                        at_open = opening <= action.limit_price if trade.plan.side == "BUY" else opening >= action.limit_price
+                        if not at_open:
+                            continue
+                event = self._execute_scheduled(trade, action, moment, opening, bar)
+                open_handled.add(action.command_id)
+                if event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
+                    if isinstance(action, (OpenTrade, AddToTrade)):
+                        trade.opened_bar = None
+                    else:
+                        self._cancel_increases(trade, moment, "first-reduction-filled")
 
         # Existing protection takes priority over targets and over a signal exit.
         for trade in self._addressed_trades.values():
             if trade.plan.instrument_id in active_tickers:
-                self._process_addressed_protection(trade, now, ohlc[trade.plan.instrument_id])
+                self._process_addressed_protection(trade, moments[trade.plan.instrument_id], ohlc[trade.plan.instrument_id])
 
         for scheduled in due:
             action = scheduled.action
-            if isinstance(action, MoveStop):
+            if isinstance(action, MoveStop) or action.command_id in open_handled:
                 continue
             trade = self._addressed_trades.get(action.trade_id)
             if trade is None or trade.plan.instrument_id not in active_tickers:
                 continue
             open_price = Decimal(str(ohlc[trade.plan.instrument_id][0]))
             bar = ohlc[trade.plan.instrument_id]
+            moment = moments[trade.plan.instrument_id]
             if isinstance(action, (OpenTrade, AddToTrade)):
-                event = self._execute_scheduled(trade, action, now, open_price, bar)
+                if self._command_events.get(action.command_id) and self._command_events[action.command_id].status is ExecutionStatus.CANCEL:
+                    continue
+                at_open = True
+                if action.order_type is EntryOrderType.LIMIT:
+                    deadline = scheduled.submitted_at + timedelta(seconds=_ttl_for(trade.plan.timeframe) or 86400)
+                    if _naive_utc(moment) >= _naive_utc(deadline):
+                        event = self._command_outcome(action, deadline, ExecutionStatus.CANCEL, "entry-timeout")
+                        self._command_events[action.command_id] = event
+                        self._addressed_events.append(event)
+                        continue
+                    limit = action.limit_price
+                    at_open = open_price <= limit if trade.plan.side == "BUY" else open_price >= limit
+                    touched = Decimal(str(bar[1])) <= limit if trade.plan.side == "BUY" else Decimal(str(bar[2])) >= limit
+                    if not at_open and not touched:
+                        self._scheduled_actions.append(scheduled)
+                        continue
+                    price = open_price if at_open else limit
+                else:
+                    price = open_price
+                event = self._execute_scheduled(trade, action, moment, price, bar)
                 if event.status not in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
                     continue
-                trade.opened_bar = now
+                trade.opened_bar = None if action.order_type is EntryOrderType.LIMIT and at_open else moment
                 # A newly filled entry may be stopped during its own bar, but its
                 # targets cannot use high/low that occurred before that fill.
-                self._process_addressed_stop(trade, now, ohlc[trade.plan.instrument_id])
+                if action.order_type is EntryOrderType.LIMIT and at_open:
+                    self._process_addressed_protection(trade, moment, bar)
+                else:
+                    self._process_addressed_stop(trade, moment, bar)
             elif isinstance(action, (CloseTrade, ReduceTrade)):
-                self._execute_scheduled(trade, action, now, open_price, bar)
+                self._execute_scheduled(trade, action, moment, open_price, bar)
+        self._processing_due = []
+
+    def _cancel_increases(self, trade: AddressedTrade, now: datetime, reason: str) -> None:
+        candidates = self._scheduled_actions + self._processing_due
+        for scheduled in candidates:
+            action = scheduled.action
+            if action.trade_id != trade.plan.trade_id or not isinstance(action, (OpenTrade, AddToTrade)):
+                continue
+            if self._command_events.get(action.command_id) and self._command_events[action.command_id].status in {
+                ExecutionStatus.FILL, ExecutionStatus.CANCEL, ExecutionStatus.REJECT,
+            }:
+                continue
+            event = self._command_outcome(action, now, ExecutionStatus.CANCEL, reason)
+            self._command_events[action.command_id] = event
+            self._addressed_events.append(event)
+        self._scheduled_actions = [s for s in self._scheduled_actions if s.action.trade_id != trade.plan.trade_id
+                                   or not isinstance(s.action, (OpenTrade, AddToTrade))]
 
     def _execute_scheduled(
         self, trade: AddressedTrade, action: TradeAction, now: datetime, fill_price: Decimal | None = None,
         bar: tuple[float, float, float, float] | None = None,
     ) -> ExecutionEvent:
-        if not isinstance(action, MoveStop) and action.state_revision != trade.revision:
+        accepted_limit = isinstance(action, (OpenTrade, AddToTrade)) and action.order_type is EntryOrderType.LIMIT
+        accepted_v2 = (trade.plan.algorithm_version == "economics-v2" and self._command_events.get(action.command_id)
+                       and self._command_events[action.command_id].status is ExecutionStatus.ACK)
+        if not isinstance(action, MoveStop) and not accepted_limit and not accepted_v2 and action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
             self._addressed_events.append(event)
             return event
         event = self._execute_action(trade, action, now, fill_price, bar=bar)
+        if accepted_limit or trade.plan.algorithm_version == "economics-v2":
+            self._command_events[action.command_id] = event
         self._addressed_events.append(event)
         return event
 
     def _process_addressed_protection(
         self, trade: AddressedTrade, now: datetime, bar: tuple[float, float, float, float]) -> None:
         position = self.manager.positions.get(trade.plan.trade_id)
-        if position is None or position.qty == 0 or trade.opened_bar == now:
+        if position is None or position.qty == 0:
             return
+        if trade.opened_bar is not None and _naive_utc(trade.opened_bar) == _naive_utc(now):
+            if trade.restored_increase_price is not None and trade.restored_increase_price == Decimal(str(bar[0])):
+                trade.opened_bar = None
+                trade.restored_increase_price = None
+            else:
+                self._process_addressed_stop(trade, now, bar)
+                return
         if self._process_addressed_stop(trade, now, bar):
             return
         _, low, high, _ = bar
@@ -715,8 +899,10 @@ class JournalBroker(BrokerPort):
                 event = self._pv_fill(
                     trade, now, filled, Decimal(str(target.price)), kind="tp",
                     target_id=target.target_id, bar=bar,
+                    reference_price=target.price,
                 )
                 self._addressed_events.append(event)
+                self._cancel_increases(trade, now, "first-reduction-filled")
                 self._publish_event(
                     EventType.TARGET_HIT,
                     now,
@@ -746,8 +932,9 @@ class JournalBroker(BrokerPort):
         trade.confirmed_stop = None
         trade.last_stop_fill = price
         trade.revision += 1
-        event = self._pv_fill(trade, now, quantity, price, kind="stop", bar=bar)
+        event = self._pv_fill(trade, now, quantity, price, kind="stop", bar=bar, reference_price=Decimal(str(stop)))
         self._addressed_events.append(event)
+        self._cancel_increases(trade, now, "protective")
         self._publish_event(
             EventType.STOP_HIT,
             now,
@@ -1076,8 +1263,6 @@ class JournalBroker(BrokerPort):
             ts_order=now,
         )
         results = [result]
-        if over_risk:
-            results.append(self.close_position(pos, order.limit_price, now, "over_risk"))
         return results
 
     def _position_over_limit(self, position_id: str, qty: int, price: float, contract: ContractMeta) -> bool:

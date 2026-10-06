@@ -11,6 +11,14 @@ from typing import Any
 
 from src.events.types import EventType
 
+DIAGNOSTIC_PAYLOAD_FIELDS = (
+    "budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess",
+    "risk_state", "unknown_reason", "requested_quantity", "selected_quantity", "limiting_constraint",
+)
+FINANCIAL_PAYLOAD_FIELDS = (
+    "gross_pnl", "net_pnl", "fees_total", "fees_known", "fee_source", "pnl_units", "quantity_remaining",
+)
+
 _REQUIRED: dict[EventType, tuple[str, ...]] = {
     EventType.DECISION: ("outcome", "side"),
     EventType.SIGNAL: ("side", "quantity", "entry", "stop"),
@@ -21,8 +29,15 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
 
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id"),
-    EventType.SIGNAL: ("targets", "expected_r", "strategy", "filter_profile", "trade_id"),
-    EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile"),
+    EventType.SIGNAL: (
+        "targets", "expected_r", "strategy", "filter_profile", "trade_id",
+        "risk_amount", "reward_amount", "costs_amount", "payoff_ratio",
+        "fixed_reward_amount", "fixed_quantity", "net_reward_amount", "algorithm_version",
+        *DIAGNOSTIC_PAYLOAD_FIELDS,
+    ),
+    EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile", "algorithm_version",
+                         "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold",
+                         *DIAGNOSTIC_PAYLOAD_FIELDS),
     EventType.HEARTBEAT: (),
     EventType.ERROR: ("message",),
     EventType.RATE_LIMITED: ("source",),
@@ -56,7 +71,7 @@ REQUIRED_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
     EventType.TRADE_CANCELLED: ("trade_id",),
     EventType.PROTECTION_ARMED: ("trade_id",),
     EventType.STOP_MOVED: ("trade_id",),
-    EventType.RISK_LIMIT_HIT: ("trade_id",),
+    EventType.RISK_LIMIT_HIT: (),
     EventType.RESERVATION_CHANGED: ("trade_id",),
     EventType.CLEARING_DONE: (),
     EventType.RATE_LIMITED: (),
@@ -82,7 +97,11 @@ OPTIONAL_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
         )
     },
     EventType.CLEARING_DONE: ("balance", "positions"),
+    EventType.RISK_LIMIT_HIT: (*_EXECUTION_OPTIONAL, "trade_id", "risk_scope", *DIAGNOSTIC_PAYLOAD_FIELDS),
 }
+for _event_type in (EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT, EventType.TARGET_HIT, EventType.TRADE_CLOSED):
+    OPTIONAL_PAYLOAD_FIELDS[_event_type] += FINANCIAL_PAYLOAD_FIELDS
+OPTIONAL_PAYLOAD_FIELDS[EventType.POSITION_ADDED] += ("requested_quantity", "selected_quantity", "limiting_constraint")
 
 
 _JSON_TYPES: dict[str, str] = {
@@ -92,6 +111,11 @@ _JSON_TYPES: dict[str, str] = {
     "error_count": "number",
     "filtered_out": "boolean",
     "targets": "array",
+    "requested_quantity": "number",
+    "selected_quantity": "number",
+    "fixed_quantity": "number",
+    "quantity_remaining": "number",
+    "fees_known": "boolean",
 }
 
 

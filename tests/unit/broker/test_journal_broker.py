@@ -208,21 +208,20 @@ class TestClearing:
 class TestOverRiskAndFifo:
     LOW_GO_META = ContractMeta(ticker="NG", price_step=1.0, step_cost=100.0, go_buy=100.0, go_sell=100.0)
 
-    def test_over_risk_counter_close_on_fill(self, tmp_path):
+    def test_over_risk_is_diagnosed_without_counter_close_on_fill(self, tmp_path):
         broker = _broker(tmp_path, initial=1000)  # кап перекоса = 3000
         broker.place_order(_signal(qty=1), self.LOW_GO_META, NOW)
         results = broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": self.LOW_GO_META})
-        assert broker.manager.positions == {}  # контр-сделка закрыла позицию
+        assert len(broker.manager.positions) == 1
         rows = broker.journal.events()
         entry = [e for e in rows if e.op == OpType.ENTRY.value and e.side == "BUY"][0]
         assert "over_risk=true" in entry.notes
-        close = [e for e in rows if e.op == OpType.EXIT.value and e.side == "SELL"][0]
-        assert close.reason == "over_risk"
+        assert not [e for e in rows if e.op == OpType.EXIT.value]
         types = {e.type for e in broker.drain_events()}
         assert EventType.RISK_LIMIT_HIT in types
         assert any(r.status is OrderStatus.FILLED for r in results)
 
-    def test_fifo_cancel_of_non_over_risk_order(self, tmp_path):
+    def test_over_risk_does_not_cancel_another_accepted_order(self, tmp_path):
         broker = _broker(tmp_path, initial=1000)  # кап перекоса = 3000
         # открытая NG-позиция: 1 лот по цене 20 → стоимость 2000 < 3000
         broker.place_order(_signal(entry_price=20.0, stop_price=19.0, qty=1, risk_rub=20.0), self.LOW_GO_META, NOW)
@@ -231,17 +230,18 @@ class TestOverRiskAndFifo:
         # отложенная BR-заявка (не over-risk)
         broker.place_order(_signal(position_id="BR-1", ticker="BR", entry_price=50.0, stop_price=49.0,
                                    qty=1, stop_distance_pct=2.0), self.LOW_GO_META, NOW + timedelta(minutes=2))
-        # рост цены NG → стоимость 10000 > 3000 → перекос: отмена BR + контр-сделка по NG
+        # Рост цены не вытесняет ранее принятую BR-заявку и не продаёт NG.
         results = broker.track_bar(
             NOW + timedelta(minutes=3),
             _bars({"NG": (99.0, 101.0, 100.0), "BR": (49.5, 52.0, 51.0)}),
             {"NG": self.LOW_GO_META, "BR": self.LOW_GO_META},
         )
         cancelled = [r for r in results if r.status is OrderStatus.CANCELLED]
-        assert cancelled and cancelled[0].reason == "risk_cap"
-        assert broker.manager.positions == {}  # NG закрыт контр-сделкой
+        assert not cancelled
+        assert broker.manager.positions
         rows = broker.journal.events()
-        assert any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+        assert not any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+        assert not any(e.op == OpType.EXIT.value and e.reason == "over_risk" for e in rows)
 
 
 class TestCancelOrder:

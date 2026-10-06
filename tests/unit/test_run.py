@@ -1,11 +1,20 @@
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
+
+import json
 
 import pandas as pd
 import pytest
 
 import run
+from src.bot.run_session import HistoricalRunSession
+from src.data.cache import DataExhaustion
+from src.history.preflight import PreflightReport
 from src.instruments import Instrument, normalize_instrument
 from src.portfolio import ContractMeta
+from src.scheduler.clock import HistoricalClock
+from src.trade_journal.storage import Storage
 
 
 def _fake_client():
@@ -220,6 +229,7 @@ class TestRuntimeComposition:
         broker.drain_events.return_value = []
         manager = MagicMock()
         storage = MagicMock()
+        bus = MagicMock()
         storage.load_trades.return_value = ()
         with patch("run.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
@@ -230,7 +240,7 @@ class TestRuntimeComposition:
         ) as manager_cls, patch("run._load_contracts_metadata", return_value={}), patch(
             "run.print_contract_metadata"
         ), patch("run._risk_limits") as limits:
-            runtime = run._build_runtime([], MagicMock(), MagicMock(), run.runtime_dir())
+            runtime = run._build_runtime([], MagicMock(), bus, run.runtime_dir())
 
         storage_cls.assert_called_once_with(
             run.runtime_dir() / run.DATABASE_FILE,
@@ -249,13 +259,21 @@ class TestRuntimeComposition:
             storage,
             broker,
             initial_balance=run.Decimal(str(run.INITIAL_DEPOSIT)),
+            budget_observer=ANY,
+            execution_observer=ANY,
             profiles_config=run.TRADE_MANAGEMENT_PROFILES,
             risk_limits=limits.return_value,
             max_qty=run.RISK_LIMITS.get("max_qty"),
             commission=run.RISK_LIMITS.get("commission"),
             slippage=run.RISK_LIMITS.get("slippage"),
             slippage_tolerance=run.RISK_LIMITS.get("slippage_tolerance"),
+            min_trade_risk_pct=run.RISK_LIMITS.get("min_trade_risk_pct"),
+            portfolio_pct=run.RISK_LIMITS.get("portfolio_pct", 2),
+            min_risk_cost_ratio=run.RISK_LIMITS.get("min_risk_cost_ratio", 2),
+            min_net_payoff=run.RISK_LIMITS.get("min_net_payoff", 1.5),
+            max_slippage_r=run.RISK_LIMITS.get("max_slippage_r", 0.25),
             contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
+            direction_limits=run.TRADING_DIRECTIONS,
             clock=None,
             signal_filter=ANY,
         )
@@ -264,6 +282,19 @@ class TestRuntimeComposition:
         assert runtime.trade_manager is manager
         assert not hasattr(runtime, "risk_manager")
         assert not hasattr(runtime, "execution")
+
+        callbacks = manager_cls.call_args.kwargs
+        callbacks["budget_observer"]({"risk_state": "unknown", "unknown_reason": "нет подтверждённого стопа"})
+        alert = bus.publish.call_args.args[0]
+        assert alert.type is run.EventType.RISK_LIMIT_HIT and alert.get("risk_scope") == "portfolio"
+        assert "trade_id" not in alert.payload
+        callbacks["execution_observer"](SimpleNamespace(trade_id="trade", timestamp=datetime(2026, 1, 1), filled_quantity=2,
+            price=run.Decimal(100), fee=run.Decimal(0), fee_source="broker", reason="entry", execution_id="exec", status="fill"),
+            {"action_type": "OPEN", "instrument_id": "SBER", "gross_pnl": run.Decimal(0), "net_pnl": run.Decimal(0),
+             "fees_total": run.Decimal(0), "fees_known": True, "pnl_units": "RUB", "quantity_remaining": 2})
+        fact = bus.publish.call_args.args[0]
+        assert fact.type is run.EventType.TRADE_OPENED and fact.get("fee_source") == "broker"
+        assert fact.get("fee") == 0 and fact.get("quantity_remaining") == 2
 
     def test_build_runtime_normalizes_selector_tuples_before_consumers(self):
         broker = MagicMock()
@@ -312,3 +343,210 @@ class TestInstrumentNames:
         ]
 
         assert run._instrument_names(instruments) == {"NGV6": "NG-9.26"}
+
+
+SHIFTED_START = datetime(2024, 1, 3, 4, 2)
+SELECTOR_SBER = ("Сбербанк", "SBER", "share")
+
+
+def _preflight_report(*, start, ok=True, shift_to=None):
+    return PreflightReport(
+        problems=() if ok else ("SBER 1m: свечи не покрывают конец диапазона",),
+        notes=() if shift_to is None else ("начало диапазона сдвинуто",),
+        start=shift_to or start,
+        shift_to=shift_to,
+        checked_pairs=2,
+        detail=["SBER 1m: пусто", "SBER 1h: пусто"],
+    )
+
+
+class TestHistoryStartShift:
+    """Проверка границ может перенести начало: прогон собирается заново."""
+
+    START = datetime(2024, 1, 1, 0, 0)
+    END = datetime(2024, 1, 5, 0, 0)
+
+    def _launch(self, tmp_path, report):
+        session = MagicMock(start=self.START, end=self.END)
+        with (
+            patch.object(run, "setup_logging"),
+            patch.object(run, "select_instruments", return_value=[SELECTOR_SBER]) as selector,
+            patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
+            patch.object(run, "_warmup_bars", return_value=41),
+            patch.object(run, "run_preflight", return_value=report),
+            patch.object(run, "build_channels") as channels,
+        ):
+            code, shifted, instruments = run._launch(
+                state_dir=tmp_path / "state",
+                client_provider=MagicMock(),
+                clock=MagicMock(),
+                session=session,
+                channel_names=[],
+                history=True,
+            )
+        return code, shifted, instruments, selector, channels
+
+    def test_launch_hands_shift_back_without_starting_bot(self, tmp_path):
+        code, shifted, instruments, _selector, channels = self._launch(
+            tmp_path, _preflight_report(start=self.START, shift_to=SHIFTED_START)
+        )
+
+        assert (code, shifted) == (3, SHIFTED_START)
+        assert [item.ticker for item in instruments] == ["SBER"]
+        channels.assert_not_called()
+
+    def test_launch_reuses_instruments_of_previous_attempt(self, tmp_path):
+        ready = [normalize_instrument(SELECTOR_SBER)]
+
+        with (
+            patch.object(run, "setup_logging"),
+            patch.object(run, "select_instruments") as selector,
+            patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
+            patch.object(run, "_warmup_bars", return_value=41),
+            patch.object(
+                run, "run_preflight",
+                return_value=_preflight_report(start=self.START, ok=False),
+            ),
+            patch.object(run, "build_channels") as channels,
+        ):
+            code, shifted, instruments = run._launch(
+                state_dir=tmp_path / "state",
+                client_provider=MagicMock(),
+                clock=MagicMock(),
+                session=MagicMock(start=self.START, end=self.END),
+                channel_names=[],
+                history=True,
+                instruments=ready,
+            )
+
+        selector.assert_not_called()
+        channels.assert_not_called()
+        assert (code, shifted, instruments) == (2, None, ready)
+
+
+class TestRunHistoryRetry:
+    """Повтор исторического прогона: один раз, с теми же инструментами."""
+
+    START = datetime(2024, 1, 1, 0, 0)
+    END = datetime(2024, 1, 5, 0, 0)
+
+    def _run(self, tmp_path):
+        with (
+            patch.object(run, "HistoricalClock"),
+            patch.object(run, "build_run_session"),
+            patch.object(run, "_timeframes", return_value={"1m"}),
+            patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
+            patch.object(run, "EmulatorClientProvider"),
+            patch.object(run, "state_dir_for", side_effect=lambda s, e: tmp_path / f"{s:%m%d%H%M}"),
+        ):
+            return run._run_history(self.START, self.END, 0.0)
+
+    def test_rejected_attempt_is_dropped_and_range_rerun(self, tmp_path):
+        calls = []
+
+        def launch(**kwargs):
+            calls.append(kwargs)
+            return [(3, SHIFTED_START, ["ready"]), (0, None, ["ready"])][len(calls) - 1]
+
+        with (
+            patch.object(run, "_launch", side_effect=launch),
+        ):
+            code = self._run(tmp_path)
+
+        assert code == 0
+        assert [call["state_dir"].name for call in calls] == ["01010000", "01030402"]
+        assert calls[0]["instruments"] is None
+        assert calls[1]["instruments"] == ["ready"]
+        assert not (tmp_path / "01010000").exists()
+
+    def test_plain_run_is_not_repeated(self, tmp_path):
+        with patch.object(run, "_launch", return_value=(2, None, ["ready"])) as launcher:
+            code = self._run(tmp_path)
+
+        assert code == 2
+        assert launcher.call_count == 1
+
+    def test_endless_shift_stops_after_one_retry(self, tmp_path):
+        with patch.object(run, "_launch", return_value=(3, SHIFTED_START, ["ready"])) as launcher:
+            code = self._run(tmp_path)
+
+        assert code == 3
+        assert launcher.call_count == 2
+
+
+class TestFinishHistoryReportsCheckedHorizon:
+    """Границы проверенного горизонта доезжают из сессии в отчёт прогона."""
+
+    def _session(self, exhaustion):
+        clock = HistoricalClock(
+            datetime(2026, 9, 25, 12, 0),
+            datetime(2026, 10, 10, 12, 0),
+            timedelta(minutes=1),
+            0.0,
+            sleeper=lambda secs: None,
+        )
+        session = HistoricalRunSession(clock)
+        for _ in range(5):
+            clock.advance()
+        session.mark_data_exhausted(exhaustion)
+        return session
+
+    def _finish(self, tmp_path, session):
+        cache = MagicMock(
+            missed_bars=7, gaps=1, longest_gap=pd.Timedelta(hours=6)
+        )
+        timeline = MagicMock()
+        timeline.now.return_value = pd.Timestamp("2026-09-25 12:05")
+        state_dir = tmp_path / "run-1"
+
+        run._finish_history(
+            Storage(tmp_path / "trades.sqlite3", initial_deposit="100000"),
+            session,
+            cache,
+            timeline,
+            state_dir,
+        )
+        payload = json.loads((state_dir / "report.json").read_text(encoding="utf-8"))
+        text = (state_dir / "report.txt").read_text(encoding="utf-8")
+        return payload, text
+
+    def test_limited_horizon_is_reported_as_limited(self, tmp_path):
+        session = self._session(
+            DataExhaustion(
+                at=pd.Timestamp("2026-09-25 12:05"),
+                horizon_start=pd.Timestamp("2026-09-25 12:05"),
+                horizon_end=pd.Timestamp("2026-10-02 12:05"),
+                range_end=pd.Timestamp("2026-10-10 12:00"),
+                horizon_limited=True,
+            )
+        )
+
+        payload, text = self._finish(tmp_path, session)
+
+        assert payload["covered"] is False
+        assert payload["crashed"] is False
+        assert payload["checked_horizon"] == {
+            "start": "2026-09-25 12:05",
+            "end": "2026-10-02 12:05",
+            "limited": True,
+        }
+        assert "Проверенный горизонт: 2026-09-25 12:05 — 2026-10-02 12:05" in text
+        assert "ограничен семью сутками" in text
+        assert "следующий бар не найден в проверенном горизонте" in payload["stop_reason"]
+
+    def test_full_remainder_is_reported_as_checked(self, tmp_path):
+        session = self._session(
+            DataExhaustion(
+                at=pd.Timestamp("2026-09-25 12:05"),
+                horizon_start=pd.Timestamp("2026-09-25 12:05"),
+                horizon_end=pd.Timestamp("2026-10-10 12:00"),
+                range_end=pd.Timestamp("2026-10-10 12:00"),
+                horizon_limited=False,
+            )
+        )
+
+        payload, text = self._finish(tmp_path, session)
+
+        assert payload["checked_horizon"]["limited"] is False
+        assert "проверен весь остаток диапазона" in payload["stop_reason"]
+        assert "ограничен семью сутками" not in text

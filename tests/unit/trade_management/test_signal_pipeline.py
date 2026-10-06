@@ -31,9 +31,12 @@ def _meta_expiring_in(days: int) -> ContractMeta:
         expiration_date=expiration_date,
     )
 
+# Геометрия допуска проверяется отдельно (test_stop_geometry.py); здесь она
+# закреплена за тестом, чтобы стоило ровно столько риска, сколько считает тест.
+GEOMETRY = {"min_stop_atr": 0, "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}
 PROFILES = {
-    "levels_rr": {"buffer_ticks": 1, "target_R": (1, 2), "shares": (0.5, 0.5)},
-    "ma_cloud": {"buffer_ticks": 1, "ma_fast_period": 10, "ma_slow_period": 40},
+    "levels_rr": {"buffer_ticks": 1, "target_R": (1, 2), "shares": (0.5, 0.5), **GEOMETRY},
+    "ma_cloud": {"buffer_ticks": 1, "ma_fast_period": 10, "ma_slow_period": 40, **GEOMETRY},
 }
 LIMITS = RiskLimits(
     per_trade=Decimal("2"), per_instrument=Decimal("6"),
@@ -366,7 +369,7 @@ def test_actions_for_signal_admits_share_entry_with_lot_sizing(tmp_path):
     broker = _FillBroker(SHARE_META)
     with Storage(tmp_path / "trades.sqlite3") as storage:
         manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
-                               profiles_config=PROFILES, risk_limits=LIMITS, max_qty=100)
+                               profiles_config=PROFILES, risk_limits=LIMITS, portfolio_pct=2, max_qty=100)
         actions = manager.actions_for_signal(
             assignment, decision, SHARE_INSTRUMENT, _frame([300.0] * 25),
             _context(price=300.0, levels=(SRLevel(297.0, SRType.SUPPORT, 2, "s1"),)),
@@ -496,3 +499,109 @@ def test_actions_for_signal_rejects_exhausted_risk_budget(tmp_path):
         # Нулевой бюджет риска — это исчерпанный лимит риска, а не общий отказ размера.
         assert [reason.code for reason in admission.rejections] == ["risk-budget"]
         assert admission.rejections[0].message == "не хватает лимита риска для входа"
+
+
+SHARE_LONG_ONLY_INSTRUMENT = SimpleNamespace(ticker="SBER", short_name="SBER", instrument_type="share")
+FUTURE_BOTH_INSTRUMENT = SimpleNamespace(ticker="NGV6", short_name="NG", instrument_type="future")
+UNLISTED_INSTRUMENT = SimpleNamespace(ticker="TCSG", short_name="TCSG", instrument_type="etf")
+
+
+class TestDirectionFilterAdmission:
+    def _manager(self, storage, *, directions, broker=None):
+        return TradeManager(storage, broker or _FillBroker(), initial_balance=Decimal("100000"),
+                            profiles_config=PROFILES, risk_limits=LIMITS, max_qty=4,
+                            direction_limits=directions)
+
+    def _assignment(self):
+        return SimpleNamespace(id="assignment-1", strategy="macd_rsi_stoch",
+                               management="levels_rr", filter_profile="basic_levels",
+                               priority=0, timeframe="15m")
+
+    def test_forbidden_short_on_share_is_rejected(self, tmp_path):
+        assignment = self._assignment()
+        decision = Decision(signal_type=SignalType.SELL, price=100.0, bar_time=BAR0,
+                            event_id="signal-1", available_at=BAR0, timeframe="15m")
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = self._manager(storage, directions={"share": ("long",)})
+            admission = manager.actions_for_signal(
+                assignment, decision, SHARE_LONG_ONLY_INSTRUMENT, _frame([100.0] * 25),
+                _context(price=100.0), timeframe="15m",
+            )
+            assert len(admission) == 0
+            assert [reason.code for reason in admission.rejections] == ["direction-not-allowed"]
+            assert admission.rejections[0].message == "направление не разрешено для этого типа инструмента"
+
+    def test_allowed_long_on_share_is_admitted(self, tmp_path):
+        assignment = self._assignment()
+        decision = Decision(signal_type=SignalType.BUY, price=300.0, bar_time=BAR0,
+                            event_id="signal-1", available_at=BAR0, timeframe="15m")
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = self._manager(storage, directions={"share": ("long",)})
+            admission = manager.actions_for_signal(
+                assignment, decision, SHARE_LONG_ONLY_INSTRUMENT, _frame([300.0] * 25),
+                _context(price=300.0, levels=(SRLevel(297.0, SRType.SUPPORT, 2, "s1"),)),
+                timeframe="15m",
+            )
+            assert len(admission) == 1
+            assert isinstance(admission[0], OpenTrade)
+            assert not admission.rejections
+
+    def test_sell_on_future_is_admitted_when_both_directions_allowed(self, tmp_path):
+        assignment = self._assignment()
+        decision = Decision(signal_type=SignalType.SELL, price=104.0, bar_time=BAR0,
+                            event_id="signal-1", available_at=BAR0, timeframe="15m")
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = self._manager(storage, directions={"future": ("long", "short")})
+            admission = manager.actions_for_signal(
+                assignment, decision, FUTURE_BOTH_INSTRUMENT, _frame([104.0] * 25),
+                _context(price=104.0,
+                         levels=(SRLevel(107.0, SRType.RESISTANCE, 2, "r1"),)),
+                timeframe="15m",
+            )
+            assert len(admission) == 1
+            assert isinstance(admission[0], OpenTrade)
+            assert not admission.rejections
+
+    def test_unlisted_instrument_type_is_not_filtered(self, tmp_path):
+        assignment = self._assignment()
+        decision = Decision(signal_type=SignalType.SELL, price=104.0, bar_time=BAR0,
+                            event_id="signal-1", available_at=BAR0, timeframe="15m")
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            manager = self._manager(storage, directions={"share": ("long",)})
+            admission = manager.actions_for_signal(
+                assignment, decision, UNLISTED_INSTRUMENT, _frame([104.0] * 25),
+                _context(price=104.0,
+                         levels=(SRLevel(107.0, SRType.RESISTANCE, 2, "r1"),)),
+                timeframe="15m",
+            )
+            assert len(admission) == 1
+            assert isinstance(admission[0], OpenTrade)
+            assert not admission.rejections
+
+    def test_owned_position_management_is_not_blocked_by_filter(self, tmp_path):
+        assignment = self._assignment()
+        entry = Decision(signal_type=SignalType.BUY, price=300.0, bar_time=BAR0,
+                         event_id="signal-1", available_at=BAR0, timeframe="15m")
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            broker = _FillBroker(SHARE_META)
+            manager = TradeManager(storage, broker, initial_balance=Decimal("100000"),
+                                   profiles_config=PROFILES, risk_limits=LIMITS, max_qty=100,
+                                   direction_limits={"share": ("long",)})
+            actions = manager.actions_for_signal(
+                assignment, entry, SHARE_LONG_ONLY_INSTRUMENT, _frame([300.0] * 25),
+                _context(price=300.0, levels=(SRLevel(297.0, SRType.SUPPORT, 2, "s1"),)),
+                timeframe="15m",
+            )
+            assert len(actions) == 1 and isinstance(actions[0], OpenTrade)
+            manager.dispatch(BAR0)
+
+            oppose = Decision(signal_type=SignalType.SELL, price=298.0, bar_time=BAR1,
+                              event_id="signal-2", available_at=BAR1, timeframe="15m")
+            admission = manager.actions_for_signal(
+                assignment, oppose, SHARE_LONG_ONLY_INSTRUMENT, _frame([298.0] * 25),
+                _context(price=298.0,
+                         levels=(SRLevel(299.0, SRType.RESISTANCE, 2, "r1"),)),
+                timeframe="15m",
+            )
+            assert not admission.rejections
+            assert len(admission) == 1 and isinstance(admission[0], CloseTrade)

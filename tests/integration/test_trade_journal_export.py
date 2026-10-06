@@ -69,7 +69,7 @@ def _write_reason_fill(storage, reason):
             (now, now),
         )
         connection.execute(
-            "INSERT INTO fills VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
+            "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
             (now,),
         )
         connection.execute(
@@ -229,14 +229,14 @@ def test_rows_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypa
 
         stale_rows = _read_csv(positions)
         assert len(stale_rows) == 1
-        assert stale_rows[0]["Trade ID"] == "trade-1"
+        assert stale_rows[0]["Статус"] == "открыта"
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", original_replace)
         assert storage.export()
 
     retried_rows = _read_csv(positions)
     assert len(retried_rows) == 1
-    assert retried_rows[0]["Trade ID"] == "trade-1"
+    assert "Trade ID" not in retried_rows[0]
 
 
 def test_first_sqlite_export_preserves_legacy_csvs_only_once(tmp_path):

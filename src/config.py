@@ -274,6 +274,7 @@ AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
 CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
+TRADING_DIRECTIONS = dict(_CONFIG.get("directions", {}))
 
 
 def trading_enabled() -> bool:

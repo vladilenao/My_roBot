@@ -17,6 +17,10 @@ class InvalidStopBoundaryError(TradeManagementException):
     """Защитный стоп вышел за границу рынка и не может быть применён."""
 
 
+class RiskStateUnknown(TradeManagementException):
+    """Нельзя оценить необходимую часть существующей экспозиции счёта."""
+
+
 class ReservationRejected(TradeManagementException):
     """Резервирование входа отклонено конкретным исчерпанным лимитом.
 

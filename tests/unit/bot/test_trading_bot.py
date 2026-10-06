@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from src.bot import TradingBot
+from src.data.cache import DataGap
 from src.events import ALL_EVENT_TYPES, Event, EventBus, EventType
 from src.instruments import Instrument
 from src.notifier.channel import Channel
@@ -1008,6 +1009,47 @@ class TestTradingBot:
         cache.flag = True
         bot._tick({"1h"})
         assert len(_decisions(channel)) == 1
+
+    def test_gap_tick_moves_market_time_and_skips_processing(self):
+        """Разрыв в данных: рыночное время переводится, тик не обрабатывает бары."""
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        channel = RecordingChannel()
+        gap = DataGap(
+            since=pd.Timestamp("2024-01-01 09:00"),
+            resume=pd.Timestamp("2024-01-01 11:00"),
+            missed=120,
+            span=pd.Timedelta(minutes=120),
+        )
+
+        class GapCache(FakeCache):
+            def take_pending_gap(self):
+                return gap
+
+        class ReanchorTimeline(FakeTimeline):
+            def __init__(self):
+                super().__init__()
+                self.reanchored = 0
+
+            def reanchor(self):
+                self.reanchored += 1
+
+        timeline = ReanchorTimeline()
+        bot = _make_bot(
+            timeline=timeline,
+            cache=GapCache(frames={"SBER": _df()}),
+            bus=channel.bus,
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch")},
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+        bot._run = MagicMock()
+
+        bot._tick({"1h"})
+
+        bot._run.mark_data_gap.assert_called_once_with(gap)
+        assert timeline.reanchored == 1
+        assert _decisions(channel) == []
+        assert strategy.compute.called is False
 
     def test_market_context_computed_once_per_instrument(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))

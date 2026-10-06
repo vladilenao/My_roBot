@@ -15,10 +15,19 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from src.events.types import EventType
+from src.events.schema import DIAGNOSTIC_PAYLOAD_FIELDS
 
 _EXECUTION_AMOUNTS = frozenset(
-    {"price", "stop", "take_profit", "pnl", "fee", "balance"}
+    {"price", "stop", "take_profit", "pnl", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
+     "budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess"}
 )
+
+
+def _diagnostics_payload(details, *, economics=False):
+    names = (*DIAGNOSTIC_PAYLOAD_FIELDS, "algorithm_version", "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold") if economics else DIAGNOSTIC_PAYLOAD_FIELDS
+    amounts = {"budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess",
+               "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold"}
+    return {key: _amount(value) if key in amounts else value for key, value in (details or {}).items() if key in names}
 
 
 def _freeze(payload: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -149,6 +158,15 @@ class Event:
         stop: Any,
         targets: tuple[Any, ...] = (),
         expected_r: Any = None,
+        risk_amount: Any = None,
+        reward_amount: Any = None,
+        costs_amount: Any = None,
+        payoff_ratio: Any = None,
+        fixed_reward_amount: Any = None,
+        fixed_quantity: int | None = None,
+        net_reward_amount: Any = None,
+        algorithm_version: str | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
         strategy: str = "",
         filter_profile: str = "",
         bar_time: Any = None,
@@ -168,6 +186,15 @@ class Event:
                 "stop": _amount(stop),
                 "targets": tuple(_amount(target) for target in targets),
                 "expected_r": _amount(expected_r),
+                "risk_amount": _amount(risk_amount),
+                "reward_amount": _amount(reward_amount),
+                "costs_amount": _amount(costs_amount),
+                "payoff_ratio": _amount(payoff_ratio),
+                "fixed_reward_amount": _amount(fixed_reward_amount),
+                "fixed_quantity": fixed_quantity,
+                "net_reward_amount": _amount(net_reward_amount),
+                "algorithm_version": algorithm_version,
+                **_diagnostics_payload(diagnostics),
                 "strategy": strategy,
                 "filter_profile": filter_profile,
                 "trade_id": trade_id,
@@ -181,6 +208,7 @@ class Event:
         *,
         reason: str,
         code: str = "",
+        diagnostics: Mapping[str, Any] | None = None,
         side: str = "",
         price: Any = None,
         strategy: str = "",
@@ -201,6 +229,7 @@ class Event:
                 "price": _amount(price),
                 "strategy": strategy,
                 "filter_profile": filter_profile,
+                **_diagnostics_payload(diagnostics, economics=True),
             },
         )
 

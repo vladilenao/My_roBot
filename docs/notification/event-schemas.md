@@ -19,7 +19,11 @@
     "entry": "130.5",
     "stop": "132",
     "targets": ["128", "126"],
-    "expected_r": "2.33"
+    "expected_r": "1.50",
+    "risk_amount": "250.00",
+    "reward_amount": "375.00",
+    "costs_amount": "14.00",
+    "payoff_ratio": "1.44"
   }
 }
 ```
@@ -37,8 +41,9 @@
 и могут отсутствовать. `additionalProperties: false` означает, что поле, которого нет
 в схеме, — ошибка отправителя, а не повод молча его игнорировать.
 
-`Decimal` сериализуется строкой, поэтому `price`, `entry`, `stop`, `fee` и `expected_r`
-в JSON имеют строковый тип: так не теряются знаки и точность. `quantity`, `tick_count`
+`Decimal` сериализуется строкой, поэтому `price`, `entry`, `stop`, `fee`, `expected_r`,
+`risk_amount`, `reward_amount`, `costs_amount` и `payoff_ratio` в JSON имеют строковый
+тип: так не теряются знаки и точность. `quantity`, `tick_count`
 и `error_count` — числа, `filtered_out` — булево, `targets` — массив строк с ценами.
 
 Блоки ниже перепечатывают `src/events/schema.py`: менять форму события нужно там, а
@@ -95,8 +100,17 @@
 ### `signal`
 
 Рекомендация, прошедшая допуск. `targets` — массив строк с ценами целей по возрастанию
-риска, `expected_r` — ожидаемый результат в долях риска с точностью до сотых. Консоль и
-Telegram.
+риска, `expected_r` — валовой плановый результат в долях риска, не статистическое матожидание. Денежные
+поля считаются для фактически допущенного объёма: `risk_amount` — риск до стопа,
+`reward_amount` — плановый доход по всем целям, `costs_amount` — круговые расходы,
+`payoff_ratio` — `(reward_amount − costs_amount) / risk_amount`. У плана без целей
+`expected_r`, `reward_amount` и `payoff_ratio` отсутствуют, а нулевые величины не подставляются.
+У тренда неизвестен полный итог; `fixed_reward_amount`/`fixed_quantity` описывают только фиксируемую часть.
+`net_reward_amount` — чистая полная плановая прибыль при известном результате. `algorithm_version` различает версии.
+`quantity`/`selected_quantity` — допущенный объём, `requested_quantity` — явный запрос при наличии,
+`limiting_constraint` — риск, ГО, предел количества, запрос или профиль. Денежная диагностика
+показывает общий бюджет после допуска с резервом этого входа, не факт исполнения.
+Консоль и Telegram.
 
 ```json
 {
@@ -131,6 +145,18 @@ Telegram.
     "expected_r": {
       "type": "string"
     },
+    "risk_amount": {
+      "type": "string"
+    },
+    "reward_amount": {
+      "type": "string"
+    },
+    "costs_amount": {
+      "type": "string"
+    },
+    "payoff_ratio": {
+      "type": "string"
+    },
     "strategy": {
       "type": "string"
     },
@@ -139,7 +165,23 @@ Telegram.
     },
     "trade_id": {
       "type": "string"
-    }
+    },
+    "fixed_reward_amount": {"type": "string"},
+    "fixed_quantity": {"type": "number"},
+    "net_reward_amount": {"type": "string"},
+    "algorithm_version": {"type": "string"},
+    "budget_base": {"type": "string"},
+    "portfolio_pct": {"type": "string"},
+    "risk_budget": {"type": "string"},
+    "open_risk": {"type": "string"},
+    "pending_risk": {"type": "string"},
+    "free_risk": {"type": "string"},
+    "risk_excess": {"type": "string"},
+    "risk_state": {"type": "string"},
+    "unknown_reason": {"type": "string"},
+    "requested_quantity": {"type": "number"},
+    "selected_quantity": {"type": "number"},
+    "limiting_constraint": {"type": "string"}
   },
   "additionalProperties": false
 }
@@ -149,6 +191,9 @@ Telegram.
 
 Сделка не допущена к исполнению. `reason` — причина из риск-менеджера, `code` — машинный
 код, если риск-менеджер его вернул.
+Экономический отказ содержит R/C/S, payoff при известности, выбранный объём,
+версию и применённый порог. `risk_state=unknown` и `unknown_reason` явно обозначают
+неполные данные портфеля; неизвестный свободный бюджет не отправляется как ноль.
 
 ```json
 {
@@ -176,7 +221,25 @@ Telegram.
     },
     "filter_profile": {
       "type": "string"
-    }
+    },
+    "algorithm_version": {"type": "string"},
+    "risk_amount": {"type": "string"},
+    "costs_amount": {"type": "string"},
+    "slippage_amount": {"type": "string"},
+    "payoff_ratio": {"type": "string"},
+    "threshold": {"type": "string"},
+    "budget_base": {"type": "string"},
+    "portfolio_pct": {"type": "string"},
+    "risk_budget": {"type": "string"},
+    "open_risk": {"type": "string"},
+    "pending_risk": {"type": "string"},
+    "free_risk": {"type": "string"},
+    "risk_excess": {"type": "string"},
+    "risk_state": {"type": "string"},
+    "unknown_reason": {"type": "string"},
+    "requested_quantity": {"type": "number"},
+    "selected_quantity": {"type": "number"},
+    "limiting_constraint": {"type": "string"}
   },
   "additionalProperties": false
 }
@@ -360,6 +423,15 @@ ISO8601.
 
 ### `trade_opened`
 
+В адресном runtime сообщение публикуется после применения execution редьюсером.
+`quantity`/`price`/`fee` относятся к одному incremental fill; `fee_source` — broker,
+configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — накопленные суммы
+сделки из подтверждённого журнала, `quantity_remaining` — фактический остаток.
+Эти финансовые поля также доступны у добора, стопа, цели и выхода.
+`fees_known=false` отмечает неизвестные исторические расходы; configured-комиссия
+явно подписывается оценкой, broker-ноль остаётся известным нулём. `pnl_units`
+различает RUB и RAW. Повтор execution не создаёт новое финансовое уведомление.
+
 Основная часть сделки исполнена: усреднение и потери ещё возможны.
 
 ```json
@@ -409,7 +481,14 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "gross_pnl": {"type": "string"},
+    "net_pnl": {"type": "string"},
+    "fees_total": {"type": "string"},
+    "fees_known": {"type": "boolean"},
+    "fee_source": {"type": "string"},
+    "pnl_units": {"type": "string"},
+    "quantity_remaining": {"type": "number"}
   },
   "additionalProperties": false
 }
@@ -466,7 +545,17 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "gross_pnl": {"type": "string"},
+    "net_pnl": {"type": "string"},
+    "fees_total": {"type": "string"},
+    "fees_known": {"type": "boolean"},
+    "fee_source": {"type": "string"},
+    "pnl_units": {"type": "string"},
+    "quantity_remaining": {"type": "number"},
+    "requested_quantity": {"type": "number"},
+    "selected_quantity": {"type": "number"},
+    "limiting_constraint": {"type": "string"}
   },
   "additionalProperties": false
 }
@@ -523,7 +612,14 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "gross_pnl": {"type": "string"},
+    "net_pnl": {"type": "string"},
+    "fees_total": {"type": "string"},
+    "fees_known": {"type": "boolean"},
+    "fee_source": {"type": "string"},
+    "pnl_units": {"type": "string"},
+    "quantity_remaining": {"type": "number"}
   },
   "additionalProperties": false
 }
@@ -580,7 +676,14 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "gross_pnl": {"type": "string"},
+    "net_pnl": {"type": "string"},
+    "fees_total": {"type": "string"},
+    "fees_known": {"type": "boolean"},
+    "fee_source": {"type": "string"},
+    "pnl_units": {"type": "string"},
+    "quantity_remaining": {"type": "number"}
   },
   "additionalProperties": false
 }
@@ -637,7 +740,14 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "gross_pnl": {"type": "string"},
+    "net_pnl": {"type": "string"},
+    "fees_total": {"type": "string"},
+    "fees_known": {"type": "boolean"},
+    "fee_source": {"type": "string"},
+    "pnl_units": {"type": "string"},
+    "quantity_remaining": {"type": "number"}
   },
   "additionalProperties": false
 }
@@ -875,16 +985,18 @@ ISO8601.
 
 ### `risk_limit_hit`
 
-Вход отбит лимитом риска.
+Диагностика общего портфельного бюджета после факта либо переоценки. При
+`risk_scope=portfolio` отдельная сделка не требуется: `trade_id` необязателен и
+не заменяется фиктивным ID. Показаны B/общий процент/лимит/open risk/pending/free/excess;
+`risk_state=unknown` сопровождается причиной вместо выдуманного свободного остатка.
+Сообщение сообщает о запрете новых входов/доборов, не об автоматической продаже.
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "payload risk_limit_hit",
   "type": "object",
-  "required": [
-    "trade_id"
-  ],
+  "required": [],
   "properties": {
     "trade_id": {
       "type": "string"
@@ -924,7 +1036,20 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "risk_scope": {"type": "string"},
+    "budget_base": {"type": "string"},
+    "portfolio_pct": {"type": "string"},
+    "risk_budget": {"type": "string"},
+    "open_risk": {"type": "string"},
+    "pending_risk": {"type": "string"},
+    "free_risk": {"type": "string"},
+    "risk_excess": {"type": "string"},
+    "risk_state": {"type": "string"},
+    "unknown_reason": {"type": "string"},
+    "requested_quantity": {"type": "number"},
+    "selected_quantity": {"type": "number"},
+    "limiting_constraint": {"type": "string"}
   },
   "additionalProperties": false
 }

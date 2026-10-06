@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tomllib
+from decimal import Decimal
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -73,6 +74,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "clearing_times": "clearing_times",
         "database_file": "database_file",
         "risk_limits": "risk_limits",
+        "directions": "directions",
         "contract_expiry_block_days": "contract_expiry_block_days",
     },
     "trade_management": {
@@ -111,6 +113,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "audit_max_bytes": int,
     "audit_backup_count": int,
     "risk_limits": dict,
+    "directions": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
 }
@@ -123,13 +126,27 @@ _NOTIFIER_EVENT_KEYS = {"console": "notifier_console_events", "telegram": "notif
 # Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
 _STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority"}
+_STOP_GEOMETRY_KEYS = frozenset(
+    {"min_stop_atr", "min_stop_ticks", "stop_beyond_bar", "max_stop_atr"}
+)
 _PROFILE_KEYS = {
-    "levels_rr": {"type", "buffer_ticks", "target_R", "shares", "max_adds", "add_fraction"},
-    "atr_trend": {"type", "atr_period", "initial_k", "trail_k", "tp1_R", "tp1_share", "max_adds", "add_fraction", "advance_R"},
-    "ma_cloud": {"type", "ma_fast_period", "ma_slow_period", "buffer_ticks", "max_adds", "add_fraction"},
-    "pattern_targets": {"type", "buffer_ticks", "fractions_to_D", "shares", "max_adds", "add_fraction"},
+    "levels_rr": {"type", "buffer_ticks", "target_R", "shares", "max_adds", "add_fraction", "min_be_r"} | _STOP_GEOMETRY_KEYS,
+    "atr_trend": {"type", "atr_period", "initial_k", "trail_k", "target_R", "shares", "max_adds", "add_fraction", "advance_R"} | _STOP_GEOMETRY_KEYS,
+    "ma_cloud": {"type", "ma_fast_period", "ma_slow_period", "buffer_ticks", "max_adds", "add_fraction"} | _STOP_GEOMETRY_KEYS,
+    "pattern_targets": {"type", "buffer_ticks", "fractions_to_D", "shares", "max_adds", "add_fraction", "min_be_r"} | _STOP_GEOMETRY_KEYS,
 }
-_RISK_LIMIT_KEYS = {"trade_pct", "instrument_pct", "portfolio_pct", "groups", "max_qty", "commission", "slippage", "slippage_tolerance"}
+_LEGACY_RISK_KEYS = frozenset({"trade_pct", "instrument_pct", "groups"})
+_RISK_DEFAULTS = {
+    "portfolio_pct": 2.0,
+    "commission": 1.5,
+    "slippage": 1.0,
+    "min_trade_risk_pct": 0.0,
+    "min_risk_cost_ratio": 2.0,
+    "min_net_payoff": 1.5,
+    "max_slippage_r": 0.25,
+}
+_RISK_LIMIT_KEYS = set(_RISK_DEFAULTS) | {"max_qty", "slippage_tolerance"}
+_ALLOWED_DIRECTIONS = frozenset({"long", "short"})
 _PATTERN_STRATEGIES = {"harmonic_abcd"}
 
 
@@ -250,7 +267,7 @@ def _validate_shares(value: Any, key: str, path: Path, count: int | None = None)
         _finite_number(share, key, path, positive=True)
         if share > 1:
             raise ConfigError(f"{path}: {key} должен содержать доли в (0, 1]")
-    if sum(value) > 1:
+    if sum((Decimal(str(item)) for item in value), Decimal(0)) > 1:
         raise ConfigError(f"{path}: {key} не должен давать сумму больше 1")
 
 
@@ -272,7 +289,10 @@ def _validate_profile_parameters(name: str, value: dict[str, Any], path: Path) -
             if key.endswith("share") or key == "add_fraction":
                 if value[key] > 1:
                     raise ConfigError(f"{path}: [trade_management.profiles.{name}] {key} должен быть в (0, 1]")
-    if name == "levels_rr":
+    if name in {"levels_rr", "pattern_targets"}:
+        value.setdefault("min_be_r", 1.5)
+        _finite_number(value["min_be_r"], f"[trade_management.profiles.{name}] min_be_r", path, non_negative=True)
+    if name in {"levels_rr", "atr_trend"}:
         targets = value.get("target_R")
         if not isinstance(targets, list) or not targets:
             raise ConfigError(f"{path}: [trade_management.profiles.{name}] target_R должен быть непустым списком")
@@ -281,6 +301,8 @@ def _validate_profile_parameters(name: str, value: dict[str, Any], path: Path) -
         if any(right <= left for left, right in zip(targets, targets[1:])):
             raise ConfigError(f"{path}: [trade_management.profiles.{name}] target_R должен возрастать")
         _validate_shares(value.get("shares"), f"[trade_management.profiles.{name}] shares", path, len(targets))
+        if name == "atr_trend" and sum((Decimal(str(x)) for x in value["shares"]), Decimal(0)) >= 1:
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] shares должна оставлять остаток под трейлинг (сумма < 1)")
     if name == "pattern_targets":
         fractions = value.get("fractions_to_D")
         if not isinstance(fractions, list) or len(fractions) != 2:
@@ -298,6 +320,29 @@ def _validate_profile_parameters(name: str, value: dict[str, Any], path: Path) -
         fast, slow = value.get("ma_fast_period"), value.get("ma_slow_period")
         if fast is None or slow is None or fast >= slow:
             raise ConfigError(f"{path}: [trade_management.profiles.{name}] требует ma_fast_period < ma_slow_period для прогрева")
+    _validate_stop_geometry(name, value, path)
+
+
+def _validate_stop_geometry(name: str, value: dict[str, Any], path: Path) -> None:
+    """Общие границы стоп-геометрии: неотрицательные числа, целые тики, согласованный потолок.
+
+    Потолок уже пола быть не может: иначе правило применяло бы две несовместимые
+    границы и итоговое расстояние зависело бы от порядка их применения.
+    """
+    where = f"[trade_management.profiles.{name}]"
+    for key in ("min_stop_atr", "stop_beyond_bar", "max_stop_atr"):
+        if key in value:
+            _finite_number(value[key], f"{where} {key}", path, non_negative=True)
+    if "min_stop_ticks" in value:
+        ticks = value["min_stop_ticks"]
+        if isinstance(ticks, bool) or not isinstance(ticks, int) or ticks < 0:
+            raise ConfigError(f"{path}: {where} min_stop_ticks должен быть целым числом >= 0")
+    min_stop_atr, max_stop_atr = value.get("min_stop_atr"), value.get("max_stop_atr")
+    if max_stop_atr is not None and min_stop_atr is not None and max_stop_atr < min_stop_atr:
+        raise ConfigError(
+            f"{path}: {where} max_stop_atr ({max_stop_atr}) не может быть меньше "
+            f"min_stop_atr ({min_stop_atr})"
+        )
 
 
 def _validate_trade_management_profiles(value: dict, path: Path) -> dict[str, dict]:
@@ -311,22 +356,88 @@ def _validate_trade_management_profiles(value: dict, path: Path) -> dict[str, di
 
 
 def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
+    _reject_legacy_risk_keys(value, path)
     unknown = set(value) - _RISK_LIMIT_KEYS
     if unknown:
         raise ConfigError(f"{path}: [trading.risk_limits] незнакомые ключи {sorted(unknown)}")
-    for key in ("trade_pct", "instrument_pct", "portfolio_pct", "commission", "slippage", "slippage_tolerance"):
+    value = {**_RISK_DEFAULTS, **value}
+    for key in ("portfolio_pct", "commission", "slippage", "slippage_tolerance", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r"):
         if key in value:
-            _finite_number(value[key], f"[trading.risk_limits] {key}", path, positive=key.endswith("_pct"), non_negative=not key.endswith("_pct"))
+            _finite_number(value[key], f"[trading.risk_limits] {key}", path, non_negative=True)
+    if value["portfolio_pct"] > 100:
+        raise ConfigError(f"{path}: [trading.risk_limits] portfolio_pct должен быть в [0, 100]")
+    if "min_trade_risk_pct" in value:
+        _finite_number(value["min_trade_risk_pct"], "[trading.risk_limits] min_trade_risk_pct", path, non_negative=True)
+        if value["min_trade_risk_pct"] > value["portfolio_pct"]:
+            raise ConfigError(
+                f"{path}: [trading.risk_limits] min_trade_risk_pct "
+                f"({value['min_trade_risk_pct']}) не может превышать portfolio_pct ({value['portfolio_pct']})"
+            )
     if "max_qty" in value and (isinstance(value["max_qty"], bool) or not isinstance(value["max_qty"], int) or value["max_qty"] <= 0):
         raise ConfigError(f"{path}: [trading.risk_limits] max_qty должен быть целым числом > 0")
-    groups = value.get("groups", {})
-    if not isinstance(groups, dict):
-        raise ConfigError(f"{path}: [trading.risk_limits] groups должна быть таблицей")
-    for group, limit in groups.items():
-        if not isinstance(group, str) or not group:
-            raise ConfigError(f"{path}: [trading.risk_limits] groups содержит пустое имя")
-        _finite_number(limit, f"[trading.risk_limits.groups] {group}", path, positive=True)
     return value
+
+
+def _validate_directions(value: dict, path: Path) -> dict[str, list[str]]:
+    """Проверка секции `[trading.directions]`: тип инструмента → список long/short."""
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path}: [trading.directions] должна быть таблицей")
+    cleaned: dict[str, list[str]] = {}
+    for instrument_type, directions in value.items():
+        key = f"[trading.directions] {instrument_type}"
+        if not isinstance(directions, list) or not directions:
+            raise ConfigError(f"{path}: {key} должен быть непустым списком направлений long/short")
+        invalid = [
+            item for item in directions
+            if not isinstance(item, str) or item not in _ALLOWED_DIRECTIONS
+        ]
+        if invalid:
+            raise ConfigError(f"{path}: {key} содержит недопустимые направления {sorted(invalid)}; допустимы только long/short в нижнем регистре")
+        cleaned[instrument_type] = list(dict.fromkeys(directions))
+    return cleaned
+
+
+def _reject_legacy_risk_keys(value: Mapping[str, Any], path: Path) -> None:
+    legacy = set(value) & _LEGACY_RISK_KEYS
+    if legacy:
+        raise ConfigError(
+            f"{path}: [trading.risk_limits] устаревшие отдельные лимиты {sorted(legacy)}. "
+            "Удалите trade_pct, instrument_pct и groups; проверьте и явно задайте "
+            "portfolio_pct — единый риск всего портфеля (поставляемый дефолт 2%). "
+            "Значения старых лимитов автоматически не переносятся."
+        )
+
+
+def _merge_management_tables(flat: dict[str, Any], inherited: Mapping[str, Any], path: Path) -> None:
+    """Нормализовать явную форму целей до наложения дефолтов предыдущего слоя."""
+    risk = flat.get("risk_limits")
+    if isinstance(risk, dict):
+        _reject_legacy_risk_keys(risk, path)
+        flat["risk_limits"] = {**inherited.get("risk_limits", {}), **risk}
+    profiles = flat.get("trade_management_profiles")
+    if not isinstance(profiles, dict):
+        return
+    merged = dict(inherited.get("trade_management_profiles", {}))
+    for name, supplied in profiles.items():
+        if not isinstance(supplied, dict):
+            raise ConfigError(f"{path}: [trade_management.profiles.{name}] должна быть таблицей")
+        supplied = dict(supplied)
+        if name == "atr_trend":
+            old_keys = set(supplied) & {"tp1_R", "tp1_share"}
+            new_keys = set(supplied) & {"target_R", "shares"}
+            if old_keys and new_keys:
+                raise ConfigError(f"{path}: [trade_management.profiles.{name}] конфликт target_R/shares и tp1_R/tp1_share")
+            if old_keys:
+                if len(old_keys) != 2:
+                    raise ConfigError(f"{path}: [trade_management.profiles.{name}] задайте полную пару tp1_R и tp1_share")
+                supplied["target_R"] = [supplied.pop("tp1_R")]
+                supplied["shares"] = [supplied.pop("tp1_share")]
+        parameters = {**merged.get(name, {}), **supplied}
+        if name == "atr_trend":
+            parameters.setdefault("target_R", [1.0, 2.0])
+            parameters.setdefault("shares", [0.25, 0.25])
+        merged[name] = parameters
+    flat["trade_management_profiles"] = merged
 
 
 def _validate_notifier_key(key: str, value: Any, path: Path) -> list[str]:
@@ -392,6 +503,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             continue
         if key == "risk_limits":
             cleaned[key] = _validate_risk_limits(value, path)
+            continue
+        if key == "directions":
+            cleaned[key] = _validate_directions(value, path)
             continue
         if key == "initial_deposit":
             if isinstance(value, bool):
@@ -550,7 +664,7 @@ def _normalize_notifier_channels(flat: dict[str, Any], path: Path) -> None:
     flat["notifier_channels"] = [legacy]
 
 
-def _parse(path: Path) -> dict[str, Any]:
+def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Чтение одного TOML-файла в «плоские» ключи конфигурации."""
     try:
         with open(path, "rb") as fh:
@@ -583,6 +697,7 @@ def _parse(path: Path) -> dict[str, Any]:
                 )
             flat[target] = value
     _normalize_notifier_channels(flat, path)
+    _merge_management_tables(flat, inherited or {}, path)
     return _validate(flat, path)
 
 
@@ -683,6 +798,6 @@ def load_config(
     for path in _candidate_files(config_file, bundled_file):
         if not path.is_file():
             continue
-        result.update(_parse(path))
+        result.update(_parse(path, result))
     _validate_combined_config(result, Path(config_file or CONFIG_FILENAME))
     return result

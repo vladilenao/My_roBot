@@ -407,3 +407,33 @@ class TestVirtualClockTicks:
         assert seen[0] == datetime(2024, 1, 1, 10, 1)
         assert seen[-1] == datetime(2024, 1, 1, 10, 10)
         assert len(seen) == 10
+
+
+class TestReanchorAfterGap:
+    """Переход часов через разрыв не должен ждать старших ТФ их пропущенных баров."""
+
+    def _timeline(self):
+        from src.scheduler.clock import HistoricalClock
+
+        clock = HistoricalClock(
+            datetime(2024, 1, 1, 10, 0), datetime(2024, 1, 1, 14, 0), timedelta(minutes=1), 0.0
+        )
+        return MultiTimeframeScheduler(["1m", "1h"], clock=clock), clock
+
+    def test_higher_timeframe_not_polled_right_after_jump(self):
+        timeline, clock = self._timeline()
+        timeline.wait_until_bar_published(lambda tf: True)
+        clock.jump_to(datetime(2024, 1, 1, 12, 0))
+
+        timeline.reanchor()
+        ready = timeline.wait_until_bar_published(lambda tf: tf == "1m")
+
+        assert ready == {"1m"}
+
+    def test_pending_catch_up_dropped_on_reanchor(self):
+        timeline, clock = self._timeline()
+        timeline.wait_until_bar_published(lambda tf: tf == "1m", wait_boundary=False)
+
+        timeline.reanchor()
+
+        assert timeline._pending == {}

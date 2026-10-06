@@ -184,3 +184,28 @@ def test_amounts_serialize_as_decimal_strings() -> None:
 
     assert payload["entry"] == "1234"
     assert payload["stop"] == "1200.5"
+
+
+def test_rich_admission_and_ownerless_portfolio_alert_match_schema():
+    diagnostics = {"budget_base": Decimal(100000), "portfolio_pct": Decimal(2), "risk_budget": Decimal(2000),
+                   "open_risk": Decimal(1200), "pending_risk": Decimal(120), "free_risk": Decimal(680),
+                   "risk_excess": Decimal(0), "risk_state": "known", "requested_quantity": 5,
+                   "selected_quantity": 2, "limiting_constraint": "margin"}
+    signal = Event.signal("SBER", side="BUY", quantity=2, entry=100, stop=96, diagnostics=diagnostics,
+                          fixed_reward_amount=160, fixed_quantity=2, net_reward_amount=120, algorithm_version="economics-v2")
+    rejected = Event.rejected("SBER", reason="ниже порога", code="payoff-below-floor",
+                             diagnostics={**diagnostics, "risk_amount": Decimal(100), "costs_amount": Decimal(40),
+                                          "payoff_ratio": Decimal("1.499"), "threshold": Decimal("1.5"), "algorithm_version": "economics-v2"})
+    alert = Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", **diagnostics)
+    for event in (signal, rejected, alert):
+        _validate(event.to_dict()["payload"], payload_schema(event.type))
+    assert "trade_id" not in alert.payload
+    assert rejected.to_dict()["payload"]["payoff_ratio"] == "1.499"
+
+
+def test_canonical_execution_money_matches_schema():
+    event = Event.broker_event(EventType.TRADE_CLOSED, trade_id="trade", quantity=5, price=106, fee=0,
+                              fee_source="broker", gross_pnl=60, fees_total=Decimal("22.5"), net_pnl=Decimal("37.5"),
+                              fees_known=True, pnl_units="RUB", quantity_remaining=0)
+    _validate(event.to_dict()["payload"], payload_schema(event.type))
+    assert event.to_dict()["payload"]["fee"] == "0"

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -59,8 +60,15 @@ def test_expected_r_for_short_sides_measures_adverse_move():
     assert plan.expected_r == Decimal("1.00")
 
 
-def test_expected_r_without_targets_is_zero():
-    assert _plan(targets=()).expected_r == Decimal("0")
+def test_expected_r_without_targets_is_absent():
+    """Нет целей — нет заявления о доходности: нуль означал бы «ничего не принесёт»."""
+    assert _plan(targets=()).expected_r is None
+
+
+def test_trade_plan_refuses_a_stop_that_lands_on_the_entry():
+    """Нулевой риск — это не план, поэтому модель не даёт его построить вовсе."""
+    with pytest.raises(ValueError, match="below entry"):
+        replace(_plan(), reference_entry=Decimal("96"), stop_price=Decimal("96"))
 
 
 def test_trade_state_rejects_average_price_without_quantity():

@@ -28,7 +28,9 @@ COMMITTED_MARGIN = Decimal("94783")
 META = ContractMeta(ticker="NGV6", price_step=1.0, step_cost=100.0, go_buy=GO, go_sell=GO)
 INSTRUMENT = SimpleNamespace(ticker="NGV6", short_name="NG")
 
-PROFILES = {"levels_rr": {"buffer_ticks": 1, "target_R": (1, 2), "shares": (0.5, 0.5)}}
+# Геометрия стопа закреплена: тест считает риск от своих же чисел.
+GEOMETRY = {"min_stop_atr": 0, "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}
+PROFILES = {"levels_rr": {"buffer_ticks": 1, "target_R": (1, 2), "shares": (0.5, 0.5), **GEOMETRY}}
 WIDE_LIMITS = RiskLimits(
     per_trade=Decimal("100"), per_instrument=Decimal("100"),
     per_group={}, portfolio=Decimal("100"),
