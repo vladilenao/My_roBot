@@ -49,6 +49,15 @@
 Блоки ниже перепечатывают `src/events/schema.py`: менять форму события нужно там, а
 документ и тест подтянутся проверкой.
 
+Необязательный `visual` — глубоко неизменяемый снимок версии 1 для Telegram:
+[visual-snapshot.json](visual-snapshot.json), исполнимый контракт `src/events/visual.py`.
+Он содержит исходный/актуальный планы, целые аллокации, подтверждённые исполнения
+и переносы стопа, происхождение комиссий и до 80 доступных закрытых свечей.
+`sequence` — устойчивый порядок фактов SQLite, `revision` — ревизия сделки;
+ключи нужны для delivery-корреляции и пользователю не выводятся. Старые события
+без `visual` сохраняют текстовое представление. Подробные истории ограничены
+64 элементами с явными агрегатами ранних исполнений, не потерей общего результата.
+
 ## События анализа
 
 Публикует бот по итогам тика: решение каждой стратегии, рекомендация, прошедшая допуск,
@@ -181,7 +190,8 @@
     "unknown_reason": {"type": "string"},
     "requested_quantity": {"type": "number"},
     "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"}
+    "limiting_constraint": {"type": "string"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -366,7 +376,7 @@ ISO8601.
 
 ### `order_rejected`
 
-Брокер отклонил заявку, сделка не открыта.
+Брокер отклонил операцию; уже открытая позиция от этого не становится закрытой.
 
 ```json
 {
@@ -415,7 +425,8 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -488,7 +499,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -555,7 +567,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "quantity_remaining": {"type": "number"},
     "requested_quantity": {"type": "number"},
     "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"}
+    "limiting_constraint": {"type": "string"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -619,7 +632,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -683,7 +697,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -691,7 +706,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `trade_closed`
 
-Позиция закрыта полностью.
+Выход из позиции. Полное закрытие определяется подтверждённым CLOSED/нулевым остатком,
+а не только типом события: REDUCE может оставить открытую часть.
 
 ```json
 {
@@ -747,7 +763,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -755,7 +772,7 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `trade_cancelled`
 
-Сделка снята до исполнения.
+Операция отменена. Отмена незаполненного остатка входа не отменяет исполненную позицию.
 
 ```json
 {
@@ -804,7 +821,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -920,7 +938,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }

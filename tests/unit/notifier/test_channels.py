@@ -110,7 +110,7 @@ class TestTelegramChannel:
 
         def fake_post(url, data, timeout):
             self.posts.append({"url": url, "text": data["text"]})
-            return _FakeResponse()
+            return _FakeResponse(body={"ok": True, "result": {"message_id": len(self.posts)}})
 
         monkeypatch.setattr(requests, "post", fake_post)
         self.channels: list[TelegramChannel] = []
@@ -136,7 +136,7 @@ class TestTelegramChannel:
 
         assert self.posts == []
 
-    def test_subscribes_to_five_trading_types_by_default(self) -> None:
+    def test_subscribes_to_nine_lifecycle_types_by_default(self) -> None:
         assert TelegramChannel.supported_types == TRADING_EVENT_TYPES
 
     def test_message_is_delivered_to_http_api(self) -> None:
@@ -145,7 +145,7 @@ class TestTelegramChannel:
         channel.close(timeout=2.0)
 
         assert [post["url"] for post in self.posts] == ["https://example.test/bottoken/sendMessage"]
-        assert "в работе, ждёт подтверждения" in self.posts[0]["text"]
+        assert "В работе, ждёт подтверждения" in self.posts[0]["text"]
 
     def test_event_outside_supported_types_is_not_sent(self) -> None:
         channel = self._channel()
@@ -178,7 +178,7 @@ class TestTelegramChannel:
             if len(attempts) == 1:
                 raise requests.ConnectionError("сеть недоступна")
             sent.append(data["text"])
-            return _FakeResponse()
+            return _FakeResponse(body={"ok": True, "result": {"message_id": len(attempts)}})
 
         monkeypatch.setattr(requests, "post", flaky_post)
         channel = self._channel()
@@ -188,7 +188,7 @@ class TestTelegramChannel:
 
         assert len(attempts) == 3
         assert len(sent) == 2
-        assert "сеть недоступна" in caplog.text
+        assert "ConnectionError" in caplog.text
 
     def test_queue_drops_oldest_when_full(self) -> None:
         channel = TelegramChannel(
@@ -224,6 +224,7 @@ class TestTelegramChannel:
                 channel._enqueue("долгое сообщение")
             channel.close(timeout=0.01)
         finally:
+            channel._worker.join(timeout=1)
             monkey.undo()
 
         assert "не завершился за" in caplog.text

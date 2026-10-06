@@ -20,6 +20,7 @@ from src.events.schema import (
     payload_schema,
 )
 from src.events.types import ALL_EVENT_TYPES, EventType
+from src.events.visual import validate as validate_visual, visual_schema
 
 DOC_PATH = Path(__file__).resolve().parents[3] / "docs" / "notification" / "event-schemas.md"
 
@@ -31,6 +32,7 @@ ALLOWED_SCHEMA_KEYS = {
     "properties",
     "additionalProperties",
     "items",
+    "$ref",
 }
 
 _JSON_TYPES: dict[str, type | tuple[type, ...]] = {
@@ -54,6 +56,10 @@ def _document_schemas() -> dict[str, dict]:
 
 
 def _validate(instance, schema, path: str = "payload") -> None:
+    if "$ref" in schema:
+        assert schema["$ref"] == "visual-snapshot.json"
+        validate_visual(instance, visual_schema(), path)
+        return
     unknown = set(schema) - ALLOWED_SCHEMA_KEYS
     assert not unknown, f"{path}: схема использует неподдерживаемые конструкции {sorted(unknown)}"
 
@@ -159,6 +165,10 @@ def test_document_schemas_match_code() -> None:
         assert documented[event_type.value] == payload_schema(event_type), (
             f"{event_type.value}: блок json в документе разошёлся с src/events/schema.py"
         )
+
+
+def test_visual_schema_document_matches_executable_contract():
+    assert json.loads(DOC_PATH.with_name("visual-snapshot.json").read_text()) == visual_schema()
 
 
 @pytest.mark.parametrize("event_type", sorted(ALL_EVENT_TYPES, key=lambda item: item.value))

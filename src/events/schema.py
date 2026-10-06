@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.events.types import EventType
+from src.events.visual import SCHEMA_ID
 
 DIAGNOSTIC_PAYLOAD_FIELDS = (
     "budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess",
@@ -102,6 +103,10 @@ OPTIONAL_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
 for _event_type in (EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT, EventType.TARGET_HIT, EventType.TRADE_CLOSED):
     OPTIONAL_PAYLOAD_FIELDS[_event_type] += FINANCIAL_PAYLOAD_FIELDS
 OPTIONAL_PAYLOAD_FIELDS[EventType.POSITION_ADDED] += ("requested_quantity", "selected_quantity", "limiting_constraint")
+for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT,
+                   EventType.TARGET_HIT, EventType.TRADE_CLOSED, EventType.STOP_MOVED,
+                   EventType.TRADE_CANCELLED, EventType.ORDER_REJECTED):
+    OPTIONAL_PAYLOAD_FIELDS[_event_type] += ("visual",)
 
 
 _JSON_TYPES: dict[str, str] = {
@@ -125,6 +130,8 @@ def _property(name: str) -> dict[str, Any]:
     ``Decimal`` сериализуется строкой, поэтому цены, цели, комиссия и
     ожидаемый результат — строки, а не числа: иначе теряются знаки и точность.
     """
+    if name == "visual":
+        return {"$ref": SCHEMA_ID}
     json_type = _JSON_TYPES.get(name, "string")
     if json_type == "array":
         return {"type": "array", "items": {"type": "string"}}

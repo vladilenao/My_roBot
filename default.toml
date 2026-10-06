@@ -33,7 +33,8 @@ events = [
 [notifier.telegram]
 # В Telegram по умолчанию только торговые события, без служебных.
 events = [
-    "signal", "stop_hit", "target_hit", "trade_closed", "trade_opened"
+    "signal", "stop_hit", "target_hit", "trade_closed", "trade_opened",
+    "position_added", "stop_moved", "trade_cancelled", "order_rejected"
 ]
 
 # Явные привязки с глобальными ID и профилями управления; каскад ТФ: глобальный 1h, timeframe

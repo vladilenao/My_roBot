@@ -42,6 +42,10 @@ TRADING_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.STOP_HIT,
         EventType.TARGET_HIT,
         EventType.TRADE_CLOSED,
+        EventType.POSITION_ADDED,
+        EventType.STOP_MOVED,
+        EventType.TRADE_CANCELLED,
+        EventType.ORDER_REJECTED,
     }
 )
 

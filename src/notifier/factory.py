@@ -15,7 +15,7 @@ from src.notifier.telegram import TelegramChannel
 log = get_logger(__name__)
 
 
-def build_channels(names=None) -> list[Channel]:
+def build_channels(names=None, *, state_dir=None) -> list[Channel]:
     """Собрать каналы уведомлений, в порядке конфигурации.
 
     ``names=None`` читает каналы конфигурации. Явный ``names=[]`` собирает
@@ -44,6 +44,7 @@ def build_channels(names=None) -> list[Channel]:
                     cloudflare_url=config.CLOUDFLARE_URL,
                     tz_offset_hours=config.BAR_TIME_TZ_OFFSET_HOURS,
                     supported_types=parse_event_types(events),
+                    delivery_path=(state_dir or config.runtime_dir()) / "telegram_delivery.sqlite3",
                 )
             )
         else:

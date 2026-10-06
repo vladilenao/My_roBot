@@ -345,7 +345,7 @@ def _launch(
         if report.notes:
             print(report.message())
 
-    channels = build_channels(channel_names)
+    channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
     bus.subscribe_all(channels)
     timeline = MultiTimeframeScheduler(
@@ -495,16 +495,28 @@ def _build_runtime(
 
     def publish_execution(execution, details):
         action = details["action_type"].split(":", 1)[0]
-        event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
+        if str(execution.status) == "reject":
+            event_type = EventType.ORDER_REJECTED
+        elif str(execution.status) == "cancel":
+            event_type = EventType.TRADE_CANCELLED
+        elif action == "MOVESTOP":
+            event_type = EventType.STOP_MOVED
+        else:
+            event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
                       "STOP": EventType.STOP_HIT, "TARGET": EventType.TARGET_HIT,
                       "REDUCE": EventType.TRADE_CLOSED, "CLOSE": EventType.TRADE_CLOSED}[action]
         bus.publish(Event.broker_event(event_type, trade_id=execution.trade_id,
             instrument=names.get(details["instrument_id"]) or "контракт не указан",
             bar_time=execution.timestamp, quantity=execution.filled_quantity, price=execution.price,
-            fee=execution.fee, fee_source=str(execution.fee_source), reason=execution.reason,
-            execution_id=execution.execution_id, status=str(execution.status),
-            **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
-                                           "requested_quantity", "selected_quantity", "limiting_constraint") if key in details}))
+             reason=execution.reason,
+             **({"fee": execution.fee, "fee_source": str(execution.fee_source)}
+                if str(execution.status) in {"fill", "partial"} else {}),
+             execution_id=execution.execution_id, status=str(execution.status),
+             visual=details.get("visual"),
+             timeframe=details["visual"].data["timeframe"] if details.get("visual") else "",
+             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+                                            "requested_quantity", "selected_quantity", "limiting_constraint")
+                if key in details and str(execution.status) in {"fill", "partial"}}))
 
     trade_manager = TradeManager(
         storage,
@@ -529,6 +541,7 @@ def _build_runtime(
         clock=clock,
     )
     trade_manager.restore()
+    trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
     contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
@@ -771,4 +784,8 @@ def _strategy_map():
 
 
 if __name__ == "__main__":
-    sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)
+    if "--telegram-chart-smoke" in sys.argv[1:]:
+        from src.notifier.telegram_chart import smoke
+        smoke()
+    else:
+        sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)

@@ -11,6 +11,7 @@ from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
 from src.events.event import Event
+from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
 from src.notifier.errors import is_rate_limit
 from src.scheduler.clock import as_aware
@@ -276,6 +277,9 @@ class TradingBot:
         tf: str = "",
         entry_candidates: list[_EntryCandidate] | None = None,
     ) -> None:
+        remember_market = getattr(self._trade_manager, "remember_market", None)
+        if callable(remember_market):
+            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -395,6 +399,8 @@ class TradingBot:
                 quantity=quantity,
                 timeframe=candidate.timeframe,
                 diagnostics=diagnostics,
+                frame=candidate.frame,
+                as_of=candidate.decision.bar_time,
             )
         self._dispatch_management_actions(
             admission.actions,
@@ -533,9 +539,14 @@ class TradingBot:
         quantity: int = 0,
         timeframe: str = "",
         diagnostics=None,
+        frame=None,
+        as_of=None,
     ) -> None:
         """Publish the admitted plan: it is queued, not yet executed."""
         economics = plan.economics
+        contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
+        meta = contract_for(instrument.ticker) if callable(contract_for) else None
+        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
         self._bus.publish(
             Event.signal(
                 self._display_name(instrument),
@@ -557,6 +568,8 @@ class TradingBot:
                 strategy=plan.profile.name,
                 timeframe=timeframe or plan.timeframe,
                 trade_id=plan.trade_id,
+                bar_time=as_of,
+                visual=visual,
             )
         )
 

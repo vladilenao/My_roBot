@@ -11,8 +11,8 @@
                                     └── подписчик фильтрует по supported_types
 ```
 
-Контур не знает про каналы, Telegram и тексты. Канал не знает про стратегии,
-сделки и базу. Связь только через `Event` и `EventType`.
+Контур не знает про каналы, Telegram и тексты. Канал получает торговые данные
+только из `Event`; Telegram отдельно хранит receipts/ссылки доставки, не финансовую истину.
 
 ## Событие
 
@@ -27,7 +27,8 @@ class Event:
 ```
 
 `bar_time` — время закрытия бара, а не время публикации уведомления.
-`payload` — `MappingProxyType`: изменить его на месте нельзя.
+`payload` глубоко неизменяем: изменить вложенные коллекции на месте нельзя.
+Необязательный `visual` содержит ограниченный самодостаточный снимок сделки/свечей.
 
 ## Каталог типов
 
@@ -72,6 +73,9 @@ class Event:
   unknown-state с причиной. Для портфельного сообщения отдельный trade_id не
   требуется. Legacy структурные BrokerEvent продолжают переводиться в Event.
 - `heartbeat` и `error` — из торгового контура напрямую.
+- `stop_moved` — после действующего ACK переноса, не acceptance `next-bar`.
+  Старый/новый подтверждённые уровни и effective time сохраняются в lifecycle-снимке.
+  Отмена/отказ операции при открытой позиции не подменяют её состояние закрытым.
 
 ## События исполнителя: соответствие и текст
 
@@ -115,15 +119,17 @@ class Channel(ABC):
 
 - **console** — источник истины. По умолчанию весь каталог событий, печать в
   `stdout` через `print`, без записи в логгер.
-- **telegram** — по умолчанию только `signal`, `trade_opened`, `stop_hit`,
-  `target_hit`, `trade_closed`. Доставка неблокирующая: `handle()` кладёт текст
-  в `queue.Queue(maxsize=1000)` и возвращается, отправляет один daemon-поток.
+- **telegram** — по умолчанию `signal`, `trade_opened`, `position_added`, `stop_hit`,
+  `target_hit`, `stop_moved`, `trade_closed`, `trade_cancelled`, `order_rejected`.
+  `handle()` кладёт Event в `queue.Queue(maxsize=1000)`; один daemon-поток
+  форматирует, рендерит и отправляет [визуальную историю](telegram-cards.md).
 
 ### Очередь Telegram
 
 - Переполнение означает, что сеть не успевает: отбрасывается **самое старое**
   сообщение, чтобы свежие состояния сделки не терялись.
-- Сообщение длиннее 4096 символов режется по границам строк.
+- Текст до 4096/подпись фото до 1024 после разбора HTML; подробности идут
+  продолжениями, без разрыва HTML-тегов/сущностей.
 - `429` и сетевые исключения пишутся в `bot_debug.log` и **не повторяются**.
 - Без токена или `chat_id` канал не отправляет и не печатает ничего: в этом
   случае пользователь не увидел бы уведомление и не понял бы почему.
@@ -140,7 +146,8 @@ channels = ["console", "telegram"]   # порядок подписки
 events = ["decision", "signal", "rejected", "heartbeat", "error"]
 
 [notifier.telegram]
-events = ["signal", "trade_opened", "stop_hit", "target_hit", "trade_closed"]
+events = ["signal", "trade_opened", "position_added", "stop_hit", "target_hit",
+          "stop_moved", "trade_closed", "trade_cancelled", "order_rejected"]
 ```
 
 Старый ключ `channel = "telegram"` поддерживается и равносилен
@@ -153,7 +160,8 @@ events = ["signal", "trade_opened", "stop_hit", "target_hit", "trade_closed"]
 
 ## Формулировки
 
-Тексты собраны в `src/notifier/templates/` и принадлежат каналу:
+Консольные тексты собраны в `src/notifier/templates/`; HTML Telegram — в
+`src/notifier/telegram_templates.py`. Шаблоны принадлежат своему каналу:
 
 - `decision` — `● NG-10.26 (1h) 22:45 | macd [basic] ➜ 🟢 ПОКУПКА (BUY) — Цена: 1234.568`
 - `rejected` — `⛔ NG-10.26 ➜ Сделка не допущена: Размер ниже минимального`

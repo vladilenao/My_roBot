@@ -118,7 +118,7 @@ def test_to_dict_is_json_serializable_shape() -> None:
     assert data["payload"]["side"] == "BUY"
 
 
-def test_catalog_has_nineteen_types_and_five_trading() -> None:
+def test_catalog_has_nineteen_types_and_nine_lifecycle_types() -> None:
     assert len(EventType) == 19
     assert len(ALL_EVENT_TYPES) == 19
     assert TRADING_EVENT_TYPES == frozenset(
@@ -128,6 +128,10 @@ def test_catalog_has_nineteen_types_and_five_trading() -> None:
             EventType.STOP_HIT,
             EventType.TARGET_HIT,
             EventType.TRADE_CLOSED,
+            EventType.POSITION_ADDED,
+            EventType.STOP_MOVED,
+            EventType.TRADE_CANCELLED,
+            EventType.ORDER_REJECTED,
         }
     )
 

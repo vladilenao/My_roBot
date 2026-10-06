@@ -47,6 +47,9 @@ from src.trade_management.pipeline import (
     build_profile_snapshot,
 )
 from src.trade_management.profiles.base import ManagementContext, PlanningContext, ProfileResult
+from src.trade_management.notification import lifecycle_snapshot
+from src.events.visual import market_snapshot, utc
+from src.scheduler.timing import CandleScheduler
 
 
 log = get_logger(__name__)
@@ -186,6 +189,8 @@ class TradeManager:
         self._post_fill_check = post_fill_check
         self._budget_observer = budget_observer
         self._execution_observer = execution_observer
+        self._visual_instruments = {}
+        self._visual_markets = {}
         self._last_budget_alert = None
         self._profiles_config = dict(profiles_config or {})
         self._risk_limits = risk_limits or _DEFAULT_RISK_LIMITS
@@ -561,6 +566,9 @@ class TradeManager:
         """Reduce one broker event, then schedule post-fill risk/protection checks."""
         if isinstance(event, FeeAdjustment):
             return self._reducer.apply_fee_adjustment(event)
+        previous_protection = self._storage.connection.execute(
+            "SELECT s.confirmed_stop,p.quantity FROM protection s JOIN positions p USING(trade_id) WHERE s.trade_id=?",
+            (event.trade_id,)).fetchone()
         if event.fee is None:
             row = self._storage.connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
             snapshot = json.loads(row[0]).get("cost_snapshot") if row else None
@@ -568,17 +576,36 @@ class TradeManager:
         applied = self._reducer.apply(event)
         if not applied:
             return False
-        if event.status is ExecutionStatus.ACK:
-            self._confirm_stop(event)
+        stop_confirmed = event.status is ExecutionStatus.ACK and self._confirm_stop(event)
         if event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
             self._enforce_entry_slippage_guard(event)
             self._rebase_open_targets(event)
-            self._notify_execution(event)
+            actual_stop = self._storage.connection.execute("SELECT confirmed_stop FROM protection WHERE trade_id=?",
+                                                         (event.trade_id,)).fetchone()
+            if actual_stop and actual_stop[0] is not None and previous_protection and (
+                    previous_protection[1] == 0 or previous_protection[0] != actual_stop[0]):
+                with self._storage.transaction() as connection:
+                    payload = json.loads(connection.execute("SELECT payload_json FROM events WHERE event_id=?",
+                                                            (event.execution_id,)).fetchone()[0])
+                    payload["confirmed_stop"] = {"old": previous_protection[0] if previous_protection[1] else None,
+                                                 "new": actual_stop[0], "effective_at": event.timestamp.isoformat()}
+                    connection.execute("UPDATE events SET payload_json=? WHERE event_id=?",
+                                       (json.dumps(payload, sort_keys=True), event.execution_id))
             self._record_portfolio_budget(event_id=event.execution_id)
         if event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL} and self._post_fill_check:
             for action in self._post_fill_check(event):
                 self.submit_action(action)
+        if stop_confirmed or event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL, ExecutionStatus.CANCEL, ExecutionStatus.REJECT}:
+            self._notify_execution(event)
         return True
+
+    def configure_visual_context(self, instruments):
+        """Runtime metadata, independent of the notification channel."""
+        self._visual_instruments.update({i.ticker: i for i in instruments})
+
+    def remember_market(self, instrument, timeframe, frame, as_of):
+        self._visual_instruments[instrument.ticker] = instrument
+        self._visual_markets[instrument.ticker, timeframe] = market_snapshot(frame, timeframe, as_of)
 
     def _notify_execution(self, event):
         if self._execution_observer is None:
@@ -598,8 +625,25 @@ class TradeManager:
         if action == "ADD":
             metadata = json.loads(payload)
             details.update(selected_quantity=selected, requested_quantity=metadata.get("requested_quantity"),
-                           limiting_constraint=metadata.get("limiting_constraint"))
+                            limiting_constraint=metadata.get("limiting_constraint"))
         try:
+            # A separate read transaction cannot write or change trade state.
+            connection = self._storage.connection
+            connection.execute("BEGIN")
+            try:
+                plan_row = connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
+                timeframe = json.loads(plan_row[0]).get("timeframe", "")
+                market = self._visual_markets.get((instrument, timeframe))
+                if market is not None:
+                    grid = CandleScheduler(timeframe)
+                    market = dict(market, candles=tuple(c for c in market["candles"]
+                                                       if utc(grid.bar_close(utc(c["time"]))) <= utc(event.timestamp)))
+                contract_for = getattr(self._broker, "contract_for", None)
+                meta = contract_for(instrument) if callable(contract_for) else None
+                details["visual"] = lifecycle_snapshot(connection, event,
+                    instrument=self._visual_instruments.get(instrument), meta=meta, market=market)
+            finally:
+                connection.rollback()
             self._execution_observer(event, details)
         except Exception as exc:
             log.warning("Не удалось доставить подтверждённое исполнение: %s", exc)
@@ -1572,15 +1616,17 @@ class TradeManager:
             (str(self._initial_balance), str(self._initial_balance), now),
         )
 
-    def _confirm_stop(self, event: ExecutionEvent) -> None:
+    def _confirm_stop(self, event: ExecutionEvent) -> bool:
         if event.reason == "next-bar":
-            return  # Request acceptance; simulator protection is not active yet.
+            return False  # Request acceptance; simulator protection is not active yet.
         with self._storage.transaction() as connection:
             row = connection.execute(
                 "SELECT requested_price FROM orders WHERE command_id = ? AND action_type = 'MOVESTOP'",
                 (event.command_id,),
             ).fetchone()
             if row is not None:
+                old = connection.execute("SELECT confirmed_stop FROM protection WHERE trade_id=?",
+                                         (event.trade_id,)).fetchone()[0]
                 connection.execute(
                     "UPDATE protection SET confirmed_stop=?, pending_stop=NULL, confirmed_order_id=?, "
                     "pending_command_id=NULL, updated_at=? WHERE trade_id=?",
@@ -1590,6 +1636,13 @@ class TradeManager:
                     "UPDATE trades SET state_revision = state_revision + 1, updated_at = ? WHERE trade_id = ?",
                     (event.timestamp.isoformat(), event.trade_id),
                 )
+                payload = json.loads(connection.execute("SELECT payload_json FROM events WHERE event_id=?",
+                                                        (event.execution_id,)).fetchone()[0])
+                payload["confirmed_stop"] = {"old": old, "new": row[0], "effective_at": event.timestamp.isoformat()}
+                connection.execute("UPDATE events SET payload_json=? WHERE event_id=?",
+                                   (json.dumps(payload, sort_keys=True), event.execution_id))
+                return True
+        return False
 
 
 def _profile_payload(plan: TradePlan) -> dict[str, object]:

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 
 from src.events.types import EventType
 from src.events.schema import DIAGNOSTIC_PAYLOAD_FIELDS
+from src.events.visual import VisualSnapshot, freeze
 
 _EXECUTION_AMOUNTS = frozenset(
     {"price", "stop", "take_profit", "pnl", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
@@ -38,7 +39,8 @@ def _freeze(payload: Mapping[str, Any] | None) -> Mapping[str, Any]:
     """
     if not payload:
         return MappingProxyType({})
-    return MappingProxyType({key: value for key, value in payload.items() if value is not None})
+    return freeze({key: value.data if isinstance(value, VisualSnapshot) else value
+                   for key, value in payload.items() if value is not None})
 
 
 def _amount(value: Any) -> Any:
@@ -172,6 +174,7 @@ class Event:
         bar_time: Any = None,
         timeframe: str = "",
         trade_id: str = "",
+        visual: VisualSnapshot | Mapping | None = None,
     ) -> "Event":
         """Рекомендация: план допущен и уйдёт в заявку, но ещё не исполнен."""
         return cls._make(
@@ -198,6 +201,7 @@ class Event:
                 "strategy": strategy,
                 "filter_profile": filter_profile,
                 "trade_id": trade_id,
+                "visual": visual,
             },
         )
 
