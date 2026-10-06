@@ -2,50 +2,15 @@ import sqlite3
 
 import pytest
 
-from src.trade_journal.schema import SCHEMA_VERSION, UnsupportedSchemaVersion
+from src.trade_journal.schema import SCHEMA_V9_SQL, SCHEMA_VERSION, UnsupportedSchemaVersion
 from src.trade_journal.storage import BUSY_TIMEOUT_MS, connect
-
-V7_SCHEMA_SQL = """
-CREATE TABLE trades (
-    trade_id TEXT PRIMARY KEY,
-    assignment_id TEXT NOT NULL,
-    instrument_id TEXT NOT NULL,
-    signal_id TEXT NOT NULL,
-    side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
-    plan_json TEXT NOT NULL,
-    profile_json TEXT NOT NULL,
-    phase TEXT NOT NULL,
-    state_revision INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
-    profile_state_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (assignment_id, instrument_id, trade_id)
-);
-CREATE TABLE positions (
-    trade_id TEXT PRIMARY KEY REFERENCES trades(trade_id) ON DELETE CASCADE,
-    side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
-    quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
-    average_price TEXT,
-    realized_pnl TEXT NOT NULL DEFAULT '0',
-    fees TEXT NOT NULL DEFAULT '0',
-    net_realized_pnl TEXT NOT NULL DEFAULT '0',
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE account (
-    account_id INTEGER PRIMARY KEY CHECK (account_id = 1),
-    balance TEXT NOT NULL,
-    equity TEXT NOT NULL,
-    realized_pnl TEXT NOT NULL DEFAULT '0',
-    fees TEXT NOT NULL DEFAULT '0',
-    net_realized_pnl TEXT NOT NULL DEFAULT '0',
-    updated_at TEXT NOT NULL
-);
-"""
-
 
 def _make_v7_database(path, *, balance: str = "1000") -> None:
     connection = sqlite3.connect(path)
-    connection.executescript(V7_SCHEMA_SQL)
+    connection.executescript(SCHEMA_V9_SQL)
+    connection.execute("ALTER TABLE trades DROP COLUMN price_step")
+    connection.execute("ALTER TABLE trades DROP COLUMN step_cost")
+    connection.execute("DROP TABLE instrument_names")
     connection.execute(
         "INSERT INTO trades (trade_id, assignment_id, instrument_id, signal_id, side, plan_json, "
         "profile_json, phase, state_revision, profile_state_json, created_at, updated_at) "

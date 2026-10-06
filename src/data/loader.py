@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from t_tech.invest import Client
 from t_tech.invest.utils import now
 from src.config import TIMEFRAMES
+from src.api.client import ClientProvider, client_context
 from src.api.instruments import find_working_instrument
 from src.api.retry import (
     DEFAULT_BASE_DELAY,
@@ -16,8 +17,21 @@ from src.api.retry import (
 )
 from src.data.timeutil import to_aware_utc
 from src.logging_setup import get_logger
+from src.scheduler.clock import Clock, as_clock
 
 log = get_logger(__name__)
+
+
+def _market_now(clock: Clock | None = None) -> datetime:
+    """Текущий рыночный момент: виртуальные часы прогона либо системные часы."""
+    return as_clock(clock).now() if clock is not None else now().replace(tzinfo=None)
+
+
+def _client_context(client_provider: ClientProvider | None = None, token=None):
+    """Контекстный менеджер клиента выбранного источника данных."""
+    if client_provider is not None:
+        return client_provider.client_context(token)
+    return client_context(token)
 
 
 def load_candles(
@@ -28,6 +42,8 @@ def load_candles(
     end_date=None,
     token=None,
     instrument_id=None,
+    client_provider=None,
+    clock=None,
 ):
 
 
@@ -35,21 +51,22 @@ def load_candles(
     Загружает исторические свечи. Полностью повторяет вашу функцию main().
     """
     simple_df = []
+    market_now = _market_now(clock)
 
     if timeframe not in TIMEFRAMES:
         raise ValueError(f"Неподдерживаемый таймфрейм '{timeframe}'. Доступные: {list(TIMEFRAMES.keys())}")
 
    # if instrument_type not in ["share", "futures"]:
-    #    raise ValueError(f"Неподдерживаемый тип инструмента '{instrument_type}'. Доступные: ['share', 'futures']")
+   #    raise ValueError(f"Неподдерживаемый тип инструмента '{instrument_type}'. Доступные: ['share', 'futures']")
 
     if start_date is None:
-        start_date = now() - timedelta(days=30)
+        start_date = market_now - timedelta(days=30)
     elif isinstance(start_date, str):
         start_date = datetime.strptime(start_date, '%Y-%m-%d')
     start_date = to_aware_utc(start_date)
 
     if end_date is None:
-        end_date = now()
+        end_date = market_now
     elif isinstance(end_date, str):
         end_date = datetime.strptime(end_date, '%Y-%m-%d')
     end_date = to_aware_utc(end_date)
@@ -57,9 +74,11 @@ def load_candles(
     if start_date >= end_date:
         raise ValueError("Дата начала должна быть меньше даты окончания")
 
-    with Client(token) as client:
+    with _client_context(client_provider, token) as client:
         if instrument_id is None:
-            instrument_id = find_working_instrument(client, ticker, instrument_type)
+            instrument_id = find_working_instrument(
+                client, ticker, instrument_type, market_now=market_now
+            )
 
         # Итерация по get_all_candles тоже может падать с RESOURCE_EXHAUSTED —
         # api_call_with_retry оборачивает только создание потока. При rate-limit

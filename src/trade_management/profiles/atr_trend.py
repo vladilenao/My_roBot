@@ -13,9 +13,11 @@ from src.trade_management.profiles.base import (
     ProfileResult,
     TradeManagementProfile,
     shared_management_rules,
+    shared_planning_rules,
 )
 from src.trade_management.profiles.rules import (
     add_quantity,
+    allocate_target_quantities,
     initial_stop,
     initial_target,
     validate_price,
@@ -29,6 +31,7 @@ class AtrTrendProfile(TradeManagementProfile):
 
     NAME = "atr_trend"
 
+    @shared_planning_rules
     def plan(self, context: PlanningContext) -> TradePlan | ProfileResult:
         side = _side(context.signal.signal_type)
         if side is None:
@@ -41,17 +44,23 @@ class AtrTrendProfile(TradeManagementProfile):
         atr_value = validate_price(atr, "atr")
         step = validate_price_step(_market_value(context.market, "price_step"))
         initial_k = _positive_parameter(context.profile.parameters, "initial_k", "2")
-        tp1_r = _positive_parameter(context.profile.parameters, "tp1_R", "1")
-        tp1_share = _share(context.profile.parameters.get("tp1_share", "0.5"))
+        if context.market.get("algorithm_version") == "economics-v2":
+            multiples = context.profile.parameters.get("target_R", (1, 2))
+            shares = context.profile.parameters.get("shares", ("0.25", "0.25"))
+        else:
+            multiples = (_positive_parameter(context.profile.parameters, "tp1_R", "1"),)
+            shares = (_share(context.profile.parameters.get("tp1_share", "0.5")),)
         raw_stop = entry - initial_k * atr_value if side == "BUY" else entry + initial_k * atr_value
         stop = initial_stop(raw_stop, step, side)
         entry, stop = validate_stop(entry, stop, side)
         risk = entry - stop if side == "BUY" else stop - entry
-        target = initial_target(
-            entry + risk * tp1_r if side == "BUY" else entry - risk * tp1_r,
-            step,
-            side,
-        )
+        try:
+            targets = tuple(TargetPlan(f"tp-{index}", entry if context.market.get("algorithm_version") == "economics-v2" else initial_target(
+                entry + risk * Decimal(str(multiple)) if side == "BUY" else entry - risk * Decimal(str(multiple)),
+                step, side), Decimal(str(share)))
+                for index, (multiple, share) in enumerate(zip(multiples, shares, strict=True), start=1))
+        except ValueError:
+            return ProfileResult(state={"reason": "target-not-ahead"})
         return TradePlan(
             trade_id=context.trade_id,
             assignment_id=context.assignment_id,
@@ -60,7 +69,7 @@ class AtrTrendProfile(TradeManagementProfile):
             signal_id=context.signal.event_id or context.trade_id,
             reference_entry=entry,
             stop_price=stop,
-            targets=(TargetPlan("tp-1", target, tp1_share),),
+            targets=targets,
             profile=context.profile,
             created_at=_created_at(context),
         )
@@ -79,6 +88,8 @@ class AtrTrendProfile(TradeManagementProfile):
         extreme_key = "high" if context.plan.side == "BUY" else "low"
         extreme_value = context.market.get(extreme_key)
         if atr is None or extreme_value is None:
+            if context.plan.algorithm_version == "economics-v2":
+                return ProfileResult(state={"reason": "insufficient-history", "trailing_active": True, "adds_disabled": True})
             return ProfileResult(state={"reason": "insufficient-history"})
 
         atr_value = validate_price(atr, "atr")
@@ -135,6 +146,8 @@ class AtrTrendProfile(TradeManagementProfile):
             if context.plan.side == "BUY"
             else context.plan.stop_price - context.plan.reference_entry
         )
+        if context.plan.algorithm_version == "economics-v2" and state.initial_stop_distance is not None:
+            risk = state.initial_stop_distance
         advance_r = _positive_parameter(context.plan.profile.parameters, "advance_R", "0.5")
         advanced = (
             price - last_entry >= risk * advance_r
@@ -164,6 +177,18 @@ class AtrTrendProfile(TradeManagementProfile):
 
 
 def _trailing_is_active(context: ManagementContext) -> bool:
+    if context.plan.algorithm_version == "economics-v2":
+        if context.state.trailing_active or context.state.completed_target_ids:
+            return True
+        if not context.market.get("holding_bar_eligible", False):
+            return False
+        maximum = context.state.max_quantity or context.state.quantity
+        allocation = allocate_target_quantities(maximum, context.plan.targets, retain_remainder_for_trailing=True)
+        if any(a.target_id == context.plan.targets[0].target_id for a in allocation.targets):
+            return False
+        threshold = context.state.target_prices.get(context.plan.targets[0].target_id, context.plan.targets[0].price)
+        observed = context.market.get("high" if context.plan.side == "BUY" else "low")
+        return observed is not None and (validate_price(observed) >= threshold if context.plan.side == "BUY" else validate_price(observed) <= threshold)
     if "tp-1" in context.state.completed_target_ids:
         return True
     # A one-contract position has no TP1 order; its threshold touch enables trailing.

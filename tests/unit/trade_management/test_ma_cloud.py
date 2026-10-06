@@ -13,7 +13,11 @@ def _planning(side=SignalType.BUY, *, ma10="103", ma40="100"):
         assignment_id="assignment-1",
         instrument_id="NG-10.26",
         signal=Decision(side, 104.0, event_id="signal-1"),
-        profile=ProfileSnapshot("ma_cloud", "1", {"buffer_ticks": 1, "max_adds": 2}),
+        profile=ProfileSnapshot(
+            "ma_cloud", "1",
+            {"buffer_ticks": 1, "max_adds": 2,
+             "min_stop_atr": 0, "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None},
+        ),
         market={"price_step": "1", "ma10": ma10, "ma40": ma40},
     )
 

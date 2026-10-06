@@ -43,7 +43,7 @@ def _write_closed_trade(connection, trade_id, instrument, *, price_step=None, st
              executed_at, executed_at),
         )
         connection.execute(
-            "INSERT INTO fills VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?)",
+            "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?)",
             (fill_id, order_id, trade_id, command_id, f"exec-{fill_id}", quantity, price,
              executed_at),
         )
@@ -97,7 +97,7 @@ def test_trade_summary_keeps_plan_volume_and_exit_sequence(tmp_path):
                     (order_id, "BR-10.26-20260918-00143", f"command-{order_id}", action, quantity, quantity, price, executed_at, executed_at),
                 )
                 connection.execute(
-                    "INSERT INTO fills VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?)",
+                    "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES (?, ?, ?, ?, ?, ?, ?, '0', ?)",
                     (fill_id, order_id, "BR-10.26-20260918-00143", f"command-{order_id}", fill_id, quantity, price, executed_at),
                 )
                 reason = "TP1" if action.startswith("TARGET") else "STOP" if action == "STOP" else ""
@@ -112,18 +112,24 @@ def test_trade_summary_keeps_plan_volume_and_exit_sequence(tmp_path):
     with summary.open(newline="", encoding="utf-8") as handle:
         row = next(csv.DictReader(handle))
     assert set(row) == {
-        "Trade ID", "Контракт", "Направление", "Статус", "Время входа", "Время выхода",
+        "Контракт", "Направление", "Статус", "Время входа", "Время выхода",
         "Длительность", "План входа", "План стопа", "План TP1", "Начальный объем", "Добрано",
         "Макс. объем", "Средняя входа", "Выходы", "Средняя выхода", "Финальная причина",
-        "Сценарий выхода", "Gross PnL", "Комиссия", "Net PnL", "Ед. PnL", "Initial Risk",
-        "Result", "MAE", "MFE",
+        "Сценарий выхода", "Gross PnL", "Комиссия", "Net PnL", "Ед. PnL", "Плановый риск (₽)",
+        "Initial Risk (₽)", "Result (R)", "MAE (R)", "MFE (R)",
+        "Полнота издержек", "Полнота экстремумов", "Определение экстремумов", "Версия алгоритма",
     }
     assert row["Статус"] == "закрыта"
     assert row["Начальный объем"] == "5"
     assert row["Добрано"] == "3"
     assert row["Макс. объем"] == "8"
-    assert row["Выходы"] == "TP1: 2 @104.00; STOP: 6 @98.00"
-    assert row["Initial Risk"] == "500.00"
+    assert row["Выходы"] == "TP1: 2 @104.00; стоп: 6 @98.00"
+    assert row["Плановый риск (₽)"] == "500.00"
+    # Without a step cost there is no way to price the risk in rubles, and the
+    # card says so rather than scoring bare price points as money.
+    assert row["Initial Risk (₽)"] == ""
+    assert row["Result (R)"] == ""
+    assert row["MAE (R)"] == ""
     assert row["Ед. PnL"] == "RAW"
     assert row["Комиссия"] == "-38.00"
     assert row["Net PnL"] == "-45.00"
@@ -137,7 +143,7 @@ def test_trade_summary_keeps_plan_volume_and_exit_sequence(tmp_path):
     assert event_rows[0]["Средняя цена после"] == "100.00"
     assert event_rows[1]["Объем позиции до"] == "5"
     assert event_rows[1]["Объем позиции после"] == "8"
-    assert event_rows[2]["Событие"] == "Цель target-1 исполнена"
+    assert event_rows[2]["Событие"] == "Цель TP1 исполнена"
     assert event_rows[2]["Объем позиции до"] == "8"
     assert event_rows[2]["Объем позиции после"] == "6"
     assert event_rows[3]["Объем позиции после"] == ""
@@ -156,10 +162,12 @@ def test_trade_summary_marks_ruble_and_raw_epoch_rows(tmp_path):
             )
     with summary.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    by_trade = {row["Trade ID"]: row for row in rows}
+    by_trade = {row["Ед. PnL"]: row for row in rows}
     assert len(by_trade) == 2
-    assert by_trade["BR-10.26-20260918-00144"]["Ед. PnL"] == "RAW"
-    assert by_trade["BR-10.26-20260918-00145"]["Ед. PnL"] == "RUB"
-    assert by_trade["BR-10.26-20260918-00145"]["Net PnL"] == "-45.00"
-    assert by_trade["BR-10.26-20260918-00145"]["Initial Risk"] == "500.00"
-    assert by_trade["BR-10.26-20260918-00145"]["Result"] == "-0.09"
+    assert by_trade["RAW"]["Ед. PnL"] == "RAW"
+    assert by_trade["RUB"]["Ед. PnL"] == "RUB"
+    assert by_trade["RUB"]["Net PnL"] == "-45.00"
+    assert by_trade["RUB"]["Плановый риск (₽)"] == "500.00"
+    # risk per unit 2 points, step 8.4 RUB over a 10-point step, on the peak of 8 contracts
+    assert by_trade["RUB"]["Initial Risk (₽)"] == "13.44"
+    assert by_trade["RUB"]["Result (R)"] == "-3.35"

@@ -160,7 +160,7 @@ class TestGeometricRisk:
 
 
 class TestOverRisk:
-    def test_marks_and_cancels_oldest_non_over_risk(self):
+    def test_marks_excess_without_cancelling_another_accepted_order(self):
         mgr = _manager(initial=1000, max_risk=2.0)  # кап перекоса = 3000
         # NG-позиция уже превышает порог (1 лот по 100 = 10000)
         mgr.positions["NG-1"] = Position(
@@ -171,7 +171,8 @@ class TestOverRisk:
         mgr.pending = _pending_orders(["BR-1", "CL-1"])
         cancels = mgr.track_bar({"NG": 100.0, "BR": 100.0, "CL": 100.0}, {"NG": NG_META, "BR": NG_META, "CL": NG_META})
         assert mgr.positions["NG-1"].over_risk is True
-        assert cancels == ["BR-1"]  # самая старая не-over-risk заявка
+        assert cancels == []
+        assert len(mgr.pending) == 2
 
     def test_no_cancel_without_pending(self):
         mgr = _manager(initial=1000, max_risk=2.0)

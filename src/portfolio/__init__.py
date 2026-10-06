@@ -10,7 +10,6 @@ from src.portfolio.risk import (
     TradeRisk,
 )
 from src.portfolio.models import (
-    BrokerEvent,
     ContractMeta,
     OrderResult,
     OrderStatus,
@@ -23,7 +22,6 @@ from src.portfolio.models import (
 
 __all__ = [
     "Account",
-    "BrokerEvent",
     "ContractMeta",
     "OrderResult",
     "OrderStatus",

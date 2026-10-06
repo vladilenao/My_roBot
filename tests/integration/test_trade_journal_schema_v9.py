@@ -2,13 +2,14 @@ import sqlite3
 
 import pytest
 
-from src.trade_journal.schema import SCHEMA_VERSION, UnsupportedSchemaVersion, initialize_schema
+from src.trade_journal.schema import SCHEMA_V9_SQL, SCHEMA_VERSION, UnsupportedSchemaVersion, initialize_schema
 from src.trade_journal.storage import Storage
 
 
 def _make_v8_database(path) -> None:
     connection = sqlite3.connect(path)
-    initialize_schema(connection)
+    connection.executescript(SCHEMA_V9_SQL)
+    connection.execute("INSERT INTO export_state (export_id,updated_at) VALUES (1,'2026-09-24')")
     connection.executescript(
         "DROP TABLE instrument_names;"
         "PRAGMA user_version = 8;"
@@ -39,7 +40,7 @@ def test_v8_database_is_migrated_to_v9_with_name_table(tmp_path):
             )
         }
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION
     assert "instrument_names" in tables
 
 
@@ -73,7 +74,7 @@ def test_database_from_a_newer_version_is_rejected(tmp_path):
     database = tmp_path / "trades.sqlite3"
     connection = sqlite3.connect(database)
     initialize_schema(connection)
-    connection.execute("PRAGMA user_version = 10")
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     connection.commit()
     connection.close()
 

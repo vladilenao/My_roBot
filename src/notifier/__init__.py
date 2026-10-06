@@ -1,18 +1,14 @@
-from src.config import BAR_TIME_TZ_OFFSET_HOURS, NOTIFIER
-from src.notifier.base import AbstractNotifier as AbstractNotifier, DecisionFormatter
-from src.notifier.console import ConsoleNotifier
-from src.notifier.telegram import TelegramNotifier
+"""Каналы доставки уведомлений и порт канала."""
 
-_notifiers = {
-    "telegram": TelegramNotifier,
-    "console": ConsoleNotifier,
-}
+from src.notifier.channel import Channel
+from src.notifier.console import ConsoleChannel
+from src.notifier.factory import build_channels, close_channels
+from src.notifier.telegram import TelegramChannel
 
-
-def get_notifier():
-    notifier_cls = _notifiers.get(NOTIFIER)
-    if notifier_cls is None:
-        available = ", ".join(sorted(_notifiers))
-        raise ValueError(f"Неизвестный канал уведомлений '{NOTIFIER}'. Доступны: {available}")
-    formatter = DecisionFormatter(tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS)
-    return notifier_cls(formatter=formatter)
+__all__ = [
+    "Channel",
+    "ConsoleChannel",
+    "TelegramChannel",
+    "build_channels",
+    "close_channels",
+]

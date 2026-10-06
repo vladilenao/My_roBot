@@ -69,7 +69,7 @@ def _write_reason_fill(storage, reason):
             (now, now),
         )
         connection.execute(
-            "INSERT INTO fills VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
+            "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
             (now,),
         )
         connection.execute(
@@ -125,6 +125,38 @@ def test_export_uses_short_contract_name_from_storage_names(tmp_path):
         position_rows = _read_csv(positions)
         assert position_rows
         assert position_rows[0]["Контракт"] == "NG-12.26"
+
+
+def test_export_never_shows_raw_ticker_for_unknown_contract(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_snapshot(storage)
+
+        journal_rows = _read_csv(journal)
+        position_rows = _read_csv(positions)
+
+        assert journal_rows[0]["Контракт"] == "контракт не указан"
+        assert position_rows[0]["Контракт"] == "контракт не указан"
+        assert "NGV6" not in journal.read_text(encoding="utf-8")
+        assert "NGV6" not in positions.read_text(encoding="utf-8")
+
+
+def test_export_keeps_persisted_names_for_contracts_outside_current_run(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_snapshot(storage)
+        storage.set_names({"NGV6": "NG-10.26"})
+
+        storage.set_names({"BRV6": "BR-7.12"})
+
+        assert _read_csv(journal)[0]["Контракт"] == "NG-10.26"
+        assert _read_csv(positions)[0]["Контракт"] == "NG-10.26"
 
 
 def test_startup_and_later_export_restore_deleted_csv_from_sqlite(tmp_path):
@@ -197,14 +229,14 @@ def test_rows_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypa
 
         stale_rows = _read_csv(positions)
         assert len(stale_rows) == 1
-        assert stale_rows[0]["Trade ID"] == "trade-1"
+        assert stale_rows[0]["Статус"] == "открыта"
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", original_replace)
         assert storage.export()
 
     retried_rows = _read_csv(positions)
     assert len(retried_rows) == 1
-    assert retried_rows[0]["Trade ID"] == "trade-1"
+    assert "Trade ID" not in retried_rows[0]
 
 
 def test_first_sqlite_export_preserves_legacy_csvs_only_once(tmp_path):

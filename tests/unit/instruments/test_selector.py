@@ -43,18 +43,18 @@ class TestFormatFuturesDisplay:
 
 class TestDeduplicate:
     def test_no_duplicates(self):
-        instruments = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
-        assert _deduplicate(instruments) == [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        instruments = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
+        assert _deduplicate(instruments) == [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
 
     def test_removes_duplicates(self):
-        instruments = [("SBER", "SBER", "share"), ("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        instruments = [("SBER", "SBER", "share", "SBER"), ("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _deduplicate(instruments)
         assert len(result) == 2
         assert result[0][1] == "SBER"
         assert result[1][1] == "GAZP"
 
     def test_preserves_first_occurrence(self):
-        instruments = [("SBER", "SBER", "share"), ("SBER old", "SBER", "future")]
+        instruments = [("SBER", "SBER", "share", "SBER"), ("SBER old", "SBER", "future")]
         result = _deduplicate(instruments)
         assert len(result) == 1
         assert result[0][0] == "SBER"
@@ -63,7 +63,7 @@ class TestDeduplicate:
         assert _deduplicate([]) == []
 
     def test_single_item(self):
-        assert _deduplicate([("SBER", "SBER", "share")]) == [("SBER", "SBER", "share")]
+        assert _deduplicate([("SBER", "SBER", "share", "SBER")]) == [("SBER", "SBER", "share", "SBER")]
 
 
 class TestFetchActiveFutures:
@@ -208,33 +208,49 @@ class TestAskChoice:
 
 
 class TestValidateInstruments:
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     def test_all_valid_stocks(self, mock_find):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _validate_instruments(client, entries, "share")
         assert len(result) == 2
-        assert result[0] == ("SBER", "SBER", "share")
-        assert result[1] == ("GAZP", "GAZP", "share")
+        assert result[0] == ("SBER", "SBER", "share", "SBER")
+        assert result[1] == ("GAZP", "GAZP", "share", "GAZP")
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     def test_all_valid_futures(self, mock_find):
         client = _mock_client()
-        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")]
         result = _validate_instruments(client, entries, "future")
         assert len(result) == 1
-        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future")
+        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
 
-    @patch("src.instruments.selector.find_working_instrument")
-    def test_some_invalid(self, mock_find):
-        mock_find.side_effect = ["uid-123", ValueError("не найден")]
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
+    def test_future_without_short_name_takes_it_from_catalog(self, mock_find):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("BAD", "BAD", "share")]
+
+        result = _validate_instruments(client, [("NGU6", "NGU6", "future")], "future")
+
+        assert result == [("NGU6", "NGU6", "future", "NG-9.26")]
+
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", None))
+    def test_future_without_any_name_keeps_placeholder_source(self, mock_find):
+        client = _mock_client()
+
+        result = _validate_instruments(client, [("NGU6", "NGU6", "future")], "future")
+
+        assert result == [("NGU6", "NGU6", "future")]
+
+    @patch("src.instruments.selector.find_working_instrument_with_name")
+    def test_some_invalid(self, mock_find):
+        mock_find.side_effect = [("uid-123", "NG-9.26"), ValueError("не найден")]
+        client = _mock_client()
+        entries = [("SBER", "SBER", "share", "SBER"), ("BAD", "BAD", "share", "BAD")]
         result = _validate_instruments(client, entries, "share")
         assert len(result) == 1
         assert result[0][1] == "SBER"
 
-    @patch("src.instruments.selector.find_working_instrument")
+    @patch("src.instruments.selector.find_working_instrument_with_name")
     def test_all_invalid(self, mock_find):
         mock_find.side_effect = ValueError("не найден")
         client = _mock_client()
@@ -244,45 +260,65 @@ class TestValidateInstruments:
 
 
 class TestSelectFromList:
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="1,3")
     def test_select_by_numbers(self, mock_input, mock_find):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share"), ("LKOH", "LKOH", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP"), ("LKOH", "LKOH", "share", "LKOH")]
         result = _select_from_list(client, entries, "share")
         assert len(result) == 2
         assert result[0][1] == "SBER"
         assert result[1][1] == "LKOH"
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="SBER,LKOH")
     def test_select_by_tickers(self, mock_input, mock_find):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share"), ("LKOH", "LKOH", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP"), ("LKOH", "LKOH", "share", "LKOH")]
         result = _select_from_list(client, entries, "share")
         assert len(result) == 2
+
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
+    @patch("builtins.input", return_value="NGU6")
+    def test_manual_ticker_keeps_short_contract_name(self, mock_input, mock_find):
+        client = _mock_client()
+        entries = [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+        result = _select_from_list(client, entries, "future")
+
+        assert result == [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
+    @patch("builtins.input", return_value="SiZ6")
+    def test_manual_ticker_outside_list_named_from_catalog(self, mock_input, mock_find):
+        client = _mock_client()
+        entries = [("NG (Природный газ) — NG-10.26", "NGU6", "future", "NG-10.26")]
+
+        result = _select_from_list(client, entries, "future")
+
+        assert result == [("SIZ6", "SIZ6", "future", "NG-9.26")]
 
     @patch("builtins.input", return_value="")
     def test_empty_input_returns_empty(self, mock_input):
         client = _mock_client()
-        result = _select_from_list(client, [("SBER", "SBER", "share")], "share")
+        result = _select_from_list(client, [("SBER", "SBER", "share", "SBER")], "share")
         assert result == []
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="99")
     def test_out_of_range_number(self, mock_input, mock_find):
         client = _mock_client()
-        result = _select_from_list(client, [("SBER", "SBER", "share")], "share")
+        result = _select_from_list(client, [("SBER", "SBER", "share", "SBER")], "share")
         assert result == []
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="1")
     def test_futures_entry(self, mock_input, mock_find):
         client = _mock_client()
-        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future")]
+        entries = [("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")]
         result = _select_from_list(client, entries, "future")
         assert len(result) == 1
-        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future")
+        assert result[0] == ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")
 
     @patch("builtins.input", return_value="")
     def test_empty_entries_returns_empty(self, mock_input):
@@ -292,16 +328,16 @@ class TestSelectFromList:
 
 
 class TestSelectInstruments:
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1", "", "нет"])
     def test_stocks_only(self, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
         assert len(result) == 1
-        assert result[0] == ("SBER", "SBER", "share")
+        assert result[0] == ("SBER", "SBER", "share", "SBER")
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
         ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
@@ -312,7 +348,7 @@ class TestSelectInstruments:
             result = select_instruments()
         assert result == [("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26")]
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1,2", "", "да", "2", "1", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[
         ("NG (Природный газ) — NG-9.26", "NGU6", "future", "NG-9.26"),
@@ -325,7 +361,7 @@ class TestSelectInstruments:
         assert "share" in types
         assert "future" in types
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "", "нет", "1", "1", "", "нет"])
     def test_empty_then_valid_triggers_retry(self, mock_input, mock_find):
         ctx = _mock_client()
@@ -333,7 +369,7 @@ class TestSelectInstruments:
             result = select_instruments()
         assert len(result) >= 1
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1", "", "нет"])
     def test_client_used_as_context_manager(self, mock_input, mock_find):
         ctx = _mock_client()
@@ -342,7 +378,7 @@ class TestSelectInstruments:
         ctx.__enter__.assert_called_once()
         ctx.__exit__.assert_called_once()
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1,3", "", "нет"])
     def test_multiple_stocks_selected(self, mock_input, mock_find):
         ctx = _mock_client()
@@ -351,24 +387,24 @@ class TestSelectInstruments:
         assert len(result) == 2
         assert all(item[2] == "share" for item in result)
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["x", "1", "1", "", "нет"])
     def test_invalid_type_choice_retry(self, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "SBER", "share")]
+        assert result == [("SBER", "SBER", "share", "SBER")]
 
-    @patch("src.instruments.selector.find_working_instrument")
+    @patch("src.instruments.selector.find_working_instrument_with_name")
     @patch("builtins.input", side_effect=["1", "1", "", "нет", "1", "1", "", "нет"])
     def test_invalid_instruments_then_valid(self, mock_input, mock_find):
-        mock_find.side_effect = [ValueError("не найден"), "uid-123"]
+        mock_find.side_effect = [ValueError("не найден"), ("uid-123", "NG-9.26")]
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
         assert len(result) >= 1
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["2", "нет", "1", "SBER", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", return_value=[])
     def test_empty_futures_shows_message(self, mock_fetch, mock_input, mock_find):
@@ -376,9 +412,9 @@ class TestSelectInstruments:
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
         assert len(result) >= 1
-        mock_fetch.assert_called_once_with(ctx)
+        assert mock_fetch.call_args.args[0] is ctx
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["2", "нет", "1", "SBER", "", "нет"])
     @patch("src.instruments.selector.fetch_active_futures", side_effect=Exception("API error"))
     def test_futures_api_error_continues(self, mock_fetch, mock_input, mock_find):
@@ -387,21 +423,21 @@ class TestSelectInstruments:
             result = select_instruments()
         assert len(result) >= 1
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1,1", "", "нет"])
     def test_same_ticker_twice_deduplicated(self, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "SBER", "share")]
+        assert result == [("SBER", "SBER", "share", "SBER")]
 
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1", "", "да", "1", "1", "", "нет"])
     def test_same_stock_across_rounds_deduplicated(self, mock_input, mock_find):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "SBER", "share")]
+        assert result == [("SBER", "SBER", "share", "SBER")]
 
 
 class TestConstants:
@@ -426,46 +462,46 @@ class TestConstants:
 
 class TestValidateInstrumentsPacing:
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     def test_pause_between_validations_not_before_first(self, mock_find, mock_sleep):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _validate_instruments(client, entries, "share", validation_pause_secs=0.5)
         assert len(result) == 2
         mock_sleep.assert_called_once_with(0.5)
 
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     def test_zero_pause_no_sleep(self, mock_find, mock_sleep):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _validate_instruments(client, entries, "share")
         assert len(result) == 2
         mock_sleep.assert_not_called()
 
-    @patch("src.instruments.selector.find_working_instrument")
+    @patch("src.instruments.selector.find_working_instrument_with_name")
     def test_rate_limit_pauses_until_reset_and_continues(self, mock_find):
         exc = RuntimeError("RESOURCE_EXHAUSTED: ratelimit_reset=30")
-        mock_find.side_effect = [exc, "uid-123"]
+        mock_find.side_effect = [exc, ("uid-123", "NG-9.26")]
         client = _mock_client()
-        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share")]
+        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share", "GAZP")]
         with patch("src.instruments.selector.time.sleep") as mock_sleep:
             result = _validate_instruments(client, entries, "share", validation_pause_secs=1.0)
         mock_sleep.assert_any_call(30.0)
-        assert result == [("GAZP", "GAZP", "share")]
+        assert result == [("GAZP", "GAZP", "share", "GAZP")]
 
-    @patch("src.instruments.selector.find_working_instrument")
+    @patch("src.instruments.selector.find_working_instrument_with_name")
     def test_rate_limit_without_reset_hint_uses_pause(self, mock_find):
         exc = RuntimeError("RESOURCE_EXHAUSTED")
-        mock_find.side_effect = [exc, "uid-123"]
+        mock_find.side_effect = [exc, ("uid-123", "NG-9.26")]
         client = _mock_client()
-        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share")]
+        entries = [("NG", "NGU6", "future"), ("GAZP", "GAZP", "share", "GAZP")]
         with patch("src.instruments.selector.time.sleep") as mock_sleep:
             result = _validate_instruments(client, entries, "share", validation_pause_secs=2.0)
         mock_sleep.assert_any_call(2.0)
-        assert result == [("GAZP", "GAZP", "share")]
+        assert result == [("GAZP", "GAZP", "share", "GAZP")]
 
-    @patch("src.instruments.selector.find_working_instrument")
+    @patch("src.instruments.selector.find_working_instrument_with_name")
     def test_rate_limit_all_dropped(self, mock_find):
         mock_find.side_effect = RuntimeError("RESOURCE_EXHAUSTED ratelimit_reset=5")
         client = _mock_client()
@@ -477,21 +513,21 @@ class TestValidateInstrumentsPacing:
 
 class TestSelectFromListPacing:
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="1,2")
     def test_pause_passed_through(self, mock_input, mock_find, mock_sleep):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _select_from_list(client, entries, "share", validation_pause_secs=1.5)
         assert len(result) == 2
         mock_sleep.assert_called_once_with(1.5)
 
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", return_value="1,2")
     def test_zero_pause_default_no_sleep(self, mock_input, mock_find, mock_sleep):
         client = _mock_client()
-        entries = [("SBER", "SBER", "share"), ("GAZP", "GAZP", "share")]
+        entries = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP")]
         result = _select_from_list(client, entries, "share")
         assert len(result) == 2
         mock_sleep.assert_not_called()
@@ -499,7 +535,7 @@ class TestSelectFromListPacing:
 
 class TestSelectInstrumentsPacing:
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1,2", "", "нет"])
     def test_validation_pause_wired_into_selection(self, mock_input, mock_find, mock_sleep):
         ctx = _mock_client()
@@ -509,11 +545,11 @@ class TestSelectInstrumentsPacing:
         mock_sleep.assert_called_once_with(0.3)
 
     @patch("src.instruments.selector.time.sleep")
-    @patch("src.instruments.selector.find_working_instrument", return_value="uid-123")
+    @patch("src.instruments.selector.find_working_instrument_with_name", return_value=("uid-123", "NG-9.26"))
     @patch("builtins.input", side_effect=["1", "1", "", "нет"])
     def test_default_zero_pause_no_sleep(self, mock_input, mock_find, mock_sleep):
         ctx = _mock_client()
         with patch("src.instruments.selector.client_context", return_value=ctx):
             result = select_instruments()
-        assert result == [("SBER", "SBER", "share")]
+        assert result == [("SBER", "SBER", "share", "SBER")]
         mock_sleep.assert_not_called()

@@ -6,7 +6,7 @@ import sqlite3
 from decimal import Decimal
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -263,6 +263,52 @@ CREATE TABLE instrument_names (
 );
 """
 
+MIGRATE_V9_TO_V10_SQL = """
+ALTER TABLE fills ADD COLUMN fee_source TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (fee_source IN ('broker', 'configured', 'unknown'));
+ALTER TABLE fills ADD COLUMN reference_price TEXT;
+ALTER TABLE fills ADD COLUMN reference_kind TEXT;
+ALTER TABLE fills ADD COLUMN order_side TEXT CHECK (order_side IN ('BUY', 'SELL'));
+ALTER TABLE fills ADD COLUMN slippage_amount TEXT;
+ALTER TABLE fills ADD COLUMN slippage_source TEXT
+    CHECK (slippage_source IN ('broker', 'simulated'));
+CREATE TABLE cost_adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL REFERENCES fills(execution_id) ON DELETE RESTRICT,
+    previous_fee TEXT NOT NULL,
+    new_fee TEXT NOT NULL,
+    delta TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+CREATE TABLE trade_measurements (
+    trade_id TEXT PRIMARY KEY REFERENCES trades(trade_id) ON DELETE CASCADE,
+    initial_stop_distance TEXT,
+    max_quantity INTEGER NOT NULL DEFAULT 0 CHECK (max_quantity >= 0),
+    coverage TEXT NOT NULL DEFAULT 'unavailable'
+        CHECK (coverage IN ('complete', 'partial', 'unavailable')),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE trade_market_observations (
+    trade_id TEXT NOT NULL REFERENCES trades(trade_id) ON DELETE CASCADE,
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    bar_id TEXT NOT NULL,
+    low TEXT,
+    high TEXT,
+    observed_price TEXT,
+    owned_from TEXT,
+    owned_to TEXT,
+    coverage TEXT NOT NULL CHECK (coverage IN ('complete', 'partial', 'unavailable')),
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (trade_id, instrument_id, timeframe, bar_id)
+);
+CREATE INDEX trade_observations_by_time ON trade_market_observations(trade_id, observed_at);
+"""
+
+# Историческая схема нужна для миграционных фикстур, не для runtime-открытия.
+SCHEMA_V9_SQL = SCHEMA_SQL
+SCHEMA_SQL += MIGRATE_V9_TO_V10_SQL
+
 
 def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | None = None) -> None:
     """Create the current schema or reject a database from another version.
@@ -273,98 +319,61 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
     только изменение схемы без сброса счёта.
     """
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION):
+    if version not in range(SCHEMA_VERSION + 1):
         raise UnsupportedSchemaVersion(
             f"unsupported SQLite schema version {version}; expected {SCHEMA_VERSION}"
         )
 
-    if version == 0:
-        existing_tables = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ).fetchall()
-        if existing_tables:
-            raise UnsupportedSchemaVersion(
-                "unversioned SQLite database contains tables and cannot be opened"
-            )
-        with connection:
-            connection.executescript(SCHEMA_SQL)
-            connection.execute(
-                "INSERT INTO export_state (export_id, updated_at) VALUES (1, datetime('now'))"
-            )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 1:
-        with connection:
-            connection.executescript(MIGRATE_V1_TO_V2_SQL)
-            connection.executescript(MIGRATE_V2_TO_V3_SQL)
-            connection.executescript(MIGRATE_V3_TO_V4_SQL)
-            connection.executescript(MIGRATE_V4_TO_V5_SQL)
-            connection.executescript(MIGRATE_V5_TO_V6_SQL)
-            _backfill_net_realized_pnl(connection)
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 2:
-        with connection:
-            connection.executescript(MIGRATE_V2_TO_V3_SQL)
-            connection.executescript(MIGRATE_V3_TO_V4_SQL)
-            connection.executescript(MIGRATE_V4_TO_V5_SQL)
-            connection.executescript(MIGRATE_V5_TO_V6_SQL)
-            _backfill_net_realized_pnl(connection)
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 3:
-        with connection:
-            connection.executescript(MIGRATE_V3_TO_V4_SQL)
-            connection.executescript(MIGRATE_V4_TO_V5_SQL)
-            connection.executescript(MIGRATE_V5_TO_V6_SQL)
-            _backfill_net_realized_pnl(connection)
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 4:
-        with connection:
-            connection.executescript(MIGRATE_V4_TO_V5_SQL)
-            connection.executescript(MIGRATE_V5_TO_V6_SQL)
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 5:
-        with connection:
-            connection.executescript(MIGRATE_V5_TO_V6_SQL)
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 6:
-        with connection:
-            connection.executescript(MIGRATE_V6_TO_V7_SQL)
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 7:
-        with connection:
-            _migrate_v7_to_v8(connection, initial_balance)
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 8:
-        with connection:
-            _migrate_v8_to_v9(connection)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    connection.execute("SAVEPOINT schema_migration")
+    try:
+        if version == 0:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
+                raise UnsupportedSchemaVersion("unversioned SQLite database contains tables and cannot be opened")
+            _execute_sql(connection, SCHEMA_SQL)
+            connection.execute("INSERT INTO export_state (export_id, updated_at) VALUES (1, datetime('now'))")
+        else:
+            migrations = {
+                1: MIGRATE_V1_TO_V2_SQL, 2: MIGRATE_V2_TO_V3_SQL,
+                3: MIGRATE_V3_TO_V4_SQL, 4: MIGRATE_V4_TO_V5_SQL,
+                5: MIGRATE_V5_TO_V6_SQL, 6: MIGRATE_V6_TO_V7_SQL,
+                9: MIGRATE_V9_TO_V10_SQL,
+            }
+            while version < SCHEMA_VERSION:
+                if version == 7:
+                    _migrate_v7_to_v8(connection, initial_balance)
+                elif version == 8:
+                    _migrate_v8_to_v9(connection)
+                else:
+                    _execute_sql(connection, migrations[version])
+                    if version == 3:
+                        _backfill_net_realized_pnl(connection)
+                version += 1
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(f"foreign key integrity check failed: {violations!r}")
+        connection.execute("RELEASE schema_migration")
+    except BaseException:
+        connection.execute("ROLLBACK TO schema_migration")
+        connection.execute("RELEASE schema_migration")
+        raise
 
 
-    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-    if violations:
-        raise sqlite3.IntegrityError(f"foreign key integrity check failed: {violations!r}")
+def _execute_sql(connection: sqlite3.Connection, script: str) -> None:
+    """DDL по отдельным statements: executescript не должен коммитить миграцию."""
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete schema SQL statement")
 
 
 def _migrate_v7_to_v8(connection: sqlite3.Connection, initial_balance: str | None) -> None:
     """Перенести v7 → v8: снапшот факторов контракта и рублёвая эпоха счёта."""
-    connection.executescript(MIGRATE_V7_TO_V8_SQL)
+    _execute_sql(connection, MIGRATE_V7_TO_V8_SQL)
     if initial_balance is None:
         return
     connection.execute(
@@ -376,7 +385,7 @@ def _migrate_v7_to_v8(connection: sqlite3.Connection, initial_balance: str | Non
 
 def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
     """Перенести v8 → v9: сохраняемая карта коротких имён контрактов."""
-    connection.executescript(MIGRATE_V8_TO_V9_SQL)
+    _execute_sql(connection, MIGRATE_V8_TO_V9_SQL)
 
 
 def _backfill_net_realized_pnl(connection: sqlite3.Connection) -> None:
