@@ -44,11 +44,12 @@ class TelegramChannel(Channel):
         self._deadline = None
         self._delivery_path = delivery_path
         self._max_transport_attempts = max(1, int(max_transport_attempts))
-        self._transport = TelegramTransport(cloudflare_url, bot_token, channel_id, request_timeout)
         self._metadata_read, self._chat = False, None
         if not self._enabled:
+            self._transport = None
             log.warning("Канал Telegram не настроен (нет токена, chat_id или адреса): уведомления не отправляются.")
             return
+        self._transport = TelegramTransport(cloudflare_url, bot_token, channel_id, request_timeout)
         self._worker = threading.Thread(target=self._run, name="telegram-notifier", daemon=True)
         self._worker.start()
 

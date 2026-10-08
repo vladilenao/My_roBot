@@ -32,6 +32,7 @@ data/
 /tests/snapshot/data/SBER_15m/*
 !/tests/snapshot/data/SBER_15m/candles.csv
 !/tests/snapshot/data/SBER_15m/telegram_cases.json
+!/tests/snapshot/data/gap_journal_expected.csv
 HIST/
 .idea/
 .vscode/

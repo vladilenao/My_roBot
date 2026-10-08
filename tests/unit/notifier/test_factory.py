@@ -82,13 +82,19 @@ class TestBuildChannels:
 
         assert channel.enabled is False
 
-    def test_telegram_request_timeout_comes_from_config(self, monkeypatch) -> None:
+    def test_telegram_request_timeout_comes_from_config(self, monkeypatch, tmp_path) -> None:
         self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
+        monkeypatch.setattr("src.config.TELEGRAM_BOT_TOKEN", "0000000000:test-token")
+        monkeypatch.setattr("src.config.TELEGRAM_CHANNEL_ID", "-1000000000000")
+        monkeypatch.setattr("src.config.CLOUDFLARE_URL", "https://example.com/bot")
         monkeypatch.setattr("src.config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT", 7)
 
-        (channel,) = build_channels()
-
-        assert channel._transport.timeout == 7
+        (channel,) = build_channels(state_dir=tmp_path)
+        try:
+            assert channel.enabled is True
+            assert channel._transport.timeout == 7
+        finally:
+            close_channels([channel])
 
     def test_telegram_max_transport_attempts_comes_from_config(self, monkeypatch) -> None:
         self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
