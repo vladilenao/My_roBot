@@ -46,8 +46,8 @@ def package_distribution(
     package_dir.mkdir(parents=True)
 
     shutil.copy2(binary, package_dir / binary.name)
-    (package_dir / "VERSION.txt").write_text(f"{version}\n")
-    (package_dir / f"robot-v{version}.txt").write_text(notes)
+    (package_dir / "VERSION.txt").write_text(f"{version}\n", newline="\n")
+    (package_dir / f"robot-v{version}.txt").write_text(notes, newline="\n")
     shutil.copy2(root / "README.txt", package_dir / "README.txt")
     shutil.copy2(root / "default.toml", package_dir / "robot.toml.example")
 

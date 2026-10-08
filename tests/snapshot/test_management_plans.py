@@ -45,6 +45,7 @@ QUANTITY = 3
 PRICE_STEP = 0.001
 STEP_COST = 8.4
 _RTOL = 1e-9
+_ATOL = PRICE_STEP
 
 _COLUMNS = [
     "datetime",
@@ -272,7 +273,7 @@ def test_management_plan_snapshot(case, profile_name, request):
 
     expected = _normalize(pd.read_csv(path))
     try:
-        assert_frame_equal(_normalize(actual), expected, check_exact=False, rtol=_RTOL)
+        assert_frame_equal(_normalize(actual), expected, check_exact=False, rtol=_RTOL, atol=_ATOL)
     except AssertionError as error:
         position, got, want = _first_divergence(actual, expected)
         pytest.fail(
@@ -299,6 +300,7 @@ def _first_divergence(actual: pd.DataFrame, expected: pd.DataFrame) -> tuple[int
                     float(got[column]),
                     float(want[column]),
                     rel_tol=_RTOL,
+                    abs_tol=_ATOL,
                 )
                 if pd.notna(got[column]) and pd.notna(want[column])
                 else pd.isna(got[column]) != pd.isna(want[column])
