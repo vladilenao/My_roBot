@@ -44,6 +44,8 @@ def build_channels(names=None, *, state_dir=None) -> list[Channel]:
                     cloudflare_url=config.CLOUDFLARE_URL,
                     tz_offset_hours=config.BAR_TIME_TZ_OFFSET_HOURS,
                     supported_types=parse_event_types(events),
+                    request_timeout=config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
+                    max_transport_attempts=config.NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                     delivery_path=(state_dir or config.runtime_dir()) / "telegram_delivery.sqlite3",
                 )
             )

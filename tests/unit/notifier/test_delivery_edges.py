@@ -46,6 +46,10 @@ def test_long_caption_continuations_keep_root_identity_and_html(tmp_path, monkey
     server = Server()
     monkeypatch.setattr(requests, "post", server.post)
     event = demo_event("plan")
+    # Проверяем разбивку подписи независимо от размера графика со 100 уровнями.
+    from src.notifier.telegram_chart import build_scene, render_png
+    photo = render_png(build_scene(event))
+    monkeypatch.setattr("src.notifier.telegram.render_png", lambda scene: photo)
     from dataclasses import replace
     from src.events.visual import serializable
     visual = serializable(event.get("visual"))

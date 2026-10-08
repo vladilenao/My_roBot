@@ -37,6 +37,13 @@ events = [
     "signal", "stop_hit", "target_hit", "trade_closed", "trade_opened",
     "position_added", "stop_moved", "trade_cancelled", "order_rejected"
 ]
+# Таймаут одного HTTP-запроса Bot API, секунд. Прокси Cloudflare под 10 с
+# не успевает (ReadTimeout на sendPhoto), а при 30 с загрузка фото дважды
+# не уложилась — 60 с запасом на медленный аплинк.
+request_timeout = 60
+# Общее число транспортных попыток на доставку: 2 = один повтор при таймауте
+# или обрыве, пока карточка не подтверждена message_id.
+max_transport_attempts = 2
 
 # Явные привязки с глобальными ID и профилями управления; каскад ТФ: глобальный 1h, timeframe
 # тикера (NG → 15m), точечный tf в инлайне, дубли на разных ТФ.
@@ -279,9 +286,9 @@ contract_expiry_block_days = 2                        # порог экспир�
 # Секция и незаданные в ней типы означают «разрешены обе стороны»; поведение
 # по умолчанию без секции не меняется. Раскомментируйте и настройте при
 # необходимости, например:
-# [trading.directions]
-#   future = ["long", "short"]     # фьючерсы: и лонг, и шорт
-#   share  = ["long"]              # акции: только лонг
+[trading.directions]
+future = ["long", "short"]     # фьючерсы: и лонг, и шорт
+share  = ["long"]              # акции: только лонг
 
 [trading.risk_limits]
 portfolio_pct = 2.0     # единый риск всех открытых остатков и pending-входов, % от min(balance, equity)

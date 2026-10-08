@@ -7,6 +7,7 @@ import requests
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
+PHOTO_REQUEST_MAX_BYTES = 15_000  # Тело multipart целиком, включая подпись и кнопки.
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,9 @@ class ApiResult:
     ok: bool
     result: object = None
     uncertain: bool = False
+    # True только для транспортных исключений (таймаут, обрыв): исход неизвестен,
+    # запрос можно повторить. Разобранный ответ (включая ok=false) не повторяется.
+    retryable: bool = False
 
 
 class TelegramTransport:
@@ -22,6 +26,15 @@ class TelegramTransport:
         self._token = token
         self.chat_id = chat_id
         self.timeout = timeout
+
+    def photo_budget(self, data):
+        """Размер PNG с учётом UTF-8 полей и multipart; без сетевого запроса."""
+        prepared = requests.Request(
+            "POST", "https://telegram.invalid/sendPhoto",
+            data={"chat_id": self.chat_id, **data},
+            files={"photo": ("trade.png", b"", "image/png")},
+        ).prepare()
+        return PHOTO_REQUEST_MAX_BYTES - len(prepared.body)
 
     def request(self, method, data=None, photo=None):
         data = {"chat_id": self.chat_id, **(data or {})}
@@ -37,8 +50,8 @@ class TelegramTransport:
                 raise ValueError("invalid response")
         except Exception as exc:
             # requests exceptions may embed the entire URL/token; never log them.
-            log.warning("Telegram %s: ошибка транспорта (%s), отправка не повторяется.", method, type(exc).__name__)
-            return ApiResult(False, uncertain=True)
+            log.warning("Telegram %s: ошибка транспорта (%s).", method, type(exc).__name__)
+            return ApiResult(False, uncertain=True, retryable=True)
         description = str(body.get("description", ""))
         if method.startswith("edit") and "message is not modified" in description.lower():
             return ApiResult(True)

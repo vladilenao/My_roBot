@@ -95,6 +95,8 @@ _EXPECTED_TYPES: dict[str, type] = {
     "notifier_channels": list,
     "notifier_console_events": list,
     "notifier_telegram_events": list,
+    "notifier_telegram_request_timeout": int,
+    "notifier_telegram_max_transport_attempts": int,
     "share_strategies": dict,
     "future_strategies": dict,
     "triple_screen_params": dict,
@@ -122,6 +124,9 @@ _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 _NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
 _NOTIFIER_EVENTS_KEYS = {"notifier_console_events", "notifier_telegram_events"}
 _NOTIFIER_EVENT_KEYS = {"console": "notifier_console_events", "telegram": "notifier_telegram_events"}
+# Служебные ключи подсекции [notifier.<канал>]: сейчас только у telegram.
+# Ключи пишутся в плоские имена notifier_telegram_<ключ>.
+_NOTIFIER_TELEGRAM_EXTRA_KEYS = {"request_timeout", "max_transport_attempts"}
 
 # Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
@@ -495,6 +500,15 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key in _NOTIFIER_EVENTS_KEYS:
             cleaned[key] = _validate_notifier_events(key, value, path)
             continue
+        if key in {
+            "notifier_telegram_request_timeout",
+            "notifier_telegram_max_transport_attempts",
+        } and (isinstance(value, bool) or value < 1):
+            option = key.removeprefix("notifier_telegram_")
+            raise ConfigError(
+                f"{path}: [notifier.telegram] {option} должен быть целым числом > 0, "
+                f"получено {value!r}"
+            )
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
             continue
@@ -617,8 +631,14 @@ def validate_triple_screen_hierarchy(
                 ) from exc
 
 
-def _parse_notifier_subsection(name: str, value: Any, path: Path) -> str:
-    """Подсекция ``[notifier.<канал>]``: только ключ ``events``."""
+def _parse_notifier_subsection(
+    name: str, value: Any, path: Path
+) -> tuple[str, dict[str, Any]]:
+    """Подсекция ``[notifier.<канал>]``: ключ ``events`` и служебные ключи.
+
+    Возвращает целевой ключ событий и дополнительные плоские ключи со
+    значениями (сейчас это только ``request_timeout`` у telegram).
+    """
     target = _NOTIFIER_EVENT_KEYS.get(name)
     if target is None:
         raise ConfigError(
@@ -627,15 +647,22 @@ def _parse_notifier_subsection(name: str, value: Any, path: Path) -> str:
         )
     if not isinstance(value, dict):
         raise ConfigError(f"{path}: [notifier.{name}] должна быть таблицей")
-    unknown = set(value) - {"events"}
+    allowed = {"events"}
+    if name == "telegram":
+        allowed |= _NOTIFIER_TELEGRAM_EXTRA_KEYS
+    unknown = set(value) - allowed
     if unknown:
         raise ConfigError(
             f"{path}: [notifier.{name}] незнакомые ключи {sorted(unknown)}; "
-            f"допустимые: ['events']"
+            f"допустимые: {sorted(allowed)}"
         )
     if "events" not in value:
         raise ConfigError(f"{path}: [notifier.{name}] обязателен ключ events")
-    return target
+    extra = {
+        f"notifier_telegram_{option}": value[option]
+        for option in sorted(_NOTIFIER_TELEGRAM_EXTRA_KEYS & set(value))
+    }
+    return target, extra
 
 
 def _normalize_notifier_channels(flat: dict[str, Any], path: Path) -> None:
@@ -684,7 +711,9 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):
-                flat[_parse_notifier_subsection(key, value, path)] = value.get("events")
+                target, extra = _parse_notifier_subsection(key, value, path)
+                flat[target] = value.get("events")
+                flat.update(extra)
                 continue
             if key == "filter" and section == "strategies":
                 flat["triple_screen_params"] = _parse_triple_screen_section(value, path)

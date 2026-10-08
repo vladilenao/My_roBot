@@ -90,6 +90,7 @@ def test_cancel_partial_entry_and_reject_stop_do_not_claim_closed_position(tmp_p
         move = MoveStop("move", "trade", storage.load_trade("trade").state.state_revision, "trailing", D(298))
         manager.submit_action(move)
         rejected = fact(manager, move, "reject-stop", ExecutionStatus.REJECT, minute=2)
+        assert facts[-1][1]["side"] == "BUY"
         snapshot = facts[-1][1]["visual"].data
         assert snapshot["state"]["quantity"] == 1 and snapshot["state"]["stop"] == "297"
         assert all(s["reason"] == "entry-protection" for s in snapshot["stops"])

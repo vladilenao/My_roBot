@@ -55,6 +55,10 @@ _DEFAULTS = {
     "notifier_channels": ["console"],
     "notifier_console_events": sorted(t.value for t in NOTIFICATION_EVENT_TYPES),
     "notifier_telegram_events": sorted(t.value for t in TRADING_EVENT_TYPES),
+    # Таймаут одного HTTP-запроса Bot API, секунд (по умолчанию прежние 10).
+    "notifier_telegram_request_timeout": 10,
+    # Общее число транспортных попыток на доставку: 1 = повторы выключены.
+    "notifier_telegram_max_transport_attempts": 1,
     # Ограничение частоты API-дозагрузок свечей и окно bounded backfill
     "data_refresh_min_interval": 5,
     "data_backfill_window_seconds": 3600,
@@ -120,6 +124,12 @@ DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 NOTIFIER_CHANNELS: tuple[str, ...] = tuple(_CONFIG["notifier_channels"])
 NOTIFIER_CONSOLE_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_console_events"])
 NOTIFIER_TELEGRAM_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_telegram_events"])
+NOTIFIER_TELEGRAM_REQUEST_TIMEOUT: int = int(
+    _CONFIG["notifier_telegram_request_timeout"]
+)
+NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS: int = int(
+    _CONFIG["notifier_telegram_max_transport_attempts"]
+)
 
 def _checked_timeframe(value: str, where: str) -> str:
     """Таймфрейм привязки/тикера обязан быть ключом TIMEFRAMES (иначе ConfigError)."""

@@ -13,6 +13,40 @@ GREEN, RED, BLUE = "#36d399", "#ff7185", "#73baff"
 BACKGROUND = "#101827"
 
 
+def compact_png(photo: bytes, max_bytes: int) -> bytes:
+    """Уменьшить PNG без обрезки; слишком плотный график отдаётся текстом."""
+    if len(photo) <= max_bytes:
+        return photo
+    from PIL import Image, ImageColor
+
+    with Image.open(BytesIO(photo)) as image:
+        rgb = image.convert("RGB")
+    # Палитра до resize исключает новые оттенки сглаживания и уменьшает PNG.
+    # Обязательные цвета не должны исчезать из-за малой площади стопа/входа.
+    fixed = [channel for color in (BACKGROUND, GREEN, RED, BLUE, "#ffffff", "#b9c4d5", "#8794a7", "#3a4558")
+             for channel in ImageColor.getrgb(color)]
+    palettes = []
+    for count in (64, 32, 16):
+        adaptive = rgb.quantize(colors=count - 8, dither=Image.Dither.NONE)
+        palette = Image.new("P", (1, 1))
+        palette.putpalette(fixed + adaptive.getpalette()[:(count - 8) * 3])
+        palettes.append(rgb.quantize(palette=palette, dither=Image.Dither.NONE))
+    minimum = min(800, rgb.width)
+    width = rgb.width
+    while True:
+        size = (width, max(1, round(rgb.height * width / rgb.width)))
+        for palette in palettes:
+            reduced = palette if size == rgb.size else palette.resize(size, Image.Resampling.NEAREST)
+            with BytesIO() as stream:
+                reduced.save(stream, format="PNG", optimize=True)
+                candidate = stream.getvalue()
+            if len(candidate) <= max_bytes:
+                return candidate
+        if width == minimum:
+            raise ValueError("График не помещается в лимит при ширине не менее 800 px")
+        width = max(minimum, int(width * .85))
+
+
 def build_scene(event, tz_offset_hours=0):
     visual = event.get("visual")
     if not visual or not visual["market"]["candles"]:

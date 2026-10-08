@@ -611,14 +611,14 @@ class TradeManager:
         if self._execution_observer is None:
             return
         row = self._storage.connection.execute(
-            "SELECT o.action_type,t.instrument_id,p.quantity,p.realized_pnl,p.fees,t.price_step,t.step_cost,o.quantity,b.payload_json "
+            "SELECT o.action_type,t.instrument_id,t.side,p.quantity,p.realized_pnl,p.fees,t.price_step,t.step_cost,o.quantity,b.payload_json "
             "FROM orders o JOIN trades t ON t.trade_id=o.trade_id JOIN positions p ON p.trade_id=t.trade_id "
             "JOIN outbox b ON b.command_id=o.command_id "
             "WHERE o.command_id=?", (event.command_id,)).fetchone()
         if row is None:
             return
-        action, instrument, quantity, gross, fees, step, cost, selected, payload = row
-        details = {"action_type": action, "instrument_id": instrument, "quantity_remaining": quantity,
+        action, instrument, side, quantity, gross, fees, step, cost, selected, payload = row
+        details = {"action_type": action, "instrument_id": instrument, "side": side, "quantity_remaining": quantity,
                    "gross_pnl": Decimal(gross), "fees_total": Decimal(fees), "net_pnl": Decimal(gross)-Decimal(fees),
                    "pnl_units": "RUB" if step is not None and cost is not None else "RAW",
                    "fees_known": self._storage.connection.execute("SELECT 1 FROM fills WHERE trade_id=? AND fee_source='unknown' LIMIT 1", (event.trade_id,)).fetchone() is None}

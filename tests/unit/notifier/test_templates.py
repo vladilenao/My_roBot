@@ -137,6 +137,10 @@ def _broker(event_type, **payload) -> Event:
             "📝 Ордер: Сделка BUY NG-10.26 отклонена (мало денег)",
         ),
         (
+            _broker(EventType.ORDER_REJECTED, side="SELL", quantity=0, reason="trade-not-open"),
+            "📝 Ордер: Сделка SELL NG-10.26 отклонена (позиция не открыта)",
+        ),
+        (
             _broker(EventType.TRADE_OPENED, side="BUY", quantity=10, price=Decimal("100.0")),
             "💰 Сделка: Вход BUY 10 NG-10.26 по 100.0",
         ),
@@ -165,6 +169,10 @@ def _broker(event_type, **payload) -> Event:
         (
             _broker(EventType.TRADE_CANCELLED, order_id=42, reason="risk_cap"),
             "❌ Отмена: Заявка 42 отменена (risk_cap)",
+        ),
+        (
+            _broker(EventType.TRADE_CANCELLED, order_id=42, reason="entry-timeout"),
+            "❌ Отмена: Заявка 42 отменена (вход не исполнен в отведённое время)",
         ),
         (
             _broker(EventType.TRADE_CANCELLED, order_id=42, reason="ttl"),

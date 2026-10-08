@@ -82,6 +82,22 @@ class TestBuildChannels:
 
         assert channel.enabled is False
 
+    def test_telegram_request_timeout_comes_from_config(self, monkeypatch) -> None:
+        self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
+        monkeypatch.setattr("src.config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT", 7)
+
+        (channel,) = build_channels()
+
+        assert channel._transport.timeout == 7
+
+    def test_telegram_max_transport_attempts_comes_from_config(self, monkeypatch) -> None:
+        self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
+        monkeypatch.setattr("src.config.NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS", 3)
+
+        (channel,) = build_channels()
+
+        assert channel._max_transport_attempts == 3
+
     def test_console_channel_prints_signal(self, monkeypatch, capsys) -> None:
         self._patch(monkeypatch, ("console",), ("signal",), ("signal",))
         (channel,) = build_channels()

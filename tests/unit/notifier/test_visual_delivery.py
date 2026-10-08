@@ -13,6 +13,7 @@ from src.notifier.telegram_chart import build_scene, render_png
 from src.notifier.telegram_delivery import DeliveryRepository, namespace
 from src.notifier.telegram_html import split_html, visible_text
 from src.notifier.telegram_templates import render
+from src.notifier.telegram_transport import PHOTO_REQUEST_MAX_BYTES
 from tests.support.telegram import demo_event
 
 
@@ -26,6 +27,9 @@ class Server:
         method = url.rsplit("/", 1)[-1]
         self.calls.append({"method": method, "data": data, "photo": files["photo"][1].read() if files else None})
         failure = self.fail.get(method)
+        if isinstance(failure, list):
+            # Последовательность исходов: первый вызов падает, дальше успех.
+            failure = failure.pop(0) if failure else None
         if isinstance(failure, Exception):
             raise failure
         body = failure or {"ok": True, "result": self.chat if method == "getChat" else {"message_id": len(self.calls)}}
@@ -56,6 +60,16 @@ def test_lifecycle_posts_preserve_plan_and_final_finances(server, tmp_path):
     photos = [c for c in server.calls if c["method"] == "sendPhoto"]
     assert len(photos) == 3
     assert all(c["photo"].startswith(b"\x89PNG") for c in photos)
+    with sqlite3.connect(tmp_path / "delivery.db") as connection:
+        saved = [row[0] for row in connection.execute("SELECT content FROM telegram_files ORDER BY file_id")]
+        navigation = [json.loads(row[0]) for row in connection.execute("SELECT data_json FROM operation_navigation ORDER BY operation_id")]
+    assert saved == [c["photo"] for c in photos]
+    assert navigation[0] == {"root": True, "roles": []}
+    assert navigation[-1] == {"root": False, "roles": ["Итог", "ЦЕЛЬ2"]}
+    for call in photos:
+        prepared = requests.Request("POST", "https://proxy.test/sendPhoto", data=call["data"],
+                                    files={"photo": ("trade.png", call["photo"], "image/png")}).prepare()
+        assert len(prepared.body) <= PHOTO_REQUEST_MAX_BYTES
     final = visible_text(photos[-1]["data"]["caption"])
     assert "+98 ₽" in final and "−6 ₽" in final.replace("-", "−") and "+92 ₽" in final
     edits = [c for c in server.calls if c["method"] == "editMessageCaption"]
@@ -68,6 +82,19 @@ def test_lifecycle_posts_preserve_plan_and_final_finances(server, tmp_path):
     for c in photos[1:]:
         button = json.loads(c["data"]["reply_markup"])["inline_keyboard"][0][0]
         assert button["url"] == "https://t.me/test_channel/1"
+
+
+def test_compression_failure_preserves_text_and_sends_no_photo(server, tmp_path, monkeypatch):
+    def too_large(*args):
+        raise ValueError("Не помещается")
+    monkeypatch.setattr("src.notifier.telegram.compact_png", too_large)
+    instance = channel(tmp_path / "delivery.db")
+    instance.handle(demo_event())
+    instance.close(10)
+    assert not any(c["method"] == "sendPhoto" for c in server.calls)
+    texts = [c["data"]["text"] for c in server.calls if c["method"] == "sendMessage"]
+    assert "297.00" in "\n".join(texts)
+    assert "ЦЕЛЬ1" in "\n".join(texts)
 
 
 def test_restart_duplicate_stale_and_two_trades(server, tmp_path):
@@ -104,6 +131,45 @@ def test_uncertain_failed_and_rate_limited_photo_never_republished(server, tmp_p
     assert [c["method"] for c in server.calls] == ["sendPhoto"]
     assert "secret" not in caplog.text
     with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT root_id FROM trades").fetchone()[0] is None
+
+
+def test_uncertain_timeout_is_retried_once_and_confirmed(server, tmp_path, monkeypatch):
+    monkeypatch.setattr("src.notifier.telegram.RETRY_DELAY", 0.0)
+    server.fail["sendPhoto"] = [requests.Timeout("https://proxy.test/bot123:secret/sendPhoto"), None]
+    path = tmp_path / "delivery.db"
+    instance = channel(path, max_transport_attempts=2)
+    instance.handle(demo_event())
+    instance.close(5)
+    assert [c["method"] for c in server.calls if c["method"] == "sendPhoto"] == ["sendPhoto", "sendPhoto"]
+    with sqlite3.connect(path) as conn:
+        status, message_id = conn.execute(
+            "SELECT status,message_id FROM attempts WHERE operation_key LIKE '%:post'"
+        ).fetchone()
+        assert status == "confirmed" and isinstance(message_id, int)
+        assert conn.execute("SELECT root_id FROM trades").fetchone()[0] is not None
+
+
+def test_failed_response_is_never_retried_even_when_allowed(server, tmp_path, monkeypatch):
+    monkeypatch.setattr("src.notifier.telegram.RETRY_DELAY", 0.0)
+    server.fail["sendPhoto"] = {"ok": False, "description": "bad photo"}
+    instance = channel(tmp_path / "delivery.db", max_transport_attempts=2)
+    instance.handle(demo_event())
+    instance.close(5)
+    assert [c["method"] for c in server.calls] == ["sendPhoto"]
+
+
+def test_second_uncertainty_stops_retrying(server, tmp_path, monkeypatch):
+    monkeypatch.setattr("src.notifier.telegram.RETRY_DELAY", 0.0)
+    timeout = requests.Timeout("https://proxy.test/bot123:secret/sendPhoto")
+    server.fail["sendPhoto"] = [timeout, timeout]
+    path = tmp_path / "delivery.db"
+    instance = channel(path, max_transport_attempts=2)
+    instance.handle(demo_event())
+    instance.close(5)
+    assert [c["method"] for c in server.calls] == ["sendPhoto", "sendPhoto"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT status,message_id FROM attempts").fetchone() == ("uncertain", None)
         assert conn.execute("SELECT root_id FROM trades").fetchone()[0] is None
 
 
