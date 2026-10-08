@@ -16,6 +16,7 @@ permissions:
 
 env:
   PYTHON_VERSION: '3.13.1'
+  PYTHONUTF8: '1'
 
 jobs:
   build:
