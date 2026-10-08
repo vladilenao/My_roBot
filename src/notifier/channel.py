@@ -17,6 +17,8 @@ class Channel(ABC):
     """Абстрактный канал доставки событий подписчику."""
 
     name: str = ""
+    notification_types: frozenset[EventType] = frozenset()
+    control_types: frozenset[EventType] = frozenset()
     supported_types: frozenset[EventType] = frozenset()
 
     def __init__(
@@ -24,13 +26,18 @@ class Channel(ABC):
         *,
         supported_types: Iterable[EventType] | None = None,
     ) -> None:
-        if supported_types is not None:
-            self.supported_types = frozenset(supported_types)
-        if not self.supported_types:
+        configured = (
+            frozenset(supported_types)
+            if supported_types is not None
+            else self.notification_types or self.supported_types
+        )
+        if not configured:
             raise ValueError(
                 f"Канал '{self.name or type(self).__name__}' должен объявить "
                 f"supported_types: пустой набор означает, что доставлять нечего"
             )
+        self.notification_types = configured
+        self.supported_types = configured | self.control_types
 
     def accepts(self, event: Event) -> bool:
         return event.type in self.supported_types

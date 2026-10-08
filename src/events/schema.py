@@ -26,6 +26,8 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
     EventType.REJECTED: ("reason",),
     EventType.HEARTBEAT: ("tick_count", "error_count"),
     EventType.ERROR: ("operation",),
+    EventType.TICK_STARTED: ("tick_id",),
+    EventType.TICK_FINISHED: ("tick_id", "completed"),
 }
 
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
@@ -43,6 +45,8 @@ _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.ERROR: ("message",),
     EventType.RATE_LIMITED: ("source",),
     EventType.CLEARING_DONE: (),
+    EventType.TICK_STARTED: (),
+    EventType.TICK_FINISHED: (),
 }
 
 _EXECUTION_OPTIONAL: tuple[str, ...] = (
@@ -115,6 +119,7 @@ _JSON_TYPES: dict[str, str] = {
     "tick_count": "number",
     "error_count": "number",
     "filtered_out": "boolean",
+    "completed": "boolean",
     "targets": "array",
     "requested_quantity": "number",
     "selected_quantity": "number",

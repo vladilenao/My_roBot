@@ -14,7 +14,7 @@ from src.config_loader import (
 from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
-from src.events.types import ALL_EVENT_TYPES, TRADING_EVENT_TYPES
+from src.events.types import NOTIFICATION_EVENT_TYPES, TRADING_EVENT_TYPES
 
 load_dotenv()  # загружает переменные из .env
 
@@ -53,7 +53,7 @@ _DEFAULTS = {
     "instrument_type": "future",
     "ticker": "NGU6",
     "notifier_channels": ["console"],
-    "notifier_console_events": sorted(t.value for t in ALL_EVENT_TYPES),
+    "notifier_console_events": sorted(t.value for t in NOTIFICATION_EVENT_TYPES),
     "notifier_telegram_events": sorted(t.value for t in TRADING_EVENT_TYPES),
     # Ограничение частоты API-дозагрузок свечей и окно bounded backfill
     "data_refresh_min_interval": 5,

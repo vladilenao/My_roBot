@@ -170,7 +170,10 @@ class TradingBot:
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self, ready_tfs: set[str]) -> None:
-        correlation_id_var.set(uuid4().hex[:8])
+        tick_id = uuid4().hex[:8]
+        correlation_id_var.set(tick_id)
+        completed = False
+        self._bus.publish(Event.tick_started(tick_id=tick_id))
         try:
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
@@ -218,7 +221,9 @@ class TradingBot:
                 except Exception as exc:
                     self._report_error(exc, f"портфельный допуск {candidate.instrument.label}")
             self._maybe_heartbeat()
+            completed = True
         finally:
+            self._bus.publish(Event.tick_finished(tick_id=tick_id, completed=completed))
             correlation_id_var.set(None)
 
     def _take_data_gap(self):

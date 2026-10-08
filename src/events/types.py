@@ -1,6 +1,6 @@
 """Каталог типов событий шины.
 
-Список закрыт: 19 типов, каждый с фиксированным набором полей payload.
+Список закрыт: 19 пользовательских и 2 служебных типа с фиксированным payload.
 Значения ``StrEnum`` совпадают с именами типов в
 ``docs/notification/event-schemas.md`` и используются в конфигурации
 ``[notifier.<канал>] events``.
@@ -33,6 +33,8 @@ class EventType(StrEnum):
     HEARTBEAT = "heartbeat"
     ERROR = "error"
     RATE_LIMITED = "rate_limited"
+    TICK_STARTED = "tick_started"
+    TICK_FINISHED = "tick_finished"
 
 
 TRADING_EVENT_TYPES: frozenset[EventType] = frozenset(
@@ -49,7 +51,11 @@ TRADING_EVENT_TYPES: frozenset[EventType] = frozenset(
     }
 )
 
+CONTROL_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {EventType.TICK_STARTED, EventType.TICK_FINISHED}
+)
 ALL_EVENT_TYPES: frozenset[EventType] = frozenset(EventType)
+NOTIFICATION_EVENT_TYPES: frozenset[EventType] = ALL_EVENT_TYPES - CONTROL_EVENT_TYPES
 
 EVENT_TYPE_NAMES: tuple[str, ...] = tuple(sorted(event.value for event in EventType))
 

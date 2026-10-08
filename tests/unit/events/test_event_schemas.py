@@ -113,6 +113,8 @@ def _samples() -> dict[EventType, Event]:
         EventType.HEARTBEAT: Event.heartbeat(tick_count=1, error_count=0),
         EventType.ERROR: Event.error(operation="тик"),
         EventType.RATE_LIMITED: Event.rate_limited(source="tinkoff"),
+        EventType.TICK_STARTED: Event.tick_started(tick_id="tick-1"),
+        EventType.TICK_FINISHED: Event.tick_finished(tick_id="tick-1", completed=True),
     }
 
 
@@ -194,6 +196,12 @@ def test_amounts_serialize_as_decimal_strings() -> None:
 
     assert payload["entry"] == "1234"
     assert payload["stop"] == "1200.5"
+
+
+def test_tick_finished_completed_serializes_as_boolean() -> None:
+    payload = Event.tick_finished(tick_id="tick-1", completed=False).to_dict()["payload"]
+
+    assert payload == {"tick_id": "tick-1", "completed": False}
 
 
 def test_rich_admission_and_ownerless_portfolio_alert_match_schema():

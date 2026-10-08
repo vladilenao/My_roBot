@@ -286,6 +286,19 @@ class Event:
         )
 
     @classmethod
+    def tick_started(cls, *, tick_id: str) -> "Event":
+        """Служебная граница начала обработки одного тика."""
+        return cls._make(EventType.TICK_STARTED, payload={"tick_id": tick_id})
+
+    @classmethod
+    def tick_finished(cls, *, tick_id: str, completed: bool) -> "Event":
+        """Служебная граница завершения обработки одного тика."""
+        return cls._make(
+            EventType.TICK_FINISHED,
+            payload={"tick_id": tick_id, "completed": completed},
+        )
+
+    @classmethod
     def error(cls, *, operation: str, message: str = "") -> "Event":
         """Ошибка операции: пользователю достаётся название операции, не дамп."""
         return cls._make(

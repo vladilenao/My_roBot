@@ -3,7 +3,7 @@
 import pytest
 
 from src.events import Event
-from src.events.types import EventType
+from src.events.types import CONTROL_EVENT_TYPES, EventType
 from src.notifier import ConsoleChannel, TelegramChannel, build_channels, close_channels
 
 
@@ -48,7 +48,8 @@ class TestBuildChannels:
         (channel,) = build_channels()
 
         assert isinstance(channel, ConsoleChannel)
-        assert channel.supported_types == frozenset({EventType.DECISION, EventType.SIGNAL})
+        assert channel.notification_types == frozenset({EventType.DECISION, EventType.SIGNAL})
+        assert channel.supported_types == frozenset({EventType.DECISION, EventType.SIGNAL}) | CONTROL_EVENT_TYPES
 
     def test_builds_channels_in_configuration_order(self, monkeypatch) -> None:
         self._patch(monkeypatch, ("telegram", "console"), ("decision",), ("signal",))

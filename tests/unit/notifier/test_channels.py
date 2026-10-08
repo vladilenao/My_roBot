@@ -1,10 +1,13 @@
 """Unit-тесты каналов: консоль, порт канала, Telegram-очередь."""
 
+import io
 import time
+from datetime import datetime, timezone
 
 import pytest
 import requests
 
+from src.events import EventBus
 from src.events.event import Event
 from src.events.types import TRADING_EVENT_TYPES, EventType
 from src.notifier.channel import Channel
@@ -66,6 +69,182 @@ class TestConsoleChannel:
         ConsoleChannel().handle(Event.rate_limited(source="tinkoff"))
 
         assert capsys.readouterr().out == ""
+
+    def test_broken_pipe_disables_channel_without_error(self) -> None:
+        class BrokenStream(io.StringIO):
+            writes = 0
+
+            def write(self, _s: str) -> int:
+                BrokenStream.writes += 1
+                raise BrokenPipeError(32, "Broken pipe")
+
+        channel = ConsoleChannel(stream=BrokenStream())
+        channel.handle(Event.heartbeat(tick_count=1, error_count=0))
+        channel.handle(Event.heartbeat(tick_count=2, error_count=0))
+
+        # Первая попытка упала в OSError (канал её пережил), вторая не делалась.
+        assert BrokenStream.writes == 1
+
+    def test_quiet_tick_prints_one_summary_through_bus(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(
+            stream=stream,
+            supported_types={EventType.DECISION, EventType.ERROR},
+            tz_offset_hours=-7,
+            now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc),
+        )
+        bus = EventBus()
+        bus.subscribe(channel)
+
+        bus.publish(Event.tick_started(tick_id="one"))
+        for instrument in ("NG-9.26", "GAZP", "Si", "RTS"):
+            for strategy in ("first", "second"):
+                bus.publish(Event.decision(
+                    instrument, outcome="no_signal", side="HOLD", strategy=strategy,
+                ))
+        bus.publish(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (8 пар: NG-9.26, GAZP, Si, RTS)\n"
+
+    def test_printed_event_suppresses_quiet_tick_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.decision("SBER", outcome="signal_buy", side="BUY", price=100))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● SBER ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.000\n"
+
+    def test_filtered_hold_is_printed_and_suppresses_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.decision("SBER", outcome="filtered", side="HOLD", filtered_out=True))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● SBER ➜ ❌ Отклонено фильтром.\n"
+
+    def test_holds_for_different_timeframes_and_profiles_count_separately(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        for timeframe, profile in (("5m", "raw"), ("15m", "raw"), ("15m", "basic_levels")):
+            channel.handle(Event.decision(
+                "GAZP", outcome="no_signal", side="HOLD", timeframe=timeframe, filter_profile=profile,
+            ))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (3 пары: GAZP)\n"
+
+    def test_disabled_decisions_do_not_produce_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, supported_types={EventType.ERROR})
+        bus = EventBus()
+        bus.subscribe(channel)
+
+        bus.publish(Event.tick_started(tick_id="one"))
+        bus.publish(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        bus.publish(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == ""
+
+    def test_unfinished_tick_and_mismatched_finish_do_not_print_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.tick_finished(tick_id="other", completed=True))
+        channel.handle(Event.tick_finished(tick_id="one", completed=False))
+        channel.handle(Event.tick_started(tick_id="two"))
+        channel.handle(Event.tick_finished(tick_id="two", completed=True))
+
+        assert stream.getvalue() == ""
+
+    def test_summary_plural_and_midnight_moscow_time(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(
+            stream=stream,
+            now=lambda: datetime(2026, 10, 8, 22, 15, tzinfo=timezone.utc),
+        )
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        for _ in range(21):
+            channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● 01:15 ➜ ⏳ Нет сигналов (21 пара: GAZP)\n"
+
+    @pytest.mark.parametrize("event", [Event.error(operation="тик"), Event.heartbeat(tick_count=1, error_count=0)])
+    def test_printed_system_event_suppresses_summary(self, event) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(event)
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert "Нет сигналов" not in stream.getvalue()
+
+    def test_events_between_ticks_do_not_suppress_next_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("SBER", outcome="signal_buy", side="BUY", price=100))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+        channel.handle(Event.error(operation="между тиками"))
+        channel.handle(Event.tick_started(tick_id="two"))
+        channel.handle(Event.decision("", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.tick_finished(tick_id="two", completed=True))
+
+        assert stream.getvalue().endswith("● 10:15 ➜ ⏳ Нет сигналов (1 пара: контракт не указан)\n")
+
+    def test_event_without_text_does_not_suppress_summary(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.rate_limited(source="tinkoff"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (1 пара: GAZP)\n"
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            Event.rejected("SBER", reason="нет объёма"),
+            Event.broker_event(EventType.TRADE_OPENED, trade_id="trade-1", side="BUY", quantity=1, price=100),
+        ],
+    )
+    def test_trade_and_rejection_events_suppress_summary(self, event) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.handle(event)
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert "Нет сигналов" not in stream.getvalue()
+
+    def test_close_discards_unfinished_holds(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        channel.close()
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+
+        assert stream.getvalue() == ""
 
 
 class TestSplitMessage:

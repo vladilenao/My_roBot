@@ -28,7 +28,7 @@
 }
 ```
 
-- `type` — один из 19 типов каталога ([events.md](events.md)).
+- `type` — один из 21 типов каталога: 19 пользовательских уведомлений и две служебные границы тика ([events.md](events.md)).
 - `instrument` — короткое имя контракта; пустая строка, если событие не про контракт.
 - `bar_time` — время закрытия бара в ISO8601 или `null`.
 - `timeframe` — таймфрейм сигнала или пустая строка.
@@ -44,7 +44,7 @@
 `Decimal` сериализуется строкой, поэтому `price`, `entry`, `stop`, `fee`, `expected_r`,
 `risk_amount`, `reward_amount`, `costs_amount` и `payoff_ratio` в JSON имеют строковый
 тип: так не теряются знаки и точность. `quantity`, `tick_count`
-и `error_count` — числа, `filtered_out` — булево, `targets` — массив строк с ценами.
+и `error_count` — числа, `filtered_out` и `completed` — булевы, `targets` — массив строк с ценами.
 
 Блоки ниже перепечатывают `src/events/schema.py`: менять форму события нужно там, а
 документ и тест подтянутся проверкой.
@@ -1113,6 +1113,52 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
   "properties": {
     "source": {
       "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### `tick_started`
+
+Служебная граница начала обработки тика. Пользователю не показывается.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload tick_started",
+  "type": "object",
+  "required": [
+    "tick_id"
+  ],
+  "properties": {
+    "tick_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### `tick_finished`
+
+Служебная граница завершения тика. `completed` отличает штатную обработку от раннего выхода или сбоя. Пользователю не показывается.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload tick_finished",
+  "type": "object",
+  "required": [
+    "tick_id",
+    "completed"
+  ],
+  "properties": {
+    "tick_id": {
+      "type": "string"
+    },
+    "completed": {
+      "type": "boolean"
     }
   },
   "additionalProperties": false

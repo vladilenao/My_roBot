@@ -22,7 +22,8 @@ fallback_ticker = "NGU6"
 channels = ["console","telegram"]
 
 [notifier.console]
-# Консоль — источник истины: по умолчанию весь каталог событий.
+# Консоль — источник истины: по умолчанию все пользовательские уведомления.
+# Границы тика доставляются ей технически и здесь не перечисляются.
 events = [
     "clearing_done", "decision", "error", "heartbeat", "order_accepted", "order_rejected",
     "position_added", "protection_armed", "rate_limited", "rejected", "reservation_changed",
