@@ -142,6 +142,15 @@ REASON_LABELS = {
     "no-contract-meta": "нет метаданных контракта",
     "insufficient-history": "недостаточно истории",
     "stale-state-revision": "устарела ревизия состояния",
+    "trade-not-open": "позиция не открыта",
+    "trade-already-open": "позиция уже открыта",
+    "unknown-trade": "неизвестная сделка",
+    "unknown-target": "неизвестная цель",
+    "limit-entry-required": "вход только по лимитной заявке",
+    "quantity-non-positive": "недопустимое количество",
+    "quantity-exceeds-trade-remainder": "количество больше остатка позиции",
+    "quantity-exceeds-target-remainder": "количество больше остатка цели",
+    "unsupported-command": "неподдерживаемая команда",
 }
 
 

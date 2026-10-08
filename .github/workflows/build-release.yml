@@ -40,6 +40,10 @@ jobs:
           PYINSTALLER_NAME: robot-${{ github.ref_name }}_${{ matrix.platform }}
         run: pyinstaller run.spec --noconfirm
 
+      - name: Smoke headless Telegram chart
+        shell: bash
+        run: '"dist/robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}" --telegram-chart-smoke'
+
       - name: Inspect dist directory
         shell: bash
         run: ls -la dist

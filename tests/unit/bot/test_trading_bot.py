@@ -232,6 +232,58 @@ def _make_bot(timeline, cache, bus, strategy, share=None, future=None, factory=N
 
 
 class TestTradingBot:
+    def test_tick_boundaries_wrap_decisions_and_heartbeat(self):
+        channel = RecordingChannel()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            bus=channel.bus,
+            strategy=_make_strategy(decision=Decision(SignalType.HOLD, 100.5)),
+            share={"SBER": _assign("macd_rsi_stoch")},
+            heartbeat=1,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert channel.events[0].type is EventType.TICK_STARTED
+        assert channel.events[-1].type is EventType.TICK_FINISHED
+        assert channel.events[0].get("tick_id") == channel.events[-1].get("tick_id")
+        assert channel.events[-1].get("completed") is True
+        assert EventType.DECISION in [event.type for event in channel.events]
+        assert EventType.HEARTBEAT in [event.type for event in channel.events]
+
+    def test_empty_tick_is_finished_as_incomplete(self):
+        channel = RecordingChannel()
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(), bus=channel.bus, strategy=_make_strategy(),
+        )
+
+        bot._tick(set())
+
+        assert [event.type for event in channel.events] == [EventType.TICK_STARTED, EventType.TICK_FINISHED]
+        assert channel.events[-1].get("completed") is False
+
+    def test_interrupted_tick_is_finished_as_incomplete(self):
+        channel = RecordingChannel()
+        trade_manager = MagicMock()
+        trade_manager.manage.return_value = ()
+        bot = _make_bot(
+            timeline=FakeTimeline(timeframes=("1m",)),
+            cache=FakeCache(frames={"SBER": _df()}),
+            bus=channel.bus,
+            strategy=_make_strategy(),
+            trade_manager=trade_manager,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+        bot._post_tick = MagicMock(side_effect=KeyboardInterrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            bot._tick({"1m"})
+
+        assert [event.type for event in channel.events] == [EventType.TICK_STARTED, EventType.TICK_FINISHED]
+        assert channel.events[-1].get("completed") is False
+
     def test_portfolio_admission_uses_stable_tick_candidate_order(self):
         trade_manager = MagicMock()
         admitted = []

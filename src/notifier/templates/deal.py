@@ -13,6 +13,7 @@ from typing import Callable
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.common import amount, budget_text, financial_text, pnl_text, price
+from src.trade_journal.export import reason_label
 
 PREFIXES = {
     EventType.ORDER_ACCEPTED: "📝 Ордер",
@@ -39,7 +40,7 @@ def _order_accepted(event: Event) -> str:
 
 
 def _order_rejected(event: Event) -> str:
-    return f"Сделка {event.get('side')} {event.instrument} отклонена ({event.get('reason')})"
+    return f"Сделка {event.get('side')} {event.instrument} отклонена ({reason_label(event.get('reason'))})"
 
 
 def _trade_opened(event: Event) -> str:
@@ -83,7 +84,7 @@ def _trade_closed(event: Event) -> str:
 def _trade_cancelled(event: Event) -> str:
     if event.get("reason") == "ttl":
         return f"Заявка {event.get('order_id')} истекла по TTL"
-    return f"Заявка {event.get('order_id')} отменена ({event.get('reason')})"
+    return f"Заявка {event.get('order_id')} отменена ({reason_label(event.get('reason'))})"
 
 
 def _protection_armed(event: Event) -> str:

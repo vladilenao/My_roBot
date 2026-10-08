@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "visual-snapshot.json",
+  "type": "object",
+  "required": ["version", "trade_id", "event_key", "sequence", "revision", "as_of", "instrument", "side", "timeframe", "unit", "plan", "state", "fills", "fill_groups", "stops", "market", "financial"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "trade_id": {"type": "string"},
+    "event_key": {"type": "string"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "revision": {"type": "integer", "minimum": 0},
+    "as_of": {"type": "string"},
+    "instrument": {"type": "string"},
+    "side": {"type": "string", "enum": ["BUY", "SELL"]},
+    "timeframe": {"type": "string"},
+    "unit": {"type": "string", "enum": ["lot", "contract"]},
+    "lot_size": {"type": "integer", "minimum": 0},
+    "price_step": {"type": "string"},
+    "plan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entry", "stop", "quantity", "targets", "trailing_quantity", "algorithm_version"],
+      "properties": {
+        "entry": {"type": "string"}, "stop": {"type": "string"},
+        "quantity": {"type": "integer", "minimum": 0},
+        "targets": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "number", "price", "quantity"],
+          "properties": {"id": {"type": "string"}, "number": {"type": "integer", "minimum": 0}, "price": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "filled": {"type": "integer", "minimum": 0}}
+        }},
+        "trailing_quantity": {"type": "integer", "minimum": 0}, "algorithm_version": {"type": "string"},
+        "risk_amount": {"type": "string"}, "reward_amount": {"type": "string"}, "costs_amount": {"type": "string"},
+        "net_reward_amount": {"type": "string"}, "fixed_reward_amount": {"type": "string"},
+        "requested_quantity": {"type": "integer", "minimum": 0}, "limiting_constraint": {"type": "string"}
+      }
+    },
+    "state": {
+      "type": "object", "additionalProperties": false, "required": ["phase", "quantity", "targets"],
+      "properties": {
+        "phase": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "average_entry": {"type": "string"}, "stop": {"type": "string"},
+        "targets": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "number", "price", "quantity"],
+          "properties": {"id": {"type": "string"}, "number": {"type": "integer", "minimum": 0}, "price": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "filled": {"type": "integer", "minimum": 0}}
+        }}
+      }
+    },
+    "fills": {"type": "array", "maxItems": 64, "items": {
+      "type": "object", "additionalProperties": false, "required": ["key", "time", "role", "side", "quantity", "price"],
+      "properties": {"key": {"type": "string"}, "time": {"type": "string"}, "role": {"type": "string"}, "side": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "price": {"type": "string"}}
+    }},
+    "fill_groups": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["role", "side", "start", "end", "quantity", "price", "count"],
+      "properties": {"role": {"type": "string"}, "side": {"type": "string"}, "start": {"type": "string"}, "end": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "price": {"type": "string"}, "count": {"type": "integer", "minimum": 0}}
+    }},
+    "stops": {"type": "array", "maxItems": 64, "items": {
+      "type": "object", "additionalProperties": false, "required": ["key", "time", "new", "reason"],
+      "properties": {"key": {"type": "string"}, "time": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "reason": {"type": "string"}}
+    }},
+    "market": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candles", "limited", "gaps", "history_limited", "stop_history_limited"],
+      "properties": {
+        "candles": {"type": "array", "maxItems": 80, "items": {
+          "type": "object", "additionalProperties": false, "required": ["time", "open", "high", "low", "close"],
+          "properties": {"time": {"type": "string"}, "open": {"type": "string"}, "high": {"type": "string"}, "low": {"type": "string"}, "close": {"type": "string"}}
+        }},
+        "limited": {"type": "boolean"}, "gaps": {"type": "boolean"}, "history_limited": {"type": "boolean"},
+        "stop_history_limited": {"type": "boolean"}, "boundary_stop": {"type": "string"}
+      }
+    },
+    "financial": {
+      "type": "object", "additionalProperties": false, "required": ["units", "fees_known", "fees_source"],
+      "properties": {"gross": {"type": "string"}, "fees": {"type": "string"}, "net": {"type": "string"}, "units": {"type": "string"}, "fees_source": {"type": "string"}, "fees_known": {"type": "boolean"}}
+    }
+  }
+}

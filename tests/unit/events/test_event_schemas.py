@@ -20,6 +20,7 @@ from src.events.schema import (
     payload_schema,
 )
 from src.events.types import ALL_EVENT_TYPES, EventType
+from src.events.visual import validate as validate_visual, visual_schema
 
 DOC_PATH = Path(__file__).resolve().parents[3] / "docs" / "notification" / "event-schemas.md"
 
@@ -31,6 +32,7 @@ ALLOWED_SCHEMA_KEYS = {
     "properties",
     "additionalProperties",
     "items",
+    "$ref",
 }
 
 _JSON_TYPES: dict[str, type | tuple[type, ...]] = {
@@ -54,6 +56,10 @@ def _document_schemas() -> dict[str, dict]:
 
 
 def _validate(instance, schema, path: str = "payload") -> None:
+    if "$ref" in schema:
+        assert schema["$ref"] == "visual-snapshot.json"
+        validate_visual(instance, visual_schema(), path)
+        return
     unknown = set(schema) - ALLOWED_SCHEMA_KEYS
     assert not unknown, f"{path}: схема использует неподдерживаемые конструкции {sorted(unknown)}"
 
@@ -107,6 +113,8 @@ def _samples() -> dict[EventType, Event]:
         EventType.HEARTBEAT: Event.heartbeat(tick_count=1, error_count=0),
         EventType.ERROR: Event.error(operation="тик"),
         EventType.RATE_LIMITED: Event.rate_limited(source="tinkoff"),
+        EventType.TICK_STARTED: Event.tick_started(tick_id="tick-1"),
+        EventType.TICK_FINISHED: Event.tick_finished(tick_id="tick-1", completed=True),
     }
 
 
@@ -161,6 +169,10 @@ def test_document_schemas_match_code() -> None:
         )
 
 
+def test_visual_schema_document_matches_executable_contract():
+    assert json.loads(DOC_PATH.with_name("visual-snapshot.json").read_text()) == visual_schema()
+
+
 @pytest.mark.parametrize("event_type", sorted(ALL_EVENT_TYPES, key=lambda item: item.value))
 def test_sample_event_matches_documented_schema(event_type: EventType) -> None:
     payload = _samples()[event_type].to_dict()["payload"]
@@ -184,6 +196,12 @@ def test_amounts_serialize_as_decimal_strings() -> None:
 
     assert payload["entry"] == "1234"
     assert payload["stop"] == "1200.5"
+
+
+def test_tick_finished_completed_serializes_as_boolean() -> None:
+    payload = Event.tick_finished(tick_id="tick-1", completed=False).to_dict()["payload"]
+
+    assert payload == {"tick_id": "tick-1", "completed": False}
 
 
 def test_rich_admission_and_ownerless_portfolio_alert_match_schema():

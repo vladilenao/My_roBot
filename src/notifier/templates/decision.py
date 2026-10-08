@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Iterable
+
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.common import budget_text, header_parts, price
@@ -18,6 +21,20 @@ def _signal_text(event: Event) -> str:
     if side == "SELL":
         return f"🔴 ПРОДАЖА (SELL) — Цена: {shown}"
     return "⏳ Нет сигнала."
+
+
+def idle_tick_summary(when: datetime, count: int, instruments: Iterable[str]) -> str:
+    """Строка консоли для штатного тика без торговых сигналов."""
+    remainder = count % 100
+    if 11 <= remainder <= 14:
+        pair_word = "пар"
+    elif count % 10 == 1:
+        pair_word = "пара"
+    elif 2 <= count % 10 <= 4:
+        pair_word = "пары"
+    else:
+        pair_word = "пар"
+    return f"● {when:%H:%M} ➜ ⏳ Нет сигналов ({count} {pair_word}: {', '.join(instruments)})"
 
 
 def render(event: Event, tz_offset_hours: float = 0.0) -> str | None:

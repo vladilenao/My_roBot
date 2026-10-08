@@ -1,6 +1,6 @@
 """Unit-тесты шаблонов: тексты уведомлений не меняются при переходе на шину."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -8,6 +8,7 @@ import pytest
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates import render
+from src.notifier.templates.decision import idle_tick_summary
 from src.strategies.contracts import Decision, SignalType
 
 
@@ -36,6 +37,16 @@ def test_hold_decision_text() -> None:
     event = Event.decision("SBER", outcome="no_signal", side="HOLD", price=None, strategy="")
 
     assert render(event) == "● SBER ➜ ⏳ Нет сигнала."
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(1, "пара"), (2, "пары"), (8, "пар"), (11, "пар"), (21, "пара")],
+)
+def test_idle_tick_summary_plural(count, expected) -> None:
+    result = idle_tick_summary(datetime(2026, 10, 8, 10, 15, tzinfo=timezone.utc), count, ("GAZP",))
+
+    assert result == f"● 10:15 ➜ ⏳ Нет сигналов ({count} {expected}: GAZP)"
 
 
 def test_filtered_decision_text() -> None:
@@ -126,6 +137,10 @@ def _broker(event_type, **payload) -> Event:
             "📝 Ордер: Сделка BUY NG-10.26 отклонена (мало денег)",
         ),
         (
+            _broker(EventType.ORDER_REJECTED, side="SELL", quantity=0, reason="trade-not-open"),
+            "📝 Ордер: Сделка SELL NG-10.26 отклонена (позиция не открыта)",
+        ),
+        (
             _broker(EventType.TRADE_OPENED, side="BUY", quantity=10, price=Decimal("100.0")),
             "💰 Сделка: Вход BUY 10 NG-10.26 по 100.0",
         ),
@@ -154,6 +169,10 @@ def _broker(event_type, **payload) -> Event:
         (
             _broker(EventType.TRADE_CANCELLED, order_id=42, reason="risk_cap"),
             "❌ Отмена: Заявка 42 отменена (risk_cap)",
+        ),
+        (
+            _broker(EventType.TRADE_CANCELLED, order_id=42, reason="entry-timeout"),
+            "❌ Отмена: Заявка 42 отменена (вход не исполнен в отведённое время)",
         ),
         (
             _broker(EventType.TRADE_CANCELLED, order_id=42, reason="ttl"),

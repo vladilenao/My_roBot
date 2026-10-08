@@ -28,7 +28,7 @@
 }
 ```
 
-- `type` — один из 19 типов каталога ([events.md](events.md)).
+- `type` — один из 21 типов каталога: 19 пользовательских уведомлений и две служебные границы тика ([events.md](events.md)).
 - `instrument` — короткое имя контракта; пустая строка, если событие не про контракт.
 - `bar_time` — время закрытия бара в ISO8601 или `null`.
 - `timeframe` — таймфрейм сигнала или пустая строка.
@@ -44,10 +44,19 @@
 `Decimal` сериализуется строкой, поэтому `price`, `entry`, `stop`, `fee`, `expected_r`,
 `risk_amount`, `reward_amount`, `costs_amount` и `payoff_ratio` в JSON имеют строковый
 тип: так не теряются знаки и точность. `quantity`, `tick_count`
-и `error_count` — числа, `filtered_out` — булево, `targets` — массив строк с ценами.
+и `error_count` — числа, `filtered_out` и `completed` — булевы, `targets` — массив строк с ценами.
 
 Блоки ниже перепечатывают `src/events/schema.py`: менять форму события нужно там, а
 документ и тест подтянутся проверкой.
+
+Необязательный `visual` — глубоко неизменяемый снимок версии 1 для Telegram:
+[visual-snapshot.json](visual-snapshot.json), исполнимый контракт `src/events/visual.py`.
+Он содержит исходный/актуальный планы, целые аллокации, подтверждённые исполнения
+и переносы стопа, происхождение комиссий и до 80 доступных закрытых свечей.
+`sequence` — устойчивый порядок фактов SQLite, `revision` — ревизия сделки;
+ключи нужны для delivery-корреляции и пользователю не выводятся. Старые события
+без `visual` сохраняют текстовое представление. Подробные истории ограничены
+64 элементами с явными агрегатами ранних исполнений, не потерей общего результата.
 
 ## События анализа
 
@@ -181,7 +190,8 @@
     "unknown_reason": {"type": "string"},
     "requested_quantity": {"type": "number"},
     "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"}
+    "limiting_constraint": {"type": "string"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -366,7 +376,7 @@ ISO8601.
 
 ### `order_rejected`
 
-Брокер отклонил заявку, сделка не открыта.
+Брокер отклонил операцию; уже открытая позиция от этого не становится закрытой.
 
 ```json
 {
@@ -415,7 +425,8 @@ ISO8601.
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -488,7 +499,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -555,7 +567,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "quantity_remaining": {"type": "number"},
     "requested_quantity": {"type": "number"},
     "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"}
+    "limiting_constraint": {"type": "string"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -619,7 +632,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -683,7 +697,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -691,7 +706,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `trade_closed`
 
-Позиция закрыта полностью.
+Выход из позиции. Полное закрытие определяется подтверждённым CLOSED/нулевым остатком,
+а не только типом события: REDUCE может оставить открытую часть.
 
 ```json
 {
@@ -747,7 +763,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "fees_known": {"type": "boolean"},
     "fee_source": {"type": "string"},
     "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"}
+    "quantity_remaining": {"type": "number"},
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -755,7 +772,7 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `trade_cancelled`
 
-Сделка снята до исполнения.
+Операция отменена. Отмена незаполненного остатка входа не отменяет исполненную позицию.
 
 ```json
 {
@@ -804,7 +821,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -920,7 +938,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     },
     "occurred_at": {
       "type": "string"
-    }
+    },
+    "visual": {"$ref": "visual-snapshot.json"}
   },
   "additionalProperties": false
 }
@@ -1094,6 +1113,52 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
   "properties": {
     "source": {
       "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### `tick_started`
+
+Служебная граница начала обработки тика. Пользователю не показывается.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload tick_started",
+  "type": "object",
+  "required": [
+    "tick_id"
+  ],
+  "properties": {
+    "tick_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### `tick_finished`
+
+Служебная граница завершения тика. `completed` отличает штатную обработку от раннего выхода или сбоя. Пользователю не показывается.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload tick_finished",
+  "type": "object",
+  "required": [
+    "tick_id",
+    "completed"
+  ],
+  "properties": {
+    "tick_id": {
+      "type": "string"
+    },
+    "completed": {
+      "type": "boolean"
     }
   },
   "additionalProperties": false

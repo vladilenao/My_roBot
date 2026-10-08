@@ -290,11 +290,12 @@ class TestRuntimeComposition:
         assert "trade_id" not in alert.payload
         callbacks["execution_observer"](SimpleNamespace(trade_id="trade", timestamp=datetime(2026, 1, 1), filled_quantity=2,
             price=run.Decimal(100), fee=run.Decimal(0), fee_source="broker", reason="entry", execution_id="exec", status="fill"),
-            {"action_type": "OPEN", "instrument_id": "SBER", "gross_pnl": run.Decimal(0), "net_pnl": run.Decimal(0),
+            {"action_type": "OPEN", "instrument_id": "SBER", "side": "BUY", "gross_pnl": run.Decimal(0), "net_pnl": run.Decimal(0),
              "fees_total": run.Decimal(0), "fees_known": True, "pnl_units": "RUB", "quantity_remaining": 2})
         fact = bus.publish.call_args.args[0]
         assert fact.type is run.EventType.TRADE_OPENED and fact.get("fee_source") == "broker"
         assert fact.get("fee") == 0 and fact.get("quantity_remaining") == 2
+        assert fact.get("side") == "BUY"
 
     def test_build_runtime_normalizes_selector_tuples_before_consumers(self):
         broker = MagicMock()

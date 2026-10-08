@@ -456,6 +456,80 @@ def test_per_channel_events_are_parsed(tmp_path):
     assert config["notifier_telegram_events"] == ["trade_closed"]
 
 
+def test_telegram_request_timeout_is_parsed(tmp_path):
+    ok = tmp_path / "robot.toml"
+    ok.write_text(
+        "[notifier]\nchannels = [\"telegram\"]\n\n"
+        "[notifier.telegram]\nevents = [\"signal\"]\nrequest_timeout = 30\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(_defaults(), config_file=ok)
+
+    assert config["notifier_telegram_request_timeout"] == 30
+
+
+def test_request_timeout_in_console_subsection_raises(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text(
+        "[notifier]\nchannels = [\"console\"]\n\n"
+        "[notifier.console]\nevents = [\"signal\"]\nrequest_timeout = 30\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="request_timeout"):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_nonpositive_request_timeout_raises(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text(
+        "[notifier]\nchannels = [\"telegram\"]\n\n"
+        "[notifier.telegram]\nevents = [\"signal\"]\nrequest_timeout = 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="request_timeout"):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_max_transport_attempts_is_parsed(tmp_path):
+    ok = tmp_path / "robot.toml"
+    ok.write_text(
+        "[notifier]\nchannels = [\"telegram\"]\n\n"
+        "[notifier.telegram]\nevents = [\"signal\"]\nmax_transport_attempts = 3\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(_defaults(), config_file=ok)
+
+    assert config["notifier_telegram_max_transport_attempts"] == 3
+
+
+def test_max_transport_attempts_in_console_subsection_raises(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text(
+        "[notifier]\nchannels = [\"console\"]\n\n"
+        "[notifier.console]\nevents = [\"signal\"]\nmax_transport_attempts = 2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="max_transport_attempts"):
+        load_config(_defaults(), config_file=bad)
+
+
+def test_zero_max_transport_attempts_raises(tmp_path):
+    bad = tmp_path / "robot.toml"
+    bad.write_text(
+        "[notifier]\nchannels = [\"telegram\"]\n\n"
+        "[notifier.telegram]\nevents = [\"signal\"]\nmax_transport_attempts = 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="max_transport_attempts"):
+        load_config(_defaults(), config_file=bad)
+
+
 def test_unknown_event_type_raises_config_error(tmp_path):
     bad = tmp_path / "robot.toml"
     bad.write_text(

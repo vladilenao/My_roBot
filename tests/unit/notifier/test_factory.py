@@ -3,7 +3,7 @@
 import pytest
 
 from src.events import Event
-from src.events.types import EventType
+from src.events.types import CONTROL_EVENT_TYPES, EventType
 from src.notifier import ConsoleChannel, TelegramChannel, build_channels, close_channels
 
 
@@ -48,7 +48,8 @@ class TestBuildChannels:
         (channel,) = build_channels()
 
         assert isinstance(channel, ConsoleChannel)
-        assert channel.supported_types == frozenset({EventType.DECISION, EventType.SIGNAL})
+        assert channel.notification_types == frozenset({EventType.DECISION, EventType.SIGNAL})
+        assert channel.supported_types == frozenset({EventType.DECISION, EventType.SIGNAL}) | CONTROL_EVENT_TYPES
 
     def test_builds_channels_in_configuration_order(self, monkeypatch) -> None:
         self._patch(monkeypatch, ("telegram", "console"), ("decision",), ("signal",))
@@ -80,6 +81,22 @@ class TestBuildChannels:
         (channel,) = build_channels()
 
         assert channel.enabled is False
+
+    def test_telegram_request_timeout_comes_from_config(self, monkeypatch) -> None:
+        self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
+        monkeypatch.setattr("src.config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT", 7)
+
+        (channel,) = build_channels()
+
+        assert channel._transport.timeout == 7
+
+    def test_telegram_max_transport_attempts_comes_from_config(self, monkeypatch) -> None:
+        self._patch(monkeypatch, ("telegram",), ("decision",), ("signal",))
+        monkeypatch.setattr("src.config.NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS", 3)
+
+        (channel,) = build_channels()
+
+        assert channel._max_transport_attempts == 3
 
     def test_console_channel_prints_signal(self, monkeypatch, capsys) -> None:
         self._patch(monkeypatch, ("console",), ("signal",), ("signal",))

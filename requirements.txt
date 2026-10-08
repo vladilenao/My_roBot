@@ -6,4 +6,5 @@ t-tech-investments
 ipython-autotime
 python-dotenv
 requests
+matplotlib==3.11.0
 pytest

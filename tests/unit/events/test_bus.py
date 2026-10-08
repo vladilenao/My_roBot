@@ -7,7 +7,14 @@ import pytest
 
 
 from src.events import Event, EventBus
-from src.events.types import ALL_EVENT_TYPES, TRADING_EVENT_TYPES, EventType, parse_event_type
+from src.events.types import (
+    ALL_EVENT_TYPES,
+    CONTROL_EVENT_TYPES,
+    NOTIFICATION_EVENT_TYPES,
+    TRADING_EVENT_TYPES,
+    EventType,
+    parse_event_type,
+)
 from src.notifier.channel import Channel
 
 
@@ -118,9 +125,11 @@ def test_to_dict_is_json_serializable_shape() -> None:
     assert data["payload"]["side"] == "BUY"
 
 
-def test_catalog_has_nineteen_types_and_five_trading() -> None:
-    assert len(EventType) == 19
-    assert len(ALL_EVENT_TYPES) == 19
+def test_catalog_has_nineteen_notifications_two_controls_and_nine_lifecycle_types() -> None:
+    assert len(EventType) == 21
+    assert len(ALL_EVENT_TYPES) == 21
+    assert len(NOTIFICATION_EVENT_TYPES) == 19
+    assert CONTROL_EVENT_TYPES == frozenset({EventType.TICK_STARTED, EventType.TICK_FINISHED})
     assert TRADING_EVENT_TYPES == frozenset(
         {
             EventType.SIGNAL,
@@ -128,6 +137,10 @@ def test_catalog_has_nineteen_types_and_five_trading() -> None:
             EventType.STOP_HIT,
             EventType.TARGET_HIT,
             EventType.TRADE_CLOSED,
+            EventType.POSITION_ADDED,
+            EventType.STOP_MOVED,
+            EventType.TRADE_CANCELLED,
+            EventType.ORDER_REJECTED,
         }
     )
 

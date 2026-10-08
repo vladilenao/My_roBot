@@ -75,6 +75,7 @@ from src.instruments import Instrument, normalize_instrument
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
 from src.notifier import build_channels, close_channels
+from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
 from src.scheduler.timing import MultiTimeframeScheduler
 
 log = get_logger(__name__)
@@ -212,13 +213,17 @@ def main(no_prompt: bool = False):
 
 
 def _run_live():
-    code, _, _ = _launch(
-        state_dir=runtime_dir(),
-        client_provider=None,
-        clock=None,
-        session=build_run_session(MODE_LIVE),
-        channel_names=None,
-    )
+    try:
+        code, _, _ = _launch(
+            state_dir=runtime_dir(),
+            client_provider=None,
+            clock=None,
+            session=build_run_session(MODE_LIVE),
+            channel_names=None,
+        )
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
     return code
 
 
@@ -309,6 +314,8 @@ def _launch(
     сюда ``instruments``, чтобы не спрашивать пользователя повторно.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
+    if not history:
+        acquire_runtime_lock(state_dir)
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
         log_file=str(state_dir / LOGGING_FILE),
@@ -345,7 +352,7 @@ def _launch(
         if report.notes:
             print(report.message())
 
-    channels = build_channels(channel_names)
+    channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
     bus.subscribe_all(channels)
     timeline = MultiTimeframeScheduler(
@@ -495,16 +502,29 @@ def _build_runtime(
 
     def publish_execution(execution, details):
         action = details["action_type"].split(":", 1)[0]
-        event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
+        if str(execution.status) == "reject":
+            event_type = EventType.ORDER_REJECTED
+        elif str(execution.status) == "cancel":
+            event_type = EventType.TRADE_CANCELLED
+        elif action == "MOVESTOP":
+            event_type = EventType.STOP_MOVED
+        else:
+            event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
                       "STOP": EventType.STOP_HIT, "TARGET": EventType.TARGET_HIT,
                       "REDUCE": EventType.TRADE_CLOSED, "CLOSE": EventType.TRADE_CLOSED}[action]
         bus.publish(Event.broker_event(event_type, trade_id=execution.trade_id,
             instrument=names.get(details["instrument_id"]) or "контракт не указан",
+            **({"side": details["side"]} if details.get("side") else {}),
             bar_time=execution.timestamp, quantity=execution.filled_quantity, price=execution.price,
-            fee=execution.fee, fee_source=str(execution.fee_source), reason=execution.reason,
-            execution_id=execution.execution_id, status=str(execution.status),
-            **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
-                                           "requested_quantity", "selected_quantity", "limiting_constraint") if key in details}))
+             reason=execution.reason,
+             **({"fee": execution.fee, "fee_source": str(execution.fee_source)}
+                if str(execution.status) in {"fill", "partial"} else {}),
+             execution_id=execution.execution_id, status=str(execution.status),
+             visual=details.get("visual"),
+             timeframe=details["visual"].data["timeframe"] if details.get("visual") else "",
+             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+                                            "requested_quantity", "selected_quantity", "limiting_constraint")
+                if key in details and str(execution.status) in {"fill", "partial"}}))
 
     trade_manager = TradeManager(
         storage,
@@ -529,6 +549,7 @@ def _build_runtime(
         clock=clock,
     )
     trade_manager.restore()
+    trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
     contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
@@ -771,4 +792,39 @@ def _strategy_map():
 
 
 if __name__ == "__main__":
-    sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)
+    if "--telegram-chart-smoke" in sys.argv[1:]:
+        from src.notifier.telegram_chart import smoke
+        smoke()
+    elif any(flag in sys.argv[1:] for flag in ("--telegram-pending", "--telegram-retry", "--telegram-cleanup-files")):
+        import argparse
+        from src import config
+        from src.notifier.telegram_recovery import cleanup, list_pending, retry
+
+        parser = argparse.ArgumentParser(description="Восстановление уведомлений Telegram")
+        action = parser.add_mutually_exclusive_group(required=True)
+        action.add_argument("--telegram-pending", action="store_true")
+        action.add_argument("--telegram-retry", action="store_true")
+        action.add_argument("--telegram-cleanup-files", action="store_true")
+        parser.add_argument("--state-dir", type=Path, default=runtime_dir())
+        parser.add_argument("--id", type=int, dest="operation_id")
+        parser.add_argument("--trade-id")
+        parser.add_argument("--from", dest="day_from")
+        parser.add_argument("--to", dest="day_to")
+        parser.add_argument("--include-uncertain", action="store_true")
+        args = parser.parse_args()
+        try:
+            if args.telegram_pending:
+                code = list_pending(config, args.state_dir, trade_id=args.trade_id, day_from=args.day_from, day_to=args.day_to)
+            elif args.telegram_cleanup_files:
+                code = cleanup(config, args.state_dir)
+            else:
+                # Ручной replay не должен пересекаться с работающим роботом.
+                acquire_runtime_lock(args.state_dir)
+                code = retry(config, args.state_dir, operation_id=args.operation_id, trade_id=args.trade_id,
+                             day_from=args.day_from, day_to=args.day_to, include_uncertain=args.include_uncertain)
+        except (RuntimeLockError, ValueError) as exc:
+            print(str(exc))
+            code = 2
+        sys.exit(code)
+    else:
+        sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)
