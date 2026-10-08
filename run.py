@@ -791,6 +791,29 @@ def _strategy_map():
     }
 
 
+_UTF8_STREAMS_SET = False
+
+
+def _force_utf8_streams() -> None:
+    """Запуск без терминала (pipe, CI) на Windows использует cp1252.
+
+    Замороженный PyInstaller-бинарь не подхватывает PYTHONUTF8 из окружения и
+    падает на кириллице при перенаправлении stdout. Локальная консоль не
+    трогается: там Python сам выбирает подходящий codepage.
+    """
+    global _UTF8_STREAMS_SET
+    if _UTF8_STREAMS_SET:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or getattr(stream, "isatty", lambda: False)():
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+    _UTF8_STREAMS_SET = True
+
+
 def _config_smoke() -> None:
     """Проверяет bundled default.toml без пользовательских файлов и сети."""
     from src.config import _DEFAULTS
@@ -818,6 +841,7 @@ def _run_smoke_command(args: list[str]) -> bool:
 
 
 if __name__ == "__main__":
+    _force_utf8_streams()
     if _run_smoke_command(sys.argv[1:]):
         pass
     elif any(flag in sys.argv[1:] for flag in ("--telegram-pending", "--telegram-retry", "--telegram-cleanup-files")):
