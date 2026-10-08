@@ -5,51 +5,133 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.13.1'
 
 jobs:
   build:
     name: robot ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: macOs
+        fail-fast: false
+        matrix:
+          include:
+          - os: macos-14
+            platform: macos-arm64
             suffix: ''
-          - os: windows-latest
-            platform: win
+            architecture: arm64
+          - os: windows-2022
+            platform: windows-x64
             suffix: '.exe'
+            architecture: x86_64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ inputs.release_tag }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          fi
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install build dependencies
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip==24.3.1
+          python -m pip install -r requirements.txt -r requirements-dev.txt -r requirements-build.txt
 
-      - name: Build executable
+      - name: Validate release metadata
         shell: bash
-        env:
-          PYINSTALLER_NAME: robot-${{ github.ref_name }}_${{ matrix.platform }}
-        run: pyinstaller run.spec --noconfirm
+        run: python -m scripts.validate_release --tag "$RELEASE_TAG"
 
-      - name: Smoke headless Telegram chart
+      - name: Run tests
         shell: bash
-        run: '"dist/robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}" --telegram-chart-smoke'
+        run: python -m pytest -q
 
-      - name: Inspect dist directory
+      - name: Run Ruff
         shell: bash
-        run: ls -la dist
+        run: python -m ruff check . --exclude tools --exclude openspec/_check_sync.py
 
-      - name: Upload artifact
+      - name: Verify native architecture
+        shell: bash
+        run: test "$(uname -m)" = "${{ matrix.architecture }}"
+
+      - name: Build distribution
+        shell: bash
+        run: python -m scripts.build_distribution --tag "$RELEASE_TAG" --platform "${{ matrix.platform }}" --dist-dir release-dist
+
+      - name: Smoke frozen binary
+        shell: bash
+        run: |
+          binary="release-dist/robot-${RELEASE_TAG}-${{ matrix.platform }}/robot-${RELEASE_TAG}-${{ matrix.platform }}${{ matrix.suffix }}"
+          "$binary" --version
+          "$binary" --config-smoke
+          "$binary" --telegram-chart-smoke
+
+      - name: Upload checked distribution
         uses: actions/upload-artifact@v4
         with:
-          name: robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}
-          path: dist/robot-${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.suffix }}
+          name: robot-${{ matrix.platform }}
+          path: release-dist/*.zip
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ inputs.release_tag }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Validate release metadata and write notes
+        shell: bash
+        run: python -m scripts.validate_release --tag "$RELEASE_TAG" --notes-file release-notes.md
+
+      - name: Download checked distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: (cd release-assets && sha256sum *.zip > checksums.txt)
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release-notes.md
+          files: |
+            release-assets/*.zip
+            release-assets/checksums.txt

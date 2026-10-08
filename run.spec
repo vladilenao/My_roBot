@@ -6,7 +6,7 @@ import os
 datas = []
 binaries = []
 hiddenimports = []
-# Имя сборки: robot-v<версия> при выпуске, иначе дефолт 'run'.
+# Имя сборки: robot-v<версия>-<платформа> при выпуске, иначе дефолт 'run'.
 # Задаётся через переменную окружения, т.к. PyInstaller не разрешает
 # --name вместе со spec-файлом.
 NAME = os.environ.get('PYINSTALLER_NAME') or 'run'

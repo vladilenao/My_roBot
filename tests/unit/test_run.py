@@ -46,6 +46,30 @@ def _frame_with_candle():
     })
 
 
+class TestSmokeCommands:
+    def test_version_prints_package_version(self, capsys):
+        assert run._run_smoke_command(["--version"])
+
+        assert capsys.readouterr().out == f"{run.__version__}\n"
+
+    def test_config_smoke_uses_bundled_default(self, monkeypatch, capsys):
+        loaded = {}
+
+        def load_config(defaults, config_file, bundled_file):
+            loaded.update(defaults=defaults, config_file=config_file, bundled_file=bundled_file)
+
+        monkeypatch.setattr("src.config_loader.load_config", load_config)
+
+        assert run._run_smoke_command(["--config-smoke"])
+
+        assert loaded["bundled_file"].name == "default.toml"
+        assert loaded["config_file"].name == "missing-robot.toml"
+        assert capsys.readouterr().out == "Конфигурация по умолчанию загружена.\n"
+
+    def test_unrecognized_arguments_are_not_smoke_commands(self):
+        assert not run._run_smoke_command(["--no-prompt"])
+
+
 class TestLoadContractsMetadata:
     def test_sets_contracts_from_context_client(self, fake_instrument):
         """Метаданные должны браться через `client_context` (Services-фасад), а не `get_client`."""

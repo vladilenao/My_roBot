@@ -791,10 +791,35 @@ def _strategy_map():
     }
 
 
-if __name__ == "__main__":
-    if "--telegram-chart-smoke" in sys.argv[1:]:
+def _config_smoke() -> None:
+    """Проверяет bundled default.toml без пользовательских файлов и сети."""
+    from src.config import _DEFAULTS
+    from src.config_loader import load_config
+
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    load_config(_DEFAULTS, config_file=root / "missing-robot.toml", bundled_file=root / "default.toml")
+    print("Конфигурация по умолчанию загружена.")
+
+
+def _run_smoke_command(args: list[str]) -> bool:
+    """Выполняет неинтерактивные проверки binary и сообщает, была ли команда."""
+    if "--version" in args:
+        print(__version__)
+        return True
+    if "--config-smoke" in args:
+        _config_smoke()
+        return True
+    if "--telegram-chart-smoke" in args:
         from src.notifier.telegram_chart import smoke
+
         smoke()
+        return True
+    return False
+
+
+if __name__ == "__main__":
+    if _run_smoke_command(sys.argv[1:]):
+        pass
     elif any(flag in sys.argv[1:] for flag in ("--telegram-pending", "--telegram-retry", "--telegram-cleanup-files")):
         import argparse
         from src import config
