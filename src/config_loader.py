@@ -41,6 +41,12 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "timeout_secs": "tick_timeout_secs",
         "catch_up_bars": "tick_catch_up_bars",
     },
+    "market_data": {
+        "database_file": "market_data_database_file",
+        "export_enabled": "market_data_export_enabled",
+        "export_host": "market_data_export_host",
+        "export_port": "market_data_export_port",
+    },
     "instruments": {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
@@ -89,6 +95,10 @@ _EXPECTED_TYPES: dict[str, type] = {
     "tick_poll_secs": int,
     "tick_timeout_secs": int,
     "tick_catch_up_bars": int,
+    "market_data_database_file": str,
+    "market_data_export_enabled": bool,
+    "market_data_export_host": str,
+    "market_data_export_port": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,

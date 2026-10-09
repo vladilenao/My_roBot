@@ -18,6 +18,11 @@ from src.config import (
     CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
+    MARKET_DATA_DATABASE_FILE,
+    MARKET_DATA_EXPORT_ENABLED,
+    MARKET_DATA_EXPORT_HOST,
+    MARKET_DATA_EXPORT_PORT,
+    MARKET_DATA_EXPORT_TOKEN,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -66,6 +71,10 @@ from src.scheduler.clock import HistoricalClock
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
+from src.data.market_store import MarketDataStore
+from src.data.export_api import MarketDataExportServer
+from src.data.reconciliation import MarketDataReconciler
+from src.data.poller import LiveMarketDataPoller
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
 from src.events.bus import EventBus
@@ -361,6 +370,11 @@ def _launch(
         catch_up_bars=CATCH_UP_BARS,
         clock=clock,
     )
+    market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
+    market_reconciler = None if market_store is None else MarketDataReconciler(
+        market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
+        client_provider=client_provider,
+    )
     data_cache = MarketDataCache(
         loader=load_candles,
         timeline=timeline,
@@ -370,6 +384,8 @@ def _launch(
         freshness_tolerance_bars=CATCH_UP_BARS,
         clock=clock,
         client_provider=client_provider,
+        market_store=market_store,
+        market_reconciler=market_reconciler,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -378,7 +394,18 @@ def _launch(
     )
 
     storage = None
+    export_server = None
+    market_poller = None
     try:
+        if not history:
+            market_poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS)
+            market_poller.start()
+        if not history and MARKET_DATA_EXPORT_ENABLED:
+            export_server = MarketDataExportServer(
+                market_store, MARKET_DATA_EXPORT_TOKEN or "",
+                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
+            )
+            export_server.start()
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
             client_provider=client_provider,
@@ -386,6 +413,10 @@ def _launch(
         storage = runtime.storage
         _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
     finally:
+        if market_poller is not None:
+            market_poller.close()
+        if export_server is not None:
+            export_server.close()
         if history:
             _finish_history(storage, session, data_cache, timeline, state_dir)
         close_channels(channels)
@@ -573,10 +604,16 @@ def _build_runtime(
             if event.trade_id not in addressed_ids:
                 bus.publish(_broker_event(event))
         trade_manager.observe_bars(prices, instrument_bar_times)
-        for ticker in prices:
-            execution_cursors[ticker] = (stamp, False)
         execution_closes.update({ticker: values[3] for ticker, values in prices.items()})
         trade_manager.mark_to_market(execution_closes)
+        # Только после всех durable операций минуты курсоры обеих БД могут
+        # продвинуться. При исключении pending_bar будет повторён.
+        for ticker in prices:
+            execution_cursors[ticker] = (stamp, False)
+            instrument = next((item for item in instruments if item.ticker == ticker), None)
+            mark_processed = getattr(data_cache, "mark_processed", None)
+            if instrument is not None and callable(mark_processed):
+                mark_processed(instrument, "1m", stamp)
 
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
@@ -610,6 +647,14 @@ def _build_runtime(
                     last, inclusive = boundary
                     fresh = frame.loc[stamps >= last if inclusive else stamps > last]
                     fresh = fresh.sort_values("datetime").drop_duplicates("datetime", keep="last")
+                    contiguous = getattr(data_cache, "contiguous_after", None)
+                    if callable(contiguous):
+                        protected = contiguous(instrument, "1m", fresh, last)
+                        # Старые адаптеры и тестовые double не обязаны знать
+                        # новый контракт покрытия; в таком случае оставляем
+                        # исходный DataFrame.
+                        if isinstance(protected, type(fresh)):
+                            fresh = protected
                     for row in fresh.itertuples(index=False):
                         stamp = to_aware_utc(row.datetime).to_pydatetime()
                         batches.setdefault(stamp, {})[ticker] = (
