@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.broker import JournalBroker
+from src.events.types import EventType
 from src.portfolio import ContractMeta, OrderStatus, PositionManager, Signal
 from src.trade_journal import OpType, TradeJournal
 
@@ -207,21 +208,20 @@ class TestClearing:
 class TestOverRiskAndFifo:
     LOW_GO_META = ContractMeta(ticker="NG", price_step=1.0, step_cost=100.0, go_buy=100.0, go_sell=100.0)
 
-    def test_over_risk_counter_close_on_fill(self, tmp_path):
+    def test_over_risk_is_diagnosed_without_counter_close_on_fill(self, tmp_path):
         broker = _broker(tmp_path, initial=1000)  # кап перекоса = 3000
         broker.place_order(_signal(qty=1), self.LOW_GO_META, NOW)
         results = broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": self.LOW_GO_META})
-        assert broker.manager.positions == {}  # контр-сделка закрыла позицию
+        assert len(broker.manager.positions) == 1
         rows = broker.journal.events()
         entry = [e for e in rows if e.op == OpType.ENTRY.value and e.side == "BUY"][0]
         assert "over_risk=true" in entry.notes
-        close = [e for e in rows if e.op == OpType.EXIT.value and e.side == "SELL"][0]
-        assert close.reason == "over_risk"
+        assert not [e for e in rows if e.op == OpType.EXIT.value]
         types = {e.type for e in broker.drain_events()}
-        assert "over_risk" in types
+        assert EventType.RISK_LIMIT_HIT in types
         assert any(r.status is OrderStatus.FILLED for r in results)
 
-    def test_fifo_cancel_of_non_over_risk_order(self, tmp_path):
+    def test_over_risk_does_not_cancel_another_accepted_order(self, tmp_path):
         broker = _broker(tmp_path, initial=1000)  # кап перекоса = 3000
         # открытая NG-позиция: 1 лот по цене 20 → стоимость 2000 < 3000
         broker.place_order(_signal(entry_price=20.0, stop_price=19.0, qty=1, risk_rub=20.0), self.LOW_GO_META, NOW)
@@ -230,17 +230,18 @@ class TestOverRiskAndFifo:
         # отложенная BR-заявка (не over-risk)
         broker.place_order(_signal(position_id="BR-1", ticker="BR", entry_price=50.0, stop_price=49.0,
                                    qty=1, stop_distance_pct=2.0), self.LOW_GO_META, NOW + timedelta(minutes=2))
-        # рост цены NG → стоимость 10000 > 3000 → перекос: отмена BR + контр-сделка по NG
+        # Рост цены не вытесняет ранее принятую BR-заявку и не продаёт NG.
         results = broker.track_bar(
             NOW + timedelta(minutes=3),
             _bars({"NG": (99.0, 101.0, 100.0), "BR": (49.5, 52.0, 51.0)}),
             {"NG": self.LOW_GO_META, "BR": self.LOW_GO_META},
         )
         cancelled = [r for r in results if r.status is OrderStatus.CANCELLED]
-        assert cancelled and cancelled[0].reason == "risk_cap"
-        assert broker.manager.positions == {}  # NG закрыт контр-сделкой
+        assert not cancelled
+        assert broker.manager.positions
         rows = broker.journal.events()
-        assert any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+        assert not any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+        assert not any(e.op == OpType.EXIT.value and e.reason == "over_risk" for e in rows)
 
 
 class TestCancelOrder:
@@ -299,13 +300,50 @@ class TestDisplayNames:
         row = broker.journal.events()[0]
         assert row.contract == "NG-10.26" and row.op == OpType.ORDER.value
 
-    def test_messages_use_short_names(self, tmp_path):
+    def test_events_use_short_names(self, tmp_path):
         broker = self._broker_with_names(tmp_path)
         broker.place_order(_signal(), NG_META, NOW)
         broker.track_bar(NOW + timedelta(minutes=1), _bars({"NG": (99.0, 101.0, 100.0)}), {"NG": NG_META})
-        messages = " | ".join(e.message for e in broker.drain_events())
-        assert "NG-10.26" in messages
-        assert "NG " not in messages.replace("NG-10.26", "")
+        events = broker.drain_events()
+        assert [e.type for e in events] == [
+            EventType.ORDER_ACCEPTED,
+            EventType.TRADE_OPENED,
+            EventType.PROTECTION_ARMED,
+        ]
+        assert {e.instrument for e in events} == {"NG-10.26"}
+
+    def test_add_event_carries_structured_fields_and_short_name(self, tmp_path):
+        from src.broker import Order
+        from src.portfolio import Position
+
+        broker = self._broker_with_names(tmp_path)
+        broker._contracts["NG"] = NG_META
+        position = Position(
+            position_id="NG-123", ticker="NG", side="BUY", qty=4, avg_price=100.0,
+            stop_price=98.0, take_profit=None, ts_entry=NOW,
+        )
+        broker.manager.positions["NG-123"] = position
+
+        results = broker._execute_entry(
+            Order(
+                order_id=99, position_id="NG-123", ticker="NG", side="BUY", qty=2,
+                limit_price=101.0, stop_price=99.0, take_profit=None, timeframe="1h",
+                ts_order=NOW, deadline=NOW + timedelta(hours=1), contract="NG",
+                risk_pct=2.0, risk_rub=200.0, source="test",
+            ),
+            NOW,
+        )
+
+        added = [e for e in broker.drain_events() if e.type is EventType.POSITION_ADDED]
+
+        assert [r.status for r in results] == [OrderStatus.FILLED]
+        assert len(added) == 1
+        assert added[0].instrument == "NG-10.26"
+        assert added[0].payload["side"] == "BUY"
+        assert added[0].payload["quantity"] == 2
+        assert added[0].payload["price"] == 101.0
+        assert added[0].trade_id == "NG-123"
+        assert position.qty == 6
 
     def test_name_replacement_after_contract_missing(self, tmp_path):
         """A raw exchange ticker is never shown when no short name is known."""
@@ -313,3 +351,56 @@ class TestDisplayNames:
         broker.place_order(_signal(), NG_META, NOW)
         row = broker.journal.events()[0]
         assert row.contract == "контракт не указан"
+
+
+class TestShareMeta:
+    """Акция: шаг цены и размер лота вместо ГО и стоимости шага фьючерса."""
+
+    SBER_META = ContractMeta(
+        ticker="SBER", price_step=0.01, step_cost=1.0, go_buy=0.0, go_sell=0.0
+    )
+
+    def _share_signal(self, **kw):
+        return _signal(
+            position_id="SBER-1",
+            ticker="SBER",
+            entry_price=300.0,
+            stop_price=297.0,
+            qty=10,
+            **kw,
+        )
+
+    def test_entry_fills_with_share_meta(self, tmp_path):
+        broker = _broker(tmp_path)
+        broker.place_order(self._share_signal(), self.SBER_META, NOW)
+        results = broker.track_bar(
+            NOW + timedelta(minutes=1), _bars({"SBER": (299.0, 301.0, 300.0)}),
+            {"SBER": self.SBER_META},
+        )
+
+        assert len(broker.manager.positions) == 1
+        assert any(r.status is OrderStatus.FILLED for r in results)
+
+    def test_pnl_uses_lot_size(self, tmp_path):
+        """Движение цены на 1 ₽ по акции в лоте 100 = 100 ₽ на контракт."""
+        broker = _broker(tmp_path)
+        broker.place_order(self._share_signal(), self.SBER_META, NOW)
+        broker.track_bar(
+            NOW + timedelta(minutes=1), _bars({"SBER": (299.0, 301.0, 300.0)}),
+            {"SBER": self.SBER_META},
+        )
+        results = broker.track_bar(
+            NOW + timedelta(minutes=2), _bars({"SBER": (296.0, 299.0, 297.0)}),
+            {"SBER": self.SBER_META},
+        )
+
+        # qty=10 лотов по 100 акций: цена 300 → 297 = -3 ₽ на акцию,
+        # -3 / 0.01 * 1.0 = -300 ₽ на лот, × 10 = -3000 ₽, комиссия 0.1% = 3 ₽
+        closes = [r for r in results if r.status is OrderStatus.FILLED]
+        assert closes and closes[0].reason == "protective"
+        assert broker.manager.account.realized_total == pytest.approx(-3003.0)
+        close_row = [
+            e for e in broker.journal.events() if e.op == OpType.EXIT.value
+        ][0]
+        assert float(close_row.pnl_part) == pytest.approx(-3003.0)
+        assert float(close_row.fee) == pytest.approx(3.0)

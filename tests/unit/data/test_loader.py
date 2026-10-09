@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -25,12 +25,17 @@ def make_candle(hours, o=1, h=2, low=0, c=3, volume=10, nano=500000000):
 @pytest.fixture
 def api_mocks():
     candles = [make_candle(0), make_candle(1)]
-    with patch("src.data.loader.Client") as mock_client_cls, \
+    client = MagicMock(name="client")
+    client.get_all_candles.return_value = candles
+    client_cm = MagicMock(name="client_context")
+    client_cm.__enter__.return_value = client
+    with patch("src.data.loader.client_context", return_value=client_cm) as mock_client_context, \
          patch("src.data.loader.find_working_instrument", return_value="uid-123") as mock_find, \
          patch("src.data.loader.api_call_with_retry", return_value=candles) as mock_retry:
         yield SimpleNamespace(
-            client_cls=mock_client_cls,
-            client=mock_client_cls.return_value.__enter__.return_value,
+            client_context=mock_client_context,
+            client_cm=client_cm,
+            client=client,
             find=mock_find,
             retry=mock_retry,
             candles=candles,
@@ -124,8 +129,17 @@ class TestRequestContract:
     def test_client_receives_token_and_closes(self, api_mocks):
         load_candles("NGU6", "future", "1h", token="tok-xyz")
 
-        api_mocks.client_cls.assert_called_once_with("tok-xyz")
-        assert api_mocks.client_cls.return_value.__exit__.called
+        api_mocks.client_context.assert_called_once_with("tok-xyz")
+        assert api_mocks.client_cm.__exit__.called
+
+    def test_client_provider_of_run_used_when_given(self, api_mocks):
+        provider = MagicMock(name="provider")
+        provider.client_context.return_value = api_mocks.client_cm
+
+        load_candles("NGU6", "future", "1h", client_provider=provider)
+
+        provider.client_context.assert_called_once_with(None)
+        api_mocks.client_context.assert_not_called()
 
 
 class TestConversion:

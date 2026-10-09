@@ -5,11 +5,11 @@ Sizing, margin checks, and reservations intentionally belong to later layers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Mapping
 
-from src.trade_management.actions import CancelEntry, CloseTrade, ReduceTrade, TradeAction
+from src.trade_management.actions import CancelEntry, CloseTrade, TradeAction
 from src.trade_management.audit import CalculationTrace, MeasuredValue, TraceLinks, TraceOutcome, calculation_trace
 
 
@@ -22,7 +22,7 @@ def _require_decimal(value: Decimal, name: str, *, non_negative: bool = True) ->
 
 @dataclass(frozen=True)
 class RiskLimits:
-    """Risk caps as percentages of the current account budget base."""
+    """Compatibility fields; only ``portfolio`` controls account admission."""
 
     per_trade: Decimal
     per_instrument: Decimal
@@ -87,8 +87,6 @@ class RiskTrade:
             raise ValueError("prices, price_step, and step_cost must be positive")
         if not isinstance(self.factual_protection_breached, bool):
             raise ValueError("factual_protection_breached must be a boolean")
-        if not self.protection_is_loss_side and not self.factual_protection_breached:
-            raise ValueError("stop must be on the loss side of the average price")
 
     @property
     def protection_is_loss_side(self) -> bool:
@@ -187,11 +185,6 @@ class PortfolioRiskManager:
 
         portfolio_risk = sum((risk.full_loss_budget for risk in trade_risks.values()), Decimal("0"))
         violations: list[RiskLimitViolation] = []
-        self._check(violations, "trade", trade_risks, budget_base * limits.per_trade / Decimal("100"), "full_loss_budget")
-        self._check(violations, "instrument", instrument_risks, budget_base * limits.per_instrument / Decimal("100"))
-        for group, used in group_risks.items():
-            if group in limits.per_group:
-                self._check(violations, "group", {group: used}, budget_base * limits.per_group[group] / Decimal("100"))
         self._check(violations, "portfolio", {"portfolio": portfolio_risk}, budget_base * limits.portfolio / Decimal("100"))
         return PortfolioRiskReport(
             budget_base=budget_base,
@@ -208,7 +201,7 @@ class PortfolioRiskManager:
         stop_distance = direction * (trade.average_price - trade.stop_price)
         stop_loss = max(Decimal("0"), stop_distance * trade.step_cost / trade.price_step * trade.quantity)
         remaining_loss = stop_loss + trade.expected_exit_cost + trade.slippage_allowance
-        full_loss_budget = max(Decimal("0"), remaining_loss + trade.paid_fees - trade.realized_pnl)
+        full_loss_budget = remaining_loss
         return TradeRisk(trade.trade_id, stop_distance, remaining_loss, full_loss_budget)
 
     def maximum_additional_quantity(
@@ -246,6 +239,8 @@ class PortfolioRiskManager:
         if maximum <= 0:
             return 0
         budget_base = max(Decimal("0"), min(balance, equity))
+        if limits.portfolio == 0:
+            return 0
         current_report = self.evaluate(balance=balance, equity=equity, limits=limits, trades=trades)
         if not current_report.allowed:
             return 0
@@ -267,17 +262,8 @@ class PortfolioRiskManager:
                 + current.slippage_allowance
                 + addition.slippage_allowance_per_contract * quantity
             )
-            full_loss_budget = max(
-                Decimal("0"), remaining_loss + current.paid_fees + addition.entry_fee_per_contract * quantity - current.realized_pnl,
-            )
+            full_loss_budget = max(Decimal(0), stop_loss) + (remaining_loss - stop_loss) + addition.entry_fee_per_contract * quantity
             difference = full_loss_budget - current_risk.full_loss_budget
-            if full_loss_budget > budget_base * limits.per_trade / Decimal("100"):
-                return False
-            if current_report.instrument_risks[current.instrument_id] + difference > budget_base * limits.per_instrument / Decimal("100"):
-                return False
-            for group in current.groups:
-                if group in limits.per_group and current_report.group_risks[group] + difference > budget_base * limits.per_group[group] / Decimal("100"):
-                    return False
             return current_report.portfolio_risk + difference <= budget_base * limits.portfolio / Decimal("100")
 
         low, high = 0, maximum
@@ -314,7 +300,7 @@ class PortfolioRiskManager:
                 "slippage": MeasuredValue(addition.slippage_allowance_per_contract, "RUB/contracts"),
                 "margin": MeasuredValue(addition.margin_per_contract, "RUB/contracts"),
             }, result=MeasuredValue(quantity, "contracts"), reason="largest-permitted-integer-quantity",
-            formula="largest q satisfying trade/instrument/group/portfolio risk and margin limits",
+            formula="largest q satisfying the single portfolio budget and free margin",
             links=TraceLinks(trade_id=current.trade_id), outcome=TraceOutcome.ACCEPTED if quantity else TraceOutcome.REJECTED,
         )
 
@@ -329,13 +315,7 @@ class PortfolioRiskManager:
         unfilled_increase_quantity: int,
         state_revision: int,
     ) -> tuple[TradeAction, ...]:
-        """Cancel an unsafe increase remainder and reduce only its owning trade.
-
-        ``filled_trade`` must contain the factual quantity, average price, and
-        confirmed stop after the broker fill.  The stop is deliberately kept
-        fixed while searching for a safe remaining size: widening it to retain
-        a larger position would accept additional risk.
-        """
+        """Handle invalid factual protection, never liquidate for budget excess."""
         if (
             isinstance(unfilled_increase_quantity, bool)
             or not isinstance(unfilled_increase_quantity, int)
@@ -347,7 +327,7 @@ class PortfolioRiskManager:
         if not any(trade.trade_id == filled_trade.trade_id for trade in trades):
             raise ValueError("filled_trade must be included in trades")
 
-        if not filled_trade.protection_is_loss_side:
+        if filled_trade.factual_protection_breached:
             actions: list[TradeAction] = []
             if unfilled_increase_quantity:
                 actions.append(CancelEntry(
@@ -364,47 +344,8 @@ class PortfolioRiskManager:
             ))
             return tuple(actions)
 
-        if self.evaluate(balance=balance, equity=equity, limits=limits, trades=trades).allowed:
-            return ()
-
-        actions: list[TradeAction] = []
-        if unfilled_increase_quantity:
-            actions.append(CancelEntry(
-                f"{filled_trade.trade_id}:cancel-increase:{state_revision}",
-                filled_trade.trade_id,
-                state_revision,
-                "factual-increase-fill-violates-risk",
-            ))
-
-        safe_quantity = 0
-        for quantity in range(filled_trade.quantity - 1, 0, -1):
-            reduced_trade = replace(filled_trade, quantity=quantity)
-            candidate_trades = tuple(
-                reduced_trade if trade.trade_id == filled_trade.trade_id else trade
-                for trade in trades
-            )
-            if self.evaluate(
-                balance=balance, equity=equity, limits=limits, trades=candidate_trades
-            ).allowed:
-                safe_quantity = quantity
-                break
-
-        if safe_quantity:
-            actions.append(ReduceTrade(
-                f"{filled_trade.trade_id}:reduce-over-risk:{state_revision}",
-                filled_trade.trade_id,
-                state_revision,
-                "factual-increase-fill-violates-risk",
-                filled_trade.quantity - safe_quantity,
-            ))
-        else:
-            actions.append(CloseTrade(
-                f"{filled_trade.trade_id}:close-over-risk:{state_revision}",
-                filled_trade.trade_id,
-                state_revision,
-                "factual-increase-fill-violates-risk",
-            ))
-        return tuple(actions)
+        # Бюджетное превышение запрещает будущие допуски, а не продаёт факт.
+        return ()
 
     @staticmethod
     def _check(

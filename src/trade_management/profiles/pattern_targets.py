@@ -15,10 +15,12 @@ from src.trade_management.profiles.base import (
     ProfileResult,
     TradeManagementProfile,
     shared_management_rules,
+    shared_planning_rules,
 )
 from src.trade_management.profiles.rules import (
     add_quantity,
     cost_aware_break_even,
+    economics_break_even,
     initial_stop,
     initial_target,
     validate_price,
@@ -33,6 +35,7 @@ class PatternTargetsProfile(TradeManagementProfile):
     NAME = "pattern_targets"
     REQUIRED_STRATEGY_CAPABILITIES = frozenset({"pattern_context"})
 
+    @shared_planning_rules
     def plan(self, context: PlanningContext) -> TradePlan | ProfileResult:
         side = _side(context.signal.signal_type)
         if side is None:
@@ -88,6 +91,15 @@ class PatternTargetsProfile(TradeManagementProfile):
     def manage(self, context: ManagementContext) -> ProfileResult:
         if context.state.quantity <= 0 or context.state.average_price is None:
             return ProfileResult()
+        if context.plan.algorithm_version == "legacy-v1" and context.market.get("legacy_costs_known") is False and "tp-1" in context.state.completed_target_ids:
+            return ProfileResult(state={"be_skip_reason": "legacy-cost-policy-unknown"})
+        if context.plan.algorithm_version == "economics-v2" and "tp-1" in context.state.completed_target_ids:
+            candidate, skipped = economics_break_even(context.plan, context.state, context.market)
+            if candidate is None:
+                return ProfileResult(state={"be_skip_reason": skipped})
+            return ProfileResult(actions=(MoveStop(
+                f"{context.plan.trade_id}:break-even:{context.state.state_revision}", context.plan.trade_id,
+                context.state.state_revision, "cost-aware-break-even", candidate),))
         actions = self._break_even(context)
         add = self._pattern_add(context)
         return ProfileResult(actions=actions + add)

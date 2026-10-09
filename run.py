@@ -5,12 +5,17 @@ from src.market_context import (
 )
 
 from src import __version__
+from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from shutil import rmtree
+import sys
 
 from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
     ACTIVE_TIMEFRAMES,
+    CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
     FUTURE_STRATEGIES,
@@ -38,27 +43,279 @@ from src.config import (
     AUDIT_MAX_BYTES,
     AUDIT_BACKUP_COUNT,
     TRADE_MANAGEMENT_PROFILES,
+    CONTRACT_EXPIRY_BLOCK_DAYS,
+    TRADING_DIRECTIONS,
     trading_enabled,
     runtime_dir,
+    run_dir_name,
+    HIST_DIR,
 )
+from src.api.emulator_client import EmulatorClientProvider
+from src.bot.run_session import build_run_session
+from src.data.timeutil import to_aware_utc, to_naive
+from src.history.preflight import active_pairs, run_preflight, smallest_period
+from src.history.report import (
+    REPORT_TXT,
+    RunMetrics,
+    collect_result,
+    completion_line,
+    crash_line,
+    write_report,
+)
+from src.scheduler.clock import HistoricalClock
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
-from src.execution import NotifyOnlyExecutionPort
+from src.events.bus import EventBus
+from src.events.event import Event
+from src.events.types import EventType
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
-from src.notifier import get_notifier
+from src.notifier import build_channels, close_channels
+from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
 from src.scheduler.timing import MultiTimeframeScheduler
 
 log = get_logger(__name__)
 
+MODE_LIVE = "live"
+MODE_HISTORY = "history"
+HISTORY_DEFAULT_PAUSE = 1.0
+MOMENT_FORMAT = "%Y-%m-%d %H:%M"
 
-def main():
-    state_dir = runtime_dir()
+
+class RunConfigurationError(Exception):
+    """Прогон не запускается: ответы оператора не задают рабочий диапазон."""
+
+
+def ask_mode(no_prompt: bool = False) -> str:
+    """Режим прогона. ``--no-prompt`` — боевая торговля без единого вопроса."""
+    if no_prompt:
+        return MODE_LIVE
+    print("=== Режим работы ===")
+    print("  1. Боевая торговля (реальный брокер, текущее время)")
+    print("  2. Историческая торговля (локальный эмулятор данных, заданный диапазон)")
+    while True:
+        answer = input("Выбор режима (1/2): ").strip()
+        if answer == "1":
+            return MODE_LIVE
+        if answer == "2":
+            return MODE_HISTORY
+        print("Нужен ответ 1 или 2.")
+
+
+def ask_history_range() -> tuple[datetime, datetime, float]:
+    """Границы исторического прогона и пауза между тиками в секундах."""
+    start = _ask_moment("Начало диапазона")
+    end = _ask_moment("Конец диапазона (не входит в прогон)")
+    pause = _ask_pause()
+    return validate_range(start, end, pause)
+
+
+def _ask_moment(prompt: str) -> datetime:
+    while True:
+        raw = input(f"{prompt} (ГГГГ-ММ-ДД ЧЧ:ММ): ").strip()
+        try:
+            return parse_moment(raw)
+        except ValueError as exc:
+            print(str(exc))
+
+
+def _ask_pause() -> float:
+    while True:
+        raw = input(f"Пауза между тиками, с (Enter — {HISTORY_DEFAULT_PAUSE:g}): ").strip()
+        if not raw:
+            return HISTORY_DEFAULT_PAUSE
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Пауза должна быть числом секунд.")
+            continue
+        if value < 0:
+            print("Пауза не может быть отрицательной.")
+            continue
+        return value
+
+
+def parse_moment(raw: str) -> datetime:
+    """Момент из строки оператора: без зоны — UTC, с зоной — приводим к UTC."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Пустая дата — введите момент в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"Не разобрана дата «{text}» — нужен формат ГГГГ-ММ-ДД ЧЧ:ММ."
+        ) from None
+    return to_naive(to_aware_utc(moment))
+
+
+def validate_range(start: datetime, end: datetime, pause: float) -> tuple[datetime, datetime, float]:
+    if to_naive(start) >= to_naive(end):
+        raise RunConfigurationError(
+            f"Начало диапазона ({start:%Y-%m-%d %H:%M}) должно быть раньше конца "
+            f"({end:%Y-%m-%d %H:%M}). Прогон не запущен."
+        )
+    return to_naive(start), to_naive(end), float(pause)
+
+
+def describe_scale(start: datetime, end: datetime, pause: float, timeframes=None) -> str:
+    """Оценка объёма прогона: тики, реальное время и каталог состояния."""
+    step = smallest_period(timeframes or (sorted(set(ACTIVE_TIMEFRAMES) | {"1m"})))
+    ticks = int((to_naive(end) - to_naive(start)).total_seconds() // step.total_seconds())
+    if pause:
+        waiting = f"Оценка реального времени при паузе {pause:g} с: {_duration(timedelta(seconds=ticks * pause))}"
+    else:
+        waiting = "Ожидание между тиками: нет (прогон без пауз, длительность определяется обработкой)"
+    return (
+        f"=== Масштаб прогона ===\n"
+        f"Шаг тика:        {step}\n"
+        f"Обработано тиков: {ticks}\n"
+        f"{waiting}\n"
+        f"Каталог состояния: {state_dir_for(start, end)}"
+    )
+
+
+def _duration(delta: timedelta) -> str:
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
+
+
+def state_dir_for(start: datetime, end: datetime, started_at: datetime | None = None) -> Path:
+    """Каталог состояния исторического прогона — отдельный от боевого."""
+    return runtime_dir(Path(HIST_DIR)) / run_dir_name(
+        to_naive(start), to_naive(end), to_naive(started_at or datetime.now())
+    )
+
+
+def main(no_prompt: bool = False):
+    try:
+        mode = ask_mode(no_prompt)
+        if mode == MODE_HISTORY:
+            start, end, pause = ask_history_range()
+            print(describe_scale(start, end, pause))
+        else:
+            start = end = pause = None
+    except (RunConfigurationError, ValueError) as exc:
+        print(str(exc))
+        return 1
+
+    if mode == MODE_HISTORY:
+        return _run_history(start, end, pause)
+    return _run_live()
+
+
+def _run_live():
+    try:
+        code, _, _ = _launch(
+            state_dir=runtime_dir(),
+            client_provider=None,
+            clock=None,
+            session=build_run_session(MODE_LIVE),
+            channel_names=None,
+        )
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
+    return code
+
+
+def _run_history(start, end, pause):
+    """Прогон с повтором, если проверка сдвинула начало на первую доступную свечу.
+
+    Сдвиг меняет часы и каталог состояния, поэтому прогон собирается заново; уже
+    выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
+    второй раз. Повтор ровно один — границы для нового начала проверены.
+    """
+    instruments = None
+    for _ in range(2):
+        clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+        state_dir = state_dir_for(start, end)
+        code, shifted, instruments = _launch(
+            state_dir=state_dir,
+            client_provider=EmulatorClientProvider(),
+            clock=clock,
+            session=build_run_session(MODE_HISTORY, clock),
+            channel_names=[],
+            history=True,
+            instruments=instruments,
+        )
+        if shifted is None:
+            return code
+        rmtree(state_dir, ignore_errors=True)
+        start = shifted
+    return code
+
+
+def _timeframes() -> list[str]:
+    return sorted(set(ACTIVE_TIMEFRAMES) | {"1m"})
+
+
+def _warmup_bars() -> int:
+    """Сколько баров прогрева требуют активные стратегии — проверка границ."""
+    from src.strategies.registry import get_strategy
+
+    needed = 1
+    for assignments in (SHARE_STRATEGIES, FUTURE_STRATEGIES):
+        for group in assignments.values():
+            for assignment in group:
+                config = _strategy_map().get(assignment.strategy)
+                if config is None:
+                    continue
+                try:
+                    needed = max(
+                        needed, get_strategy(assignment.strategy, config).required_history()
+                    )
+                except Exception as exc:  # noqa: BLE001 — стратегию проверит бот при старте
+                    log.debug("Прогрев для %s не посчитан: %s", assignment.strategy, exc)
+    return needed
+
+
+def _source_ping(client_provider):
+    """Проверка живости источника: у эмулятора есть ``/health``, у T-API нет."""
+    client_context = getattr(client_provider, "client_context", None)
+    if client_context is None:
+        return None
+
+    def ping() -> None:
+        with client_context() as client:
+            probe = getattr(client, "ping", None)
+            if probe is not None:
+                probe()
+
+    return ping
+
+
+def _launch(
+    *,
+    state_dir,
+    client_provider,
+    clock,
+    session,
+    channel_names,
+    history: bool = False,
+    instruments=None,
+) -> tuple[int, datetime | None, list]:
+    """Единая сборка прогона: различаются только источник, часы и каталог.
+
+    Всё остальное — кэш, планировщик, стратегии, исполнение и журнал — собирается
+    одинаково, поэтому исторический прогон идёт по тому же конвейеру, что и боевой.
+
+    Возвращает код завершения, сдвиг начала и выбранные инструменты: если
+    проверка перенесла начало на первую доступную свечу, собранные часы и каталог
+    уже не годятся, а прогонать диапазон должен вызывающий — он же передаст
+    сюда ``instruments``, чтобы не спрашивать пользователя повторно.
+    """
     state_dir.mkdir(parents=True, exist_ok=True)
+    if not history:
+        acquire_runtime_lock(state_dir)
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
         log_file=str(state_dir / LOGGING_FILE),
@@ -67,17 +324,52 @@ def main():
         backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
-    instruments = select_instruments() or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-    notifier = get_notifier()
+    if instruments is None:
+        instruments = select_instruments(
+            validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
+            client_provider=client_provider,
+            market_now=None if clock is None else clock.now(),
+        ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+        instruments = [normalize_instrument(item) for item in instruments]
+
+    if history:
+        report = run_preflight(
+            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            start=session.start,
+            end=session.end,
+            warmup_bars=_warmup_bars(),
+            load_candles=load_candles,
+            client_provider=client_provider,
+            clock=clock,
+            ping=_source_ping(client_provider),
+        )
+        if not report.ok:
+            print(report.message())
+            return 2, None, instruments
+        if report.start != session.start:
+            print(report.message())
+            return 3, report.start, instruments
+        if report.notes:
+            print(report.message())
+
+    channels = build_channels(channel_names, state_dir=state_dir)
+    bus = EventBus()
+    bus.subscribe_all(channels)
     timeline = MultiTimeframeScheduler(
-        timeframes=sorted(set(ACTIVE_TIMEFRAMES) | {"1m"}), sleep_secs=SLEEP_SECONDS
+        timeframes=_timeframes(),
+        sleep_secs=SLEEP_SECONDS if clock is None else clock.pause_secs,
+        catch_up_bars=CATCH_UP_BARS,
+        clock=clock,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
         timeline=timeline,
         token=TINKOFF_TOKEN,
-        data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL,
-        data_backfill_window_seconds=DATA_BACKFILL_WINDOW_SECONDS,
+        data_refresh_min_interval=DATA_REFRESH_MIN_INTERVAL if clock is None else 0.0,
+        data_backfill_window_seconds=None if clock is not None else DATA_BACKFILL_WINDOW_SECONDS,
+        freshness_tolerance_bars=CATCH_UP_BARS,
+        clock=clock,
+        client_provider=client_provider,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -85,15 +377,58 @@ def main():
         provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
     )
 
-    runtime = _build_runtime(instruments, notifier, data_cache)
+    storage = None
+    try:
+        runtime = _build_runtime(
+            instruments, data_cache, bus, state_dir, clock=clock, session=session,
+            client_provider=client_provider,
+        )
+        storage = runtime.storage
+        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
+    finally:
+        if history:
+            _finish_history(storage, session, data_cache, timeline, state_dir)
+        close_channels(channels)
+    return 0, None, instruments
 
+
+def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
+    """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
+    if storage is None:
+        return
+    reason = session.stop_reason()
+    crashed = not reason
+    longest_gap = getattr(data_cache, "longest_gap", None)
+    exhaustion = getattr(session, "exhaustion", None)
+    metrics = RunMetrics(
+        start=session.start,
+        end=session.end,
+        ticks=session.ticks_done(),
+        missed_bars=data_cache.missed_bars,
+        gaps=getattr(data_cache, "gaps", 0),
+        longest_gap_seconds=0.0 if longest_gap is None else longest_gap.total_seconds(),
+        covered=bool(getattr(session, "covered", False)),
+        stop_reason=reason or "остановлено оператором",
+        market_now=to_naive(timeline.now()),
+        crashed=crashed,
+        horizon_start=None if exhaustion is None else exhaustion.horizon_start,
+        horizon_end=None if exhaustion is None else exhaustion.horizon_end,
+        horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
+    )
+    write_report(
+        state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
+    )
+    print(crash_line(metrics) if crashed else completion_line(state_dir / REPORT_TXT))
+
+
+
+def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> None:
     TradingBot(
         instruments=instruments,
-        notifier=notifier,
+        bus=bus,
         strategy_map=_strategy_map(),
         data_cache=data_cache,
         timeline=timeline,
-        execution=runtime.execution,
         share_strategies=SHARE_STRATEGIES,
         future_strategies=FUTURE_STRATEGIES,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
@@ -105,44 +440,43 @@ def main():
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        risk_manager=runtime.risk_manager,
         post_tick=runtime.post_tick,
         trade_manager=runtime.trade_manager,
         action_executor=runtime.action_executor,
+        run=session,
     ).run()
 
 
 class _Runtime:
-    def __init__(self, execution, post_tick=None, trade_manager=None, risk_manager=None,
-                 action_executor=None) -> None:
-        self.execution = execution
+    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None) -> None:
         self.post_tick = post_tick
         self.trade_manager = trade_manager
-        self.risk_manager = risk_manager
         self.action_executor = action_executor
+        self.storage = storage
 
 
-def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
+def _build_runtime(
+    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None
+) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
     Neither mode constructs an exchange adapter. The only broker selected here is
     the addressed candle simulator, and durable trade state is restored from
-    SQLite rather than either legacy CSV projection.
+    SQLite rather than either legacy CSV projection. ``state_dir`` — каталог
+    состояния прогона: общий для боевого режима, отдельный у исторического.
     """
     instruments = [
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
     ]
     if not trading_enabled():
         log.info("Торговый режим выключен — NotifyOnly.")
-        return _Runtime(NotifyOnlyExecutionPort(notifier))
+        return _Runtime()
 
     from src.broker import create_addressable_journal_broker
-    from src.portfolio import PortfolioRiskManager
     from src.trade_journal.storage import Storage
     from src.trade_management.manager import TradeManager
 
     try:
-        state_dir = runtime_dir()
         state_dir.mkdir(parents=True, exist_ok=True)
         storage = Storage(
             state_dir / DATABASE_FILE,
@@ -151,6 +485,8 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
             audit_path=state_dir / AUDIT_FILE,
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
+            initial_deposit=str(INITIAL_DEPOSIT),
+            clock=clock,
         )
         broker = create_addressable_journal_broker(
             INITIAL_DEPOSIT,
@@ -159,24 +495,63 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         )
     except Exception as exc:
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
-        return _Runtime(NotifyOnlyExecutionPort(notifier))
+        return _Runtime()
 
     risk_limits = _risk_limits()
+    names = _instrument_names(instruments)
+
+    def publish_execution(execution, details):
+        action = details["action_type"].split(":", 1)[0]
+        if str(execution.status) == "reject":
+            event_type = EventType.ORDER_REJECTED
+        elif str(execution.status) == "cancel":
+            event_type = EventType.TRADE_CANCELLED
+        elif action == "MOVESTOP":
+            event_type = EventType.STOP_MOVED
+        else:
+            event_type = {"OPEN": EventType.TRADE_OPENED, "ADD": EventType.POSITION_ADDED,
+                      "STOP": EventType.STOP_HIT, "TARGET": EventType.TARGET_HIT,
+                      "REDUCE": EventType.TRADE_CLOSED, "CLOSE": EventType.TRADE_CLOSED}[action]
+        bus.publish(Event.broker_event(event_type, trade_id=execution.trade_id,
+            instrument=names.get(details["instrument_id"]) or "контракт не указан",
+            **({"side": details["side"]} if details.get("side") else {}),
+            bar_time=execution.timestamp, quantity=execution.filled_quantity, price=execution.price,
+             reason=execution.reason,
+             **({"fee": execution.fee, "fee_source": str(execution.fee_source)}
+                if str(execution.status) in {"fill", "partial"} else {}),
+             execution_id=execution.execution_id, status=str(execution.status),
+             visual=details.get("visual"),
+             timeframe=details["visual"].data["timeframe"] if details.get("visual") else "",
+             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+                                            "requested_quantity", "selected_quantity", "limiting_constraint")
+                if key in details and str(execution.status) in {"fill", "partial"}}))
+
     trade_manager = TradeManager(
         storage,
         broker,
         initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+        budget_observer=lambda details: bus.publish(Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", **details)),
+        execution_observer=publish_execution,
         profiles_config=TRADE_MANAGEMENT_PROFILES,
         risk_limits=risk_limits,
         max_qty=RISK_LIMITS.get("max_qty"),
         commission=RISK_LIMITS.get("commission"),
         slippage=RISK_LIMITS.get("slippage"),
+        slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
+        min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
+        portfolio_pct=RISK_LIMITS.get("portfolio_pct", 2),
+        min_risk_cost_ratio=RISK_LIMITS.get("min_risk_cost_ratio", 2),
+        min_net_payoff=RISK_LIMITS.get("min_net_payoff", 1.5),
+        max_slippage_r=RISK_LIMITS.get("max_slippage_r", 0.25),
+        contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
+        direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
+        clock=clock,
     )
     trade_manager.restore()
+    trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
-    risk_manager = PortfolioRiskManager()
-    contracts = _load_contracts_metadata(instruments)
+    contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
     storage.set_names(_instrument_names(instruments))
@@ -187,6 +562,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
         try:
             prices = {}
             bar_times = []
+            instrument_bar_times = {}
             for instrument in instruments:
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -209,6 +585,7 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
                         float(frame["high"].iloc[-1]),
                         float(frame["close"].iloc[-1]),
                     )
+                    instrument_bar_times[instrument.ticker] = bar_time
                 except Exception as exc:
                     log.warning(
                         "Сбой обработки бара %s по %s: %s",
@@ -216,25 +593,29 @@ def _build_runtime(instruments, notifier, data_cache) -> _Runtime:
                     )
                     continue
             if prices:
-                broker.track_bar(max(bar_times), prices, contracts)
-            for event in broker.drain_events():
-                notifier.notify_event(event.type, event.position_id, event.message)
-            for event in broker.drain_addressed_events():
+                broker.track_bar(max(bar_times), prices, contracts, bar_times=instrument_bar_times)
+            addressed = list(broker.drain_addressed_events())
+            for event in addressed:
                 try:
                     trade_manager.consume(event)
                 except Exception as exc:
                     log.warning(
                         "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
                     )
+            addressed_ids = {event.trade_id for event in addressed}
+            for event in broker.drain_events():
+                if event.trade_id not in addressed_ids:
+                    bus.publish(_broker_event(event))
+            trade_manager.observe_bars(prices, instrument_bar_times)
+            trade_manager.mark_to_market({ticker: values[3] for ticker, values in prices.items()})
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 
     return _Runtime(
-        NotifyOnlyExecutionPort(notifier),
         post_tick=on_bar,
         trade_manager=trade_manager,
-        risk_manager=risk_manager,
         action_executor=action_executor,
+        storage=storage,
     )
 
 
@@ -254,15 +635,36 @@ class _OutboxExecutor:
             log.warning("Сбой доставки команд исполнению: %s", exc)
 
 
+def _broker_event(event) -> Event:
+    """Publish one structured executor fact without a single word of wording.
+
+    Clearing is a portfolio-wide snapshot rather than a trade outcome, so it
+    carries neither a trade nor a contract name and has its own constructor.
+    """
+    if event.type is EventType.CLEARING_DONE:
+        return Event.clearing_done(
+            balance=event.payload.get("balance"),
+            positions=event.payload.get("positions", 0),
+            bar_time=event.ts,
+        )
+    return Event.broker_event(
+        event.type,
+        trade_id=event.trade_id,
+        instrument=event.instrument,
+        bar_time=event.ts,
+        **event.payload,
+    )
+
+
 def _risk_limits():
     """Build typed portfolio limits from the validated configuration values."""
     from src.portfolio import RiskLimits
 
     return RiskLimits(
-        per_trade=Decimal(str(RISK_LIMITS["trade_pct"])),
-        per_instrument=Decimal(str(RISK_LIMITS["instrument_pct"])),
-        per_group={key: Decimal(str(value)) for key, value in RISK_LIMITS.get("groups", {}).items()},
-        portfolio=Decimal(str(RISK_LIMITS["portfolio_pct"])),
+        per_trade=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
+        per_instrument=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
+        per_group={},
+        portfolio=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
     )
 
 
@@ -274,7 +676,12 @@ def _instrument_ticker(instrument) -> str | None:
 
 
 def _instrument_names(instruments) -> dict[str, str]:
-    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов."""
+    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов.
+
+    В карту попадают только настоящие короткие имена: тикер и полный label
+    пользователю не показываются, для неизвестного контракта остаётся
+    ``контракт не указан``.
+    """
     names: dict[str, str] = {}
     for instrument in instruments:
         ticker = _instrument_ticker(instrument)
@@ -283,30 +690,83 @@ def _instrument_names(instruments) -> dict[str, str]:
         if isinstance(instrument, (tuple, list)):
             short = instrument[3] if len(instrument) > 3 else None
         else:
-            short = getattr(instrument, "short_name", None) or getattr(instrument, "label", None)
-        names[ticker] = short or ticker
+            short = getattr(instrument, "short_name", None)
+        if short:
+            names[ticker] = short
     return names
 
 
-def _load_contracts_metadata(instruments):
-    """Кэш метаданных контрактов из API Тильды; при сбое — пустой кэш (входы отклоняются)."""
-    if not TINKOFF_TOKEN:
+def _load_contracts_metadata(instruments, client_provider=None):
+    """Кэш метаданных контрактов из источника данных прогона.
+
+    Акции и фьючерсы грузятся по-разному: у фьючерса есть шаг, стоимость шага,
+    ГО и дата экспирации, у акции — шаг цены и размер лота (цена лота выводится
+    как ``шаг × лот``, ГО отсутствует). Без метаданных входы отклоняются с
+    причиной `no-contract-metadata`, поэтому инструменты без метаданных
+    перечисляются в лог явно. При сбое — частичный кэш: без него потерян ровно
+    тот инструмент, чьи метаданные не прочитались.
+    """
+    by_type: dict[str, set[str]] = {}
+    for instrument in instruments:
+        ticker = _instrument_ticker(instrument)
+        if not ticker:
+            continue
+        by_type.setdefault(_instrument_type(instrument), set()).add(ticker)
+    if not by_type:
+        return {}
+
+    from src.api.instruments import load_futures_contracts, load_share_contracts
+
+    try:
+        context = (
+            client_provider.client_context() if client_provider is not None else None
+        ) or _token_client_context()
+    except Exception as exc:
+        log.warning("Не удалось открыть клиент источника (%s) — входы отклонятся.", exc)
+        return {}
+    if context is None:
         log.warning("Нет TINKOFF_TOKEN — метаданные контрактов недоступны.")
         return {}
-    tickers = {t for t in (_instrument_ticker(i) for i in instruments) if t}
-    if not tickers:
-        return {}
-    try:
-        from src.api.client import client_context
-        from src.api.instruments import load_futures_contracts
 
-        with client_context() as client:
-            contracts = load_futures_contracts(client, tickers=tickers)
-        log.info("Метаданные контрактов загружены: %s", sorted(contracts))
-        return contracts
-    except Exception as exc:
-        log.warning("Не удалось загрузить метаданные контрактов (%s) — входы отклонятся.", exc)
-        return {}
+    contracts: dict[str, object] = {}
+    loaders = {"future": load_futures_contracts, "share": load_share_contracts}
+    with context as client:
+        for instrument_type, tickers in by_type.items():
+            loader = loaders.get(instrument_type)
+            if loader is None:
+                log.warning(
+                    "Метаданные для типа %s не поддерживаются: %s — входы отклонятся.",
+                    instrument_type, sorted(tickers),
+                )
+                continue
+            try:
+                contracts.update(loader(client, tickers=tickers))
+            except Exception as exc:
+                log.warning(
+                    "Не удалось загрузить метаданные %s (%s) — входы по ним отклонятся.",
+                    sorted(tickers), exc,
+                )
+    known = set(contracts)
+    missing = sorted(t for ts in by_type.values() for t in ts if t not in known)
+    if missing:
+        log.warning("Нет метаданных контрактов для: %s — входы отклонятся.", missing)
+    log.info("Метаданные контрактов загружены: %s", sorted(contracts))
+    return contracts
+
+
+def _token_client_context():
+    """Контекст клиента Тильды; без токена возвращается ``None``."""
+    if not TINKOFF_TOKEN:
+        return None
+    from src.api.client import client_context
+
+    return client_context()
+
+
+def _instrument_type(instrument) -> str:
+    if isinstance(instrument, (tuple, list)):
+        return str(instrument[2]) if len(instrument) > 2 else ""
+    return str(getattr(instrument, "instrument_type", "") or "")
 
 
 def print_contract_metadata(contracts) -> None:
@@ -331,5 +791,89 @@ def _strategy_map():
     }
 
 
+_UTF8_STREAMS_SET = False
+
+
+def _force_utf8_streams() -> None:
+    """Запуск без терминала (pipe, CI) на Windows использует cp1252.
+
+    Замороженный PyInstaller-бинарь не подхватывает PYTHONUTF8 из окружения и
+    падает на кириллице при перенаправлении stdout. Локальная консоль не
+    трогается: там Python сам выбирает подходящий codepage.
+    """
+    global _UTF8_STREAMS_SET
+    if _UTF8_STREAMS_SET:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or getattr(stream, "isatty", lambda: False)():
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+    _UTF8_STREAMS_SET = True
+
+
+def _config_smoke() -> None:
+    """Проверяет bundled default.toml без пользовательских файлов и сети."""
+    from src.config import _DEFAULTS
+    from src.config_loader import load_config
+
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    load_config(_DEFAULTS, config_file=root / "missing-robot.toml", bundled_file=root / "default.toml")
+    print("Конфигурация по умолчанию загружена.")
+
+
+def _run_smoke_command(args: list[str]) -> bool:
+    """Выполняет неинтерактивные проверки binary и сообщает, была ли команда."""
+    if "--version" in args:
+        print(__version__)
+        return True
+    if "--config-smoke" in args:
+        _config_smoke()
+        return True
+    if "--telegram-chart-smoke" in args:
+        from src.notifier.telegram_chart import smoke
+
+        smoke()
+        return True
+    return False
+
+
 if __name__ == "__main__":
-    main()
+    _force_utf8_streams()
+    if _run_smoke_command(sys.argv[1:]):
+        pass
+    elif any(flag in sys.argv[1:] for flag in ("--telegram-pending", "--telegram-retry", "--telegram-cleanup-files")):
+        import argparse
+        from src import config
+        from src.notifier.telegram_recovery import cleanup, list_pending, retry
+
+        parser = argparse.ArgumentParser(description="Восстановление уведомлений Telegram")
+        action = parser.add_mutually_exclusive_group(required=True)
+        action.add_argument("--telegram-pending", action="store_true")
+        action.add_argument("--telegram-retry", action="store_true")
+        action.add_argument("--telegram-cleanup-files", action="store_true")
+        parser.add_argument("--state-dir", type=Path, default=runtime_dir())
+        parser.add_argument("--id", type=int, dest="operation_id")
+        parser.add_argument("--trade-id")
+        parser.add_argument("--from", dest="day_from")
+        parser.add_argument("--to", dest="day_to")
+        parser.add_argument("--include-uncertain", action="store_true")
+        args = parser.parse_args()
+        try:
+            if args.telegram_pending:
+                code = list_pending(config, args.state_dir, trade_id=args.trade_id, day_from=args.day_from, day_to=args.day_to)
+            elif args.telegram_cleanup_files:
+                code = cleanup(config, args.state_dir)
+            else:
+                # Ручной replay не должен пересекаться с работающим роботом.
+                acquire_runtime_lock(args.state_dir)
+                code = retry(config, args.state_dir, operation_id=args.operation_id, trade_id=args.trade_id,
+                             day_from=args.day_from, day_to=args.day_to, include_uncertain=args.include_uncertain)
+        except (RuntimeLockError, ValueError) as exc:
+            print(str(exc))
+            code = 2
+        sys.exit(code)
+    else:
+        sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)

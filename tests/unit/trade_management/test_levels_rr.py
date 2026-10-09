@@ -22,6 +22,10 @@ def _context(side: SignalType, market: dict[str, object]) -> PlanningContext:
                 "buffer_ticks": 1,
                 "target_R": (1, 2),
                 "shares": ("0.5", "0.5"),
+                "min_stop_atr": "1.5",
+                "min_stop_ticks": "1",
+                "stop_beyond_bar": "0",
+                "max_stop_atr": "3",
             },
         ),
         market={"price_step": "1", **market},
@@ -29,8 +33,8 @@ def _context(side: SignalType, market: dict[str, object]) -> PlanningContext:
 
 
 @pytest.mark.parametrize(("side", "market", "stop", "targets"), [
-    (SignalType.BUY, {"support": "97"}, "96", ("104", "108")),
-    (SignalType.SELL, {"resistance": "103"}, "104", ("96", "92")),
+    (SignalType.BUY, {"support": "97", "atr": "2"}, "96", ("104", "108")),
+    (SignalType.SELL, {"resistance": "103", "atr": "2"}, "104", ("96", "92")),
 ])
 def test_levels_rr_plans_correct_side_structure_and_r_targets(side, market, stop, targets):
     plan = LevelsRrProfile().plan(_context(side, market))

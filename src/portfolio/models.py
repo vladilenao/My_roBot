@@ -16,7 +16,11 @@ class OrderStatus(str, Enum):
 
 @dataclass(frozen=True)
 class ContractMeta:
-    """Биржевые параметры контракта (фьючерс): шаг цены, стоимость шага, ГО."""
+    """Биржевые параметры контракта (фьючерс): шаг цены, стоимость шага, ГО.
+
+    ``expiration_date`` — naive UTC момент экспирации фьючерса; для контрактов
+    без даты экспирации (акции) остаётся ``None``.
+    """
 
     ticker: str
     price_step: float
@@ -24,6 +28,7 @@ class ContractMeta:
     go_buy: float
     go_sell: float
     currency: str = "RUB"
+    expiration_date: Optional[datetime] = None
 
     def position_value(self, qty: int, price: float) -> float:
         """Номинальная стоимость позиции в валюте: qty * шагов * стоимость шага."""
@@ -129,16 +134,6 @@ class ProtectiveOrder:
 
 
 @dataclass(frozen=True)
-class BrokerEvent:
-    """Событие исполнителя (заявка, сделка, отмена, снимок) для уведомлений."""
-
-    type: str
-    ts: datetime
-    position_id: str
-    message: str
-
-
-@dataclass(frozen=True)
 class OrderResult:
     """Результат операции исполнителя без привязки к движению рынка."""
 
@@ -153,7 +148,6 @@ class OrderResult:
     reason: str
     message: str
     ts_order: datetime
-    events: tuple[BrokerEvent, ...] = ()
 
 
 @dataclass(frozen=True)

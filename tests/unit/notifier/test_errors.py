@@ -1,26 +1,42 @@
-"""Unit-тесты отображения ошибок для пользователя."""
+"""Тесты слоя ошибок: пользователю достаётся причина словами, а не дампом."""
 
-from src.notifier.errors import user_error_message
+import pytest
+
+from src.events.event import Event
+from src.notifier.errors import is_rate_limit
+from src.notifier.templates import render
 
 
-class TestUserErrorMessage:
-    """Проверка user_error_message()."""
+@pytest.mark.parametrize(
+    "text",
+    [
+        "RESOURCE_EXHAUSTED: превышен лимит запросов",
+        "rpc error: code = ResourceExhausted desc = quota",
+        "resource_exhausted",
+    ],
+)
+def test_rate_limit_is_recognised(text: str) -> None:
+    assert is_rate_limit(RuntimeError(text)) is True
 
-    def test_rate_limit_returns_none(self) -> None:
-        exc = RuntimeError(
-            "(<StatusCode.RESOURCE_EXHAUSTED: 8>, '', Metadata(ratelimit_remaining=0))"
-        )
-        assert user_error_message(exc, "обновление данных SBER (15m)") is None
 
-    def test_generic_error_returns_friendly_text_with_operation(self) -> None:
-        operation = "анализ NG-9.26 (1h, flat_triangle)"
-        message = user_error_message(RuntimeError("connection refused"), operation)
-        assert message is not None
-        assert operation in message
-        assert "bot_debug.log" in message
-        assert "connection refused" not in message
+@pytest.mark.parametrize(
+    "text",
+    [
+        "connection reset by peer",
+        "Не удалось получить свечи",
+        "",
+    ],
+)
+def test_ordinary_errors_are_not_rate_limits(text: str) -> None:
+    assert is_rate_limit(RuntimeError(text)) is False
 
-    def test_no_rate_limit_marker_returns_text(self) -> None:
-        message = user_error_message(ValueError("bad assignment"), "обработка тика")
-        assert message is not None
-        assert "обработка тика" in message
+
+def test_error_text_keeps_operation_without_traceback() -> None:
+    event = Event.error(operation="анализ NG-10.26 (1h)")
+
+    text = render(event)
+
+    assert text is not None
+    assert "анализ NG-10.26 (1h)" in text
+    assert "bot_debug.log" in text
+    assert "Traceback" not in text

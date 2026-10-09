@@ -10,7 +10,7 @@ from src.trade_journal.storage import ReservationCandidate, Storage
 def _seed_order(storage: Storage, suffix: str, quantity: int = 2) -> None:
     now = "2026-01-01T00:00:00+00:00"
     storage.connection.execute(
-        "INSERT INTO trades VALUES (?, ?, 'NGV6', ?, 'BUY', '{}', '{}', 'OPEN', 0, '{}', ?, ?)",
+        "INSERT INTO trades VALUES (?, ?, 'NGV6', ?, 'BUY', '{}', '{}', 'OPEN', 0, '{}', ?, ?, NULL, NULL)",
         (f"trade-{suffix}", f"assignment-{suffix}", f"signal-{suffix}", now, now),
     )
     storage.connection.execute(
@@ -108,3 +108,70 @@ def test_partial_fill_transfers_reservation_and_confirmed_cancel_releases_only_r
             "SELECT risk_amount, margin_amount, status FROM reservations"
         ).fetchone() == ("0", "0", "RELEASED")
         assert storage.connection.execute("SELECT quantity FROM positions WHERE trade_id='trade-one'").fetchone() == (2,)
+
+
+def test_cancel_command_releases_reservation_left_by_its_own_entry_order(tmp_path):
+    """Отмена незаполненного входа приходит отдельной командой, а не событием входа."""
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        _seed_order(storage, "one", quantity=2)
+        now = "2026-01-01T00:00:00+00:00"
+        storage.connection.execute(
+            "INSERT INTO outbox VALUES ('command-cancel', 'trade-one', '{}', 'SENT', ?, NULL)", (now,)
+        )
+        storage.connection.execute(
+            "INSERT INTO orders VALUES ('order-cancel', 'trade-one', 'command-cancel', 'CANCEL', "
+            "'PENDING', 1, 0, NULL, ?, ?)",
+            (now, now),
+        )
+        storage.connection.execute(
+            "INSERT INTO account VALUES (1, '1000', '1000', '0', '0', '0', '2026-01-01T00:00:00+00:00')"
+        )
+        storage.connection.commit()
+        storage.reserve_candidates(
+            (_candidate("one", priority=0, risk="800"),),
+            risk_budget=Decimal("1000"), margin_budget=Decimal("1000"),
+        )
+        reducer = ExecutionReducer(storage)
+
+        assert reducer.apply(ExecutionEvent(
+            "ack-1", "order-one", "command-one", "trade-one", ExecutionStatus.ACK, 0,
+            None, Decimal("0"), datetime.now(timezone.utc), "next-bar",
+        ))
+        assert storage.connection.execute("SELECT status FROM reservations").fetchone() == ("ACTIVE",)
+
+        assert reducer.apply(ExecutionEvent(
+            "cancel-1", "order-cancel", "command-cancel", "trade-one", ExecutionStatus.CANCEL, 0,
+            None, Decimal("0"), datetime.now(timezone.utc), "entry-timeout",
+        ))
+
+        assert storage.connection.execute(
+            "SELECT phase FROM trades WHERE trade_id = 'trade-one'"
+        ).fetchone() == ("CANCELLED",)
+        assert storage.connection.execute(
+            "SELECT risk_amount, margin_amount, status FROM reservations"
+        ).fetchone() == ("0", "0", "RELEASED")
+
+
+def test_restart_releases_only_reservations_of_finished_trades(tmp_path):
+    path = tmp_path / "trades.sqlite3"
+    with Storage(path) as storage:
+        _seed_order(storage, "live")
+        _seed_order(storage, "dead")
+        storage.connection.execute(
+            "UPDATE trades SET phase = 'CANCELLED' WHERE trade_id = 'trade-dead'"
+        )
+        storage.connection.commit()
+        storage.reserve_candidates(
+            (_candidate("live", priority=0, risk="500"), _candidate("dead", priority=1, risk="500")),
+            risk_budget=Decimal("1000"), margin_budget=Decimal("1000"),
+        )
+        assert storage.release_terminal_reservations() == 1
+        assert storage.connection.execute(
+            "SELECT trade_id, status FROM reservations ORDER BY trade_id"
+        ).fetchall() == [("trade-dead", "RELEASED"), ("trade-live", "ACTIVE")]
+
+    with Storage(path) as storage:
+        assert storage.release_terminal_reservations() == 0
+        assert storage.connection.execute(
+            "SELECT trade_id, status FROM reservations ORDER BY trade_id"
+        ).fetchall() == [("trade-dead", "RELEASED"), ("trade-live", "ACTIVE")]

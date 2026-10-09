@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import cast
 from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
+import pandas as pd
 
 from src.config_loader import (
     ConfigError,
@@ -13,6 +14,7 @@ from src.config_loader import (
 from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
+from src.events.types import NOTIFICATION_EVENT_TYPES, TRADING_EVENT_TYPES
 
 load_dotenv()  # загружает переменные из .env
 
@@ -45,9 +47,18 @@ _DEFAULTS = {
     "heartbeat_every_ticks": 60,
     "tick_poll_secs": 1,
     "tick_timeout_secs": 65,
+    # Горизонт догона поздно опубликованных баров (в периодах ТФ) — управляет
+    # и планировщиком (D1), и терпимостью готовности к отстающим инструментам (D2).
+    "tick_catch_up_bars": 2,
     "instrument_type": "future",
     "ticker": "NGU6",
-    "notifier": "console",
+    "notifier_channels": ["console"],
+    "notifier_console_events": sorted(t.value for t in NOTIFICATION_EVENT_TYPES),
+    "notifier_telegram_events": sorted(t.value for t in TRADING_EVENT_TYPES),
+    # Таймаут одного HTTP-запроса Bot API, секунд (по умолчанию прежние 10).
+    "notifier_telegram_request_timeout": 10,
+    # Общее число транспортных попыток на доставку: 1 = повторы выключены.
+    "notifier_telegram_max_transport_attempts": 1,
     # Ограничение частоты API-дозагрузок свечей и окно bounded backfill
     "data_refresh_min_interval": 5,
     "data_backfill_window_seconds": 3600,
@@ -77,6 +88,9 @@ _DEFAULTS = {
     "audit_file": "trade_decision_trace.log",
     "audit_max_bytes": 10_485_760,
     "audit_backup_count": 5,
+    # Горизонт блокировки входов и принудительного закрытия фьючерсов:
+    # календарные сутки до момента экспирации контракта.
+    "contract_expiry_block_days": 2,
 }
 
 _CONFIG = load_config(_DEFAULTS)
@@ -97,13 +111,25 @@ HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
 TICK_POLL_SECS = _CONFIG["tick_poll_secs"]
 TICK_TIMEOUT_SECS = _CONFIG["tick_timeout_secs"]
 
+# Догон баров, опубликованных позже окна ожидания: горизонт повторного опроса
+# границы в периодах таймфрейма; одновременно порог «неактивности» пары в гейте.
+CATCH_UP_BARS = _CONFIG["tick_catch_up_bars"]
+
 # Ограничения дозагрузок свечевого кэша: мин. пауза между API-вызовами
 # и окно инкрементальной дозагрузки (bounded backfill).
 DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
 DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 
-# Канал уведомлений: "telegram" | "console"
-NOTIFIER = _CONFIG["notifier"]
+# Каналы уведомлений в порядке конфигурации: "console" | "telegram"
+NOTIFIER_CHANNELS: tuple[str, ...] = tuple(_CONFIG["notifier_channels"])
+NOTIFIER_CONSOLE_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_console_events"])
+NOTIFIER_TELEGRAM_EVENTS: tuple[str, ...] = tuple(_CONFIG["notifier_telegram_events"])
+NOTIFIER_TELEGRAM_REQUEST_TIMEOUT: int = int(
+    _CONFIG["notifier_telegram_request_timeout"]
+)
+NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS: int = int(
+    _CONFIG["notifier_telegram_max_transport_attempts"]
+)
 
 def _checked_timeframe(value: str, where: str) -> str:
     """Таймфрейм привязки/тикера обязан быть ключом TIMEFRAMES (иначе ConfigError)."""
@@ -213,15 +239,39 @@ LOGGING_BACKUP_COUNT = _CONFIG["logging_backup_count"]
 DATA_DIR = _CONFIG.get("data_dir", "data")
 
 
-def runtime_dir() -> Path:
-    """Абсолютный каталог состояния робота: ``app_dir()/data_dir``.
+# Корневой каталог прогонов исторического режима (состояние каждого прогона —
+# в отдельном подкаталоге, чтобы прогоны не смешивали прибыль и убыток).
+HIST_DIR = _CONFIG.get("hist_dir", "HIST")
+
+# Исторический режим: адрес локального Historical Broker API Emulator.
+HISTORICAL_API_URL = _CONFIG.get("historical_api_url", "http://127.0.0.1:8100")
+
+
+def runtime_dir(base: Path | None = None) -> Path:
+    """Абсолютный каталог состояния робота: ``base`` либо ``app_dir()/data_dir``.
 
     В dev это ``<корень проекта>/data``, в PyInstaller-сборке — ``data`` рядом
-    с исполняемым файлом. Каталог не создаётся здесь: создание выполняет тот,
-    кто открывает первые файлы (``run.main``).
+    с исполняемым файлом. Исторический прогон передаёт свой каталог ``base``.
+    Каталог не создаётся здесь: создание выполняет тот, кто открывает первые
+    файлы (``run.main``).
     """
+    if base is not None:
+        root = Path(base)
+        return root if root.is_absolute() else app_dir() / root
     path = Path(DATA_DIR)
     return path if path.is_absolute() else app_dir() / path
+
+
+def run_dir_name(start, end, started_at) -> str:
+    """Имя каталога прогона: границы диапазона и время запуска прогона."""
+    return "-".join(
+        _stamp(moment) for moment in (started_at, start, end)
+    )
+
+
+def _stamp(moment) -> str:
+    """Компактная метка момента, безопасная для имени каталога."""
+    return pd.Timestamp(moment).strftime("%Y%m%dT%H%M%S")
 
 # Торговая секция [trading]: SQLite-backed candle simulation.
 # При отсутствии секции (старые конфиги без торговых дефолтов) режим NotifyOnly.
@@ -236,13 +286,16 @@ AUDIT_MAX_BYTES = _CONFIG.get("audit_max_bytes", 10_485_760)
 AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
+CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
+TRADING_DIRECTIONS = dict(_CONFIG.get("directions", {}))
 
 
 def trading_enabled() -> bool:
     """Признак активного торгового режима (наличие секции `[trading]` после слияния конфигов).
 
     В дефолтной сборке секция всегда есть → торговый режим активен. Отсутствие
-    всех ключей (старый robot.toml без дефолтов) оставляет `NotifyOnlyExecutionPort`.
+    всех ключей (старый robot.toml без дефолтов) оставляет робота в режиме
+    NotifyOnly: заявки не создаются, идут только уведомления.
     """
     return any(
         key in _CONFIG

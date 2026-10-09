@@ -29,10 +29,11 @@ JOURNAL_COLUMNS = (
     "position_qty_before", "position_qty_after", "avg_price_before", "avg_price_after", "reason",
 )
 POSITIONS_COLUMNS = (
-    "trade_id", "contract", "direction", "status", "entry_at", "exit_at", "duration",
+    "contract", "direction", "status", "entry_at", "exit_at", "duration",
     "planned_entry", "planned_stop", "planned_tp1", "initial_quantity", "added_quantity",
     "max_quantity", "average_entry", "exits", "average_exit", "final_reason", "exit_scenario",
-    "gross_pnl", "fees", "net_pnl", "initial_risk", "result_r", "mae_r", "mfe_r",
+    "gross_pnl", "fees", "net_pnl", "pnl_units", "planned_risk", "initial_risk", "result_r", "mae_r", "mfe_r",
+    "cost_coverage", "excursion_coverage", "excursion_definition", "algorithm_version",
 )
 
 # Человекочитаемые русскоязычные заголовки CSV-проекций. Позиции соответствуют
@@ -52,7 +53,6 @@ JOURNAL_HEADERS = (
     "Причина",
 )
 POSITIONS_HEADERS = (
-    "Trade ID",
     "Контракт",
     "Направление",
     "Статус",
@@ -73,10 +73,16 @@ POSITIONS_HEADERS = (
     "Gross PnL",
     "Комиссия",
     "Net PnL",
-    "Initial Risk",
-    "Result",
-    "MAE",
-    "MFE",
+    "Ед. PnL",
+    "Плановый риск (₽)",
+    "Initial Risk (₽)",
+    "Result (R)",
+    "MAE (R)",
+    "MFE (R)",
+    "Полнота издержек",
+    "Полнота экстремумов",
+    "Определение экстремумов",
+    "Версия алгоритма",
 )
 
 _SIDE_LABELS = {"BUY": "Покупка", "SELL": "Продажа"}
@@ -104,6 +110,56 @@ _ACTION_LABELS = {
     "CLOSE": "закрытие позиции",
     "STOP": "стоп",
 }
+
+REASON_LABELS = {
+    "levels-profitable-add": "прибыльный добор по уровням",
+    "atr-profitable-advance": "добор после продвижения по ATR",
+    "ma-cloud-profitable-retest": "прибыльный ретест облака",
+    "pattern-profitable-same-formation": "добор по той же формации",
+    "cost-aware-break-even": "безубыток всей сделки",
+    "atr-trailing-stop": "трейлинг по ATR",
+    "STOP": "стоп", "CLOSE": "закрытие", "REDUCE": "частичный выход",
+    "next-bar": "вход перенесён на следующий бар",
+    "entry-timeout": "вход не исполнен в отведённое время",
+    "contract-expiring": "контракт истекает",
+    "profile-entry": "вход по профилю",
+    "protective": "стоп",
+    "tp": "цель по цене",
+    "risk-cap": "лимит риска",
+    "duplicate-signal": "дублирующий сигнал",
+    "opposite-exposure": "встречная позиция",
+    "opposite-signal-management": "управление по встречному сигналу",
+    "raw-opposite-signal": "встречный сигнал",
+    "ma40-opposite-close": "цена ушла за MA40",
+    "ma10-or-cloud-partial-exit": "частичный выход по MA10/облаку",
+    "factual-increase-fill-invalidates-protection": "добор нарушил защиту",
+    "factual-increase-fill-violates-risk": "добор нарушил лимиты риска",
+    "late-increase-fill-after-cancel": "компенсация позднего добора",
+    "clearing": "клиринг",
+    "ttl": "истёк срок заявки",
+    "close-not-confirmed": "закрытие не подтверждено",
+    "filter-rejected": "сигнал отфильтрован",
+    "no-contract-meta": "нет метаданных контракта",
+    "insufficient-history": "недостаточно истории",
+    "stale-state-revision": "устарела ревизия состояния",
+    "trade-not-open": "позиция не открыта",
+    "trade-already-open": "позиция уже открыта",
+    "unknown-trade": "неизвестная сделка",
+    "unknown-target": "неизвестная цель",
+    "limit-entry-required": "вход только по лимитной заявке",
+    "quantity-non-positive": "недопустимое количество",
+    "quantity-exceeds-trade-remainder": "количество больше остатка позиции",
+    "quantity-exceeds-target-remainder": "количество больше остатка цели",
+    "unsupported-command": "неподдерживаемая команда",
+}
+
+
+def reason_label(code: object) -> str:
+    """Перевести код причины в русскую фразу; неизвестный код — как есть."""
+    text = str(code or "")
+    if text.startswith("tp:"):
+        return REASON_LABELS["tp"]
+    return REASON_LABELS.get(text, text)
 
 
 class CsvExporter:
@@ -195,12 +251,17 @@ class CsvExporter:
                 )
                 if actual_fill:
                     replay[trade_id] = (after_qty, after_avg)
+                display_action = str(row.get("action_type") or "")
+                if display_action.startswith("TARGET:"):
+                    index = self._connection.execute("SELECT target_index FROM targets WHERE trade_id=? AND target_id=?",
+                                                     (trade_id, display_action.partition(":")[2])).fetchone()
+                    display_action = f"TARGET:TP{index[0]+1}" if index else "TARGET:"
                 journal_rows.append({
                     "occurred_at": self._msk(row.get("occurred_at")),
                     "contract": self._display_contract(str(row.get("instrument_id") or "")),
                     "side": _SIDE_LABELS.get(str(row.get("side") or "").upper(), ""),
                     "event": self._describe_event(
-                        str(row.get("event_type") or ""), str(row.get("action_type") or "")
+                        str(row.get("event_type") or ""), display_action
                     ),
                     "quantity": quantity,
                     "price": price,
@@ -208,17 +269,18 @@ class CsvExporter:
                     "position_qty_after": after_qty if after_qty else "",
                     "avg_price_before": self._money(before_avg) if before_avg is not None else "",
                     "avg_price_after": self._money(after_avg) if after_avg is not None else "",
-                    "reason": payload.get("reason") or "",
+                    "reason": reason_label(payload.get("reason")),
                 })
             position_rows = []
             for row in self._rows(
                 """
-                SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
-                       trades.plan_json, positions.quantity, positions.average_price,
-                       positions.realized_pnl, positions.fees, positions.updated_at
-                FROM positions
-                JOIN trades ON trades.trade_id = positions.trade_id
-                ORDER BY positions.trade_id
+SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
+       trades.plan_json, trades.price_step, trades.step_cost,
+       positions.quantity, positions.average_price,
+       positions.realized_pnl, positions.fees, positions.updated_at
+FROM positions
+JOIN trades ON trades.trade_id = positions.trade_id
+ORDER BY positions.trade_id
                 """
             ):
                 ticker = str(row.get("instrument_id") or "")
@@ -278,37 +340,72 @@ class CsvExporter:
         average_entry = entry_value / entry_total if entry_total else None
         average_exit = exit_value / exit_total if exit_total else None
         initial_risk = self._initial_risk(trade_id)
+        point_value = self._point_value(row.get("price_step"), row.get("step_cost"))
+        realized_risk = self._realized_initial_risk(
+            plan, average_entry, point_value, max_qty,
+        )
+        version = plan.get("algorithm_version", "legacy-v1")
+        measurement = self._connection.execute("SELECT initial_stop_distance,max_quantity,coverage FROM trade_measurements WHERE trade_id=?", (trade_id,)).fetchone()
+        if version == "economics-v2":
+            max_qty = measurement[1] if measurement else max_qty
+            economics = plan.get("economics") or {}
+            initial_risk = Decimal(economics["risk_amount"]) if economics.get("risk_amount") is not None else None
+            realized_risk = (Decimal(measurement[0])*point_value*max_qty
+                             if measurement and measurement[0] is not None and point_value and max_qty > 0 else
+                             None)
         gross = Decimal(str(row.get("realized_pnl") or "0"))
         fees = Decimal(str(row.get("fees") or "0"))
         net = gross - fees
         exit_reasons = [str(fill["reason"]) for fill in exits if fill["reason"]]
+        units = self._pnl_units(row.get("price_step"), row.get("step_cost"))
         return {
             "trade_id": trade_id,
             "contract": self._display_contract(str(row.get("instrument_id") or "")),
             "direction": "LONG" if side == "BUY" else "SHORT" if side == "SELL" else "",
-            "status": lifecycle_label(str(row.get("phase") or ""), quantity=int(row.get("quantity") or 0)),
+            "status": "частично закрыта" if exits and row.get("quantity", 0) > 0 else lifecycle_label(str(row.get("phase") or ""), quantity=int(row.get("quantity") or 0)),
             "entry_at": self._msk(first_entry["executed_at"]) if first_entry else "",
             "exit_at": self._msk(last_exit["executed_at"]) if last_exit else "",
-            "duration": self._duration(first_entry, last_exit),
+            "duration": self._duration(first_entry, last_exit) if row.get("quantity") == 0 else "",
             "planned_entry": plan.get("reference_entry") or "",
             "planned_stop": plan.get("stop_price") or "",
-            "planned_tp1": self._first_target(trade_id),
+            "planned_tp1": plan["targets"][0].get("price", self._first_target(trade_id)) if plan.get("targets") else "",
             "initial_quantity": entry_qty or "",
             "added_quantity": added_qty or "",
             "max_quantity": max_qty or "",
             "average_entry": self._money(average_entry) if average_entry is not None else "",
             "exits": self._format_exits(exits),
             "average_exit": self._money(average_exit) if average_exit is not None else "",
-            "final_reason": exit_reasons[-1] if row.get("quantity") == 0 and exit_reasons else "",
+            "final_reason": reason_label(exit_reasons[-1]) if row.get("quantity") == 0 and exit_reasons else "",
             "exit_scenario": self._exit_scenario(exits, int(row.get("quantity") or 0)),
-            "gross_pnl": self._money(gross),
-            "fees": self._money(-fees),
-            "net_pnl": self._money(net),
-            "initial_risk": self._money(initial_risk) if initial_risk is not None else "",
-            "result_r": self._ratio(net, initial_risk),
-            "mae_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=True),
-            "mfe_r": self._extreme_r(trade_id, average_entry, initial_risk, side, adverse=False),
+            "gross_pnl": self._money(gross) if first_entry else "",
+            "fees": self._money(-fees) if first_entry else "",
+            "net_pnl": self._money(net) if first_entry else "",
+            "pnl_units": units,
+            "planned_risk": self._money(initial_risk) if initial_risk is not None else "",
+            "initial_risk": self._money(realized_risk) if realized_risk is not None else "",
+            "result_r": self._ratio(net, realized_risk),
+            "mae_r": self._extreme_r(
+                trade_id, average_entry, realized_risk, side, adverse=True,
+                point_value=point_value, max_qty=max_qty,
+            ),
+            "mfe_r": self._extreme_r(
+                trade_id, average_entry, realized_risk, side, adverse=False,
+                point_value=point_value, max_qty=max_qty,
+            ),
+            "cost_coverage": self._cost_coverage(trade_id),
+            "excursion_coverage": {"complete": "полные доступные наблюдения", "partial": "частичные", "unavailable": "нет наблюдений"}.get(
+                measurement[2] if version == "economics-v2" and measurement else "partial" if entries and version == "legacy-v1" else "unavailable"),
+            "excursion_definition": "holding-bars-v2" if version == "economics-v2" else "Fills-bounded Excursion Metrics",
+            "algorithm_version": version,
         }
+
+    def _cost_coverage(self, trade_id):
+        sources = {r[0] for r in self._connection.execute("SELECT DISTINCT fee_source FROM fills WHERE trade_id=?", (trade_id,))}
+        if not sources or sources == {"unknown"}:
+            return "неизвестны"
+        if "unknown" in sources:
+            return "частично известны"
+        return "брокерские суммы" if sources == {"broker"} else "конфигурационная оценка" if sources == {"configured"} else "смешанные источники"
 
     def _fills(self, trade_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         entries: list[dict[str, object]] = []
@@ -327,6 +424,10 @@ class CsvExporter:
             value = dict(row)
             value["kind"] = "entry" if action in {"OPEN", "ADD"} else "exit"
             value["reason"] = payload.get("reason") or self._action_reason(str(row["action_type"]))
+            if action == "TARGET":
+                target_id = str(row["action_type"]).partition(":")[2]
+                index = self._connection.execute("SELECT target_index FROM targets WHERE trade_id=? AND target_id=?", (trade_id, target_id)).fetchone()
+                value["reason"] = f"TP{index[0]+1}" if index else "цель"
             (entries if value["kind"] == "entry" else exits).append(value)
         return entries, exits
 
@@ -360,7 +461,7 @@ class CsvExporter:
     @classmethod
     def _format_exits(cls, exits: list[dict[str, object]]) -> str:
         return "; ".join(
-            f"{fill['reason']}: {fill['quantity']} @{cls._money(fill['price'])}" for fill in exits
+            f"{reason_label(fill['reason'])}: {fill['quantity']} @{cls._money(fill['price'])}" for fill in exits
         )
 
     @staticmethod
@@ -368,9 +469,9 @@ class CsvExporter:
         if not exits or remaining:
             return ""
         if len(exits) == 1:
-            return str(exits[0]["reason"])
+            return reason_label(exits[0]["reason"])
         return " + ".join(
-            f"{str(fill['reason'])}_PARTIAL" if index < len(exits) - 1 else f"{fill['reason']}_REMAINDER"
+            f"{reason_label(fill['reason'])} (часть)" if index < len(exits) - 1 else f"{reason_label(fill['reason'])} (остаток)"
             for index, fill in enumerate(exits)
         )
 
@@ -379,23 +480,64 @@ class CsvExporter:
         return format(value / divisor, ".2f") if divisor and divisor != 0 else ""
 
     def _extreme_r(
-        self, trade_id: str, entry: Decimal | None, risk: Decimal | None, side: str, *, adverse: bool
+        self, trade_id: str, entry: Decimal | None, risk: Decimal | None, side: str, *, adverse: bool,
+        point_value: Decimal | None, max_qty: int,
     ) -> str:
-        if entry is None or not risk or risk == 0:
+        """How far the position went against or with the trade, in initial risk.
+
+        The excursion is measured in money, not in price points: a point on one
+        contract is worth its own step cost, so comparing a raw price distance
+        between two different instruments means nothing.
+        """
+        if entry is None or not risk or risk == 0 or not point_value or max_qty <= 0:
             return ""
         values: list[Decimal] = []
-        for row in self._rows("SELECT payload_json FROM events WHERE trade_id = ? ORDER BY event_seq", (trade_id,)):
-            payload = self._payload(row["payload_json"])
-            for key in (("low", "price") if adverse else ("high", "price")):
-                if payload.get(key) is not None:
-                    values.append(Decimal(str(payload[key])))
-                    break
+        version = self._payload(self._connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()[0]).get("algorithm_version", "legacy-v1")
+        key = "low" if (side == "BUY") == adverse else "high"
+        if version == "economics-v2":
+            for row in self._rows("SELECT low,high,observed_price FROM trade_market_observations WHERE trade_id=?", (trade_id,)):
+                for column in (key, "observed_price"):
+                    if row[column] is not None:
+                        values.append(Decimal(row[column]))
+        else:
+            for row in self._rows(
+            "SELECT payload_json FROM events WHERE trade_id = ? "
+            "AND event_type IN ('FILL', 'PARTIAL') ORDER BY event_seq", (trade_id,),
+            ):
+                payload = self._payload(row["payload_json"])
+                for column in (key, "price"):
+                    if payload.get(column) is not None:
+                        values.append(Decimal(str(payload[column])))
+                        break
         if not values:
             return ""
         favorable = (max(values) - entry) if side == "BUY" else (entry - min(values))
-        unfavorable = (min(values) - entry) if side == "BUY" else (entry - max(values))
+        unfavorable = (entry - min(values)) if side == "BUY" else (max(values) - entry)
         result = unfavorable if adverse else favorable
-        return format(result / risk, ".2f")
+        return format(max(Decimal(0), result) * point_value * max_qty / risk, ".2f")
+
+    def _realized_initial_risk(
+        self, plan: Mapping[str, object], average_entry: Decimal | None,
+        point_value: Decimal | None, max_qty: int,
+    ) -> Decimal | None:
+        """Money at risk from the price actually paid to the stop set for it.
+
+        The stop distance the plan admitted is kept, but it is re-measured from
+        the average the position actually holds: a gapped entry pays a different
+        price and is judged against its own stop rather than the one it was
+        admitted on. Returns ``None`` when the contract's step cost is unknown,
+        which keeps a comparison across instruments honest instead of scoring a
+        price distance in one contract's points against another's rubles.
+        """
+        if average_entry is None or not point_value or max_qty <= 0:
+            return None
+        try:
+            distance = abs(Decimal(str(plan["reference_entry"])) - Decimal(str(plan["stop_price"])))
+        except (KeyError, TypeError, InvalidOperation):
+            return None
+        if distance == 0:
+            return None
+        return distance * point_value * max_qty
 
     def _rows(self, query: str, parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
         cursor = self._connection.execute(query, parameters)
@@ -483,8 +625,34 @@ class CsvExporter:
             return str(text)
         return format(value.quantize(Decimal("0.01")), "f")
 
+    @staticmethod
+    def _point_value(price_step: object, step_cost: object) -> Decimal | None:
+        """Rubles one price step is worth, or ``None`` when the snapshot lacks it."""
+        if price_step in (None, "") or step_cost in (None, ""):
+            return None
+        try:
+            step, cost = Decimal(str(price_step)), Decimal(str(step_cost))
+        except InvalidOperation:
+            return None
+        return cost/step if all(value.is_finite() and value > 0 for value in (step, cost)) else None
+
+    @staticmethod
+    def _pnl_units(price_step: object, step_cost: object) -> str:
+        """Единицы PnL карточки: RUB для сделок со снапшотом факторов, иначе RAW."""
+        if price_step in (None, "") or step_cost in (None, ""):
+            return "RAW"
+        try:
+            return "RUB" if Decimal(str(price_step)) != 0 else "RAW"
+        except InvalidOperation:
+            return "RAW"
+
     def _display_contract(self, ticker: str) -> str:
-        return self._names.get(ticker) or ticker
+        """Короткое имя контракта; без известного имени — «контракт не указан».
+
+        Сырой биржевой тикер пользователю не показывается нигде, включая журнал
+        и ``trade_summary.csv`` (правило именования в ``openspec/config.yaml``).
+        """
+        return self._names.get(ticker) or "контракт не указан"
 
     @staticmethod
     def _strategy_tf(trade_id: object) -> str:
@@ -496,6 +664,8 @@ class CsvExporter:
     @staticmethod
     def _describe_event(event_type: str, action_type: str) -> str:
         et = (event_type or "").upper()
+        if et == "FEE_ADJUSTMENT":
+            return "Комиссия уточнена брокером"
         status = _STATUS_LABELS.get(et, event_type or "")
         action, _, target = (action_type or "").partition(":")
         if action == "TARGET" and target:

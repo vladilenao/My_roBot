@@ -193,21 +193,24 @@ class TestLogMatrix:
 class TestNotifierLoggingIsolation:
     """Проверка что UI-уведомления НЕ проходят через логгер (design D1)."""
 
-    def test_console_notify_does_not_emit_log_records(self, caplog) -> None:
-        from src.notifier import ConsoleNotifier
+    def test_console_channel_does_not_emit_log_records(self, caplog) -> None:
+        from src.events.event import Event
+        from src.notifier import ConsoleChannel
 
         with caplog.at_level(logging.DEBUG):
-            notifier = ConsoleNotifier()
-            notifier.notify("UI-сообщение через console")
+            ConsoleChannel().handle(Event.error(operation="проверка"))
 
-        assert caplog.records == [], "notify() не должен писать в логгер"
+        assert caplog.records == [], "канал не должен писать в логгер"
 
-    def test_console_notify_prints_to_stdout(self, capsys) -> None:
-        from src.notifier import ConsoleNotifier
+    def test_console_channel_prints_to_stdout(self, capsys) -> None:
+        from src.events.event import Event
+        from src.notifier import ConsoleChannel
 
-        ConsoleNotifier().notify("UI-сообщение через console")
+        ConsoleChannel().handle(Event.heartbeat(tick_count=7, error_count=1))
 
-        assert capsys.readouterr().out == "UI-сообщение через console\n"
+        out = capsys.readouterr().out
+        assert out.startswith("💓 Сердцебиение: тиков работы — 7")
+        assert out.endswith("\n")
 
     def test_logger_output_does_not_go_to_stdout(self, tmp_path: Path, capsys) -> None:
         log_file = tmp_path / "test.log"

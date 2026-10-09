@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from uuid import uuid4
 
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
+from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
+from src.events.event import Event
+from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
-from src.notifier.errors import user_error_message
+from src.notifier.errors import is_rate_limit
+from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
 
 log = get_logger(__name__)
+
+_DECISION_OUTCOMES = {
+    SignalType.BUY: "signal_buy",
+    SignalType.SELL: "signal_sell",
+}
 
 
 class _OperationError(Exception):
@@ -60,11 +70,10 @@ class TradingBot:
     def __init__(
         self,
         instruments,
-        notifier,
+        bus,
         strategy_map: dict[str, object],
         data_cache,
         timeline,
-        execution,
         strategy_factory=get_strategy,
         share_strategies: dict[str, list[Assignment]] | None = None,
         future_strategies: dict[str, list[Assignment]] | None = None,
@@ -73,17 +82,17 @@ class TradingBot:
         tick_timeout_secs: float = 65.0,
         context_cache=None,
         signal_filter=None,
-        risk_manager=None,
         post_tick=None,
         trade_manager=None,
         action_executor=None,
         protection_timeframe: str = "1m",
+        run=None,
     ) -> None:
-        self._notifier = notifier
+        self._bus = bus
         self._strategy_map = strategy_map
         self._data_cache = data_cache
         self._timeline = timeline
-        self._execution = execution
+        self._run = run if run is not None else LiveRunSession()
         self._strategy_factory = strategy_factory
         self._share_strategies = share_strategies or {}
         self._future_strategies = future_strategies or {}
@@ -92,7 +101,6 @@ class TradingBot:
         self._tick_timeout_secs = tick_timeout_secs
         self._context_cache = context_cache
         self._signal_filter = signal_filter
-        self._risk_manager = risk_manager
         self._post_tick = post_tick
         self._trade_manager = trade_manager
         self._action_executor = action_executor
@@ -115,7 +123,7 @@ class TradingBot:
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча активного ТФ» ──
     def _loop(self) -> None:
         first = True
-        while True:
+        while not self._run.should_stop():
             try:
                 if first:
                     ready_tfs = self._bootstrap()
@@ -139,6 +147,7 @@ class TradingBot:
                     time.sleep(delay)
                 else:
                     time.sleep(self._timeline.fallback_secs())
+        log.info("Прогон завершён: %s", self._run.stop_reason())
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
@@ -161,7 +170,10 @@ class TradingBot:
 
     # ── ПУНКТ 3: один тик — обновить данные и обработать инструменты ──
     def _tick(self, ready_tfs: set[str]) -> None:
-        correlation_id_var.set(uuid4().hex[:8])
+        tick_id = uuid4().hex[:8]
+        correlation_id_var.set(tick_id)
+        completed = False
+        self._bus.publish(Event.tick_started(tick_id=tick_id))
         try:
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
@@ -174,6 +186,19 @@ class TradingBot:
                     self._data_cache.refresh_if_new_candle(tf)
                 except Exception as exc:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
+            self._data_cache.close_tick()
+            if getattr(self._data_cache, "data_exhausted", False):
+                self._run.mark_data_exhausted(
+                    getattr(self._data_cache, "data_exhaustion", None)
+                )
+            gap = self._take_data_gap()
+            if gap is not None:
+                # Разрыв в данных: рыночное время переведено на следующий имеющийся
+                # бар, тик ничего не принёс, поэтому обработка бара на этом шаге
+                # не делается — следующий тик начнётся уже за разрывом.
+                self._run.mark_data_gap(gap)
+                self._timeline.reanchor()
+                return
             if not ready_tfs:
                 return
             # Protection is simulated from closed base bars before any strategy
@@ -196,8 +221,17 @@ class TradingBot:
                 except Exception as exc:
                     self._report_error(exc, f"портфельный допуск {candidate.instrument.label}")
             self._maybe_heartbeat()
+            completed = True
         finally:
+            self._bus.publish(Event.tick_finished(tick_id=tick_id, completed=completed))
             correlation_id_var.set(None)
+
+    def _take_data_gap(self):
+        """Забирает найденный кэшем разрыв в данных (одноразово, ``None`` — разрыва нет)."""
+        take = getattr(self._data_cache, "take_pending_gap", None)
+        if not callable(take):
+            return None
+        return take()
 
     # ── ПУНКТ 2.1: готов ли свежий закрытый бар ТФ (для ожидания до появления) ──
     def _bar_is_ready(self, timeframe: str) -> bool:
@@ -248,6 +282,9 @@ class TradingBot:
         tf: str = "",
         entry_candidates: list[_EntryCandidate] | None = None,
     ) -> None:
+        remember_market = getattr(self._trade_manager, "remember_market", None)
+        if callable(remember_market):
+            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -352,14 +389,23 @@ class TradingBot:
             candidate.context,
             timeframe=candidate.timeframe,
         )
+        diagnostics = dict(admission.diagnostics)
+        if admission.rejections and not diagnostics:
+            provider = getattr(self._trade_manager, "portfolio_diagnostics", None)
+            if callable(provider):
+                details = provider()
+                if isinstance(details, Mapping):
+                    diagnostics = dict(details)
         if admission.plan is not None:
             quantity = admission.actions[0].quantity if admission.actions else 0
-            self._execution.report_entry_accepted(
+            self._publish_signal(
                 admission.plan,
                 candidate.instrument,
                 quantity=quantity,
-                filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
+                diagnostics=diagnostics,
+                frame=candidate.frame,
+                as_of=candidate.decision.bar_time,
             )
         self._dispatch_management_actions(
             admission.actions,
@@ -370,10 +416,12 @@ class TradingBot:
             candidate.timeframe,
         )
         for reason in admission.rejections:
-            self._execution.report_rejection(
+            self._publish_rejection(
                 candidate.decision,
                 candidate.instrument,
-                reason_message=reason.message,
+                reason=reason.message,
+                code=reason.code,
+                diagnostics=diagnostics,
                 filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
             )
@@ -415,11 +463,15 @@ class TradingBot:
                 )
                 if candidate.signal_type is SignalType.HOLD:
                     continue
-            executor = self._action_executor or self._execution
+            executor = self._action_executor
+            if executor is None:
+                raise TypeError(
+                    "action executor is required: orders are delivered through the outbox"
+                )
             submit = getattr(executor, "submit", None)
             if submit is None:
                 raise TypeError("action executor must support submit(action, now)")
-            submit(action, datetime.now(timezone.utc).replace(microsecond=0))
+            submit(action, as_aware(self._timeline.now()).replace(microsecond=0))
 
     # ── компактная сводка индикаторов по итоговому бару (для отладки) ──
     @staticmethod
@@ -443,14 +495,114 @@ class TradingBot:
     # ── читаемое имя инструмента для логов (короткое «NG-10.26», не тикер и не label) ──
     @staticmethod
     def _display_name(instrument: Instrument) -> str:
-        return instrument.short_name or instrument.ticker
+        return instrument.short_name or "контракт не указан"
 
-    # ── ПУНКТ 4.2.3-4.2.4: доставка через порт на каждом тике ──
+    # ── ПУНКТ 4.2.3-4.2.4: доставка через шину на каждом тике ──
     def _emit(self, instrument: Instrument, name: str, decision, *, filter_profile: str = "", filtered_out: bool = False, timeframe: str = "") -> None:
-        self._execution.execute(
-            decision, instrument,
-            filter_profile=filter_profile, filtered_out=filtered_out,
+        self._publish_decision(
+            decision,
+            instrument,
+            filter_profile=filter_profile,
+            filtered_out=filtered_out,
             timeframe=timeframe,
+        )
+
+    def _publish_decision(
+        self,
+        decision,
+        instrument: Instrument,
+        *,
+        filter_profile: str = "",
+        filtered_out: bool = False,
+        timeframe: str = "",
+    ) -> None:
+        """Publish the strategy outcome; the channel decides how it reads."""
+        if filtered_out:
+            outcome = "filtered"
+        else:
+            outcome = _DECISION_OUTCOMES.get(decision.signal_type, "no_signal")
+        self._bus.publish(
+            Event.decision(
+                self._display_name(instrument),
+                outcome=outcome,
+                side=decision.signal_type.name,
+                price=decision.price,
+                strategy=decision.strategy_name or "",
+                filter_profile=filter_profile,
+                filtered_out=filtered_out,
+                bar_time=decision.bar_time,
+                timeframe=timeframe,
+                event_id=decision.event_id or "",
+            )
+        )
+
+    def _publish_signal(
+        self,
+        plan,
+        instrument: Instrument,
+        *,
+        quantity: int = 0,
+        timeframe: str = "",
+        diagnostics=None,
+        frame=None,
+        as_of=None,
+    ) -> None:
+        """Publish the admitted plan: it is queued, not yet executed."""
+        economics = plan.economics
+        contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
+        meta = contract_for(instrument.ticker) if callable(contract_for) else None
+        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
+        self._bus.publish(
+            Event.signal(
+                self._display_name(instrument),
+                side=plan.side,
+                quantity=quantity,
+                entry=plan.reference_entry,
+                stop=plan.stop_price,
+                targets=tuple(target.price for target in plan.targets),
+                expected_r=plan.expected_r,
+                risk_amount=None if economics is None else economics.risk_amount,
+                reward_amount=None if economics is None else economics.reward_amount,
+                costs_amount=None if economics is None else economics.costs_amount,
+                payoff_ratio=None if economics is None else economics.payoff_ratio,
+                fixed_reward_amount=None if economics is None else economics.fixed_reward_amount,
+                fixed_quantity=None if economics is None else economics.fixed_quantity,
+                net_reward_amount=None if economics is None else economics.net_reward_amount,
+                algorithm_version=plan.algorithm_version,
+                diagnostics=diagnostics,
+                strategy=plan.profile.name,
+                timeframe=timeframe or plan.timeframe,
+                trade_id=plan.trade_id,
+                bar_time=as_of,
+                visual=visual,
+            )
+        )
+
+    def _publish_rejection(
+        self,
+        decision,
+        instrument: Instrument,
+        *,
+        reason: str,
+        code: str = "",
+        diagnostics=None,
+        filter_profile: str = "",
+        timeframe: str = "",
+    ) -> None:
+        """Publish why the plan was not admitted."""
+        self._bus.publish(
+            Event.rejected(
+                self._display_name(instrument),
+                reason=reason,
+                code=code,
+                diagnostics=diagnostics,
+                side=decision.signal_type.name,
+                price=decision.price,
+                strategy=decision.strategy_name or "",
+                filter_profile=filter_profile,
+                bar_time=decision.bar_time,
+                timeframe=timeframe,
+            )
         )
 
     # ── диспетчеризация привязок по типу инструмента ──
@@ -519,24 +671,18 @@ class TradingBot:
         self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
-        message = (
-            f"💓 Сердцебиение: тиков работы — {self._tick_count}, "
-            f"ошибок за период — {self._errors_in_period}."
+        self._bus.publish(
+            Event.heartbeat(
+                tick_count=self._tick_count,
+                error_count=self._errors_in_period,
+            )
         )
-        try:
-            self._notifier.notify(message)
-        except Exception:
-            log.exception("Не удалось доставить сердцебиение.")
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
 
     def _report_error(self, exc: Exception, operation: str = "обработка тика") -> None:
         self._errors_in_period += 1
         log.exception("Ошибка тика (%s): %s", operation, exc)
-        message = user_error_message(exc, operation)
-        if message is None:
+        if is_rate_limit(exc):
             return
-        try:
-            self._notifier.notify(message)
-        except Exception:
-            log.exception("Не удалось уведомить об ошибке робота.")
+        self._bus.publish(Event.error(operation=operation))

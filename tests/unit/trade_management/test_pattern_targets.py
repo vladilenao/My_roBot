@@ -18,7 +18,11 @@ def _context(side=SignalType.BUY, *, entry="106", references=None, available_at=
         signal=Decision(side, float(entry), event_id="signal-1", available_at=pd.Timestamp(available_at), idea_references=references if references is not None else {
             "pattern_id": "pattern-1", "c": "104", "d": "114", "time_available": "2024-01-01T10:00:00",
         }),
-        profile=ProfileSnapshot("pattern_targets", "1", parameters or {"buffer_ticks": 1}),
+        profile=ProfileSnapshot(
+            "pattern_targets", "1",
+            parameters or {"buffer_ticks": 1, "min_stop_atr": 0, "min_stop_ticks": 1,
+                           "stop_beyond_bar": 0, "max_stop_atr": None},
+        ),
         market={"price_step": "1"},
     )
 

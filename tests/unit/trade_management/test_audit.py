@@ -157,7 +157,7 @@ def test_trace_exports_structured_values_and_all_identifiers_independent_of_root
         with storage.transaction() as connection:
             connection.execute(
                 "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'BUY', "
-                "'{}', '{}', 'OPEN', 0, '{}', ?, ?)",
+                "'{}', '{}', 'OPEN', 0, '{}', ?, ?, NULL, NULL)",
                 (timestamp, timestamp),
             )
             connection.execute(
@@ -250,7 +250,7 @@ def test_sizing_reservation_and_clearing_traces_include_independent_inputs(tmp_p
         with storage.transaction() as connection:
             connection.execute(
                 "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NG', 'signal-1', 'BUY', "
-                "'{}', '{}', 'OPEN', 0, '{}', ?, ?)", (timestamp, timestamp),
+                "'{}', '{}', 'OPEN', 0, '{}', ?, ?, NULL, NULL)", (timestamp, timestamp),
             )
             connection.execute(
                 "INSERT INTO outbox VALUES ('command-1', 'trade-1', '{}', 'PENDING', ?, NULL)",

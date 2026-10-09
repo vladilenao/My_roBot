@@ -1,9 +1,10 @@
 pip>=23
-numba
-pandas-ta-classic
+numba==0.67.0
+pandas-ta-classic==0.6.52
 --extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 t-tech-investments
 ipython-autotime
 python-dotenv
 requests
+matplotlib==3.11.0
 pytest

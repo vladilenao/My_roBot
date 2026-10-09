@@ -3,16 +3,41 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
-from src.broker.port import ExecutionEvent, ExecutionStatus
+from src.broker.port import ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
+from src.logging_setup import get_logger
 from src.trade_journal.storage import Storage
 from src.trade_management.audit import CalculationTrace, CalculationTraceRepository, MeasuredValue, TraceLinks, calculation_trace
+from src.trade_management.models import TargetPlan
+from src.trade_management.profiles.rules import allocate_target_quantities
+from src.trade_journal.observations import record_fill_price
 
 
 _INCREASE_ACTIONS = {"OPEN", "ADD"}
 _REDUCE_ACTIONS = {"REDUCE", "CLOSE", "TARGET", "STOP"}
+_TERMINAL_PHASES = ("CLOSED", "CANCELLED", "REJECTED", "ERROR")
+log = get_logger(__name__)
+_WARNED_STEP_MISSING: set[str] = set()
+
+
+def _warn_missing_step(trade_id: str) -> None:
+    """Say once that a trade cannot be priced in rubles.
+
+    Without the contract's step the money behind a fill is unknowable, so the
+    row stays marked as unusable for ruble metrics rather than quietly scored
+    in bare price points. The metadata snapshot is deliberately not read here:
+    event reduction has to stay reproducible from the journal alone.
+    """
+    if trade_id in _WARNED_STEP_MISSING:
+        return
+    _WARNED_STEP_MISSING.add(trade_id)
+    log.warning(
+        "сделка %s без шага цены и стоимости шага: рублёвые метрики недоступны", trade_id,
+    )
+
+
 def _decimal(value: str | Decimal) -> Decimal:
     return Decimal(value)
 
@@ -56,8 +81,15 @@ def apply_fill(
     quantity: int,
     price: Decimal,
     fee: Decimal,
+    price_step: Decimal | None = None,
+    step_cost: Decimal | None = None,
 ) -> tuple[PositionState, AccountState]:
-    """Pure state transition for one incremental confirmed fill."""
+    """Pure state transition for one incremental confirmed fill.
+
+    Для сделок-снапшотов (``price_step`` и ``step_cost`` не ``None``) выходной
+    PnL считается в рублях через стоимость шага; без снапшота сохраняется
+    прежний сырой расчёт ``цена × объём`` (fallback, как у брокера).
+    """
     if quantity <= 0:
         raise ValueError("fill quantity must be positive")
     if price <= 0 or fee < 0:
@@ -82,7 +114,11 @@ def apply_fill(
         if position.average_price is None or quantity > position.quantity:
             raise ValueError("reducing fill exceeds open position")
         direction = Decimal("1") if side == "BUY" else Decimal("-1")
-        gross = direction * (price - position.average_price) * quantity
+        delta = price - position.average_price
+        if price_step is not None and step_cost is not None and price_step > 0:
+            gross = direction * delta / price_step * step_cost * quantity
+        else:
+            gross = direction * delta * quantity
         remaining = position.quantity - quantity
         next_position = PositionState(
             quantity=remaining,
@@ -111,18 +147,26 @@ def apply_fill_with_trace(
     quantity, price, fee = int(kwargs["quantity"]), kwargs["price"], kwargs["fee"]
     assert isinstance(price, Decimal) and isinstance(fee, Decimal)
     gross = next_account.realized_pnl - account.realized_pnl
+    price_step = kwargs.get("price_step")
+    step_cost = kwargs.get("step_cost")
     trace = calculation_trace(
         "clearing.apply_fill", inputs={
             "side": MeasuredValue(side, "side"), "action": MeasuredValue(action, "action"),
             "quantity": MeasuredValue(quantity, "contracts"), "fill_price": MeasuredValue(price, "price"),
             "average_price_before": MeasuredValue(position.average_price, "price"),
+            "price_step": MeasuredValue(price_step, "price") if price_step is not None
+            else MeasuredValue("", "price"),
+            "step_cost": MeasuredValue(step_cost, "RUB") if step_cost is not None
+            else MeasuredValue("", "RUB"),
             "fee": MeasuredValue(fee, "RUB"), "gross_pnl_before": MeasuredValue(position.realized_pnl, "RUB"),
             "fees_before": MeasuredValue(position.fees, "RUB"),
         }, result=MeasuredValue({"quantity": next_position.quantity, "gross_pnl": str(gross),
                                   "fees": str(next_position.fees), "net_pnl": str(next_position.net_realized_pnl),
                                   "balance": str(next_account.balance)}, "position-account-state"),
         reason="confirmed-fill-cleared",
-        formula="increase: weighted average; reduce: direction*(fill-average)*quantity; balance += gross-fee",
+        formula=("increase: weighted average; "
+                 "reduce: direction*(fill-average)/price_step*step_cost*quantity (raw fallback without factors); "
+                 "balance += gross-fee"),
         links=TraceLinks(),
     )
     return next_position, next_account, trace
@@ -144,6 +188,8 @@ class ExecutionReducer:
             ).fetchone():
                 return False
 
+            if self._is_broker_initiated(event.command_id):
+                self._ensure_pv_order(connection, event)
             order = self._order(connection, event)
             self._assert_event_matches_order(event, order)
             now = event.timestamp.isoformat()
@@ -153,37 +199,65 @@ class ExecutionReducer:
 
             if filled:
                 position, account = self._states(connection, event.trade_id)
+                trade_row = connection.execute(
+                    "SELECT side, price_step, step_cost, plan_json FROM trades WHERE trade_id = ?",
+                    (event.trade_id,),
+                ).fetchone()
+                plan_data = json.loads(trade_row[3])
+                cost_data = plan_data.get("cost_snapshot")
+                rate = None if cost_data is None else Decimal(str(cost_data["commission"]))
+                event = resolve_execution_fee(event, rate)
+                if event.reference_price is not None and event.order_side is not None and trade_row[1] is not None and trade_row[2] is not None:
+                    direction = Decimal(1) if event.order_side == "BUY" else Decimal(-1)
+                    event = replace(event, slippage_amount=(
+                        direction * (event.price - event.reference_price) / Decimal(str(trade_row[1]))
+                        * Decimal(str(trade_row[2])) * event.filled_quantity
+                    ))
                 next_position, next_account, fill_trace = apply_fill_with_trace(
                     position,
                     account,
-                    side=connection.execute(
-                        "SELECT side FROM trades WHERE trade_id = ?", (event.trade_id,)
-                    ).fetchone()[0],
+                    side=trade_row[0],
                     action_type=action_type,
                     quantity=event.filled_quantity,
                     price=event.price,
                     fee=event.fee,
+                    price_step=Decimal(str(trade_row[1])) if trade_row[1] is not None else None,
+                    step_cost=Decimal(str(trade_row[2])) if trade_row[2] is not None else None,
                 )
                 self._traces.record_in_transaction(connection, fill_trace)
+                if trade_row[1] is None or trade_row[2] is None:
+                    _warn_missing_step(event.trade_id)
                 total_filled = order["filled_quantity"] + event.filled_quantity
                 if total_filled > order["quantity"]:
                     raise ValueError("filled quantity exceeds order quantity")
                 order_status = "FILLED" if total_filled == order["quantity"] else "PARTIAL"
                 self._write_states(connection, event.trade_id, next_position, next_account, now)
+                self._measure_position(connection, event.trade_id, position.quantity, next_position, plan_data, now)
                 connection.execute(
-                    "INSERT INTO fills (fill_id, order_id, trade_id, command_id, execution_id, quantity, price, fee, executed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO fills (fill_id, order_id, trade_id, command_id, execution_id, quantity, price, fee, executed_at, "
+                    "fee_source,reference_price,reference_kind,order_side,slippage_amount,slippage_source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (event.execution_id, order["order_id"], event.trade_id, event.command_id,
-                     event.execution_id, event.filled_quantity, _text(event.price), _text(event.fee), now),
+                      event.execution_id, event.filled_quantity, _text(event.price), _text(event.fee), now,
+                      str(event.fee_source), None if event.reference_price is None else _text(event.reference_price),
+                      event.reference_kind, event.order_side,
+                      None if event.slippage_amount is None else _text(event.slippage_amount), event.slippage_source),
                 )
                 connection.execute(
                     "UPDATE orders SET filled_quantity = ?, status = ?, updated_at = ? WHERE order_id = ?",
                     (total_filled, order_status, now, order["order_id"]),
                 )
+                if plan_data.get("algorithm_version") == "economics-v2":
+                    instrument = connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()[0]
+                    record_fill_price(connection, event, instrument)
                 self._update_reservation(connection, order, total_filled, now)
+                if action_type.upper().split(":", 1)[0] in _INCREASE_ACTIONS and plan_data.get("algorithm_version") == "economics-v2":
+                    self._sync_target_allocations(connection, event.trade_id)
                 self._update_target(connection, event.trade_id, action_type, event.filled_quantity)
                 self._update_phase(connection, event.trade_id, action_type, next_position.quantity)
+                self._release_reservations_if_terminal(connection, event.trade_id, now)
             else:
+                event = resolve_execution_fee(event, None)
                 order_status = status
                 connection.execute(
                     "UPDATE orders SET status = ?, updated_at = ? WHERE order_id = ?",
@@ -192,12 +266,95 @@ class ExecutionReducer:
                 if event.status in {ExecutionStatus.REJECT, ExecutionStatus.CANCEL}:
                     self._release_reservation(connection, order, now)
                     self._update_terminal_outcome(connection, event, order, now)
+                    self._release_reservations_if_terminal(connection, event.trade_id, now)
 
             connection.execute(
                 "INSERT INTO events (event_id, trade_id, order_id, command_id, event_type, payload_json, occurred_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (event.execution_id, event.trade_id, order["order_id"], event.command_id,
                  status, json.dumps(self._payload(event), sort_keys=True), now),
+            )
+        return True
+
+    @staticmethod
+    def _sync_target_allocations(connection, trade_id):
+        plan_json, profile_json = connection.execute("SELECT plan_json,profile_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+        data, profile = json.loads(plan_json), json.loads(profile_json)
+        targets = tuple(TargetPlan(t["target_id"], Decimal(t["price"]), Decimal(t["share"])) for t in data.get("targets", ()))
+        if not targets:
+            return
+        total = connection.execute("SELECT COALESCE(SUM(f.quantity),0) FROM fills f JOIN orders o ON o.order_id=f.order_id "
+                                   "WHERE f.trade_id=? AND o.action_type IN ('OPEN','ADD')", (trade_id,)).fetchone()[0]
+        allocations = allocate_target_quantities(total, targets, retain_remainder_for_trailing=profile["name"] == "atr_trend")
+        quantities = {a.target_id: a.quantity for a in allocations.targets}
+        for target_id, filled in connection.execute("SELECT target_id,filled_quantity FROM targets WHERE trade_id=?", (trade_id,)):
+            connection.execute("UPDATE targets SET planned_quantity=? WHERE trade_id=? AND target_id=?",
+                               (max(filled, quantities.get(target_id, 0)), trade_id, target_id))
+
+    @staticmethod
+    def _measure_position(connection, trade_id, previous_quantity, position, plan, now):
+        old = connection.execute("SELECT initial_stop_distance,max_quantity FROM trade_measurements WHERE trade_id=?",
+                                 (trade_id,)).fetchone()
+        distance = old[0] if old else None
+        maximum = max(previous_quantity, position.quantity, old[1] if old else 0)
+        if position.quantity > previous_quantity and plan.get("algorithm_version") == "economics-v2":
+            planned_distance = abs(Decimal(plan["reference_entry"]) - Decimal(plan["stop_price"]))
+            side = connection.execute("SELECT side FROM trades WHERE trade_id=?", (trade_id,)).fetchone()[0]
+            direction = Decimal(1) if side == "BUY" else Decimal(-1)
+            stop = position.average_price - direction * planned_distance
+            if plan.get("price_step") is not None:
+                step = Decimal(plan["price_step"])
+                stop = (stop/step).to_integral_value(rounding=ROUND_FLOOR if side == "BUY" else ROUND_CEILING)*step
+            confirmed = connection.execute("SELECT confirmed_stop FROM protection WHERE trade_id=?", (trade_id,)).fetchone()
+            initial_stop = Decimal(confirmed[0]) if confirmed and confirmed[0] is not None else stop
+            if confirmed and confirmed[0] is not None:
+                stop = max(stop, Decimal(confirmed[0])) if side == "BUY" else min(stop, Decimal(confirmed[0]))
+            connection.execute("UPDATE protection SET confirmed_stop=?,updated_at=? WHERE trade_id=?",
+                               (_text(stop), now, trade_id))
+            if previous_quantity == 0 and distance is None:
+                distance = _text(abs(position.average_price - initial_stop))
+        connection.execute(
+            "INSERT INTO trade_measurements(trade_id,initial_stop_distance,max_quantity,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(trade_id) DO UPDATE SET initial_stop_distance=excluded.initial_stop_distance, "
+            "max_quantity=excluded.max_quantity,updated_at=excluded.updated_at",
+            (trade_id, distance, maximum, now),
+        )
+
+    def apply_fee_adjustment(self, event: FeeAdjustment) -> bool:
+        """Уточнить абсолютную комиссию одного execution без повторного объёма/PnL."""
+        with self._storage.transaction() as connection:
+            previous = connection.execute(
+                "SELECT execution_id,new_fee FROM cost_adjustments WHERE adjustment_id=?", (event.adjustment_id,),
+            ).fetchone()
+            if previous:
+                if previous[0] != event.execution_id or Decimal(previous[1]) != event.new_fee:
+                    raise ValueError("conflicting repeated fee adjustment")
+                return False
+            row = connection.execute(
+                "SELECT trade_id,fee FROM fills WHERE execution_id=?", (event.execution_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown execution for fee adjustment")
+            trade_id, original_fee = row
+            delta = event.new_fee - Decimal(original_fee)
+            now = event.timestamp.isoformat()
+            connection.execute("INSERT INTO cost_adjustments VALUES(?,?,?,?,?,?)", (
+                event.adjustment_id, event.execution_id, original_fee, _text(event.new_fee), _text(delta), now,
+            ))
+            connection.execute("UPDATE fills SET fee=?,fee_source='broker' WHERE execution_id=?",
+                               (_text(event.new_fee), event.execution_id))
+            for table, key, identity in (("positions", "trade_id", trade_id), ("account", "account_id", 1)):
+                old = connection.execute(f"SELECT realized_pnl,fees FROM {table} WHERE {key}=?", (identity,)).fetchone()
+                fees = Decimal(old[1]) + delta
+                connection.execute(f"UPDATE {table} SET fees=?,net_realized_pnl=?,updated_at=? WHERE {key}=?",
+                                   (_text(fees), _text(Decimal(old[0]) - fees), now, identity))
+            balance, equity = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
+            connection.execute("UPDATE account SET balance=?,equity=? WHERE account_id=1",
+                               (_text(Decimal(balance) - delta), _text(Decimal(equity) - delta)))
+            connection.execute(
+                "INSERT INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                (f"fee-adjustment:{event.adjustment_id}", trade_id, "FEE_ADJUSTMENT",
+                 json.dumps({"execution_id": event.execution_id, "new_fee": _text(event.new_fee), "delta": _text(delta)}), now),
             )
         return True
 
@@ -210,6 +367,106 @@ class ExecutionReducer:
         if row is None:
             raise ValueError(f"unknown command {event.command_id}")
         return dict(zip((column[0] for column in cursor.description), row, strict=True))
+
+    @staticmethod
+    def _is_broker_initiated(command_id: str) -> bool:
+        """Защитные закрытия брокера помечены маркером ``:pv:`` в command_id."""
+        return ":pv:" in command_id
+
+    def _ensure_pv_order(self, connection, event: ExecutionEvent) -> None:
+        """Синтезировать durable-заявку для закрытия, не порождённого командой.
+
+        Схема связывает каждый филл с заявкой и каждую заявку с командой, но у
+        защитного закрытия команды менеджера нет. Чтобы применять его штатным
+        путём филла, создаётся пара ``outbox('SENT')`` + ``orders`` с типом
+        ``STOP`` или ``TARGET:<id>``. Статус ``SENT`` исключает повторный
+        диспатч ``claim_outbox`` (берёт только ``PENDING``). Повторный реплей
+        того же события до синтеза отсекается проверкой ``execution_id`` выше.
+        """
+        if connection.execute(
+            "SELECT 1 FROM orders WHERE command_id = ?", (event.command_id,)
+        ).fetchone():
+            return
+        action_type, _, target_id = self._pv_action(event)
+        now = event.timestamp.isoformat()
+        connection.execute(
+            "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at, sent_at) "
+            "VALUES (?, ?, ?, 'SENT', ?, ?)",
+            (event.command_id, event.trade_id, "{}", now, now),
+        )
+        connection.execute(
+            "INSERT INTO orders (order_id, trade_id, command_id, action_type, status, quantity, "
+            "filled_quantity, requested_price, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'PENDING', ?, 0, NULL, ?, ?)",
+            (event.command_id, event.trade_id, event.command_id, action_type,
+             event.filled_quantity, now, now),
+        )
+        if target_id:
+            self._bind_target_plan(connection, event.trade_id, target_id)
+
+    @staticmethod
+    def _pv_action(event: ExecutionEvent) -> tuple[str, str, str]:
+        """Разобрать ``<trade>:pv:<stop|tp>[:<target>]:<bar>`` в (action, kind, target)."""
+        _, _, rest = event.command_id.partition(":pv:")
+        kind, _, payload = rest.partition(":")
+        if kind == "stop":
+            return "STOP", kind, ""
+        if kind == "tp":
+            target_id = payload.partition(":")[0]
+            return f"TARGET:{target_id}", kind, target_id
+        raise ValueError(f"unsupported protective directive {kind!r}")
+
+    @staticmethod
+    def _bind_target_plan(connection, trade_id: str, target_id: str) -> None:
+        """Заполнить ``planned_quantity`` цели из подтверждённых входов.
+
+        Профильные планы не знают объём цели заранее: он зависит от накопленных
+        входов. Защитное закрытие цели применяется через ``_update_target``,
+        который сравнивает заполнение с ``planned_quantity`` — её нужно связать
+        из суммы исполнений ``OPEN``/``ADD`` и долей цели по плану (та же
+        аллокация, что у брокера: последняя цель получает остаток).
+        """
+        row = connection.execute(
+            "SELECT planned_quantity FROM targets WHERE trade_id = ? AND target_id = ?",
+            (trade_id, target_id),
+        ).fetchone()
+        if row is None or row[0] != 0:
+            return
+        entry_quantity = connection.execute(
+            "SELECT COALESCE(SUM(f.quantity), 0) FROM fills f "
+            "JOIN orders o ON o.order_id = f.order_id "
+            "WHERE f.trade_id = ? AND o.action_type IN ('OPEN', 'ADD')",
+            (trade_id,),
+        ).fetchone()[0]
+        if entry_quantity <= 0:
+            return
+        plan_row = connection.execute(
+            "SELECT plan_json FROM trades WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        shares = {
+            item["target_id"]: Decimal(str(item["share"]))
+            for item in json.loads(plan_row[0]).get("targets", [])
+        }
+        ids = [t[0] for t in connection.execute(
+            "SELECT target_id FROM targets WHERE trade_id = ? ORDER BY target_index", (trade_id,)
+        ).fetchall()]
+        allocated = 0
+        planned = 0
+        for index, item in enumerate(ids):
+            quantity = (
+                entry_quantity - allocated
+                if index == len(ids) - 1
+                else int(entry_quantity * shares.get(item, Decimal("0")))
+            )
+            allocated += quantity
+            if item == target_id:
+                planned = quantity
+                break
+        if planned > 0:
+            connection.execute(
+                "UPDATE targets SET planned_quantity = ? WHERE trade_id = ? AND target_id = ?",
+                (planned, trade_id, target_id),
+            )
 
     @staticmethod
     def _assert_event_matches_order(event: ExecutionEvent, order: dict[str, object]) -> None:
@@ -278,6 +535,26 @@ class ExecutionReducer:
             )
 
     @staticmethod
+    def _release_reservations_if_terminal(connection, trade_id: str, now: str) -> None:
+        """Free the whole risk budget once the trade reached a terminal phase.
+
+        :meth:`_release_reservation` only frees the remainder of the very order
+        the event refers to.  An unfilled entry is cancelled through a separate
+        ``CANCEL`` command, so its entry reservation is never touched there and
+        would keep blocking every later admission.
+        """
+        row = connection.execute(
+            "SELECT phase FROM trades WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        if row is None or row[0] not in _TERMINAL_PHASES:
+            return
+        connection.execute(
+            "UPDATE reservations SET risk_amount='0', margin_amount='0', status='RELEASED', updated_at=? "
+            "WHERE trade_id = ? AND status = 'ACTIVE'",
+            (now, trade_id),
+        )
+
+    @staticmethod
     def _update_target(connection, trade_id: str, action_type: str, quantity: int) -> None:
         action, _, target_id = action_type.partition(":")
         if action != "TARGET" or not target_id:
@@ -293,8 +570,13 @@ class ExecutionReducer:
         if filled > target["planned_quantity"]:
             raise ValueError("target fill exceeds planned quantity")
         connection.execute(
-            "UPDATE targets SET filled_quantity=?, status=? WHERE target_id=?",
-            (filled, "FILLED" if filled == target["planned_quantity"] else "PARTIAL", target_id),
+            "UPDATE targets SET filled_quantity=?, status=? WHERE target_id=? AND trade_id=?",
+            (
+                filled,
+                "FILLED" if filled == target["planned_quantity"] else "PARTIAL",
+                target_id,
+                trade_id,
+            ),
         )
 
     @staticmethod
@@ -312,8 +594,9 @@ class ExecutionReducer:
         else:
             return
         connection.execute(
-            "UPDATE trades SET phase = ?, state_revision = state_revision + 1 WHERE trade_id = ? AND phase != ?",
-            (phase, trade_id, phase),
+            "UPDATE trades SET phase = CASE WHEN phase='REDUCING' AND ? IN ('OPEN','ADD') "
+            "THEN 'REDUCING' ELSE ? END, state_revision = state_revision + 1 WHERE trade_id = ?",
+            (action, phase, trade_id),
         )
 
     @staticmethod
@@ -322,7 +605,7 @@ class ExecutionReducer:
         action = str(order["action_type"]).upper().split(":", 1)[0]
         if event.status is ExecutionStatus.REJECT and action == "OPEN":
             phase = "REJECTED"
-        elif action == "OPEN":
+        elif action in {"OPEN", "CANCEL"}:
             quantity = connection.execute(
                 "SELECT quantity FROM positions WHERE trade_id = ?", (event.trade_id,)
             ).fetchone()
@@ -344,4 +627,9 @@ class ExecutionReducer:
             "reason": event.reason, "status": event.status.value, "quantity": event.filled_quantity,
             "low": _text(event.market_low) if event.market_low is not None else None,
             "high": _text(event.market_high) if event.market_high is not None else None,
+            "fee_source": str(event.fee_source),
+            "reference_price": None if event.reference_price is None else _text(event.reference_price),
+            "reference_kind": event.reference_kind, "order_side": event.order_side,
+            "slippage_amount": None if event.slippage_amount is None else _text(event.slippage_amount),
+            "slippage_source": event.slippage_source,
         }

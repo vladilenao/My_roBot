@@ -133,14 +133,9 @@ class PositionManager:
     def track_bar(self, prices: dict[str, float], contracts: dict[str, ContractMeta] | None = None) -> list[str]:
         self._prices = dict(prices)
         self._contracts = dict(contracts or {})
-        over_ids = set(self.apply_over_risk(self.positions))
-        if not over_ids:
-            return []
-        cancel_candidates = sorted(
-            (order for order in self.pending.values() if order.position_id not in over_ids),
-            key=lambda order: (order.ts_order, order.order_id),
-        )
-        return [cancel_candidates[0].position_id] if cancel_candidates else []
+        self.apply_over_risk(self.positions)
+        # Превышение диагностируется, но не вытесняет ранее принятые заявки.
+        return []
 
     def register_order(self, order: PendingOrder) -> None:
         self.pending[order.order_id] = order

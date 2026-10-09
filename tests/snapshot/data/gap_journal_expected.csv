@@ -1,0 +1,16 @@
+stage,field,value
+gap,phase,REJECTED
+gap,quantity,3
+gap,average_price,102.0
+gap,confirmed_stop,98.0
+gap,outbox:c-open,SENT
+gap,outbox:trade-gap:gap-entry:c-open,SENT
+gap,rejected:execution.slippage_guard,gap-entry
+rebase,phase,OPEN
+rebase,quantity,3
+rebase,average_price,100.5
+rebase,confirmed_stop,100
+rebase,target:tp-1,104.5
+rebase,target:tp-2,108.5
+rebase,rejected:management.stop-boundary,stop_loss_beyond_market_boundary
+boundary,stop_beyond_market_refused,True

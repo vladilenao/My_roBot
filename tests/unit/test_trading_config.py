@@ -2,6 +2,7 @@ import pytest
 
 from src.config import (
     CLEARING_TIMES,
+    CONTRACT_EXPIRY_BLOCK_DAYS,
     INITIAL_DEPOSIT,
     JOURNAL_FILE,
     MAX_RISK_PCT,
@@ -200,6 +201,9 @@ class TestImportConstants:
     def test_canonical_export_file_defaults(self):
         assert JOURNAL_FILE == "trade_event.csv"
         assert POSITIONS_FILE == "trade_summary.csv"
+
+    def test_contract_expiry_block_days_default(self):
+        assert CONTRACT_EXPIRY_BLOCK_DAYS == 2
 
 
 def cfg_ref(tmp_path):

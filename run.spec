@@ -1,17 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 import t_tech
 import os
 
 datas = []
 binaries = []
 hiddenimports = []
-# Имя сборки: robot-v<версия> при выпуске, иначе дефолт 'run'.
+# Имя сборки: robot-v<версия>-<платформа> при выпуске, иначе дефолт 'run'.
 # Задаётся через переменную окружения, т.к. PyInstaller не разрешает
 # --name вместе со spec-файлом.
 NAME = os.environ.get('PYINSTALLER_NAME') or 'run'
 # Вшитые дефолты конфигурации (распаковываются в sys._MEIPASS при старте)
 datas += [(os.path.join(SPECPATH, 'default.toml'), '.')]
+datas += collect_data_files('matplotlib', includes=['mpl-data/fonts/ttf/DejaVuSans.ttf', 'mpl-data/matplotlibrc'])
 tmp_ret = collect_all('pandas_ta_classic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('t_tech')
@@ -29,7 +30,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    hooksconfig={},
+    hooksconfig={'matplotlib': {'backends': ['Agg']}},
     runtime_hooks=[],
     excludes=['PyQt6', 'PySide6'],
     noarchive=False,

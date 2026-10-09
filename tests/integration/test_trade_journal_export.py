@@ -22,7 +22,7 @@ def _write_snapshot(storage):
     with storage.transaction() as connection:
         connection.execute(
             "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'BUY', "
-            "'{}', '{}', 'OPEN', 1, '{}', ?, ?)",
+            "'{}', '{}', 'OPEN', 1, '{}', ?, ?, NULL, NULL)",
             (now, now),
         )
         connection.execute(
@@ -46,6 +46,69 @@ def _change_snapshot(storage):
         connection.execute("UPDATE positions SET quantity = 1 WHERE trade_id = 'trade-1'")
 
 
+def _write_reason_fill(storage, reason):
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.transaction() as connection:
+        connection.execute(
+            "INSERT INTO trades VALUES ('trade-1', 'assignment-1', 'NGV6', 'signal-1', 'SELL', "
+            "'{}', '{}', 'CLOSED', 1, '{}', ?, ?, NULL, NULL)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO positions VALUES ('trade-1', 'SELL', 0, '100', '0', '0', '0', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at) "
+            "VALUES ('cmd-1', 'trade-1', '{}', 'SENT', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO orders VALUES ('order-1', 'trade-1', 'cmd-1', 'CLOSE', 'FILLED', 2, 2, "
+            "'100', ?, ?)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) VALUES ('fill-1', 'order-1', 'trade-1', 'cmd-1', 'exec-1', 2, '100', '0', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO events (event_id, trade_id, order_id, command_id, event_type, payload_json, occurred_at) "
+            "VALUES ('exec-1', 'trade-1', 'order-1', 'cmd-1', 'FILL', ?, ?)",
+            (json.dumps({"reason": reason}), now),
+        )
+
+
+def _export_reason_rows(tmp_path, reason):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_reason_fill(storage, reason)
+        return _read_csv(journal), _read_csv(positions)
+
+
+def test_reason_labels_render_known_codes_in_russian(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "opposite-signal-management")
+
+    assert journal_rows[0]["Причина"] == "управление по встречному сигналу"
+    assert position_rows[0]["Финальная причина"] == "управление по встречному сигналу"
+
+
+def test_stale_state_revision_reason_is_russian(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "stale-state-revision")
+
+    assert journal_rows[0]["Причина"] == "устарела ревизия состояния"
+    assert position_rows[0]["Финальная причина"] == "устарела ревизия состояния"
+
+
+def test_reason_labels_pass_through_unknown_codes(tmp_path):
+    journal_rows, position_rows = _export_reason_rows(tmp_path, "custom-machine-code")
+
+    assert journal_rows[0]["Причина"] == "custom-machine-code"
+    assert position_rows[0]["Финальная причина"] == "custom-machine-code"
+
+
 def test_export_uses_short_contract_name_from_storage_names(tmp_path):
     database = tmp_path / "trades.sqlite3"
     journal = tmp_path / "journal.csv"
@@ -62,6 +125,38 @@ def test_export_uses_short_contract_name_from_storage_names(tmp_path):
         position_rows = _read_csv(positions)
         assert position_rows
         assert position_rows[0]["Контракт"] == "NG-12.26"
+
+
+def test_export_never_shows_raw_ticker_for_unknown_contract(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_snapshot(storage)
+
+        journal_rows = _read_csv(journal)
+        position_rows = _read_csv(positions)
+
+        assert journal_rows[0]["Контракт"] == "контракт не указан"
+        assert position_rows[0]["Контракт"] == "контракт не указан"
+        assert "NGV6" not in journal.read_text(encoding="utf-8")
+        assert "NGV6" not in positions.read_text(encoding="utf-8")
+
+
+def test_export_keeps_persisted_names_for_contracts_outside_current_run(tmp_path):
+    database = tmp_path / "trades.sqlite3"
+    journal = tmp_path / "journal.csv"
+    positions = tmp_path / "positions.csv"
+
+    with Storage(database, journal_path=journal, positions_path=positions) as storage:
+        _write_snapshot(storage)
+        storage.set_names({"NGV6": "NG-10.26"})
+
+        storage.set_names({"BRV6": "BR-7.12"})
+
+        assert _read_csv(journal)[0]["Контракт"] == "NG-10.26"
+        assert _read_csv(positions)[0]["Контракт"] == "NG-10.26"
 
 
 def test_startup_and_later_export_restore_deleted_csv_from_sqlite(tmp_path):
@@ -134,14 +229,14 @@ def test_rows_expose_lag_until_a_failed_projection_is_retried(tmp_path, monkeypa
 
         stale_rows = _read_csv(positions)
         assert len(stale_rows) == 1
-        assert stale_rows[0]["Trade ID"] == "trade-1"
+        assert stale_rows[0]["Статус"] == "открыта"
 
         monkeypatch.setattr("src.trade_journal.export.os.replace", original_replace)
         assert storage.export()
 
     retried_rows = _read_csv(positions)
     assert len(retried_rows) == 1
-    assert retried_rows[0]["Trade ID"] == "trade-1"
+    assert "Trade ID" not in retried_rows[0]
 
 
 def test_first_sqlite_export_preserves_legacy_csvs_only_once(tmp_path):

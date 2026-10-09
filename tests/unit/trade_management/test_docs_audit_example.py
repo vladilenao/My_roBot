@@ -41,6 +41,10 @@ def _levels_rr_context(trade_id: str, assignment_id: str, instrument_id: str, si
             "target_R": [Decimal("1"), Decimal("2")],
             "shares": [Decimal("0.5"), Decimal("0.5")],
             "max_adds": 0,
+            "min_stop_atr": "1.5",
+            "min_stop_ticks": "1",
+            "stop_beyond_bar": "0",
+            "max_stop_atr": "3",
         },
     )
     return PlanningContext(
@@ -54,6 +58,7 @@ def _levels_rr_context(trade_id: str, assignment_id: str, instrument_id: str, si
             "resistance": Decimal("103"),
             "price_step": Decimal("1"),
             "entry": Decimal("100"),
+            "atr": Decimal("2"),
         },
     )
 
@@ -73,6 +78,7 @@ def test_docs_entry_audit_trace_is_accepted_with_doc_values() -> None:
     assert result["entry"] == "100.0"
     assert result["stop"] == "96"
     assert result["targets"] == [("tp-1", "104", "0.5"), ("tp-2", "108", "0.5")]
+    assert result["stop_basis"] == "structural"
     assert trace.links.assignment_id == assignment_id
     assert trace.links.trade_id == trade_id
     assert trace.links.signal_id is not None
