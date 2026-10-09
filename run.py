@@ -558,11 +558,36 @@ def _build_runtime(
     broker.set_names(_instrument_names(instruments))
     print_contract_metadata(contracts)
 
+    # Cursors advance only after executions and observations of a minute have
+    # committed. On restart SQLite provides the safe boundary of live state.
+    execution_cursors = storage.execution_bar_boundaries()
+    execution_closes = {}
+    pending_bar = None
+
+    def commit_bar(stamp, prices, addressed, broker_events):
+        instrument_bar_times = {ticker: stamp for ticker in prices}
+        for event in addressed:
+            trade_manager.consume(event)
+        addressed_ids = {event.trade_id for event in addressed}
+        for event in broker_events:
+            if event.trade_id not in addressed_ids:
+                bus.publish(_broker_event(event))
+        trade_manager.observe_bars(prices, instrument_bar_times)
+        for ticker in prices:
+            execution_cursors[ticker] = (stamp, False)
+        execution_closes.update({ticker: values[3] for ticker, values in prices.items()})
+        trade_manager.mark_to_market(execution_closes)
+
     def on_bar(ready_tfs: set[str]) -> None:
+        nonlocal pending_bar
         try:
-            prices = {}
-            bar_times = []
-            instrument_bar_times = {}
+            # The simulator has already advanced if a durable write failed.
+            # Retry those same events before asking it to execute another bar.
+            if pending_bar is not None:
+                commit_bar(*pending_bar)
+                pending_bar = None
+            batches = {}
+            initial_boundaries = None
             for instrument in instruments:
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -574,40 +599,34 @@ def _build_runtime(
                     continue
                 if frame.empty:
                     continue
-                bar_time = frame["datetime"].iloc[-1]
-                if hasattr(bar_time, "to_pydatetime"):
-                    bar_time = bar_time.to_pydatetime()
                 try:
-                    bar_times.append(bar_time)
-                    prices[instrument.ticker] = (
-                        float(frame["open"].iloc[-1]),
-                        float(frame["low"].iloc[-1]),
-                        float(frame["high"].iloc[-1]),
-                        float(frame["close"].iloc[-1]),
-                    )
-                    instrument_bar_times[instrument.ticker] = bar_time
+                    ticker = instrument.ticker
+                    stamps = frame["datetime"].map(to_aware_utc)
+                    boundary = execution_cursors.get(ticker)
+                    if boundary is None:
+                        if initial_boundaries is None:
+                            initial_boundaries = storage.execution_bar_boundaries()
+                        boundary = initial_boundaries.get(ticker, (stamps.max(), True))
+                    last, inclusive = boundary
+                    fresh = frame.loc[stamps >= last if inclusive else stamps > last]
+                    fresh = fresh.sort_values("datetime").drop_duplicates("datetime", keep="last")
+                    for row in fresh.itertuples(index=False):
+                        stamp = to_aware_utc(row.datetime).to_pydatetime()
+                        batches.setdefault(stamp, {})[ticker] = (
+                            float(row.open), float(row.low), float(row.high), float(row.close),
+                        )
                 except Exception as exc:
                     log.warning(
-                        "Сбой обработки бара %s по %s: %s",
-                        bar_time, _instrument_ticker(instrument), exc,
+                        "Сбой подготовки минутных баров по %s: %s",
+                        _instrument_ticker(instrument), exc,
                     )
                     continue
-            if prices:
-                broker.track_bar(max(bar_times), prices, contracts, bar_times=instrument_bar_times)
-            addressed = list(broker.drain_addressed_events())
-            for event in addressed:
-                try:
-                    trade_manager.consume(event)
-                except Exception as exc:
-                    log.warning(
-                        "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
-                    )
-            addressed_ids = {event.trade_id for event in addressed}
-            for event in broker.drain_events():
-                if event.trade_id not in addressed_ids:
-                    bus.publish(_broker_event(event))
-            trade_manager.observe_bars(prices, instrument_bar_times)
-            trade_manager.mark_to_market({ticker: values[3] for ticker, values in prices.items()})
+            for stamp, prices in sorted(batches.items()):
+                instrument_bar_times = {ticker: stamp for ticker in prices}
+                broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
+                pending_bar = (stamp, prices, list(broker.drain_addressed_events()), list(broker.drain_events()))
+                commit_bar(*pending_bar)
+                pending_bar = None
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 

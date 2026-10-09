@@ -328,6 +328,7 @@ class TestRuntimeComposition:
         manager = MagicMock()
         storage = MagicMock()
         storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
         cache = MagicMock()
         cache.frame_for.return_value = _frame_with_candle()
         with patch("run.trading_enabled", return_value=True), patch(
