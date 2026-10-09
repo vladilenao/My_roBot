@@ -449,8 +449,12 @@ class JournalBroker(BrokerPort):
 
     @staticmethod
     def _command_outcome(action: TradeAction, now: datetime, status: ExecutionStatus, reason: str) -> ExecutionEvent:
+        execution_id = f"{action.command_id}:{status.value}"
+        if status is ExecutionStatus.CANCEL:
+            r = (reason or "cancel").replace(":", "-")
+            execution_id = f"cancel:{action.trade_id}:{r}:{action.command_id}"
         return ExecutionEvent(
-            execution_id=f"{action.command_id}:{status.value}", order_id=action.command_id,
+            execution_id=execution_id, order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=status,
             filled_quantity=0, price=None, fee=Decimal("0"), timestamp=now, reason=reason,
             fee_source=FeeSource.UNKNOWN,
