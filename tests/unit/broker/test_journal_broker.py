@@ -281,8 +281,8 @@ class TestCancelEventInstrument:
         assert len(events) == 1
         assert events[0].instrument == "NG-10.26"
         text = self._console_text(events[0])
-        assert text == "❌ Отмена: Заявка NG-10.26 отменена (risk_cap)"
-        assert "None" not in text and "контракт не указан" not in text
+        assert "NG-10.26   ОТМЕНА" in text and "Причина: risk_cap" in text
+        assert "None" not in text and "контракт не указан" not in text and "❌" not in text
 
     def test_expire_order_carries_short_name(self, tmp_path):
         broker = self._named_broker(tmp_path)
@@ -292,8 +292,8 @@ class TestCancelEventInstrument:
         events = [e for e in broker.drain_events() if e.type is EventType.TRADE_CANCELLED]
         assert events and events[0].instrument == "NG-10.26"
         text = self._console_text(events[0])
-        assert text == "❌ Отмена: Заявка NG-10.26 истекла по TTL"
-        assert "None" not in text
+        assert "NG-10.26   ОТМЕНА" in text and "Причина: истёк срок TTL" in text
+        assert "None" not in text and "❌" not in text
 
 
 class TestMigration:

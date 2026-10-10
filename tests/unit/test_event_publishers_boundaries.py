@@ -366,7 +366,7 @@ class TestTradeIdStaysInternal:
         event = recorder.events[0]
         assert event.get("trade_id") == "trade-1"
         assert "trade-1" not in (recorder.texts()[0] or "")
-        assert recorder.texts()[0].startswith("💰 Сделка")
+        assert "ВЫХОД · исполнено 2 по 110" in recorder.texts()[0]
 
     def test_clearing_event_carries_no_trade_and_no_contract(self):
         recorder = Recorder()
@@ -387,7 +387,7 @@ class TestTradeIdStaysInternal:
         assert "trade_id" not in event.payload
         text = recorder.texts()[0]
         assert "NGV6" not in text
-        assert "100000" in text
+        assert "100 000 ₽" in text
         assert "2" in text
 
 

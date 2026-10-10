@@ -8,6 +8,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
+import shutil
+import sys
+from threading import Lock
 from typing import IO, Callable, Iterable
 
 from src.events.event import Event
@@ -20,8 +24,42 @@ from src.notifier.templates.decision import idle_tick_summary
 log = get_logger(__name__)
 
 
+def _supports_color(stream: IO[str], *, platform_name: str | None = None) -> bool:
+    if "NO_COLOR" in os.environ or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    try:
+        is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    except (OSError, ValueError):
+        is_tty = False
+    if not is_tty:
+        return False
+    if (platform_name or os.name) != "nt":
+        return True
+    # В старой консоли Windows ANSI допустим лишь после включения VT-режима.
+    if stream not in (sys.stdout, sys.stderr):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.argtypes = (wintypes.DWORD,)
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel32.GetStdHandle(-11 if stream is sys.stdout else -12)
+        mode = wintypes.DWORD()
+        if not handle or handle == ctypes.c_void_p(-1).value or not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(mode.value & 0x0004) or bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 class ConsoleChannel(Channel):
-    """Печатает текст уведомления в поток вывода."""
+    """Печатает один завершённый блок уведомления в поток вывода."""
 
     name = "console"
     notification_types: frozenset[EventType] = NOTIFICATION_EVENT_TYPES
@@ -39,6 +77,7 @@ class ConsoleChannel(Channel):
         self._tz_offset_hours = tz_offset_hours
         self._stream = stream
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._write_lock = Lock()
         self._disabled = False
         self._active_tick_id: str | None = None
         self._hold_count = 0
@@ -59,10 +98,15 @@ class ConsoleChannel(Channel):
         if self._is_clean_hold(event):
             self._remember_hold(event)
             return
-        text = render(event, self._tz_offset_hours)
+        stream = self._stream if self._stream is not None else sys.stdout
+        text = render(
+            event, self._tz_offset_hours, now=self._now(),
+            width=shutil.get_terminal_size(fallback=(96, 24)).columns,
+            color=_supports_color(stream),
+        )
         if text is None:
             return
-        printed = self._write(text)
+        printed = self._write(text, separate_after=event.type is not EventType.HEARTBEAT)
         if printed and self._active_tick_id is not None:
             self._printed_in_tick = True
 
@@ -95,21 +139,25 @@ class ConsoleChannel(Channel):
                 if moment.tzinfo is None:
                     moment = moment.replace(tzinfo=timezone.utc)
                 moscow = moment.astimezone(timezone(timedelta(hours=3)))
-                self._write(idle_tick_summary(moscow, self._hold_count, self._hold_instruments))
+                stream = self._stream if self._stream is not None else sys.stdout
+                self._write(idle_tick_summary(
+                    moscow, self._hold_count, self._hold_instruments,
+                    color=_supports_color(stream),
+                ))
         finally:
             self._active_tick_id = None
             self._hold_count = 0
             self._hold_instruments.clear()
             self._printed_in_tick = False
 
-    def _write(self, text: str) -> bool:
+    def _write(self, text: str, *, separate_after: bool = False) -> bool:
         try:
-            if self._stream is None:
-                print(text, flush=True)
-            else:
-                print(text, file=self._stream, flush=True)
+            with self._write_lock:
+                stream = self._stream if self._stream is not None else sys.stdout
+                stream.write(text + ("\n\n" if separate_after else "\n"))
+                stream.flush()
             return True
-        except OSError:
+        except (OSError, ValueError):
             # Закрытый stdout (запуск из-под мёртвого терминала, `head` и т.п.):
             # печать отключается, чтобы не заливать лог повторными ошибками.
             self._disabled = True

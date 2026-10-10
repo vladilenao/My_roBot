@@ -209,7 +209,7 @@ class TestNotifierLoggingIsolation:
         ConsoleChannel().handle(Event.heartbeat(tick_count=7, error_count=1))
 
         out = capsys.readouterr().out
-        assert out.startswith("💓 Сердцебиение: тиков работы — 7")
+        assert "СИСТЕМА    7 тактов работы · 1 ошибка" in out
         assert out.endswith("\n")
 
     def test_logger_output_does_not_go_to_stdout(self, tmp_path: Path, capsys) -> None:

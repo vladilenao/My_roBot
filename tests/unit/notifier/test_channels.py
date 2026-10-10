@@ -11,7 +11,7 @@ from src.events import EventBus
 from src.events.event import Event
 from src.events.types import TRADING_EVENT_TYPES, EventType
 from src.notifier.channel import Channel
-from src.notifier.console import ConsoleChannel
+from src.notifier.console import ConsoleChannel, _supports_color
 from src.notifier.telegram import MESSAGE_LIMIT, TelegramChannel, _split_message
 
 
@@ -52,10 +52,60 @@ class TestChannelPort:
 
 
 class TestConsoleChannel:
-    def test_prints_rendered_text(self, capsys) -> None:
-        ConsoleChannel().handle(Event.heartbeat(tick_count=1, error_count=0))
+    def test_color_capability_respects_terminal_and_environment(self, monkeypatch) -> None:
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
 
-        assert capsys.readouterr().out == "💓 Сердцебиение: тиков работы — 1, ошибок за период — 0.\n"
+        terminal = Terminal()
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("TERM", "xterm-256color")
+        assert _supports_color(terminal, platform_name="posix")
+        assert not _supports_color(io.StringIO(), platform_name="posix")
+        assert not _supports_color(terminal, platform_name="nt")
+        monkeypatch.setenv("NO_COLOR", "")
+        assert not _supports_color(terminal, platform_name="posix")
+        monkeypatch.delenv("NO_COLOR")
+        monkeypatch.setenv("TERM", "dumb")
+        assert not _supports_color(terminal, platform_name="posix")
+
+    def test_terminal_color_and_pipe_plain_text_match(self, monkeypatch) -> None:
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("TERM", "xterm-256color")
+        def now() -> datetime:
+            return datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc)
+        event = Event.decision("SBER", outcome="signal_sell", side="SELL", price=100)
+        terminal = Terminal()
+        plain = io.StringIO()
+        ConsoleChannel(stream=terminal, now=now).handle(event)
+        ConsoleChannel(stream=plain, now=now).handle(event)
+        assert "\x1b[35m" in terminal.getvalue()
+        assert terminal.getvalue().endswith("\x1b[0m\n\n")
+        assert terminal.getvalue().replace("\x1b[35m", "").replace("\x1b[0m", "") == plain.getvalue()
+
+    def test_quiet_scan_is_muted_only_in_terminal(self, monkeypatch) -> None:
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("TERM", "xterm")
+        stream = Terminal()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+        channel.handle(Event.tick_started(tick_id="one"))
+        channel.handle(Event.decision("SBER", outcome="no_signal", side="HOLD"))
+        channel.handle(Event.tick_finished(tick_id="one", completed=True))
+        assert stream.getvalue() == "\x1b[90m10:15  СКАН       Сигналов нет · 1 проверка\x1b[0m\n"
+
+    def test_prints_rendered_text(self, capsys) -> None:
+        ConsoleChannel(now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc)).handle(
+            Event.heartbeat(tick_count=1, error_count=0))
+
+        assert capsys.readouterr().out == "10:15  СИСТЕМА    1 такт работы · 0 ошибок\n"
 
     def test_writes_to_given_stream(self) -> None:
         import io
@@ -85,6 +135,28 @@ class TestConsoleChannel:
         # Первая попытка упала в OSError (канал её пережил), вторая не делалась.
         assert BrokenStream.writes == 1
 
+    def test_closed_stream_disables_channel_without_error(self) -> None:
+        stream = io.StringIO()
+        stream.close()
+        channel = ConsoleChannel(stream=stream)
+        channel.handle(Event.heartbeat(tick_count=1, error_count=0))
+        channel.handle(Event.heartbeat(tick_count=2, error_count=0))
+        assert channel._disabled
+
+    def test_whole_multiline_block_uses_one_write(self) -> None:
+        class CountingStream(io.StringIO):
+            writes = 0
+
+            def write(self, value: str) -> int:
+                self.writes += 1
+                return super().write(value)
+
+        stream = CountingStream()
+        channel = ConsoleChannel(stream=stream)
+        channel.handle(Event.error(operation="анализ сделки"))
+        assert stream.writes == 1
+        assert stream.getvalue().count("\n") == 4
+
     def test_quiet_tick_prints_one_summary_through_bus(self) -> None:
         stream = io.StringIO()
         channel = ConsoleChannel(
@@ -104,7 +176,7 @@ class TestConsoleChannel:
                 ))
         bus.publish(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (8 пар: NG-9.26, GAZP, Si, RTS)\n"
+        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 8 проверок\n"
 
     def test_printed_event_suppresses_quiet_tick_summary(self) -> None:
         stream = io.StringIO()
@@ -115,7 +187,19 @@ class TestConsoleChannel:
         channel.handle(Event.decision("SBER", outcome="signal_buy", side="BUY", price=100))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● SBER ➜ 🟢 ПОКУПКА (BUY) — Цена: 100.000\n"
+        assert stream.getvalue() == "10:15  SBER       ПОКУПКА · 100.000\n\n"
+
+    def test_decision_plan_and_rejection_keep_publication_order(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
+        channel.handle(Event.decision("SBER", outcome="signal_buy", side="BUY", price=100))
+        channel.handle(Event.signal("SBER", side="BUY", quantity=1, entry=100, stop=96))
+        channel.handle(Event.rejected("SBER", reason="лимит риска", side="BUY"))
+
+        text = stream.getvalue()
+        assert text.index("ПОКУПКА · 100.000") < text.index("ПЛАН · ПОКУПКА") < text.index("ОТКЛОНЕНО")
+        assert text.count("10:15  SBER") == 3
+        assert text.count("\n\n") == 3
 
     def test_filtered_hold_is_printed_and_suppresses_summary(self) -> None:
         stream = io.StringIO()
@@ -126,7 +210,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("SBER", outcome="filtered", side="HOLD", filtered_out=True))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● SBER ➜ ❌ Отклонено фильтром.\n"
+        assert stream.getvalue().endswith("SBER       ОТКЛОНЕНО\n       Причина: отклонено фильтром\n\n")
 
     def test_holds_for_different_timeframes_and_profiles_count_separately(self) -> None:
         stream = io.StringIO()
@@ -139,7 +223,7 @@ class TestConsoleChannel:
             ))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (3 пары: GAZP)\n"
+        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 3 проверки\n"
 
     def test_disabled_decisions_do_not_produce_summary(self) -> None:
         stream = io.StringIO()
@@ -178,7 +262,7 @@ class TestConsoleChannel:
             channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● 01:15 ➜ ⏳ Нет сигналов (21 пара: GAZP)\n"
+        assert stream.getvalue() == "01:15  СКАН       Сигналов нет · 21 проверка\n"
 
     @pytest.mark.parametrize("event", [Event.error(operation="тик"), Event.heartbeat(tick_count=1, error_count=0)])
     def test_printed_system_event_suppresses_summary(self, event) -> None:
@@ -204,7 +288,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="two", completed=True))
 
-        assert stream.getvalue().endswith("● 10:15 ➜ ⏳ Нет сигналов (1 пара: контракт не указан)\n")
+        assert stream.getvalue().endswith("10:15  СКАН       Сигналов нет · 1 проверка\n")
 
     def test_event_without_text_does_not_suppress_summary(self) -> None:
         stream = io.StringIO()
@@ -215,7 +299,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "● 10:15 ➜ ⏳ Нет сигналов (1 пара: GAZP)\n"
+        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 1 проверка\n"
 
     @pytest.mark.parametrize(
         "event",

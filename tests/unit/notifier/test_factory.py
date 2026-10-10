@@ -114,4 +114,5 @@ class TestBuildChannels:
 
         out = capsys.readouterr().out
         assert "NG-10.26" in out
-        assert "в работе, ждёт подтверждения" in out
+        assert "ПЛАН · ПОКУПКА" in out
+        assert "ждёт подтверждения" in out
