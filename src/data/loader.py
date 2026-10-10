@@ -102,6 +102,10 @@ def load_candles(
                     candle.low.units + candle.low.nano / 1e9,
                     candle.close.units + candle.close.nano / 1e9,
                     candle.volume,
+                    # Брокер может отдать текущую незавершённую свечу. Она
+                    # сохраняется для диагностики, но не должна попасть в
+                    # стратегию и экспорт завершённых данных.
+                    bool(getattr(candle, "is_complete", True)),
                     ])
                 break
             except Exception as exc:
@@ -124,6 +128,6 @@ def load_candles(
     if not simple_df:
         return pd.DataFrame(), instrument_id
 
-    df = pd.DataFrame(simple_df, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+    df = pd.DataFrame(simple_df, columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'is_complete'])
     df['datetime'] = df['datetime'].dt.tz_localize(None)
     return df, instrument_id

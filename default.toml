@@ -12,6 +12,14 @@ data_dir = "data"
 poll_secs = 1
 timeout_secs = 300
 
+# Локальная база живых завершённых свечей. Экспорт выключен, пока не задан
+# MARKET_DATA_EXPORT_TOKEN в окружении и export_enabled = true.
+[market_data]
+database_file = "market-data.sqlite3"
+export_enabled = false
+export_host = "127.0.0.1"
+export_port = 8101
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"

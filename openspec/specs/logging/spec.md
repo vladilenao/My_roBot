@@ -316,7 +316,7 @@ src
 
 #### Scenario: Обычный лог INFO
 - **WHEN** уровень bot_debug.log установлен INFO
-- **THEN** подробные расчёты всё равно доступны в SQLite и trade_audit.log
+- **THEN** подробные расчёты всё равно доступны в SQLite и trade_decision_trace.log
 
 ### Requirement: Unit-проверки аудита
 Нормативный уровень: MUST.

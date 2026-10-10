@@ -449,8 +449,12 @@ class JournalBroker(BrokerPort):
 
     @staticmethod
     def _command_outcome(action: TradeAction, now: datetime, status: ExecutionStatus, reason: str) -> ExecutionEvent:
+        execution_id = f"{action.command_id}:{status.value}"
+        if status is ExecutionStatus.CANCEL:
+            r = (reason or "cancel").replace(":", "-")
+            execution_id = f"cancel:{action.trade_id}:{r}:{action.command_id}"
         return ExecutionEvent(
-            execution_id=f"{action.command_id}:{status.value}", order_id=action.command_id,
+            execution_id=execution_id, order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=status,
             filled_quantity=0, price=None, fee=Decimal("0"), timestamp=now, reason=reason,
             fee_source=FeeSource.UNKNOWN,
@@ -621,14 +625,14 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason="",
-            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена (id={order_id})",
+            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена",
             ts_order=now,
         )
 
     def cancel_order(self, order_id: int, reason: str) -> OrderResult:
         order = self._orders.get(order_id)
         if order is None or order.status != OrderStatus.NEW:
-            return self._noop_result(f"Заявка {order_id} не найдена или не активна")
+            return self._noop_result("Заявка не найдена или не активна")
         order.status = OrderStatus.CANCELLED
         self._write_terminal(order, reason, now := self._clock.now().replace(microsecond=0))
         self._orders.pop(order_id, None)
@@ -637,6 +641,7 @@ class JournalBroker(BrokerPort):
             EventType.TRADE_CANCELLED,
             now,
             trade_id=order.position_id,
+            instrument=self._display(order.ticker),
             order_id=order_id,
             reason=reason,
         )
@@ -650,7 +655,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason=reason,
-            message=f"Заявка {order_id} отменена ({reason})",
+            message=f"Заявка {self._display(order.ticker)} отменена ({reason})",
             ts_order=now,
         )
 
@@ -1157,6 +1162,7 @@ class JournalBroker(BrokerPort):
             EventType.TRADE_CANCELLED,
             now,
             trade_id=order.position_id,
+            instrument=self._display(order.ticker),
             order_id=order_id,
             reason="ttl",
         )
@@ -1170,7 +1176,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason="ttl",
-            message=f"Заявка {order_id} истекла по TTL",
+            message=f"Заявка {self._display(order.ticker)} истекла по TTL",
             ts_order=now,
         )
 

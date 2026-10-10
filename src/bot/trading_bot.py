@@ -199,12 +199,13 @@ class TradingBot:
                 self._run.mark_data_gap(gap)
                 self._timeline.reanchor()
                 return
+            # Protection is simulated from closed base bars before any strategy
+            # may calculate a new entry. One lagging pair must not block the
+            # available minutes of other instruments behind the global TF gate.
+            if self._post_tick is not None:
+                self._post_tick({self._protection_timeframe})
             if not ready_tfs:
                 return
-            # Protection is simulated from closed base bars before any strategy
-            # may calculate a new entry from a slower timeframe.
-            if self._protection_timeframe in ready_tfs and self._post_tick is not None:
-                self._post_tick({self._protection_timeframe})
             entry_candidates: list[_EntryCandidate] = []
             for instrument in self._instruments:
                 try:

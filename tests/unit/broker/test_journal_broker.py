@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.broker import JournalBroker
+from src.events.event import Event
 from src.events.types import EventType
+from src.notifier.templates import render
 from src.portfolio import ContractMeta, OrderStatus, PositionManager, Signal
 from src.trade_journal import OpType, TradeJournal
 
@@ -253,6 +255,45 @@ class TestCancelOrder:
         assert broker.manager.pending == {}
         rows = broker.journal.events()
         assert any(e.op == OpType.CANCEL.value and e.reason == "risk_cap" for e in rows)
+
+
+class TestCancelEventInstrument:
+    """Отмена от прямого издателя несёт короткое имя; консоль не печатает None."""
+
+    def _named_broker(self, tmp_path):
+        journal = TradeJournal.created_on_init(tmp_path / "j.csv")
+        mgr = PositionManager(initial_deposit=100000, max_risk_pct=2.0)
+        return JournalBroker(journal, mgr, ["14:05", "19:00"], contract_names={"NG": "NG-10.26"})
+
+    def _console_text(self, event):
+        rendered = Event.broker_event(
+            event.type, trade_id=event.trade_id, instrument=event.instrument,
+            bar_time=event.ts, **event.payload,
+        )
+        return render(rendered)
+
+    def test_cancel_order_carries_short_name(self, tmp_path):
+        broker = self._named_broker(tmp_path)
+        res = broker.place_order(_signal(), NG_META, NOW)
+        broker.drain_events()
+        broker.cancel_order(res.order_id, "risk_cap")
+        events = [e for e in broker.drain_events() if e.type is EventType.TRADE_CANCELLED]
+        assert len(events) == 1
+        assert events[0].instrument == "NG-10.26"
+        text = self._console_text(events[0])
+        assert "NG-10.26   ОТМЕНА" in text and "Причина: risk_cap" in text
+        assert "None" not in text and "контракт не указан" not in text and "❌" not in text
+
+    def test_expire_order_carries_short_name(self, tmp_path):
+        broker = self._named_broker(tmp_path)
+        broker.place_order(_signal(timeframe="30m"), NG_META, NOW)
+        broker.drain_events()
+        broker.track_bar(NOW + timedelta(seconds=3601), _bars({"NG": (100.5, 101.5, 101.0)}), {"NG": NG_META})
+        events = [e for e in broker.drain_events() if e.type is EventType.TRADE_CANCELLED]
+        assert events and events[0].instrument == "NG-10.26"
+        text = self._console_text(events[0])
+        assert "NG-10.26   ОТМЕНА" in text and "Причина: истёк срок TTL" in text
+        assert "None" not in text and "❌" not in text
 
 
 class TestMigration:

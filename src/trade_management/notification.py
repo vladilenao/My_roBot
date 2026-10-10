@@ -11,6 +11,7 @@ from decimal import Decimal
 from src.events.visual import VisualSnapshot, bounded_history, market_snapshot, utc
 from src.trade_management.profiles.rules import allocate_target_quantities
 from src.trade_management.models import TargetPlan
+from src.broker.port import ExecutionStatus
 
 
 def plan_data(plan, quantity):
@@ -148,7 +149,11 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
     # A request refusal is not a refusal of an already filled position.
     if row["quantity"] > 0 and phase in {"CANCELLED", "REJECTED"}:
         phase = "OPEN"
-    return VisualSnapshot({"version": 1, "trade_id": event.trade_id, "event_key": event.execution_id,
+    event_key = event.execution_id
+    if event.status is ExecutionStatus.CANCEL:
+        r = (event.reason or "cancel").replace(":", "-")
+        event_key = f"cancel:{event.trade_id}:{r}"
+    return VisualSnapshot({"version": 1, "trade_id": event.trade_id, "event_key": event_key,
                            "sequence": sequence, "revision": row["state_revision"], "as_of": utc(event.timestamp).isoformat(),
                            "instrument": getattr(instrument, "short_name", None) or "контракт не указан",
                            "side": row["side"], "timeframe": plan.get("timeframe", ""), **quantity_context(instrument, meta),

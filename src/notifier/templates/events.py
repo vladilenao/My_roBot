@@ -251,8 +251,6 @@ def _execution(event: Event, when: str) -> Block | None:
     if kind is EventType.ORDER_ACCEPTED:
         status, suffix = "ЗАЯВКА ПРИНЯТА", f" · {side} · {quantity}{at_price}"
         role = side_role
-        if event.get("order_id") is not None:
-            details.append(f"Заявка: {event.get('order_id')}")
     elif kind is EventType.ORDER_REJECTED:
         status, suffix, role = "ОРДЕР ОТКЛОНЁН", f" · {side}", "warning"
         details.append(f"Причина: {reason_label(event.get('reason'))}")
@@ -275,7 +273,7 @@ def _execution(event: Event, when: str) -> Block | None:
         if event.get("gross_pnl") is None and event.get("pnl") is not None:
             details.append(f"Результат: {_money(event.get('pnl'), signed=True)}")
     elif kind is EventType.TRADE_CANCELLED:
-        status, suffix, role = "ОТМЕНА", f" · заявка {event.get('order_id')}", "warning"
+        status, suffix, role = "ОТМЕНА", "", "warning"
         details.append("Причина: истёк срок TTL" if event.get("reason") == "ttl"
                        else f"Причина: {reason_label(event.get('reason'))}")
     elif kind is EventType.PROTECTION_ARMED:

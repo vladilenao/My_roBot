@@ -479,6 +479,47 @@ class Storage:
             for row in cursor.fetchall()
         )
 
+    def execution_bar_boundaries(self) -> dict[str, tuple[datetime, bool]]:
+        """Safe replay starts for instruments with durable pending/open trades.
+
+        An observed minute is complete and excluded. A last execution minute
+        without an observation is included, but older bars cannot be applied
+        to the already restored position/stop. Pending commands alone do not
+        advance that boundary: earlier protection must still run first.
+        """
+        boundaries = {}
+        instruments = self.connection.execute(
+            "SELECT DISTINCT instrument_id FROM trades "
+            "WHERE phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')"
+        ).fetchall()
+        for (instrument,) in instruments:
+            candidates = []
+            for (stamp,) in self.connection.execute(
+                "SELECT bar_id FROM trade_market_observations "
+                "WHERE instrument_id=? AND timeframe='1m'", (instrument,),
+            ):
+                candidates.append((as_aware(datetime.fromisoformat(stamp)), False))
+            for stamp, kind, payload in self.connection.execute(
+                "SELECT e.occurred_at,e.event_type,e.payload_json FROM events e "
+                "JOIN trades t USING(trade_id) WHERE t.instrument_id=?", (instrument,),
+            ):
+                if kind in ('FILL', 'PARTIAL') or json.loads(payload).get('confirmed_stop'):
+                    candidates.append((as_aware(datetime.fromisoformat(stamp)), True))
+            if candidates:
+                latest = max(stamp for stamp, _ in candidates)
+                boundaries[instrument] = (latest, all(include for stamp, include in candidates if stamp == latest))
+                continue
+            # No position has executed yet. Start at submission, not at the
+            # warm-up history that happened before the order existed.
+            stamps = [as_aware(datetime.fromisoformat(stamp)) for (stamp,) in self.connection.execute(
+                "SELECT b.created_at FROM outbox b JOIN trades t USING(trade_id) "
+                "WHERE t.instrument_id=? AND t.phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')",
+                (instrument,),
+            )]
+            if stamps:
+                boundaries[instrument] = (min(stamps), True)
+        return boundaries
+
     def load_trade(self, trade_id: str, *, include_terminal: bool = False) -> RecoveredTrade | None:
         """Load one trade without re-registering it anywhere.
 

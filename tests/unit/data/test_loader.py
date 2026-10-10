@@ -147,12 +147,13 @@ class TestConversion:
         df, uid = load_candles("NGU6", "future", "1h")
 
         assert uid == "uid-123"
-        assert list(df.columns) == ["datetime", "open", "high", "low", "close", "volume"]
+        assert list(df.columns) == ["datetime", "open", "high", "low", "close", "volume", "is_complete"]
         assert df["open"].tolist() == [1.5, 1.5]
         assert df["high"].tolist() == [2.5, 2.5]
         assert df["low"].tolist() == [0.5, 0.5]
         assert df["close"].tolist() == [3.5, 3.5]
         assert df["volume"].tolist() == [10, 10]
+        assert df["is_complete"].tolist() == [True, True]
 
     def test_datetime_timezone_removed(self, api_mocks):
         df, _ = load_candles("NGU6", "future", "1h")
