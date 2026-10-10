@@ -35,7 +35,7 @@ DEFAULT_PREFIX = "📌 Событие"
 def _order_accepted(event: Event) -> str:
     return (
         f"Заявка {event.get('side')} {event.get('quantity')} {event.instrument} "
-        f"по {amount(event.get('price'))} принята (id={event.get('order_id')})"
+        f"по {amount(event.get('price'))} принята"
     )
 
 
@@ -83,8 +83,8 @@ def _trade_closed(event: Event) -> str:
 
 def _trade_cancelled(event: Event) -> str:
     if event.get("reason") == "ttl":
-        return f"Заявка {event.get('order_id')} истекла по TTL"
-    return f"Заявка {event.get('order_id')} отменена ({reason_label(event.get('reason'))})"
+        return f"Заявка {event.instrument} истекла по TTL"
+    return f"Заявка {event.instrument} отменена ({reason_label(event.get('reason'))})"
 
 
 def _protection_armed(event: Event) -> str:
