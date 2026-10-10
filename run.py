@@ -55,11 +55,12 @@ from src.config import (
     run_dir_name,
     HIST_DIR,
 )
-from src.api.emulator_client import EmulatorClientProvider
+from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
 from src.history.preflight import active_pairs, run_preflight, smallest_period
 from src.history.report import (
+    MarketDataSync,
     REPORT_TXT,
     RunMetrics,
     collect_result,
@@ -243,18 +244,54 @@ def _run_history(start, end, pause):
     выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
     второй раз. Повтор ровно один — границы для нового начала проверены.
     """
+    provider = EmulatorClientProvider()
+    try:
+        sync = provider.prepare_snapshot()
+    except EmulatorError as exc:
+        market_data_sync = MarketDataSync(reason=exc.message)
+        print(f"Импорт My Robot перед прогоном не подтверждён: {exc.message}")
+    else:
+        if sync["synchronized"]:
+            market_data_sync = MarketDataSync(
+                status="synchronized",
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                snapshot_generation=sync["snapshot_generation"],
+            )
+            print(
+                "Импорт My Robot подтверждён: "
+                f"снимок {sync['snapshot_generation']}, "
+                f"курсор {sync['after_id']}/{sync['target_change_id']}."
+            )
+        else:
+            source = sync.get("source")
+            state = source.get("state") if isinstance(source, dict) else None
+            reason = (
+                f"эмулятор сообщил состояние {state}"
+                if state in {"incomplete", "blocked", "error"}
+                else "эмулятор не подтвердил полноту журнала"
+            )
+            market_data_sync = MarketDataSync(
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                reason=reason,
+            )
+            print(f"Импорт My Robot перед прогоном не подтверждён: {reason}")
     instruments = None
     for _ in range(2):
         clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
         state_dir = state_dir_for(start, end)
         code, shifted, instruments = _launch(
             state_dir=state_dir,
-            client_provider=EmulatorClientProvider(),
+            client_provider=provider,
             clock=clock,
             session=build_run_session(MODE_HISTORY, clock),
             channel_names=[],
             history=True,
             instruments=instruments,
+            market_data_sync=market_data_sync,
         )
         if shifted is None:
             return code
@@ -311,6 +348,7 @@ def _launch(
     channel_names,
     history: bool = False,
     instruments=None,
+    market_data_sync: MarketDataSync | None = None,
 ) -> tuple[int, datetime | None, list]:
     """Единая сборка прогона: различаются только источник, часы и каталог.
 
@@ -418,12 +456,17 @@ def _launch(
         if export_server is not None:
             export_server.close()
         if history:
-            _finish_history(storage, session, data_cache, timeline, state_dir)
+            _finish_history(
+                storage, session, data_cache, timeline, state_dir, market_data_sync
+            )
         close_channels(channels)
     return 0, None, instruments
 
 
-def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
+def _finish_history(
+    storage, session, data_cache, timeline, state_dir,
+    market_data_sync: MarketDataSync | None = None,
+) -> None:
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
@@ -445,6 +488,7 @@ def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
         horizon_start=None if exhaustion is None else exhaustion.horizon_start,
         horizon_end=None if exhaustion is None else exhaustion.horizon_end,
         horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
+        market_data_sync=market_data_sync or MarketDataSync(),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)

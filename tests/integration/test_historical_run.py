@@ -17,6 +17,7 @@ from t_tech.invest.schemas import CandleInterval
 
 import run
 from src.data.timeutil import to_naive
+from src.history.preflight import PreflightReport
 from src.history.report import REPORT_JSON, REPORT_TXT
 from src.portfolio.models import ContractMeta
 from src.strategies.contracts import Assignment, Decision, SignalType
@@ -161,6 +162,14 @@ class StubEmulatorClient:
 class StubProvider:
     def __init__(self, client):
         self._client = client
+        self._client.sync_calls = 0
+
+    def prepare_snapshot(self):
+        self._client.sync_calls += 1
+        return {
+            "producer_id": "robot-db-1", "target_change_id": 12,
+            "after_id": 12, "synchronized": True, "snapshot_generation": 42,
+        }
 
     @property
     def base_url(self):
@@ -314,6 +323,26 @@ def _traded_moments(state_dir):
 
 
 class TestHistoricalRunDeterminism:
+    def test_shifted_start_reuses_one_import_snapshot(self, tmp_path):
+        original = run.run_preflight
+        calls = 0
+
+        def shift_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return PreflightReport(start=START + STEP, checked_pairs=1)
+            return original(*args, **kwargs)
+
+        with patch.object(run, "run_preflight", side_effect=shift_once):
+            code, client = _run_history(tmp_path / "shifted")
+
+        report = json.loads((tmp_path / "shifted" / REPORT_JSON).read_text(encoding="utf-8"))
+        assert code == 0
+        assert calls == 2
+        assert client.sync_calls == 1
+        assert report["market_data_sync"]["snapshot_generation"] == 42
+
     def test_pause_zero_and_one_second_give_same_pnl(self, tmp_path):
         _, _ = _run_history(tmp_path / "p0", pause=0.0)
         _, _ = _run_history(tmp_path / "p1", pause=1.0)
@@ -373,6 +402,16 @@ class TestHistoricalBoundaries:
 
 
 class TestIsolatedState:
+    def test_each_run_checks_import_and_records_snapshot(self, tmp_path):
+        _, first_client = _run_history(tmp_path / "a")
+        _, second_client = _run_history(tmp_path / "b")
+
+        first = json.loads((tmp_path / "a" / REPORT_JSON).read_text(encoding="utf-8"))
+        second = json.loads((tmp_path / "b" / REPORT_JSON).read_text(encoding="utf-8"))
+        assert first_client.sync_calls == second_client.sync_calls == 1
+        assert first["market_data_sync"]["snapshot_generation"] == 42
+        assert second["market_data_sync"]["status"] == "synchronized"
+
     def test_two_runs_keep_separate_pnl(self, tmp_path):
         _run_history(tmp_path / "a")
         _run_history(tmp_path / "b")
@@ -408,6 +447,7 @@ class TestCrashStop:
 
         report = json.loads((tmp_path / "crash" / REPORT_JSON).read_text(encoding="utf-8"))
         assert report["crashed"] is True
+        assert report["market_data_sync"]["snapshot_generation"] == 42
         assert report["market_now"].startswith("2023-06-01 10:")
         assert (tmp_path / "crash" / REPORT_TXT).exists()
 
