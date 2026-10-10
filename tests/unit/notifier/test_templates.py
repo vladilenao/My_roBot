@@ -1,5 +1,8 @@
-"""Unit-тесты шаблонов: тексты уведомлений не меняются при переходе на шину."""
+"""Контракт постоянного консольного формата «События»."""
 
+from __future__ import annotations
+
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -9,282 +12,216 @@ from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates import render
 from src.notifier.templates.decision import idle_tick_summary
-from src.strategies.contracts import Decision, SignalType
+
+NOW = datetime(2026, 10, 9, 13, 5, tzinfo=timezone.utc)
 
 
-def _decision(signal_type=SignalType.BUY, price=Decimal("1234.5678")) -> Decision:
-    return Decision(signal_type, price, strategy_name="macd_rsi_stoch")
+def shown(event: Event, **options) -> str | None:
+    return render(event, now=NOW, **options)
 
 
-def test_buy_decision_text() -> None:
-    event = Event.decision(
-        "NG-10.26", outcome="signal_buy", side="BUY", price=Decimal("1234.5678"),
-        strategy="macd_rsi_stoch", filter_profile="basic_levels", timeframe="15m",
-        bar_time=datetime(2026, 9, 26, 22, 45),
+def broker(kind: EventType, **payload) -> Event:
+    return Event.broker_event(kind, trade_id="internal-id", instrument="PHOR", **payload)
+
+
+def test_buy_sell_filter_and_rejection_are_complete_blocks() -> None:
+    buy = Event.decision("SBER", outcome="signal_buy", side="BUY", price="100.123456",
+                         strategy="macd_rsi_stoch", filter_profile="raw", timeframe="15m",
+                         bar_time=datetime(2026, 10, 9, 13, 15))
+    sell = Event.decision("SBER", outcome="signal_sell", side="SELL", price=300)
+    filtered = Event.decision("SBER", outcome="filtered", side="BUY", price=300, filtered_out=True)
+    rejected = Event.rejected("SBER", reason="Размер позиции ниже минимального", side="BUY", price="100.1234")
+
+    assert shown(buy) == (
+        "13:15  SBER       ПОКУПКА · 100.123\n"
+        "       Период: 15m\n"
+        "       Стратегия: macd_rsi_stoch · профиль raw"
     )
-
-    assert render(event) == "● NG-10.26 (15m) 22:45 | macd_rsi_stoch [basic_levels] ➜ 🟢 ПОКУПКА (BUY) — Цена: 1234.568"
-
-
-def test_sell_decision_text() -> None:
-    # round(Decimal, 3) печатает три знака после запятой — прежнее поведение сохранено
-    event = Event.decision("SBER", outcome="signal_sell", side="SELL", price=Decimal("300"))
-
-    assert render(event) == "● SBER ➜ 🔴 ПРОДАЖА (SELL) — Цена: 300.000"
-
-
-def test_hold_decision_text() -> None:
-    event = Event.decision("SBER", outcome="no_signal", side="HOLD", price=None, strategy="")
-
-    assert render(event) == "● SBER ➜ ⏳ Нет сигнала."
-
-
-@pytest.mark.parametrize(
-    ("count", "expected"),
-    [(1, "пара"), (2, "пары"), (8, "пар"), (11, "пар"), (21, "пара")],
-)
-def test_idle_tick_summary_plural(count, expected) -> None:
-    result = idle_tick_summary(datetime(2026, 10, 8, 10, 15, tzinfo=timezone.utc), count, ("GAZP",))
-
-    assert result == f"● 10:15 ➜ ⏳ Нет сигналов ({count} {expected}: GAZP)"
-
-
-def test_filtered_decision_text() -> None:
-    event = Event.decision("SBER", outcome="filtered", side="BUY", price=Decimal("300"), filtered_out=True)
-
-    assert render(event) == "● SBER ➜ ❌ Отклонено фильтром."
-
-
-def test_rejection_text_keeps_marker_and_reason() -> None:
-    event = Event.rejected("SBER", reason="Размер позиции ниже минимального", side="BUY")
-
-    assert render(event) == "⛔ SBER ➜ Сделка не допущена: Размер позиции ниже минимального"
-
-
-def test_timezone_offset_applies_to_bar_time() -> None:
-    event = Event.decision(
-        "SBER", outcome="signal_buy", side="BUY", price=Decimal("300"),
-        bar_time=datetime(2026, 9, 26, 20, 0),
-    )
-
-    assert render(event, tz_offset_hours=3) == "● SBER 23:00 ➜ 🟢 ПОКУПКА (BUY) — Цена: 300.000"
-
-
-def test_signal_text_reports_plan_quantity_targets_and_expected_r() -> None:
-    event = Event.signal(
-        "NG-10.26", side="SELL", quantity=7, entry=Decimal("100.5"), stop=Decimal("101"),
-        targets=(Decimal("98"), Decimal("97.25")), expected_r=Decimal("2.5"), timeframe="1h",
-        risk_amount=Decimal("250.00"), reward_amount=Decimal("375.00"),
-        costs_amount=Decimal("14.00"), payoff_ratio=Decimal("1.44"),
-    )
-
-    assert render(event) == (
-        "● NG-10.26 (1h) ➜ Сделка SELL, объём 7 — Вход: 100.5, Стоп: 101, "
-        "Цели: 98, 97.25 — в работе, ждёт подтверждения, "
-        "валовой план 2.50R ≈ 375 ₽ (риск 250 ₽), оценка издержек 14 ₽, чистый план 361 ₽, чистый payoff 1.44"
+    assert shown(sell) == "16:05  SBER       ПРОДАЖА · 300.000"
+    assert shown(filtered) == "16:05  SBER       ОТКЛОНЕНО\n       Причина: отклонено фильтром"
+    assert shown(rejected) == (
+        "16:05  SBER       ОТКЛОНЕНО · ПОКУПКА · 100.123\n"
+        "       Причина: Размер позиции ниже минимального"
     )
 
 
-def test_signal_without_targets_shows_none() -> None:
-    event = Event.signal("NG-10.26", side="BUY", quantity=1, entry=Decimal("100"), stop=Decimal("96"))
-
-    assert "Цели: нет" in render(event)
-
-
-def test_signal_without_targets_claims_no_profit() -> None:
-    """Нулевая доходность не заявляется: у плана без целей её и не существует."""
-    event = Event.signal(
-        "NG-10.26", side="BUY", quantity=1, entry=Decimal("3.030"), stop=Decimal("3.012"),
-        targets=(), expected_r=None, timeframe="15m",
-        risk_amount=Decimal("151.20"), reward_amount=Decimal("0.00"), payoff_ratio=None,
-    )
-
-    text = render(event)
-
-    assert "Цели: нет" in text
-    assert "R" not in text
-    assert "0.00" not in text
-    assert "151.20" not in text
+def test_bar_time_uses_configured_offset_and_publication_uses_moscow() -> None:
+    event = Event.decision("SBER", outcome="signal_buy", side="BUY", price=300,
+                           bar_time=datetime(2026, 10, 9, 20, 0))
+    assert shown(event, tz_offset_hours=3).startswith("23:00  SBER")
+    assert shown(Event.error(operation="тик")).startswith("16:05  СИСТЕМА")
 
 
-def test_signal_reports_r_without_money_when_the_plan_has_no_economics() -> None:
-    """План, построенный до появления денежной экономики, остаётся читаемым."""
-    event = Event.signal(
-        "NG-10.26", side="BUY", quantity=1, entry=Decimal("100"), stop=Decimal("96"),
-        targets=(Decimal("104"),), expected_r=Decimal("1.0"),
-    )
-
-    assert render(event).endswith("валовой план 1.00R")
-
-
-def _broker(event_type, **payload) -> Event:
-    return Event.broker_event(
-        event_type, trade_id="trade-1", instrument="NG-10.26", **payload
+@pytest.mark.parametrize("count,word", [
+    (1, "проверка"), (2, "проверки"), (8, "проверок"),
+    (11, "проверок"), (21, "проверка"),
+])
+def test_quiet_scan_counts_checks_not_pairs(count: int, word: str) -> None:
+    assert idle_tick_summary(NOW, count, ("GAZP", "SBER")) == (
+        f"13:05  СКАН       Сигналов нет · {count} {word}"
     )
 
 
-@pytest.mark.parametrize(
-    ("event", "expected"),
-    [
-        (
-            _broker(EventType.ORDER_ACCEPTED, side="BUY", quantity=10,
-                    price=Decimal("100.0"), order_id=42),
-            "📝 Ордер: Заявка BUY 10 NG-10.26 по 100.0 принята (id=42)",
-        ),
-        (
-            _broker(EventType.ORDER_REJECTED, side="BUY", quantity=10,
-                    price=Decimal("100.0"), reason="мало денег"),
-            "📝 Ордер: Сделка BUY NG-10.26 отклонена (мало денег)",
-        ),
-        (
-            _broker(EventType.ORDER_REJECTED, side="SELL", quantity=0, reason="trade-not-open"),
-            "📝 Ордер: Сделка SELL NG-10.26 отклонена (позиция не открыта)",
-        ),
-        (
-            _broker(EventType.TRADE_OPENED, side="BUY", quantity=10, price=Decimal("100.0")),
-            "💰 Сделка: Вход BUY 10 NG-10.26 по 100.0",
-        ),
-        (
-            _broker(EventType.POSITION_ADDED, side="SELL", quantity=3, price=Decimal("105.5")),
-            "➕ Добор: Добор SELL 3 NG-10.26 по 105.5",
-        ),
-        (
-            _broker(EventType.TARGET_HIT, quantity=2, price=Decimal("110.0")),
-            "🎯 Цель: Цель 2 NG-10.26 по 110.0",
-        ),
-        (
-            _broker(EventType.STOP_HIT, quantity=2, price=Decimal("95.0")),
-            "🛑 Стоп: Защитный стоп 2 NG-10.26 по 95.0",
-        ),
-        (
-            _broker(EventType.TRADE_CLOSED, quantity=2, price=Decimal("110.0"),
-                    pnl=Decimal("200.0")),
-            "💰 Сделка: Закрытие 2 NG-10.26 по 110.0 (PnL 200)",
-        ),
-        (
-            _broker(EventType.TRADE_CLOSED, quantity=2, price=Decimal("110.0"),
-                    pnl=Decimal("-20.5"), reason="protective"),
-            "💰 Сделка: Закрытие позиции NG-10.26 2 шт: PnL -20.5 руб",
-        ),
-        (
-            _broker(EventType.TRADE_CANCELLED, order_id=42, reason="risk_cap"),
-            "❌ Отмена: Заявка 42 отменена (risk_cap)",
-        ),
-        (
-            _broker(EventType.TRADE_CANCELLED, order_id=42, reason="entry-timeout"),
-            "❌ Отмена: Заявка 42 отменена (вход не исполнен в отведённое время)",
-        ),
-        (
-            _broker(EventType.TRADE_CANCELLED, order_id=42, reason="ttl"),
-            "❌ Отмена: Заявка 42 истекла по TTL",
-        ),
-        (
-            _broker(EventType.PROTECTION_ARMED, stop=Decimal("95.0"),
-                    take_profit=Decimal("110.0")),
-            "🛡 Защита: Защитный стоп 95.0 / ТП 110.0 установлен",
-        ),
-        (
-            _broker(EventType.RISK_LIMIT_HIT),
-            "⚠️ Риск: Лимит риска достигнут — требуется проверка общего бюджета",
-        ),
-    ],
-)
-def test_executor_event_text_keeps_wording(event: Event, expected: str) -> None:
-    assert render(event) == expected
-
-
-def test_clearing_text_reports_balance_and_positions_without_contract() -> None:
-    event = Event.clearing_done(balance=Decimal("100000"), positions=2)
-
-    assert render(event) == "🏛 Клиринг: снимок баланса 100000 руб, открыто позиций: 2"
-
-
-def test_trade_id_is_correlation_only_and_never_shown() -> None:
-    event = _broker(EventType.TRADE_CLOSED, quantity=2, price=Decimal("110.0"), pnl=1)
-
-    assert event.get("trade_id") == "trade-1"
-    assert "trade-1" not in render(event)
-
-
-def test_event_without_published_wording_renders_nothing() -> None:
-    assert render(_broker(EventType.RESERVATION_CHANGED, quantity=1)) is None
-
-
-def test_heartbeat_and_error_text() -> None:
-    assert render(Event.heartbeat(tick_count=10, error_count=2)) == (
-        "💓 Сердцебиение: тиков работы — 10, ошибок за период — 2."
+def test_plan_is_distinct_from_confirmed_execution() -> None:
+    event = Event.signal("NG-10.26", side="SELL", quantity=7, entry="100.5", stop="101",
+                         targets=("98", "97.25"), expected_r="2.5", risk_amount="250",
+                         reward_amount="375", costs_amount="14", payoff_ratio="1.44", timeframe="1h")
+    assert shown(event) == (
+        "16:05  NG-10.26   ПЛАН · ПРОДАЖА\n"
+        "       Период: 1h\n"
+        "       7 контрактов · вход 100.5 · стоп 101\n"
+        "       Цели: 98 / 97.25 · ждёт подтверждения\n"
+        "       Риск: 250 ₽\n"
+        "       План до расходов: ≈375 ₽ (2,50R)\n"
+        "       Издержки: ≈14 ₽\n"
+        "       План после расходов: ≈361 ₽\n"
+        "       Чистый payoff: 1,44"
     )
-    assert render(Event.error(operation="анализ NG-10.26 (1h)")) == (
-        "❗ Сбой: анализ NG-10.26 (1h). Робот продолжает работу. "
-        "Подробности — в bot_debug.log рядом с роботом."
+    assert "исполнено" not in shown(event)
+
+
+def test_plan_with_unknown_result_does_not_claim_zero_profit() -> None:
+    event = Event.signal("SBER", side="BUY", quantity=8, entry=100, stop=96,
+                         targets=(106, 110), risk_amount=64, costs_amount=32,
+                         fixed_reward_amount=64, fixed_quantity=4)
+    text = shown(event)
+    assert "Фиксируемая часть: 4 · валовой план ≈64 ₽" in text
+    assert "Полный результат и payoff неизвестны" in text
+    assert "0,00R" not in text
+
+
+def test_plan_does_not_replace_unknown_risk_or_costs_with_zero() -> None:
+    event = Event.signal("SBER", side="BUY", quantity=1, entry=100, stop=96,
+                         targets=(104,), expected_r=1)
+    text = shown(event)
+    assert "Риск: неизвестно" in text
+    assert "Издержки: неизвестно" in text
+    assert "Риск: 0 ₽" not in text and "Издержки: ≈0 ₽" not in text
+
+
+def test_money_is_rounded_for_display_only() -> None:
+    event = Event.signal("SBER", side="BUY", quantity=1, entry=100, stop=96,
+                         targets=(104,), expected_r="2.03", risk_amount="256.4433",
+                         reward_amount="521.43471", costs_amount="17.43471")
+    text = shown(event)
+    assert "Риск: 256,44 ₽" in text
+    assert "План до расходов: ≈521,43 ₽" in text
+    assert "Издержки: ≈17,43 ₽" in text
+    assert event.get("risk_amount") == Decimal("256.4433")
+    assert event.get("costs_amount") == Decimal("17.43471")
+
+
+def test_target_quantity_is_execution_volume_and_financial_facts_are_separate() -> None:
+    event = broker(EventType.TARGET_HIT, quantity=4, price=5298, gross_pnl=568, net_pnl=541,
+                   fee="7.5", fee_source="configured", fees_total=27, fees_known=True, pnl_units="RUB")
+    assert shown(event) == (
+        "16:05  PHOR       ЦЕЛЬ · исполнено 4 по 5298\n"
+        "       Результат: +568 ₽ до комиссий · +541 ₽ после\n"
+        "       Комиссия исполнения: ≈7,50 ₽ (оценка) · накоплено 27 ₽"
     )
+    assert "№4" not in shown(event) and "internal-id" not in shown(event)
 
 
-def test_rate_limited_event_has_no_text() -> None:
-    assert render(Event.rate_limited(source="tinkoff")) is None
-
-
-def test_decision_price_is_rounded_to_three() -> None:
-    event = Event.decision("SBER", outcome="signal_buy", side="BUY", price=Decimal("100.123456"))
-
-    assert render(event).endswith("Цена: 100.123")
-
-
-def test_decision_payload_accepts_real_decision_object() -> None:
-    decision = _decision()
-
-    event = Event.decision(
-        "SBER", outcome="signal_buy", side=decision.signal_type.name,
-        price=decision.price, strategy=decision.strategy_name or "",
+def test_loss_unknown_fee_and_raw_units() -> None:
+    loss = broker(EventType.TRADE_CLOSED, quantity=5, price=106, quantity_remaining=0,
+                  gross_pnl="-529.98282", net_pnl="-535.98282", fees_known=False,
+                  fee_source="unknown", pnl_units="RUB")
+    assert shown(loss) == (
+        "16:05  PHOR       ВЫХОД · исполнено 5 по 106\n"
+        "       Остаток: 0\n"
+        "       Результат: −529,98 ₽ до комиссий · −535,98 ₽ после\n"
+        "       Комиссия исполнения: неизвестна · накопленные издержки частично неизвестны"
     )
-
-    assert event.get("side") == "BUY"
-
-
-def test_signal_distinguishes_gross_net_costs_sizing_and_shared_budget():
-    event = Event.signal("SBER", side="BUY", quantity=2, entry=100, stop=96, targets=(106, 110),
-        expected_r=2, risk_amount=80, reward_amount=160, costs_amount=40, payoff_ratio=Decimal("1.5"),
-        algorithm_version="economics-v2", diagnostics={"requested_quantity": 5, "selected_quantity": 2,
-            "limiting_constraint": "margin", "portfolio_pct": Decimal(2), "budget_base": Decimal(100000),
-            "risk_budget": Decimal(2000), "open_risk": Decimal(1200), "pending_risk": Decimal(120),
-            "free_risk": Decimal(680), "risk_excess": Decimal(0), "risk_state": "known"})
-    text = render(event)
-    assert "валовой план 2.00R" in text and "чистый план 120 ₽" in text and "чистый payoff 1.50" in text
-    assert "запрошено 5, выбрано 2" in text and "ограничение: ГО" in text
-    assert "общий бюджет 2%" in text and "свободно 680 ₽" in text
-    assert "в работе, ждёт подтверждения" in text and "версия economics-v2" in text
+    raw = broker(EventType.TRADE_CLOSED, quantity=1, price=3, gross_pnl=2, net_pnl=1,
+                 fee=0, fee_source="broker", fees_known=True, fees_total=0, pnl_units="RAW")
+    assert "Результат: +2 RAW до комиссий · +1 RAW после" in shown(raw)
+    assert "Комиссия исполнения: 0 ₽ (брокер)" in shown(raw)
 
 
-def test_trailing_fixed_part_is_not_a_full_payoff():
-    event = Event.signal("SBER", side="BUY", quantity=8, entry=100, stop=96, targets=(106, 110),
-                         risk_amount=64, costs_amount=32, fixed_reward_amount=64, fixed_quantity=4)
-    text = render(event)
-    assert "фиксируемая часть: 4" in text and "полный результат и payoff неизвестны" in text
-    assert "0.00R" not in text and "чистый payoff" not in text
+def test_rejection_budget_and_long_reason_wrap_without_truncation() -> None:
+    reason = "риск до стопа слишком мал относительно расчётных издержек и текущего свободного бюджета"
+    event = Event.rejected("MOEX", reason=reason, side="SELL", price="152.3", diagnostics={
+        "risk_amount": Decimal("3.65"), "costs_amount": Decimal("40"),
+        "portfolio_pct": Decimal("2"), "budget_base": Decimal("99949.8"),
+        "risk_budget": Decimal("1998.996"), "open_risk": Decimal("0"),
+        "pending_risk": Decimal("260.4433"), "free_risk": Decimal("1738.537"),
+        "risk_state": "known",
+    })
+    text = shown(event, width=52)
+    assert all(len(line) <= 52 for line in text.splitlines())
+    assert "Причина: риск до стопа слишком мал" in text
+    assert "относительно расчётных издержек" in text
+    assert "Бюджет риска: 1 999 ₽" in text
+    assert "свободно: 1 738,54 ₽" in text
+    assert "Проверка: риск 3,65 ₽" in text
 
 
-def test_portfolio_excess_message_has_numbers_and_no_liquidation_claim():
-    event = Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", portfolio_pct=2, budget_base=100000,
-        risk_budget=2000, open_risk=2100, pending_risk=0, free_risk=0, risk_excess=100, risk_state="known")
-    text = render(event)
-    assert "превышение 100 ₽" in text and "открытый риск 2100 ₽" in text and "лимит 2000 ₽" in text
-    assert "новые входы/доборы запрещены" in text
-    assert "закрывается" not in text and "контр-сделк" not in text and "trade_id" not in event.payload
+def test_narrow_terminal_keeps_subject_and_status_visible() -> None:
+    event = Event.rejected("", reason="Не хватает свободного бюджета для сделки")
+    text = shown(event, width=30)
+    assert all(len(line) <= 30 for line in text.splitlines())
+    assert "контракт не указан" in text
+    assert "ОТКЛОНЕНО" in text
+    assert "Не хватает\n       свободного бюджета для" in text
 
 
-def test_unknown_budget_message_explains_missing_protection():
-    event = Event.rejected("SBER", code="risk-state-unknown", reason="неизвестен текущий риск открытого портфеля",
-        diagnostics={"risk_state": "unknown", "unknown_reason": "нет подтверждённого стопа", "portfolio_pct": Decimal(2)})
-    assert "нет подтверждённого стопа" in render(event) and "свободный бюджет неизвестен" in render(event)
+def test_unknown_portfolio_budget_is_explicit() -> None:
+    event = Event.rejected("SBER", reason="неизвестен риск", diagnostics={
+        "risk_state": "unknown", "unknown_reason": "нет подтверждённого стопа", "portfolio_pct": 2,
+    })
+    text = shown(event)
+    assert "Риск портфеля неизвестен: нет подтверждённого стопа" in text
+    assert "Свободный бюджет: неизвестно" in text
 
 
-def test_financial_fact_keeps_known_broker_zero_and_unknown_history_distinct():
-    event = Event.broker_event(EventType.TRADE_CLOSED, instrument="SBER", trade_id="internal-id", quantity=5, price=106,
-        quantity_remaining=0, gross_pnl=60, net_pnl=Decimal("37.5"), fees_total=Decimal("22.5"),
-        fee=0, fee_source="broker", fees_known=True, pnl_units="RUB")
-    text = render(event)
-    assert "комиссия исполнения 0 ₽ (брокер)" in text and "gross 60 ₽" in text and "net 37.5 ₽" in text
-    assert "internal-id" not in text
-    unknown = Event.broker_event(EventType.TRADE_CLOSED, instrument="SBER", quantity=5, price=106,
-        quantity_remaining=0, gross_pnl=60, net_pnl=60, fees_total=0, fee=0, fee_source="unknown", fees_known=False, pnl_units="RUB")
-    assert "комиссия исполнения неизвестна" in render(unknown) and "издержки частично неизвестны" in render(unknown)
+@pytest.mark.parametrize("kind,expected", [
+    (EventType.ORDER_ACCEPTED, "ЗАЯВКА ПРИНЯТА"),
+    (EventType.ORDER_REJECTED, "ОРДЕР ОТКЛОНЁН"),
+    (EventType.TRADE_OPENED, "ВХОД"),
+    (EventType.POSITION_ADDED, "ДОБОР"),
+    (EventType.STOP_HIT, "СТОП"),
+    (EventType.TRADE_CLOSED, "ВЫХОД"),
+    (EventType.TRADE_CANCELLED, "ОТМЕНА"),
+    (EventType.PROTECTION_ARMED, "ЗАЩИТА УСТАНОВЛЕНА"),
+    (EventType.RISK_LIMIT_HIT, "ЛИМИТ РИСКА"),
+    (EventType.CLEARING_DONE, "КЛИРИНГ"),
+])
+def test_currently_visible_execution_types_still_have_a_block(kind: EventType, expected: str) -> None:
+    event = Event.broker_event(kind, instrument="PHOR", side="BUY", quantity=1, price=100,
+                               order_id=42, reason="trade-not-open", stop=95, take_profit=110)
+    assert expected in shown(event)
+
+
+def test_system_blocks_and_silent_types() -> None:
+    assert shown(Event.heartbeat(tick_count=60, error_count=0)) == (
+        "16:05  СИСТЕМА    60 тактов работы · 0 ошибок"
+    )
+    assert shown(Event.error(operation="анализ NG-10.26 (1h)")) == (
+        "16:05  СИСТЕМА    СБОЙ\n"
+        "       Операция: анализ NG-10.26 (1h)\n"
+        "       Робот продолжает работу · подробности в bot_debug.log рядом с роботом"
+    )
+    for kind in (EventType.STOP_MOVED, EventType.RESERVATION_CHANGED, EventType.RATE_LIMITED):
+        assert shown(Event.broker_event(kind, instrument="PHOR")) is None
+
+
+@pytest.mark.parametrize("event,code", [
+    (Event.decision("SBER", outcome="signal_buy", side="BUY", price=100), "32"),
+    (Event.decision("SBER", outcome="signal_sell", side="SELL", price=100), "35"),
+    (Event.rejected("SBER", reason="нет объёма"), "33"),
+    (Event.error(operation="тик"), "31"),
+    (Event.heartbeat(tick_count=1, error_count=0), "90"),
+])
+def test_color_roles_preserve_exact_plain_content(event: Event, code: str) -> None:
+    plain = shown(event)
+    colored = shown(event, color=True)
+    assert f"\x1b[{code}m" in colored and colored.endswith("\x1b[0m")
+    assert re.sub(r"\x1b\[[0-9;]*m", "", colored) == plain
+
+
+def test_color_does_not_leak_between_blocks() -> None:
+    buy = Event.decision("SBER", outcome="signal_buy", side="BUY", price=100)
+    sell = Event.decision("SBER", outcome="signal_sell", side="SELL", price=100)
+    combined = shown(buy, color=True) + "\n" + shown(sell, color=True)
+    assert "\x1b[0m\n" in combined
+    assert "\x1b[31m" not in combined
