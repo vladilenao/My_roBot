@@ -24,6 +24,18 @@ REPORT_TXT = "report.txt"
 REPORT_JSON = "report.json"
 
 
+@dataclass(frozen=True)
+class MarketDataSync:
+    """Результат проверки импорта My Robot для одного исторического прогона."""
+
+    status: str = "unconfirmed"
+    producer_id: str | None = None
+    target_change_id: int | None = None
+    after_id: int | None = None
+    snapshot_generation: int | None = None
+    reason: str | None = None
+
+
 def _stamp(moment) -> str:
     if moment is None:
         return ""
@@ -72,6 +84,7 @@ class RunMetrics:
     horizon_start: datetime | None = None
     horizon_end: datetime | None = None
     horizon_limited: bool = False
+    market_data_sync: MarketDataSync = field(default_factory=MarketDataSync)
 
 
 @dataclass
@@ -141,6 +154,20 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
         f"Диапазон:        {_stamp(metrics.start)} — {_stamp(metrics.end)}",
         f"Охват диапазона: {coverage}",
     ]
+    sync = metrics.market_data_sync
+    head.append(
+        "Импорт My Robot: "
+        + ("подтверждён" if sync.status == "synchronized" else "не подтверждён")
+    )
+    head.append(
+        "Источник/курсор/снимок: "
+        f"{sync.producer_id or 'неизвестен'} / "
+        f"{sync.after_id if sync.after_id is not None else '?'}"
+        f"/{sync.target_change_id if sync.target_change_id is not None else '?'} / "
+        f"{sync.snapshot_generation if sync.snapshot_generation is not None else 'нет'}"
+    )
+    if sync.reason:
+        head.append(f"Причина неподтверждения: {sync.reason}")
     if metrics.horizon_start is not None and metrics.horizon_end is not None:
         head.append(
             f"Проверенный горизонт: {_stamp(metrics.horizon_start)} — "
@@ -198,6 +225,7 @@ def write_report(
         "stop_reason": metrics.stop_reason,
         "market_now": _stamp(metrics.market_now),
         "crashed": metrics.crashed,
+        "market_data_sync": asdict(metrics.market_data_sync),
         "checked_horizon": (
             {
                 "start": _stamp(metrics.horizon_start),

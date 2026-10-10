@@ -39,6 +39,7 @@ _INTERVALS = {
 
 # Потолок свечей в одной странице: максимум эмулятора — меньше страниц на 1m.
 _CANDLES_PAGE_LIMIT = 200_000
+_SYNC_TIMEOUT = 300.0
 
 class EmulatorError(RuntimeError):
     """Ошибка локального эмулятора исторических данных."""
@@ -148,9 +149,13 @@ class HistoricalClient:
     свечей и поиск инструмента работают без изменений.
     """
 
-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self, base_url: str | None = None, *, timeout: float = 60.0,
+        snapshot_generation: int | None = None,
+    ) -> None:
         self._base_url = (base_url or HISTORICAL_API_URL).rstrip("/")
         self._timeout = timeout
+        self._snapshot_generation = snapshot_generation
         self.instruments = HistoricalInstruments(self)
         self._closed = False
 
@@ -172,6 +177,29 @@ class HistoricalClient:
     def ping(self) -> dict:
         """Проверка живости источника: ``GET /health``."""
         return self._get("/health")
+
+    def sync_market_data(self) -> dict:
+        """Проверить импорт My Robot перед историческим прогоном."""
+        url = f"{self._base_url}/api/v1/market-import/sync"
+        try:
+            post = request.Request(url, data=b"", method="POST")
+            with request.urlopen(post, timeout=self._timeout) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            raise self._error(exc) from exc
+        except urlerror.URLError as exc:
+            raise EmulatorError("SOURCE_UNAVAILABLE", f"Эмулятор недоступен: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise EmulatorError(
+                "SOURCE_TIMEOUT", f"Эмулятор не ответил за {self._timeout:g}s"
+            ) from exc
+        except OSError as exc:
+            raise EmulatorError("SOURCE_UNAVAILABLE", f"Сбой связи с эмулятором: {exc}") from exc
+        except ValueError as exc:
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректный JSON") from exc
+        if not isinstance(result, dict):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор не вернул объект JSON")
+        return result
 
     def get_all_candles(
         self,
@@ -195,6 +223,8 @@ class HistoricalClient:
             "interval": self._interval(interval),
             "limit": _CANDLES_PAGE_LIMIT,
         }
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
         if from_ is not None:
             params["from"] = _bounds(from_)
         if to is not None:
@@ -322,8 +352,13 @@ class HistoricalClient:
 
     def _error(self, exc: HTTPError) -> EmulatorError:
         try:
-            detail = json.loads(exc.read().decode("utf-8")).get("error", {})
+            body = json.loads(exc.read().decode("utf-8"))
+            detail = body.get("error") or body.get("detail") or {}
         except Exception:  # noqa: BLE001 — тело ошибки может быть любым
+            detail = {}
+        if isinstance(detail, str):
+            return EmulatorError("MARKET_IMPORT_FAILED", detail, exc.code)
+        if not isinstance(detail, dict):
             detail = {}
         return EmulatorError(
             detail.get("code", "INTERNAL_ERROR"),
@@ -335,13 +370,46 @@ class HistoricalClient:
 class EmulatorClientProvider(ClientProvider):
     """Провайдер исторического режима: локальный эмулятор без токена T-API."""
 
-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self, base_url: str | None = None, *, timeout: float = 60.0,
+        sync_timeout: float = _SYNC_TIMEOUT,
+    ) -> None:
         self._base_url = base_url or HISTORICAL_API_URL
         self._timeout = timeout
+        self._sync_timeout = sync_timeout
+        self._snapshot_generation: int | None = None
 
     @property
     def base_url(self) -> str:
         return self._base_url
 
     def client_context(self, token=None) -> HistoricalClient:
-        return HistoricalClient(self._base_url, timeout=self._timeout)
+        return HistoricalClient(
+            self._base_url, timeout=self._timeout,
+            snapshot_generation=self._snapshot_generation,
+        )
+
+    def prepare_snapshot(self) -> dict:
+        """Один раз догнать журнал и закрепить свечной снимок за провайдером."""
+        self._snapshot_generation = None
+        with HistoricalClient(self._base_url, timeout=self._sync_timeout) as client:
+            result = client.sync_market_data()
+        producer = result.get("producer_id")
+        target = result.get("target_change_id")
+        after = result.get("after_id")
+        synchronized = result.get("synchronized")
+        if (
+            not isinstance(producer, str) or not producer
+            or type(target) is not int or target < 0
+            or type(after) is not int or after < 0
+            or type(synchronized) is not bool
+        ):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректный статус импорта")
+        if synchronized:
+            generation = result.get("snapshot_generation")
+            if type(generation) is not int or generation < 0 or after < target:
+                raise EmulatorError(
+                    "INVALID_RESPONSE", "Эмулятор не подтвердил границу или номер снимка"
+                )
+            self._snapshot_generation = generation
+        return result

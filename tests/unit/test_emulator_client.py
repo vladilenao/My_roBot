@@ -64,6 +64,100 @@ def _http_error(status, body):
     return HTTPError("http://emulator:8100/x", status, "err", {}, io.BytesIO(payload))
 
 
+def _sync_result(**overrides):
+    result = {
+        "producer_id": "robot-db-1",
+        "target_change_id": 12,
+        "after_id": 12,
+        "synchronized": True,
+        "snapshot_generation": 42,
+    }
+    result.update(overrides)
+    return result
+
+
+class TestMarketDataSnapshot:
+    def test_preflight_post_uses_separate_timeout_and_all_candle_pages_use_snapshot(self):
+        pages = _PagedHttp(_rows(5), page_size=2)
+        calls = []
+
+        def respond(url, timeout=None):
+            calls.append((url, timeout))
+            if hasattr(url, "get_method"):
+                assert url.get_method() == "POST"
+                assert url.full_url.endswith("/api/v1/market-import/sync")
+                return _Response(_sync_result())
+            return pages(url, timeout=timeout)
+
+        with patch("src.api.emulator_client.request.urlopen", respond):
+            provider = EmulatorClientProvider("http://emulator:8100", timeout=4, sync_timeout=30)
+            assert provider.prepare_snapshot()["snapshot_generation"] == 42
+            list(provider.client_context().get_all_candles(
+                from_=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
+                instrument_id="uid-1",
+            ))
+
+        assert calls[0][1] == 30
+        assert all(timeout == 4 for _, timeout in calls[1:])
+        assert len(pages.requests) == 3
+        assert all(page["snapshot_generation"] == "42" for page in pages.requests)
+
+    def test_unconfirmed_response_clears_previous_snapshot(self):
+        responses = iter([_sync_result(), _sync_result(synchronized=False)])
+        calls = []
+
+        def respond(url, timeout=None):
+            if hasattr(url, "get_method"):
+                return _Response(next(responses))
+            calls.append(url)
+            return _Response({"candles": []})
+
+        with patch("src.api.emulator_client.request.urlopen", respond):
+            provider = EmulatorClientProvider("http://emulator:8100")
+            provider.prepare_snapshot()
+            assert provider.prepare_snapshot()["synchronized"] is False
+            list(provider.client_context().get_all_candles(
+                from_=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
+                instrument_id="uid-1",
+            ))
+
+        assert "snapshot_generation" not in calls[0]
+
+    @pytest.mark.parametrize("response", [
+        _sync_result(synchronized=True, snapshot_generation=True),
+        _sync_result(synchronized=True, snapshot_generation=-1),
+        _sync_result(synchronized=True, after_id=11),
+        _sync_result(synchronized="true"),
+        _sync_result(target_change_id="12"),
+    ])
+    def test_malformed_sync_response_is_rejected(self, response):
+        with patch("src.api.emulator_client.request.urlopen", return_value=_Response(response)):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.code == "INVALID_RESPONSE"
+
+    def test_sync_error_detail_is_readable(self):
+        with patch(
+            "src.api.emulator_client.request.urlopen",
+            side_effect=_http_error(503, {"detail": "My Robot недоступен"}),
+        ):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.status == 503
+        assert "My Robot недоступен" in str(raised.value)
+
+    def test_sync_connection_reset_is_reported_as_unavailable(self):
+        with patch(
+            "src.api.emulator_client.request.urlopen",
+            side_effect=ConnectionResetError("соединение разорвано"),
+        ):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.code == "SOURCE_UNAVAILABLE"
+
+
 class TestQuotationConversion:
     def test_integer_price(self):
         assert _quotation(100.0) == schemas.Quotation(units=100, nano=0)

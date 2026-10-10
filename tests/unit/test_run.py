@@ -328,6 +328,7 @@ class TestRuntimeComposition:
         manager = MagicMock()
         storage = MagicMock()
         storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
         cache = MagicMock()
         cache.frame_for.return_value = _frame_with_candle()
         with patch("run.trading_enabled", return_value=True), patch(
@@ -455,13 +456,20 @@ class TestRunHistoryRetry:
     START = datetime(2024, 1, 1, 0, 0)
     END = datetime(2024, 1, 5, 0, 0)
 
-    def _run(self, tmp_path):
+    def _run(self, tmp_path, provider=None):
+        provider = provider or MagicMock()
+        if provider.prepare_snapshot.side_effect is None:
+            provider.prepare_snapshot.return_value = {
+                "producer_id": "robot-db-1", "target_change_id": 12,
+                "after_id": 12, "synchronized": True, "snapshot_generation": 42,
+            }
+        self.provider = provider
         with (
             patch.object(run, "HistoricalClock"),
             patch.object(run, "build_run_session"),
             patch.object(run, "_timeframes", return_value={"1m"}),
             patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
-            patch.object(run, "EmulatorClientProvider"),
+            patch.object(run, "EmulatorClientProvider", return_value=provider),
             patch.object(run, "state_dir_for", side_effect=lambda s, e: tmp_path / f"{s:%m%d%H%M}"),
         ):
             return run._run_history(self.START, self.END, 0.0)
@@ -482,7 +490,51 @@ class TestRunHistoryRetry:
         assert [call["state_dir"].name for call in calls] == ["01010000", "01030402"]
         assert calls[0]["instruments"] is None
         assert calls[1]["instruments"] == ["ready"]
+        assert calls[0]["client_provider"] is calls[1]["client_provider"]
+        assert calls[0]["market_data_sync"] == calls[1]["market_data_sync"]
+        assert calls[0]["market_data_sync"].snapshot_generation == 42
+        self.provider.prepare_snapshot.assert_called_once_with()
         assert not (tmp_path / "01010000").exists()
+
+    def test_import_failure_keeps_independent_history_available(self, tmp_path, capsys):
+        provider = MagicMock()
+        provider.prepare_snapshot.side_effect = run.EmulatorError(
+            "SOURCE_UNAVAILABLE", "My Robot недоступен"
+        )
+        with patch.object(run, "_launch", return_value=(0, None, ["ready"])) as launcher:
+            assert self._run(tmp_path, provider) == 0
+
+        sync = launcher.call_args.kwargs["market_data_sync"]
+        assert sync.status == "unconfirmed"
+        assert sync.snapshot_generation is None
+        assert "не подтверждён" in capsys.readouterr().out
+
+    def test_new_history_run_checks_import_again(self, tmp_path):
+        first = MagicMock()
+        second = MagicMock()
+        first.prepare_snapshot.return_value = {
+            "producer_id": "robot-db-1", "target_change_id": 12,
+            "after_id": 12, "synchronized": True, "snapshot_generation": 42,
+        }
+        second.prepare_snapshot.return_value = {
+            "producer_id": "robot-db-1", "target_change_id": 13,
+            "after_id": 13, "synchronized": True, "snapshot_generation": 43,
+        }
+        with (
+            patch.object(run, "HistoricalClock"),
+            patch.object(run, "build_run_session"),
+            patch.object(run, "_timeframes", return_value={"1m"}),
+            patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
+            patch.object(run, "EmulatorClientProvider", side_effect=[first, second]),
+            patch.object(run, "state_dir_for", return_value=tmp_path / "run"),
+            patch.object(run, "_launch", return_value=(0, None, ["ready"])) as launcher,
+        ):
+            run._run_history(self.START, self.END, 0.0)
+            run._run_history(self.START, self.END, 0.0)
+
+        assert [call.kwargs["market_data_sync"].snapshot_generation for call in launcher.call_args_list] == [42, 43]
+        first.prepare_snapshot.assert_called_once_with()
+        second.prepare_snapshot.assert_called_once_with()
 
     def test_plain_run_is_not_repeated(self, tmp_path):
         with patch.object(run, "_launch", return_value=(2, None, ["ready"])) as launcher:

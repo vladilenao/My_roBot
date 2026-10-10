@@ -246,7 +246,7 @@ lifecycle может дополнить факт необязательным `c
 ## Область 5. Аудит и экспорт
 
 Трасса расчёта (`CalculationTrace`) пишется в `calculations` и повторно
-выводится в `trade_audit.log` (JSONL) — см.
+выводится в `trade_decision_trace.log` (JSONL) — см.
 [docs/trade-management/storage-and-audit.md](trade-management/storage-and-audit.md)
 §3–4.
 
@@ -311,6 +311,6 @@ lifecycle может дополнить факт необязательным `c
 - [docs/trade-management/profiles.md](trade-management/profiles.md) — параметры
   профилей (`profile_json`), четыре профиля сопровождения.
 - [docs/trade-management/storage-and-audit.md](trade-management/storage-and-audit.md)
-  §3–4 — аудит-трассы, `trade_audit.log` (JSONL), примеры живых расчётов.
+  §3–4 — аудит-трассы, `trade_decision_trace.log` (JSONL), примеры живых расчётов.
 - [docs/trade-management/trade-event.md](trade-management/trade-event.md) — CSV-проекция
   событий (читаемая форма `events.payload_json`).

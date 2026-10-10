@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import threading
+from functools import wraps
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -11,6 +13,15 @@ from src.data.timeutil import to_naive
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
+
+
+def _synchronized(method):
+    """Защищает кадры при фоновом приёме и основном торговом цикле."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 # Сколько тиков подряд без единого нового закрытого бара — кандидат в разрыв
 # данных. Дальше решает поиск следующего имеющегося бара: нашёлся — это пауза в
@@ -105,13 +116,18 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
         self._clock = clock
         self._history = bool(getattr(clock, "is_virtual", False))
         self._client_provider = client_provider
+        # В историческом режиме источник уже является эмулятором. Локальный
+        # журнал живых данных включается только вызывающим кодом live-режима.
+        self._market_store = market_store
+        self._market_source = market_source
+        self._market_reconciler = market_reconciler
         self._data_refresh_min_interval = data_refresh_min_interval  # мин. пауза между API-дозагрузками
         self._data_backfill_window_seconds = data_backfill_window_seconds  # окно инкр. дозагрузки (bounded backfill)
         self._freshness_tolerance_bars = freshness_tolerance_bars  # терпимость готовности ТФ (в барах), 0 = жёсткий AND
@@ -131,6 +147,8 @@ class MarketDataCache:
         self._empty_ticks = 0
         self._tick_progressed = 0
         self._tick_expected: set[str] = set()
+        self._lock = threading.RLock()
+        self._coverage_blocks: set[tuple] = set()
 
     @property
     def missed_bars(self) -> int:
@@ -194,8 +212,29 @@ class MarketDataCache:
             self._uids[key] = instrument_id
         if df is not None and not df.empty and "datetime" in df.columns:
             df = df.sort_values("datetime").reset_index(drop=True)
+            if self._market_store is not None and instrument_id:
+                self._market_store.record_candles(
+                    source=self._market_source,
+                    instrument_uid=instrument_id,
+                    interval=timeframe,
+                    candles=df,
+                )
+                # Стратегия читает тот же подтверждённый локальный слепок,
+                # который экспортируется эмулятору. Это позволяет пережить
+                # перезапуск и принять позднюю исправленную минуту.
+                df = self._market_store.current_frame(
+                    source=self._market_source,
+                    instrument_uid=instrument_id,
+                    interval=timeframe,
+                )
+                if self._market_reconciler is not None:
+                    self._market_reconciler.reconcile(
+                        instrument_uid=instrument_id, interval=timeframe,
+                        candles=df, now=self._timeline.now(),
+                    )
         return df
 
+    @_synchronized
     def frame_for(self, instrument, timeframe: str) -> pd.DataFrame:
         """Готовые (закрытые) свечи пары (инструмент, ТФ); ленивая первичная загрузка."""
         key = self._key(instrument, timeframe)
@@ -204,8 +243,54 @@ class MarketDataCache:
         frame = self._frames[key]
         if frame is None or frame.empty:
             return pd.DataFrame()
-        return self._closed_only(frame, timeframe)
+        closed = self._closed_only(frame, timeframe)
+        return self._resolved_only(key, closed, timeframe)
 
+    @_synchronized
+    def contiguous_after(self, instrument, timeframe: str, frame: pd.DataFrame, last_bar) -> pd.DataFrame:
+        """Оставляет для симуляции ряд до первой неразрешённой минуты.
+
+        ``frame_for`` защищает анализ от внутренних дыр, а этот метод учитывает
+        ещё и already durable курсор исполнения, который может быть раньше
+        первого нового ряда после перезапуска.
+        """
+        if self._market_reconciler is None or frame.empty or timeframe != "1m" or last_bar is None:
+            return frame
+        key = self._key(instrument, timeframe)
+        instrument_id = self._uids.get(key)
+        if not instrument_id:
+            return frame.iloc[0:0].copy()
+        previous = _naive(last_bar)
+        allowed: list[int] = []
+        for index, row in frame.sort_values("datetime").iterrows():
+            stamp = _naive(row["datetime"])
+            probe = previous + pd.Timedelta(minutes=1)
+            while probe < stamp:
+                state = self._market_reconciler.interval_state(
+                    instrument_uid=instrument_id, interval=timeframe,
+                    open_time=probe, now=self._timeline.now(),
+                )
+                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    self._report_coverage_block(key, probe, state)
+                    return frame.loc[allowed].copy()
+                probe += pd.Timedelta(minutes=1)
+            allowed.append(index)
+            previous = stamp
+        return frame.loc[allowed].copy()
+
+    @_synchronized
+    def mark_processed(self, instrument, timeframe: str, stamp) -> None:
+        """Фиксирует прогресс симуляции только после commit журнала сделок."""
+        if self._market_store is None:
+            return
+        instrument_id = self._uids.get(self._key(instrument, timeframe))
+        if instrument_id:
+            self._market_store.mark_processed(
+                source=self._market_source, instrument_uid=instrument_id,
+                interval=timeframe, open_time=stamp,
+            )
+
+    @_synchronized
     def ensure_loaded(self, instrument, timeframe: str) -> None:
         """Гарантирует актуальность кадра пары (инструмент, ТФ) по требованию.
 
@@ -245,6 +330,7 @@ class MarketDataCache:
             self._last_loaded[key] = _naive(closed["datetime"].max())
             self._note_new_bar(key, closed)
 
+    @_synchronized
     def refresh_if_new_candle(self, timeframe: str, now=None, force: bool = False) -> None:
         """Инкрементально дозагружает новые закрытые бары таймфрейма, если граница сместилась.
 
@@ -288,16 +374,20 @@ class MarketDataCache:
                 return
             frame = self._frames[key]
             last_dt = self._last_loaded.get(key)
-            start = self._incremental_start(last_dt, now)
-            try:
-                new_df = self._load(self._instruments[key], timeframe, start_date=start)
-            except Exception as exc:
-                if not self._history and "resource_exhausted" in str(exc).lower():
-                    log.warning("Rate limit при дозагрузке %s: %s", key, exc)
-                    self._retry_after = self._pause_after_rate_limit(exc, now)
-                    return
-                raise
-            merged = self._merge_new_bars(frame, new_df, last_dt)
+            recovered, recovery_attempted = self._recover_oldest_gap(key, timeframe, now)
+            if recovery_attempted:
+                merged = self._merge_new_bars(frame, recovered, last_dt)
+            else:
+                start = self._incremental_start(last_dt, now)
+                try:
+                    new_df = self._load(self._instruments[key], timeframe, start_date=start)
+                except Exception as exc:
+                    if not self._history and "resource_exhausted" in str(exc).lower():
+                        log.warning("Rate limit при дозагрузке %s: %s", key, exc)
+                        self._retry_after = self._pause_after_rate_limit(exc, now)
+                        return
+                    raise
+                merged = self._merge_new_bars(frame, new_df, last_dt)
             self._frames[key] = merged
             closed = self._closed_only(merged, timeframe)
             self._last_loaded[key] = _naive(closed["datetime"].max()) if not closed.empty else last_dt
@@ -323,6 +413,7 @@ class MarketDataCache:
         if expected:
             self._tick_expected.add(timeframe)
 
+    @_synchronized
     def close_tick(self) -> None:
         """Закрывает учёт рыночного тика: одна запись в счётчики прогона за тик.
 
@@ -338,6 +429,7 @@ class MarketDataCache:
             return
         self._register_tick(progressed, expected)
 
+    @_synchronized
     def has_fresh_closed_bar(self, timeframe: str, now=None) -> bool:
         """Появился ли свежий закрытый бар таймфрейма в загруженных кэшах.
 
@@ -659,15 +751,84 @@ class MarketDataCache:
     def _closed_only(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         grid = self._timeline.grid(timeframe)
         boundary = _naive(grid.current_candle_start(self._timeline.now()))
-        return frame[frame["datetime"] < boundary].copy()
+        complete = frame["is_complete"].astype(bool) if "is_complete" in frame.columns else True
+        return frame[(frame["datetime"] < boundary) & complete].copy()
+
+    def _resolved_only(self, key: tuple, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """Не выдаёт стратегиям свечи после первой неразрешённой минуты.
+
+        В историческом режиме прежняя семантика остаётся неизменной. В живом
+        режиме состояние приходит из durable store и календаря брокера.
+        """
+        if self._market_reconciler is None or frame.empty or timeframe != "1m":
+            return frame
+        instrument_id = self._uids.get(key)
+        if not instrument_id:
+            return frame.iloc[0:0].copy()
+        ordered = frame.sort_values("datetime")
+        period = pd.Timedelta(minutes=1)
+        allowed: list[int] = []
+        previous = None
+        for index, row in ordered.iterrows():
+            stamp = _naive(row["datetime"])
+            if previous is not None:
+                probe = previous + period
+                while probe < stamp:
+                    state = self._market_reconciler.interval_state(
+                        instrument_uid=instrument_id, interval=timeframe,
+                        open_time=probe, now=self._timeline.now(),
+                    )
+                    if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                        self._report_coverage_block(key, probe, state)
+                        return ordered.loc[allowed].copy()
+                    probe += period
+            allowed.append(index)
+            previous = stamp
+        return ordered.loc[allowed].copy()
+
+    def _report_coverage_block(self, key: tuple, stamp: pd.Timestamp, state: str) -> None:
+        marker = (*key, _naive(stamp), state)
+        if marker in self._coverage_blocks:
+            return
+        self._coverage_blocks.add(marker)
+        log.warning(
+            "Симуляция %s остановлена перед неразрешённой свечой %s (%s)",
+            key, _naive(stamp), state,
+        )
+
+    def _recover_oldest_gap(self, key: tuple, timeframe: str, now) -> tuple[pd.DataFrame | None, bool]:
+        """Один bounded запрос старейшей дыры, отдельно от свежего окна."""
+        if self._market_reconciler is None or self._history:
+            return None, False
+        instrument_id = self._uids.get(key)
+        if not instrument_id:
+            return None, False
+        gap = self._market_reconciler.recovery_candidate(instrument_uid=instrument_id, interval=timeframe)
+        if gap is None or gap >= _naive(now):
+            return None, False
+        period = pd.Timedelta(seconds=self._tf_period_secs(timeframe, gap))
+        try:
+            recovered = self._load(
+                self._instruments[key], timeframe, start_date=gap, end_date=gap + period,
+            )
+        except Exception as exc:
+            if "resource_exhausted" in str(exc).lower():
+                self._retry_after = self._pause_after_rate_limit(exc, _naive(now))
+                return None, True
+            raise
+        if recovered is None or recovered.empty:
+            self._market_reconciler.record_empty_recovery(
+                instrument_uid=instrument_id, interval=timeframe, open_time=gap,
+            )
+        return recovered, True
 
     def _merge_new_bars(self, frame, new_df, last_dt):
         if new_df is None or new_df.empty:
             return frame
-        if last_dt is not None:
-            new_df = new_df[new_df["datetime"] > _naive(last_dt)]
-        if new_df.empty:
-            return frame
+        # Нельзя отбрасывать строку только потому, что её время старше
+        # последней загруженной свечи: брокер способен опубликовать 12:01
+        # после уже полученной 12:03 либо исправить старую свечу. Последняя
+        # версия того же open time заменяет предыдущую.
         return pd.concat([frame, new_df], ignore_index=True).drop_duplicates(
             subset="datetime", keep="last"
         ).sort_values("datetime").reset_index(drop=True)

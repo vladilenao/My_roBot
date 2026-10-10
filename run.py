@@ -18,6 +18,11 @@ from src.config import (
     CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
+    MARKET_DATA_DATABASE_FILE,
+    MARKET_DATA_EXPORT_ENABLED,
+    MARKET_DATA_EXPORT_HOST,
+    MARKET_DATA_EXPORT_PORT,
+    MARKET_DATA_EXPORT_TOKEN,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -50,11 +55,12 @@ from src.config import (
     run_dir_name,
     HIST_DIR,
 )
-from src.api.emulator_client import EmulatorClientProvider
+from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
 from src.history.preflight import active_pairs, run_preflight, smallest_period
 from src.history.report import (
+    MarketDataSync,
     REPORT_TXT,
     RunMetrics,
     collect_result,
@@ -66,6 +72,10 @@ from src.scheduler.clock import HistoricalClock
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
+from src.data.market_store import MarketDataStore
+from src.data.export_api import MarketDataExportServer
+from src.data.reconciliation import MarketDataReconciler
+from src.data.poller import LiveMarketDataPoller
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
 from src.events.bus import EventBus
@@ -234,18 +244,54 @@ def _run_history(start, end, pause):
     выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
     второй раз. Повтор ровно один — границы для нового начала проверены.
     """
+    provider = EmulatorClientProvider()
+    try:
+        sync = provider.prepare_snapshot()
+    except EmulatorError as exc:
+        market_data_sync = MarketDataSync(reason=exc.message)
+        print(f"Импорт My Robot перед прогоном не подтверждён: {exc.message}")
+    else:
+        if sync["synchronized"]:
+            market_data_sync = MarketDataSync(
+                status="synchronized",
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                snapshot_generation=sync["snapshot_generation"],
+            )
+            print(
+                "Импорт My Robot подтверждён: "
+                f"снимок {sync['snapshot_generation']}, "
+                f"курсор {sync['after_id']}/{sync['target_change_id']}."
+            )
+        else:
+            source = sync.get("source")
+            state = source.get("state") if isinstance(source, dict) else None
+            reason = (
+                f"эмулятор сообщил состояние {state}"
+                if state in {"incomplete", "blocked", "error"}
+                else "эмулятор не подтвердил полноту журнала"
+            )
+            market_data_sync = MarketDataSync(
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                reason=reason,
+            )
+            print(f"Импорт My Robot перед прогоном не подтверждён: {reason}")
     instruments = None
     for _ in range(2):
         clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
         state_dir = state_dir_for(start, end)
         code, shifted, instruments = _launch(
             state_dir=state_dir,
-            client_provider=EmulatorClientProvider(),
+            client_provider=provider,
             clock=clock,
             session=build_run_session(MODE_HISTORY, clock),
             channel_names=[],
             history=True,
             instruments=instruments,
+            market_data_sync=market_data_sync,
         )
         if shifted is None:
             return code
@@ -302,6 +348,7 @@ def _launch(
     channel_names,
     history: bool = False,
     instruments=None,
+    market_data_sync: MarketDataSync | None = None,
 ) -> tuple[int, datetime | None, list]:
     """Единая сборка прогона: различаются только источник, часы и каталог.
 
@@ -361,6 +408,11 @@ def _launch(
         catch_up_bars=CATCH_UP_BARS,
         clock=clock,
     )
+    market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
+    market_reconciler = None if market_store is None else MarketDataReconciler(
+        market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
+        client_provider=client_provider,
+    )
     data_cache = MarketDataCache(
         loader=load_candles,
         timeline=timeline,
@@ -370,6 +422,8 @@ def _launch(
         freshness_tolerance_bars=CATCH_UP_BARS,
         clock=clock,
         client_provider=client_provider,
+        market_store=market_store,
+        market_reconciler=market_reconciler,
     )
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
@@ -378,7 +432,18 @@ def _launch(
     )
 
     storage = None
+    export_server = None
+    market_poller = None
     try:
+        if not history:
+            market_poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS)
+            market_poller.start()
+        if not history and MARKET_DATA_EXPORT_ENABLED:
+            export_server = MarketDataExportServer(
+                market_store, MARKET_DATA_EXPORT_TOKEN or "",
+                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
+            )
+            export_server.start()
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
             client_provider=client_provider,
@@ -386,13 +451,22 @@ def _launch(
         storage = runtime.storage
         _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
     finally:
+        if market_poller is not None:
+            market_poller.close()
+        if export_server is not None:
+            export_server.close()
         if history:
-            _finish_history(storage, session, data_cache, timeline, state_dir)
+            _finish_history(
+                storage, session, data_cache, timeline, state_dir, market_data_sync
+            )
         close_channels(channels)
     return 0, None, instruments
 
 
-def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
+def _finish_history(
+    storage, session, data_cache, timeline, state_dir,
+    market_data_sync: MarketDataSync | None = None,
+) -> None:
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
@@ -414,6 +488,7 @@ def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
         horizon_start=None if exhaustion is None else exhaustion.horizon_start,
         horizon_end=None if exhaustion is None else exhaustion.horizon_end,
         horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
+        market_data_sync=market_data_sync or MarketDataSync(),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -558,11 +633,42 @@ def _build_runtime(
     broker.set_names(_instrument_names(instruments))
     print_contract_metadata(contracts)
 
+    # Cursors advance only after executions and observations of a minute have
+    # committed. On restart SQLite provides the safe boundary of live state.
+    execution_cursors = storage.execution_bar_boundaries()
+    execution_closes = {}
+    pending_bar = None
+
+    def commit_bar(stamp, prices, addressed, broker_events):
+        instrument_bar_times = {ticker: stamp for ticker in prices}
+        for event in addressed:
+            trade_manager.consume(event)
+        addressed_ids = {event.trade_id for event in addressed}
+        for event in broker_events:
+            if event.trade_id not in addressed_ids:
+                bus.publish(_broker_event(event))
+        trade_manager.observe_bars(prices, instrument_bar_times)
+        execution_closes.update({ticker: values[3] for ticker, values in prices.items()})
+        trade_manager.mark_to_market(execution_closes)
+        # Только после всех durable операций минуты курсоры обеих БД могут
+        # продвинуться. При исключении pending_bar будет повторён.
+        for ticker in prices:
+            execution_cursors[ticker] = (stamp, False)
+            instrument = next((item for item in instruments if item.ticker == ticker), None)
+            mark_processed = getattr(data_cache, "mark_processed", None)
+            if instrument is not None and callable(mark_processed):
+                mark_processed(instrument, "1m", stamp)
+
     def on_bar(ready_tfs: set[str]) -> None:
+        nonlocal pending_bar
         try:
-            prices = {}
-            bar_times = []
-            instrument_bar_times = {}
+            # The simulator has already advanced if a durable write failed.
+            # Retry those same events before asking it to execute another bar.
+            if pending_bar is not None:
+                commit_bar(*pending_bar)
+                pending_bar = None
+            batches = {}
+            initial_boundaries = None
             for instrument in instruments:
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -574,40 +680,42 @@ def _build_runtime(
                     continue
                 if frame.empty:
                     continue
-                bar_time = frame["datetime"].iloc[-1]
-                if hasattr(bar_time, "to_pydatetime"):
-                    bar_time = bar_time.to_pydatetime()
                 try:
-                    bar_times.append(bar_time)
-                    prices[instrument.ticker] = (
-                        float(frame["open"].iloc[-1]),
-                        float(frame["low"].iloc[-1]),
-                        float(frame["high"].iloc[-1]),
-                        float(frame["close"].iloc[-1]),
-                    )
-                    instrument_bar_times[instrument.ticker] = bar_time
+                    ticker = instrument.ticker
+                    stamps = frame["datetime"].map(to_aware_utc)
+                    boundary = execution_cursors.get(ticker)
+                    if boundary is None:
+                        if initial_boundaries is None:
+                            initial_boundaries = storage.execution_bar_boundaries()
+                        boundary = initial_boundaries.get(ticker, (stamps.max(), True))
+                    last, inclusive = boundary
+                    fresh = frame.loc[stamps >= last if inclusive else stamps > last]
+                    fresh = fresh.sort_values("datetime").drop_duplicates("datetime", keep="last")
+                    contiguous = getattr(data_cache, "contiguous_after", None)
+                    if callable(contiguous):
+                        protected = contiguous(instrument, "1m", fresh, last)
+                        # Старые адаптеры и тестовые double не обязаны знать
+                        # новый контракт покрытия; в таком случае оставляем
+                        # исходный DataFrame.
+                        if isinstance(protected, type(fresh)):
+                            fresh = protected
+                    for row in fresh.itertuples(index=False):
+                        stamp = to_aware_utc(row.datetime).to_pydatetime()
+                        batches.setdefault(stamp, {})[ticker] = (
+                            float(row.open), float(row.low), float(row.high), float(row.close),
+                        )
                 except Exception as exc:
                     log.warning(
-                        "Сбой обработки бара %s по %s: %s",
-                        bar_time, _instrument_ticker(instrument), exc,
+                        "Сбой подготовки минутных баров по %s: %s",
+                        _instrument_ticker(instrument), exc,
                     )
                     continue
-            if prices:
-                broker.track_bar(max(bar_times), prices, contracts, bar_times=instrument_bar_times)
-            addressed = list(broker.drain_addressed_events())
-            for event in addressed:
-                try:
-                    trade_manager.consume(event)
-                except Exception as exc:
-                    log.warning(
-                        "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
-                    )
-            addressed_ids = {event.trade_id for event in addressed}
-            for event in broker.drain_events():
-                if event.trade_id not in addressed_ids:
-                    bus.publish(_broker_event(event))
-            trade_manager.observe_bars(prices, instrument_bar_times)
-            trade_manager.mark_to_market({ticker: values[3] for ticker, values in prices.items()})
+            for stamp, prices in sorted(batches.items()):
+                instrument_bar_times = {ticker: stamp for ticker in prices}
+                broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
+                pending_bar = (stamp, prices, list(broker.drain_addressed_events()), list(broker.drain_events()))
+                commit_bar(*pending_bar)
+                pending_bar = None
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
 

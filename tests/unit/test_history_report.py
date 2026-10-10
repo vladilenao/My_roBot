@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.broker import ExecutionEvent, ExecutionStatus
 from src.history.report import (
+    MarketDataSync,
     REPORT_JSON,
     REPORT_TXT,
     RunMetrics,
@@ -149,6 +150,42 @@ class TestCollectResult:
 
 
 class TestWriteReport:
+    def test_sync_snapshot_is_written_to_both_reports(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        sync = MarketDataSync(
+            status="synchronized", producer_id="robot-db-1",
+            target_change_id=12, after_id=12, snapshot_generation=42,
+        )
+
+        txt, js = write_report(
+            tmp_path, _metrics(market_data_sync=sync), collect_result(storage)
+        )
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert payload["market_data_sync"]["status"] == "synchronized"
+        assert payload["market_data_sync"]["snapshot_generation"] == 42
+        assert payload["market_data_sync"]["after_id"] == 12
+        assert "Импорт My Robot: подтверждён" in txt.read_text(encoding="utf-8")
+        assert "robot-db-1 / 12/12 / 42" in txt.read_text(encoding="utf-8")
+
+    def test_unconfirmed_sync_is_preserved_in_crash_report(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        sync = MarketDataSync(reason="My Robot недоступен")
+
+        txt, js = write_report(
+            tmp_path, _metrics(crashed=True, market_data_sync=sync), collect_result(storage)
+        )
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert payload["market_data_sync"] == {
+            "status": "unconfirmed", "producer_id": None,
+            "target_change_id": None, "after_id": None,
+            "snapshot_generation": None, "reason": "My Robot недоступен",
+        }
+        assert "Причина неподтверждения: My Robot недоступен" in txt.read_text(
+            encoding="utf-8"
+        )
+
     def test_writes_both_files(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
 

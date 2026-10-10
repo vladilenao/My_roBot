@@ -458,6 +458,18 @@ class TestTradingBot:
         assert trade_manager.manage.call_count == 2
         assert trade_manager.manage.call_args_list[0].kwargs["timeframe"] == "1m"
 
+    @pytest.mark.parametrize("ready_tfs", [set(), {"1h"}])
+    def test_available_protection_bars_do_not_wait_for_global_1m_readiness(self, ready_tfs):
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(),
+        )
+        bot._post_tick = MagicMock()
+
+        bot._tick(ready_tfs)
+
+        bot._post_tick.assert_called_once_with({"1m"})
+
     def test_deleted_assignment_keeps_1m_management_subscription(self):
         trade_manager = MagicMock()
         trade_manager.manage.return_value = ()

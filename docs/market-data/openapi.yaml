@@ -1,0 +1,403 @@
+openapi: 3.0.3
+info:
+  title: My Robot — экспорт рыночных данных
+  version: 1.0.0-proposal
+  description: |
+    Контракт локального экспорта My Robot. Historical Broker API Emulator
+    забирает завершённые версии свечей и состояния покрытия из локального
+    журнала, сохраняет их и подтверждает курсор.
+servers:
+  - url: /
+    description: Тот же узел, где опубликован Swagger UI; по умолчанию loopback.
+tags:
+  - name: MarketDataExport
+    description: Чтение изменений локального рыночного журнала.
+paths:
+  /openapi.yaml:
+    get:
+      tags: [MarketDataExport]
+      summary: Машиночитаемый контракт API
+      operationId: getMarketDataOpenApi
+      security: []
+      responses:
+        '200':
+          description: Действующая OpenAPI 3.0.3 спецификация.
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      tags: [MarketDataExport]
+      summary: Интерактивная документация Swagger UI
+      operationId: getMarketDataSwaggerUi
+      security: []
+      responses:
+        '200':
+          description: Swagger UI с возможностью указать экспортный токен.
+          content:
+            text/html:
+              schema:
+                type: string
+  /api/v1/market-data/source:
+    get:
+      tags: [MarketDataExport]
+      summary: Идентичность источника и доступный диапазон курсора
+      operationId: getMarketDataSource
+      responses:
+        '200':
+          description: Идентичность локальной БД и допустимая начальная позиция.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceInfo'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                schema_version: 1
+                min_after_id: 0
+                max_change_id: 42
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/changes:
+    get:
+      tags: [MarketDataExport]
+      summary: Следующая страница изменений после курсора
+      operationId: getMarketDataChanges
+      parameters:
+        - name: producer_id
+          in: query
+          required: true
+          description: Идентичность источника, полученная от GET /source.
+          schema:
+            type: string
+            format: uuid
+        - name: after_id
+          in: query
+          required: true
+          description: Последний долговечно сохранённый change_id; минимум min_after_id.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Максимум изменений в странице.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 500
+      responses:
+        '200':
+          description: Изменения отсортированы по возрастанию change_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePage'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                next_after_id: 42
+                has_more: false
+                changes:
+                  - change_id: 42
+                    kind: candle_upsert
+                    recorded_at: '2026-10-09T09:02:03Z'
+                    candle:
+                      source: tbank_exchange
+                      instrument_uid: e6123145-6bd5-43d9-8e7d-33b1a331ce43
+                      interval: 1m
+                      open_time_utc: '2026-10-09T09:01:00Z'
+                      open: '301.50'
+                      high: '302.00'
+                      low: '301.25'
+                      close: '301.75'
+                      volume: 412
+                      is_complete: true
+                      revision: 1
+                      received_at: '2026-10-09T09:02:03Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/ProducerMismatch'
+        '410':
+          $ref: '#/components/responses/CursorExpired'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/consumers/{consumer_id}/checkpoint:
+    put:
+      tags: [MarketDataExport]
+      summary: Подтвердить уже сохранённые потребителем изменения
+      operationId: putMarketDataCheckpoint
+      description: |
+        Потребитель вызывает после commit своей БД. Повтор и меньший
+        change_id не откатывают ранее подтверждённый курсор.
+      parameters:
+        - name: consumer_id
+          in: path
+          required: true
+          description: Стабильное имя потребителя, например historical-emulator.
+          schema:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckpointRequest'
+            example:
+              producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+              change_id: 42
+      responses:
+        '200':
+          description: Последний подтверждённый курсор потребителя.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointResponse'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                consumer_id: historical-emulator
+                acknowledged_through: 42
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/ProducerMismatch'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+components:
+  securitySchemes:
+    ExportToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Отдельный токен чтения и подтверждения экспортного потока.
+  responses:
+    BadRequest:
+      description: Неверный параметр или идентификатор вне допустимого диапазона.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Unauthorized:
+      description: Токен отсутствует или неверен.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    ProducerMismatch:
+      description: Курсор относится к другой локальной БД My Robot.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: PRODUCER_MISMATCH
+            message: Запрошенный producer_id не совпадает с текущим.
+    CursorExpired:
+      description: Курсор старше сохранённого диапазона; требуется сверка.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: CURSOR_EXPIRED
+            message: Часть журнала изменений недоступна; выполните сверку.
+    Unavailable:
+      description: Локальное рыночное хранилище временно недоступно.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+  schemas:
+    SourceInfo:
+      type: object
+      additionalProperties: false
+      required: [producer_id, schema_version, min_after_id, max_change_id]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+          description: Постоянен до пересоздания локальной БД.
+        schema_version:
+          type: integer
+          minimum: 1
+        min_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Наименьший курсор, с которого доступна полная выдача.
+        max_change_id:
+          type: integer
+          format: int64
+          minimum: 0
+    ChangePage:
+      type: object
+      additionalProperties: false
+      required: [producer_id, next_after_id, has_more, changes]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        next_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Последний change_id страницы либо исходный after_id при пустом ответе.
+        has_more:
+          type: boolean
+        changes:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/CandleChange'
+              - $ref: '#/components/schemas/IntervalStatusChange'
+    CandleChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, recorded_at, candle]
+      properties:
+        change_id:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum: [candle_upsert]
+        recorded_at:
+          type: string
+          format: date-time
+        candle:
+          $ref: '#/components/schemas/CompleteCandle'
+    IntervalStatusChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, recorded_at, interval_status]
+      properties:
+        change_id:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum: [interval_status]
+        recorded_at:
+          type: string
+          format: date-time
+        interval_status:
+          $ref: '#/components/schemas/IntervalStatus'
+    CompleteCandle:
+      type: object
+      additionalProperties: false
+      required: [source, instrument_uid, interval, open_time_utc, open, high, low, close, volume, is_complete, revision, received_at]
+      properties:
+        source:
+          type: string
+          description: Идентификатор брокерского источника и типа свечи.
+        instrument_uid:
+          type: string
+          minLength: 1
+        interval:
+          type: string
+          minLength: 1
+          example: 1m
+        open_time_utc:
+          type: string
+          format: date-time
+        open:
+          $ref: '#/components/schemas/DecimalPrice'
+        high:
+          $ref: '#/components/schemas/DecimalPrice'
+        low:
+          $ref: '#/components/schemas/DecimalPrice'
+        close:
+          $ref: '#/components/schemas/DecimalPrice'
+        volume:
+          type: integer
+          format: int64
+          minimum: 0
+        is_complete:
+          type: boolean
+          enum: [true]
+        revision:
+          type: integer
+          minimum: 1
+        received_at:
+          type: string
+          format: date-time
+    DecimalPrice:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]+)?$'
+      description: Десятичное число строкой для сохранения точности.
+      example: '301.75'
+    IntervalStatus:
+      type: object
+      additionalProperties: false
+      required: [source, instrument_uid, interval, open_time_utc, state, observed_at, evidence]
+      properties:
+        source:
+          type: string
+        instrument_uid:
+          type: string
+          minLength: 1
+        interval:
+          type: string
+          example: 1m
+        open_time_utc:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [received, scheduled_closed, confirmed_no_trade, pending, unresolved]
+        observed_at:
+          type: string
+          format: date-time
+        evidence:
+          type: string
+          minLength: 1
+          description: Источник и основание классификации интервала.
+    CheckpointRequest:
+      type: object
+      additionalProperties: false
+      required: [producer_id, change_id]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        change_id:
+          type: integer
+          format: int64
+          minimum: 0
+    CheckpointResponse:
+      type: object
+      additionalProperties: false
+      required: [producer_id, consumer_id, acknowledged_through]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        consumer_id:
+          type: string
+        acknowledged_through:
+          type: integer
+          format: int64
+          minimum: 0
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: CURSOR_EXPIRED
+        message:
+          type: string
+security:
+  - ExportToken: []
