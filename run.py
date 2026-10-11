@@ -427,6 +427,7 @@ def _launch(
             return 3, report.start, selection or instruments
         if report.notes:
             print(report.message())
+        session.set_boundary_checks(report.boundaries)
 
     channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
@@ -454,6 +455,8 @@ def _launch(
         market_store=market_store,
         market_reconciler=market_reconciler,
     )
+    if history:
+        data_cache.set_boundary_checks(report.boundaries)
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
     PROFILES["triple_screen"] = TripleScreenFilter(
@@ -514,6 +517,7 @@ def _finish_history(
     crashed = not original_reason
     longest_gap = getattr(data_cache, "longest_gap", None)
     exhaustion = getattr(session, "exhaustion", None)
+    last_processed = getattr(data_cache, "last_processed_bar", None)
     metrics = RunMetrics(
         start=session.start,
         end=session.end,
@@ -529,6 +533,9 @@ def _finish_history(
         horizon_end=None if exhaustion is None else exhaustion.horizon_end,
         horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
         market_data_sync=market_data_sync or MarketDataSync(),
+        boundary_checks=tuple(getattr(session, "boundary_checks", ())),
+        last_processed_bar=last_processed if isinstance(last_processed, datetime) else None,
+        terminal_gap=bool(getattr(session, "terminal_gap", None)),
         rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
     )
     write_report(
@@ -783,8 +790,10 @@ def _build_runtime(
                 pending_bar = (stamp, prices, list(broker.drain_addressed_events()), list(broker.drain_events()))
                 commit_bar(*pending_bar)
                 pending_bar = None
+            return True
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
+            return False
 
     return _Runtime(
         post_tick=on_bar,

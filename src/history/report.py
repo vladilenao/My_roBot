@@ -86,6 +86,9 @@ class RunMetrics:
     horizon_limited: bool = False
     market_data_sync: MarketDataSync = field(default_factory=MarketDataSync)
     rollover: dict | None = None
+    boundary_checks: tuple = ()
+    last_processed_bar: datetime | None = None
+    terminal_gap: bool = False
 
 
 @dataclass
@@ -180,6 +183,14 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
                 "Горизонт поиска ограничен семью сутками: после него данные "
                 "не проверялись и их отсутствие не утверждается."
             )
+    if metrics.boundary_checks:
+        head.append("Проверенные правые границы:")
+        for check in metrics.boundary_checks:
+            head.append("  "+check.message())
+    if metrics.last_processed_bar is not None:
+        head.append(f"Последний обработанный бар: {_stamp(metrics.last_processed_bar)}")
+    if metrics.terminal_gap:
+        head.append("Конец диапазона внутри подтверждённого перерыва; это не доказательство отсутствия потерь данных.")
     if metrics.rollover is not None:
         plan = metrics.rollover
         head.extend(["", "Фьючерсы: calendar / close-and-wait",
@@ -258,6 +269,9 @@ def write_report(
         "journal": origin,
         "rollover": metrics.rollover,
         "selection_mode": "automatic" if metrics.rollover is not None else "fixed",
+        "boundary_checks": [item.payload() for item in metrics.boundary_checks],
+        "last_processed_bar": _stamp(metrics.last_processed_bar),
+        "terminal_gap": metrics.terminal_gap,
     }
     txt_path.write_text(
         "\n".join(_lines(metrics, result, origin)) + "\n", encoding="utf-8"

@@ -352,14 +352,16 @@ class TestHigherTimeframeTail:
 
 
 class TestStartShift:
-    """Начало в нерабочей точке календара переносится на первую доступную свечу."""
+    """Начало в нерабочей точке переносится на ближайший бар драйверного потока."""
 
     END = datetime(2024, 1, 10, 0, 0)
+    SHIFTED = datetime(2024, 1, 3, 4, 0)
     AHEAD = _window("2024-01-01 00:00", "2024-01-08 00:00")
-    SHIFTED_HEAD = _window("2024-01-03 04:00", "2024-01-03 04:03")
+    SHIFTED_HEAD = _window("2024-01-03 03:58", "2024-01-03 04:01")
     SHIFTED_TAIL = _window("2024-01-09 23:58", "2024-01-10 00:00")
-    SHIFTED_HEAD_BARS = _bars("2024-01-03 04:00:00", "2024-01-03 04:01:00", "2024-01-03 04:02:00")
+    SHIFTED_HEAD_BARS = _bars("2024-01-03 03:59:00", "2024-01-03 04:00:00")
     SHIFTED_TAIL_BARS = _bars("2024-01-09 23:58:00", "2024-01-09 23:59:00")
+    SHIFTED_SCAN = (pd.Timestamp("2024-01-03 04:00"), pd.Timestamp(END))
 
     def _source(self, *, ahead=None, shifted_head=None, scan=None) -> _candles:
         return _candles(
@@ -371,11 +373,7 @@ class TestStartShift:
                 ),
                 self.SHIFTED_TAIL: self.SHIFTED_TAIL_BARS,
             },
-            scan_windows=(
-                SCAN_WINDOW,
-                (pd.Timestamp(START), pd.Timestamp(self.END)),
-                (pd.Timestamp("2024-01-03 04:02"), pd.Timestamp(self.END)),
-            ),
+            scan_windows=(self.SHIFTED_SCAN,),
             scan=scan,
         )
 
@@ -385,8 +383,8 @@ class TestStartShift:
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert report.start == datetime(2024, 1, 3, 4, 2)
-        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:02" in report.notes[0]
+        assert report.start == self.SHIFTED
+        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:00" in report.notes[0]
 
     def test_shift_note_printed_with_passed_check(self):
         source = self._source(ahead=_bars("2024-01-03 04:00:00"))
@@ -397,7 +395,7 @@ class TestStartShift:
         assert "начало диапазона сдвинуто" in message
 
     def test_shift_and_gap_warning_coexist(self):
-        scan = _frame("2024-01-03 04:02", "2024-01-03 04:10").drop(index=3)
+        scan = _frame("2024-01-03 04:00", "2024-01-03 04:10").drop(index=3)
         source = self._source(
             ahead=_bars("2024-01-03 04:00:00"),
             scan=scan,
@@ -406,7 +404,7 @@ class TestStartShift:
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:02" in report.notes[0]
+        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:00" in report.notes[0]
         assert "разрывов данных: 1" in report.notes[-1]
 
     def test_remaining_problem_reported_after_shift(self):
@@ -415,9 +413,21 @@ class TestStartShift:
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is False
-        assert report.start == datetime(2024, 1, 3, 4, 2)
+        assert report.start == self.SHIFTED
         assert "сдвинуто" in report.notes[0]
-        assert "2024-01-03 04:02" in report.problems[0]
+        assert "2024-01-03 04:00" in report.problems[0]
+
+    def test_shift_does_not_repeat_when_warmup_insufficient(self):
+        source = self._source(
+            ahead=_bars("2024-01-03 04:00:00"),
+            shifted_head=_bars("2024-01-03 04:00:00"),
+        )
+
+        report = _run(start=START, end=self.END, load_candles=source)
+
+        assert report.ok is False
+        assert report.start == self.SHIFTED
+        assert any("прогрев" in problem for problem in report.problems)
 
     def test_data_beyond_lookahead_stays_an_error(self):
         report = _run(start=START, end=self.END, load_candles=self._source())
@@ -427,32 +437,33 @@ class TestStartShift:
         assert "свечи не покрывают начало диапазона 2024-01-01 00:00" in report.problems[0]
         assert "ближайшая свеча" not in report.problems[0]
 
-    def test_shift_aligned_to_coarsest_timeframe(self):
+    def test_shift_follows_driver_not_coarser_timeframe(self):
         pairs = (Pair("SBER", "share", "1m"), Pair("SBER", "share", "1h"))
         source = _candles(
             {
                 HEAD_WINDOW: pd.DataFrame(),
+                self.AHEAD: _bars("2024-01-03 04:07:00"),
+                _window("2024-01-03 04:05", "2024-01-03 04:08"): _bars(
+                    "2024-01-03 04:06:00", "2024-01-03 04:07:00"
+                ),
                 _window("2023-12-31 22:00", "2024-01-01 01:00"): _hourly(
                     "2023-12-31 22:00:00", "2024-01-01 00:00:00"
                 ),
-                self.AHEAD: _bars("2024-01-03 04:07:00"),
-                _window("2024-01-03 03:00", "2024-01-03 06:00"): _hourly(
+                _window("2024-01-03 02:07", "2024-01-03 05:07"): _hourly(
                     "2024-01-03 03:00:00", "2024-01-03 04:00:00", "2024-01-03 05:00:00"
-                ),
-                _window("2024-01-03 04:58", "2024-01-03 05:01"): _bars(
-                    "2024-01-03 04:58:00", "2024-01-03 04:59:00", "2024-01-03 05:00:00"
                 ),
                 self.SHIFTED_TAIL: self.SHIFTED_TAIL_BARS,
                 _window("2024-01-09 22:00", "2024-01-10 00:00"): _hourly(
                     "2024-01-09 22:00:00", "2024-01-09 23:00:00"
                 ),
-            }
+            },
+            scan_windows=((pd.Timestamp("2024-01-03 04:07"), pd.Timestamp(self.END)),),
         )
 
         report = _run(pairs=pairs, start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert report.start == datetime(2024, 1, 3, 5, 0)
+        assert report.start == datetime(2024, 1, 3, 4, 7)
 
     def test_unreachable_source_is_not_hidden_by_shift(self):
         source = self._source(ahead=_bars("2024-01-03 04:00:00"))
