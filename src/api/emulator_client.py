@@ -22,6 +22,7 @@ from src.api.client import ClientProvider
 from src.config import HISTORICAL_API_URL
 from src.data.timeutil import to_aware_utc, to_naive
 from src.logging_setup import get_logger
+from src.instruments.futures import FuturesCard
 
 log = get_logger(__name__)
 
@@ -178,6 +179,22 @@ class HistoricalClient:
         """Проверка живости источника: ``GET /health``."""
         return self._get("/health")
 
+    def futures_catalog(self) -> tuple[FuturesCard, ...]:
+        """Полный legacy-каталог: страница ровно limit не доказывает конец."""
+        rows = []
+        offset = 0
+        while True:
+            page = self._get("/api/v1/instruments", {
+                "instrument_type": "future", "limit": 5000, "offset": offset,
+            })
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise EmulatorError("INVALID_RESPONSE", "Некорректный каталог фьючерсов")
+            rows.extend(page)
+            if len(page) < 5000:
+                break
+            offset += len(page)
+        return tuple(FuturesCard.from_row(row) for row in rows)
+
     def sync_market_data(self) -> dict:
         """Проверить импорт My Robot перед историческим прогоном."""
         url = f"{self._base_url}/api/v1/market-import/sync"
@@ -323,6 +340,10 @@ class HistoricalClient:
             # константами: пустое значение означает «источник не отдал», а не
             # «нулевое обеспечение».
             fields["expiration_date"] = _expiration(row.get("expiration_date"))
+            fields["first_trade_date"] = _expiration(row.get("first_trade_date"))
+            fields["last_trade_date"] = _expiration(row.get("last_trade_date"))
+            fields["basic_asset"] = row.get("basic_asset") or ""
+            fields["basic_asset_size"] = _quotation(row.get("basic_asset_size"))
             fields["min_price_increment_amount"] = _quotation(
                 row.get("min_price_increment_amount", row.get("min_price_increment"))
             )

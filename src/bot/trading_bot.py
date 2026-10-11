@@ -10,6 +10,7 @@ from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset
 from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
 from src.instruments import Instrument, normalize_instrument
+from src.instruments.model import instrument_key
 from src.events.event import Event
 from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
@@ -18,6 +19,7 @@ from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
+from src.history.contract_lifecycle import ConstantContractLifecycle, ContractLifecycleError
 
 log = get_logger(__name__)
 
@@ -53,7 +55,7 @@ class _EntryCandidate:
         return (
             -self.assignment.priority,
             self.assignment.id,
-            self.instrument.ticker,
+            instrument_key(self.instrument),
             self.decision.event_id or "",
         )
 
@@ -87,6 +89,7 @@ class TradingBot:
         action_executor=None,
         protection_timeframe: str = "1m",
         run=None,
+        contract_lifecycle=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -110,6 +113,7 @@ class TradingBot:
             i if isinstance(i, Instrument) else normalize_instrument(i)
             for i in instruments
         ]
+        self._contract_lifecycle = contract_lifecycle or ConstantContractLifecycle(self._instruments)
         self._tick_count = 0
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
@@ -138,6 +142,9 @@ class TradingBot:
             except KeyboardInterrupt:
                 log.info("Бот остановлен.")
                 return
+            except ContractLifecycleError as exc:
+                self._run.mark_contract_failure(str(exc))
+                return
             except Exception as exc:
                 self._report_error(exc, "обработка тика")
                 if _is_rate_limited(exc):
@@ -158,7 +165,8 @@ class TradingBot:
         опубликован (запуск на границе), ждёт его появления с тем же таймаутом,
         что и штатный тик. Возвращает ТФ с готовой свежей свечой.
         """
-        for instrument in self._instruments:
+        bootstrap_instruments = self._contract_lifecycle.market_instruments() if self._contract_lifecycle.automatic else self._instruments
+        for instrument in bootstrap_instruments:
             for tf in self._assigned_timeframes(instrument):
                 self._data_cache.frame_for(instrument, tf)
         return self._timeline.wait_until_bar_published(
@@ -175,6 +183,9 @@ class TradingBot:
         completed = False
         self._bus.publish(Event.tick_started(tick_id=tick_id))
         try:
+            if self._contract_lifecycle.automatic:
+                self._contract_lifecycle.before_tick(self._timeline.now())
+                self._instruments = list(self._contract_lifecycle.market_instruments())
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
                     try:
@@ -187,6 +198,12 @@ class TradingBot:
                 except Exception as exc:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             self._data_cache.close_tick()
+            calendar = getattr(self._data_cache, "take_calendar_event", None)
+            event = calendar() if self._contract_lifecycle.automatic and callable(calendar) else None
+            if event is not None:
+                self._run.clock.jump_to(event)
+                self._timeline.reanchor()
+                return
             if getattr(self._data_cache, "data_exhausted", False):
                 self._run.mark_data_exhausted(
                     getattr(self._data_cache, "data_exhaustion", None)
@@ -204,6 +221,9 @@ class TradingBot:
             # available minutes of other instruments behind the global TF gate.
             if self._post_tick is not None:
                 self._post_tick({self._protection_timeframe})
+            if self._contract_lifecycle.automatic:
+                self._contract_lifecycle.after_execution(self._timeline.now())
+                self._instruments = list(self._contract_lifecycle.market_instruments())
             if not ready_tfs:
                 return
             entry_candidates: list[_EntryCandidate] = []
@@ -299,6 +319,9 @@ class TradingBot:
                     continue
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=tf)
+                if self._contract_lifecycle.automatic and not self._contract_lifecycle.signal_allowed(
+                        instrument, frame["datetime"].iloc[-1], decision.bar_time, self._timeline.now()):
+                    continue
                 log.debug(
                     "%s %s | %s → %s %s",
                     self._display_name(instrument), tf, name,
@@ -308,7 +331,7 @@ class TradingBot:
                 bar_time = self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1])
                 msk_time = bar_time + timedelta(hours=BAR_TIME_TZ_OFFSET_HOURS)
                 event_id = (
-                    f"{assignment.id}:{instrument.ticker}:{tf}:"
+                    f"{assignment.id}:{instrument_key(instrument)}:{tf}:"
                     f"{msk_time.isoformat()}:{decision.signal_type.value}"
                 )
                 decision = replace(
@@ -551,7 +574,7 @@ class TradingBot:
         """Publish the admitted plan: it is queued, not yet executed."""
         economics = plan.economics
         contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
-        meta = contract_for(instrument.ticker) if callable(contract_for) else None
+        meta = contract_for(instrument_key(instrument)) if callable(contract_for) else None
         visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
         self._bus.publish(
             Event.signal(
@@ -609,6 +632,10 @@ class TradingBot:
     # ── диспетчеризация привязок по типу инструмента ──
     def _strategies_for(self, instrument: Instrument) -> list[Assignment]:
         if instrument.instrument_type == "future":
+            if isinstance(instrument.family, str):
+                from src.instruments.futures import FAMILIES
+                return self._future_strategies.get(instrument.family,
+                    self._future_strategies.get(FAMILIES[instrument.family][0], []))
             return self._future_strategies.get(instrument.ticker[:2].upper(), [])
         return self._share_strategies.get(instrument.ticker, [])
 

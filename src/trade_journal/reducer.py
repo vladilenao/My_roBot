@@ -196,6 +196,11 @@ class ExecutionReducer:
             status = event.status.value.upper()
             action_type = order["action_type"]
             filled = event.status in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}
+            if event.status is ExecutionStatus.CANCEL and event.reason == "contract-rollover":
+                # Локальная отмена неотправленного увеличения и его терминальный
+                # факт коммитятся вместе: такой intent больше нельзя claim-ить.
+                connection.execute("UPDATE outbox SET status='DISCARDED' WHERE command_id=? AND status IN ('PENDING','CLAIMED')",
+                                   (event.command_id,))
 
             if filled:
                 position, account = self._states(connection, event.trade_id)

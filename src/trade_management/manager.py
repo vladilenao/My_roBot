@@ -23,6 +23,7 @@ from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
     action_from_payload, action_payload,
 )
+from src.instruments.model import instrument_key
 from src.trade_management.errors import (
     InvalidStopBoundaryError,
     ReservationRejected,
@@ -218,6 +219,74 @@ class TradeManager:
         self._min_net_payoff = Decimal(str(min_net_payoff))
         self._max_slippage_r = Decimal(str(max_slippage_r))
         self._equity_unknown = False
+        self.contract_lifecycle = None
+
+    def initialize_account(self):
+        """Начальный капитал прогона существует и при отсутствии сделок."""
+        with self._storage.transaction() as connection:
+            self._ensure_account(connection, as_aware(self._clock.now()).isoformat())
+
+    def contract_has_obligations(self, ticker):
+        return bool(self._storage.connection.execute(
+            "SELECT 1 FROM trades t JOIN positions p USING(trade_id) WHERE t.instrument_id=? "
+            "AND (p.quantity>0 OR EXISTS(SELECT 1 FROM orders o WHERE o.trade_id=t.trade_id "
+            "AND o.status IN ('PENDING','ACK','PARTIAL') AND o.action_type IN ('OPEN','ADD','CLOSE','REDUCE','CANCEL')))",
+            (ticker,)).fetchone())
+
+    def consume_queued_broker_events(self):
+        drain = getattr(self._broker, "drain_addressed_events", None)
+        if callable(drain):
+            for event in drain():
+                self.consume(event)
+
+    def drain_contract(self, ticker, *, market_close=None):
+        """Отменить увеличения и закрыть остаток; не создавать второе ожидание."""
+        now = as_aware(self._clock.now())
+        rows = self._storage.connection.execute(
+            "SELECT o.command_id,o.trade_id FROM orders o JOIN trades t USING(trade_id) "
+            "JOIN outbox b ON b.command_id=o.command_id WHERE t.instrument_id=? "
+            "AND o.action_type IN ('OPEN','ADD') AND o.status='PENDING' AND b.status='PENDING'", (ticker,)).fetchall()
+        for command_id, trade_id in rows:
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:rollover-local-cancel", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL,
+                filled_quantity=0, price=None, fee=Decimal(0), timestamp=now, reason="contract-rollover"))
+        submitted = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker:
+                continue
+            pending = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type IN ('OPEN','ADD') AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            cancelling = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type='CANCEL' AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            if pending and not cancelling:
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision, reason="contract-rollover")
+                if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
+                    submitted.append(action)
+        # Подтверждения CANCEL могут изменить ревизию: закрытия строятся после них.
+        if submitted:
+            self.dispatch(now)
+            self.consume_queued_broker_events()
+        # CancelEntry подтверждает отмену всех увеличений сделки, включая
+        # неопределённую доставку после сбоя ACK. Поздние fills всё равно
+        # применяются reducer-ом и снова удерживают переходный барьер.
+        unresolved = self._storage.connection.execute(
+            "SELECT o.command_id,o.trade_id FROM orders o JOIN trades t USING(trade_id) "
+            "WHERE t.instrument_id=? AND o.action_type IN ('OPEN','ADD') AND o.status='PENDING' "
+            "AND EXISTS(SELECT 1 FROM orders c WHERE c.trade_id=o.trade_id AND c.action_type='CANCEL' AND c.status='CANCEL')",
+            (ticker,)).fetchall()
+        for command_id, trade_id in unresolved:
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:rollover-confirmed-cancel", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL,
+                filled_quantity=0, price=None, fee=Decimal(0), timestamp=now, reason="contract-rollover"))
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker or state.quantity <= 0:
+                continue
+            closing = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type='CLOSE' AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            if not closing:
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision, reason="contract-rollover")
+                if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
+                    submitted.append(action)
+        return tuple(submitted)
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -374,6 +443,10 @@ class TradeManager:
         is left half-written.
         """
         self._assert_stop_within_market(action, market_close)
+        if isinstance(action, AddToTrade) and self.contract_lifecycle is not None:
+            row = self._storage.connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            if row and not self.contract_lifecycle.can_increase(row[0], self._clock.now()):
+                return False
         if isinstance(action, (CloseTrade, ReduceTrade)) and action.reference_price is None and market_close is not None:
             action = replace(action, reference_price=Decimal(str(market_close)))
         now = as_aware(self._clock.now()).isoformat()
@@ -601,11 +674,11 @@ class TradeManager:
 
     def configure_visual_context(self, instruments):
         """Runtime metadata, independent of the notification channel."""
-        self._visual_instruments.update({i.ticker: i for i in instruments})
+        self._visual_instruments.update({instrument_key(i): i for i in instruments})
 
     def remember_market(self, instrument, timeframe, frame, as_of):
-        self._visual_instruments[instrument.ticker] = instrument
-        self._visual_markets[instrument.ticker, timeframe] = market_snapshot(frame, timeframe, as_of)
+        self._visual_instruments[instrument_key(instrument)] = instrument
+        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of)
 
     def _notify_execution(self, event):
         if self._execution_observer is None:
@@ -666,8 +739,10 @@ class TradeManager:
         if decision.signal_type is SignalType.HOLD:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
+        if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
+            return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
-        meta = contract(instrument.ticker) if callable(contract) else None
+        meta = contract(instrument_key(instrument)) if callable(contract) else None
         if meta is None:
             log.debug("actions_for_signal %s: нет метаданных контракта", instrument.ticker)
             return SignalAdmission(
@@ -729,17 +804,20 @@ class TradeManager:
     ) -> tuple[TradeAction, ...]:
         """Protect each live trade of the instrument from the provided frame."""
         now = now or as_aware(self._clock.now())
+        if self.contract_lifecycle is not None and self.contract_lifecycle.retiring(instrument_key(instrument), now):
+            return self.drain_contract(instrument_key(instrument))
         contract = getattr(self._broker, "contract_for", None)
-        meta = contract(instrument.ticker) if callable(contract) else None
+        meta = contract(instrument_key(instrument)) if callable(contract) else None
         if meta is None:
             return ()
-        if _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
-            return self._close_expiring(instrument.ticker)
+        automatic_contract = self.contract_lifecycle is not None and self.contract_lifecycle.contains(instrument_key(instrument))
+        if not automatic_contract and _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
+            return self._close_expiring(instrument_key(instrument))
         results: list[TradeAction] = []
-        results.extend(self._cancel_stale_entries(instrument.ticker, now))
+        results.extend(self._cancel_stale_entries(instrument_key(instrument), now))
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
-            if plan.instrument_id != instrument.ticker or state.phase not in _MANAGEABLE or state.quantity <= 0:
+            if plan.instrument_id != instrument_key(instrument) or state.phase not in _MANAGEABLE or state.quantity <= 0:
                 continue
             profile_cls = PROFILE_CLASSES.get(plan.profile.name)
             if profile_cls is None:
@@ -919,7 +997,7 @@ class TradeManager:
                 if callable(apply_with_trace):
                     filtered, filter_trace = apply_with_trace(
                         decision, context, profile_name=assignment.filter_profile,
-                        instrument=instrument.ticker, timeframe=timeframe
+                        instrument=instrument_key(instrument), timeframe=timeframe
                     )
                     if filter_trace is not None:
                         self._traces.record(filter_trace)
@@ -1003,7 +1081,7 @@ class TradeManager:
             PlanningContext(
                 trade_id=trade_id,
                 assignment_id=assignment.id,
-                instrument_id=instrument.ticker,
+                instrument_id=instrument_key(instrument),
                 signal=decision,
                 profile=snapshot,
                 market=market,
@@ -1528,7 +1606,7 @@ class TradeManager:
         elif isinstance(action, AddToTrade):
             allowed = phase in {TradePhase.OPEN, TradePhase.BUILDING}
         elif isinstance(action, CancelEntry):
-            allowed = phase is TradePhase.ENTRY_PENDING
+            allowed = phase is TradePhase.ENTRY_PENDING or (action.reason == "contract-rollover" and phase in _MANAGEABLE)
         else:
             allowed = phase in _MANAGEABLE
         if not allowed:

@@ -143,10 +143,10 @@ def open_readonly(database: Path) -> sqlite3.Connection:
             "Запустите робота и повторите либо откройте копию базы."
         ) from error
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version < 9 or version > 10:
+    if version < 9 or version > 11:
         connection.close()
         raise StateUnavailable(
-            f"схема базы версии {version}, отчёт поддерживает версии 9–10.\n"
+            f"схема базы версии {version}, отчёт поддерживает версии 9–11.\n"
             "Запустите робот один раз на обновлённом коде — он обновит базу и запишет имена контрактов."
         )
     return connection

@@ -188,12 +188,14 @@ def _show_current(instruments):
             print(f"  - {item[0]} ({item[2]})")
 
 
-def select_instruments(validation_pause_secs=0, client_provider=None, market_now=None):
+def select_instruments(validation_pause_secs=0, client_provider=None, market_now=None, historical=False):
     """Интерактивный выбор инструментов через клиента источника данных прогона.
 
     ``client_provider`` — порт источника (исторический прогон отдаёт свой
     клиент), ``market_now`` — рыночный момент для окна экспирации и валидации.
     """
+    if historical:
+        return _select_history(client_provider, market_now)
     instruments = []
     print("=== Выбор торговых инструментов ===\n")
 
@@ -244,3 +246,49 @@ def select_instruments(validation_pause_secs=0, client_provider=None, market_now
     print()
 
     return instruments
+
+
+def _select_history(client_provider, market_now):
+    from src.history.selection import HistorySelection
+    from src.instruments.futures import FAMILIES, family_for
+    from src.instruments.model import normalize_instrument
+
+    fixed, families, catalog = [], [], None
+    print("=== Выбор инструментов исторического прогона ===")
+    with client_provider.client_context() as client:
+        while True:
+            kind = _ask_choice("Акции — 1, фьючерсы — 2: ", ("1", "2"))
+            if kind == "1":
+                found = _select_from_list(client, [(t, t, "share") for t in RTS_STOCK_TICKERS], "share", market_now=market_now)
+                fixed.extend(normalize_instrument(item) for item in found)
+            else:
+                mode = _ask_choice("Семейство с автоматической сменой — 1 (Enter), фиксированный контракт — 2: ", ("", "1", "2"))
+                if mode == "2":
+                    found = _select_from_list(client, fetch_active_futures(client, market_now), "future", market_now=market_now)
+                    for item in found:
+                        instrument = normalize_instrument(item)
+                        if family_for(instrument.ticker, instrument.short_name or "") in families:
+                            print("Конфликт: семейство уже выбрано автоматически.")
+                        else:
+                            fixed.append(instrument)
+                else:
+                    if catalog is None:
+                        catalog = client.futures_catalog()
+                    choices = [family for family in FAMILIES if any(c.family == family and c.standard for c in catalog)]
+                    for index, family in enumerate(choices, 1):
+                        print(f"  {index}. {family} ({FAMILIES[family][1]})")
+                    raw = input("Семейства: номера или коды через запятую: ").strip()
+                    for token in raw.replace(",", " ").split():
+                        family = choices[int(token)-1] if token.isdigit() and 1 <= int(token) <= len(choices) else token.upper()
+                        if family not in choices:
+                            print("Неизвестное или отсутствующее семейство.")
+                        elif any(i.instrument_type == "future" and family_for(i.ticker, i.short_name or "") == family for i in fixed):
+                            print("Конфликт: контракт семейства уже выбран фиксированно.")
+                        elif family not in families:
+                            families.append(family)
+            again = _ask_choice("Добавить ещё инструменты? (да/нет): ", ("да", "нет", "д", "n", "y", "yes", "no"))
+            if again in ("нет", "n", "no"):
+                if fixed or families:
+                    unique = {(i.ticker, i.instrument_type): i for i in fixed}
+                    return HistorySelection(tuple(unique.values()), tuple(families), catalog or ())
+                print("Необходимо выбрать хотя бы один инструмент.")

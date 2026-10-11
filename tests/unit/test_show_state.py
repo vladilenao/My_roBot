@@ -415,7 +415,7 @@ def test_unknown_account_does_not_become_zero_capital(tmp_path):
 
 def test_v10_report_refuses_future_schema(tmp_path):
     path, connection = _database(tmp_path)
-    connection.execute("PRAGMA user_version=11")
+    connection.execute("PRAGMA user_version=12")
     connection.commit()
     connection.close()
     with pytest.raises(show_state.StateUnavailable):

@@ -98,9 +98,11 @@ _DEFAULTS = {
     # Горизонт блокировки входов и принудительного закрытия фьючерсов:
     # календарные сутки до момента экспирации контракта.
     "contract_expiry_block_days": 2,
+    "historical_rollover": {"policy": "calendar", "families": {}},
 }
 
 _CONFIG = load_config(_DEFAULTS)
+HISTORICAL_ROLLOVER = _CONFIG["historical_rollover"]
 
 TIMEFRAME = _CONFIG["timeframe"]
 if TIMEFRAME not in TIMEFRAMES:

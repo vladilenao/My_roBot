@@ -66,6 +66,10 @@ class HistoricalRunSession(RunSession):
         self._data_exhausted_at = None
         self._exhaustion = None
         self._gaps_skipped = 0
+        self._contract_failure = ""
+
+    def mark_contract_failure(self, reason):
+        self._contract_failure = reason
 
     @property
     def start(self):
@@ -78,7 +82,7 @@ class HistoricalRunSession(RunSession):
     @property
     def covered(self) -> bool:
         """Дошёл ли прогон до правой границы диапазона (полный охват)."""
-        return self._data_exhausted_at is None and self._clock.finished
+        return not self._contract_failure and self._data_exhausted_at is None and self._clock.finished
 
     @property
     def exhaustion(self):
@@ -116,9 +120,11 @@ class HistoricalRunSession(RunSession):
         )
 
     def should_stop(self) -> bool:
-        return self._data_exhausted_at is not None or self._clock.finished
+        return bool(self._contract_failure) or self._data_exhausted_at is not None or self._clock.finished
 
     def stop_reason(self) -> str:
+        if self._contract_failure:
+            return f"незавершённый контрактный переход: {self._contract_failure}"
         if self._data_exhausted_at is not None:
             stop_at = _stamp(self._data_exhausted_at)
             exhaustion = self._exhaustion

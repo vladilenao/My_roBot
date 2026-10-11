@@ -40,6 +40,9 @@ class HtfFrameProvider:
         (время закрытия рабочей свечи тика). Если ``max_close`` не задан —
         свечи, закрытые к текущему моменту планировщика.
         """
+        resolver = getattr(self._cache, "instrument_for", None)
+        if isinstance(instrument, str) and callable(resolver):
+            instrument = resolver(instrument)
         self._cache.ensure_loaded(instrument, timeframe)
         frame = self._cache.frame_for(instrument, timeframe)
         if frame is None or frame.empty:

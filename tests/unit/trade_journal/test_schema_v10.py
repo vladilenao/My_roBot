@@ -33,7 +33,7 @@ def test_migration_preserves_money_and_active_state_without_ruble_reset():
     before = {table: connection.execute(f"SELECT * FROM {table}").fetchall()
               for table in ("trades", "positions", "account", "orders", "protection", "targets", "reservations")}
     schema.initialize_schema(connection, initial_balance="123456")
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     for table, rows in before.items():
         assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
@@ -74,7 +74,7 @@ def test_current_schema_has_new_tables_and_rejects_future_versions():
     schema.initialize_schema(connection)
     tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"cost_adjustments", "trade_measurements", "trade_market_observations"} <= tables
-    connection.execute("PRAGMA user_version=11")
+    connection.execute(f"PRAGMA user_version={schema.SCHEMA_VERSION+1}")
     with pytest.raises(schema.UnsupportedSchemaVersion):
         schema.initialize_schema(connection)
     connection.close()
@@ -83,8 +83,9 @@ def test_current_schema_has_new_tables_and_rejects_future_versions():
 def test_v9_reader_refuses_v10_without_mutating_the_database(monkeypatch):
     connection = sqlite3.connect(":memory:")
     schema.initialize_schema(connection)
+    original_version = schema.SCHEMA_VERSION
     monkeypatch.setattr(schema, "SCHEMA_VERSION", 9)
     with pytest.raises(schema.UnsupportedSchemaVersion):
         schema.initialize_schema(connection)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == original_version
     connection.close()

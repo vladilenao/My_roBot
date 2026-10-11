@@ -202,6 +202,7 @@ class JournalBroker(BrokerPort):
         self._scheduled_actions: list[ScheduledAction] = []
         self._processing_due: list[ScheduledAction] = []
         self._processed_addressed_bars: set[tuple[str, datetime]] = set()
+        self.increase_allowed = None
         # Addressed SQLite runtime starts with no CSV-derived state. Legacy CSV
         # callers retain their explicit replay path below.
         if journal is not None:
@@ -748,6 +749,14 @@ class JournalBroker(BrokerPort):
                 pending.append(scheduled)
         self._scheduled_actions = pending
         self._processing_due = due
+
+        if self.increase_allowed is not None:
+            for scheduled in due:
+                action = scheduled.action
+                trade = self._addressed_trades[action.trade_id]
+                if isinstance(action, (OpenTrade, AddToTrade)) and not self.increase_allowed(
+                        trade.plan.instrument_id, moments[trade.plan.instrument_id]):
+                    self._cancel_increases(trade, moments[trade.plan.instrument_id], "contract-rollover")
 
         # A confirmed stop amendment is active at this bar's open, before its range.
         for scheduled in due:

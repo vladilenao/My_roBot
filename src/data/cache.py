@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.api.retry import DEFAULT_BASE_DELAY, rate_limit_reset_secs
 from src.data.timeutil import to_naive
+from src.instruments.model import instrument_key
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -149,6 +150,48 @@ class MarketDataCache:
         self._tick_expected: set[str] = set()
         self._lock = threading.RLock()
         self._coverage_blocks: set[tuple] = set()
+        self._active_tickers = None
+        self._active_pairs = None
+        self._next_contract_event = None
+        self._pending_calendar = None
+
+    def set_active_instruments(self, instruments, *, next_event=None, active_pairs=None):
+        self._active_tickers = {instrument_key(item) for item in instruments}
+        self._active_pairs = active_pairs
+        self._next_contract_event = next_event
+
+    def _active_key(self, key):
+        return (self._active_tickers is None or key[0] in self._active_tickers) and (
+            self._active_pairs is None or (key[0], key[2]) in self._active_pairs)
+
+    def instrument_for(self, ticker):
+        return next(instrument for instrument in self._instruments.values() if instrument_key(instrument) == ticker)
+
+    def take_calendar_event(self):
+        event, self._pending_calendar = self._pending_calendar, None
+        return event
+
+    @_synchronized
+    def prepare_history(self, instrument, timeframe, min_bars, earliest):
+        """Собственные закрытые бары; служебное чтение не двигает исполнение."""
+        now = _naive(self._timeline.now())
+        if now <= earliest:
+            return False
+        self.ensure_loaded(instrument, timeframe)
+        frame = self.frame_for(instrument, timeframe)
+        span = pd.Timedelta(days=30)
+        while len(frame) < min_bars:
+            span *= 2
+            lower = max(_naive(earliest), now-span)
+            key = self._key(instrument, timeframe)
+            loaded = self._load(instrument, timeframe, start_date=lower)
+            self._frames[key] = loaded
+            frame = self.frame_for(instrument, timeframe)
+            if not frame.empty:
+                self._last_loaded[key] = _naive(frame["datetime"].max())
+            if lower == _naive(earliest):
+                break
+        return len(frame) >= min_bars
 
     @property
     def missed_bars(self) -> int:
@@ -175,7 +218,7 @@ class MarketDataCache:
         return gap
 
     def _key(self, instrument, timeframe: str) -> tuple:
-        return (instrument.ticker, instrument.instrument_type, timeframe)
+        return (instrument_key(instrument), instrument.instrument_type, timeframe)
 
     def _source_kwargs(self) -> dict:
         """Аргументы источника данных для загрузчика.
@@ -205,7 +248,7 @@ class MarketDataCache:
             start_date=start_date,
             end_date=end_date,
             token=self._token,
-            instrument_id=self._uids.get(key),
+            instrument_id=self._uids.get(key) or getattr(instrument, "uid", None),
             **self._source_kwargs(),
         )
         if instrument_id is not None:
@@ -304,6 +347,8 @@ class MarketDataCache:
             return
         frame = self._frames[key]
         if frame is None or frame.empty:
+            if self._history:
+                self._initial_load(instrument, timeframe, key)
             return
         now = _naive(self._timeline.now())
         if not self._history:
@@ -356,12 +401,17 @@ class MarketDataCache:
             self._retry_after = None
         candidates = []
         for key in list(self._frames.keys()):
-            if key[2] != timeframe:
+            if key[2] != timeframe or not self._active_key(key):
                 continue
             if not force and self._observed.get(key, boundary) >= boundary:
                 continue
             frame = self._frames[key]
             if frame is None or frame.empty:
+                if self._history:
+                    self._initial_load(self._instruments[key], timeframe, key)
+                    frame = self._frames[key]
+                    if frame is not None and not frame.empty:
+                        candidates.append((pd.Timestamp.min, key))
                 self._observed[key] = boundary
                 continue
             closed = self._closed_only(frame, timeframe)
@@ -452,7 +502,7 @@ class MarketDataCache:
             frames = [
                 frame
                 for key, frame in self._frames.items()
-                if key[2] == timeframe
+                if key[2] == timeframe and self._active_key(key)
             ]
             if not frames:
                 return True
@@ -471,7 +521,7 @@ class MarketDataCache:
         lagging = False
         have_frames = False
         for key, frame in self._frames.items():
-            if key[2] != timeframe:
+            if key[2] != timeframe or not self._active_key(key):
                 continue
             have_frames = True
             if frame is None or frame.empty:
@@ -581,6 +631,11 @@ class MarketDataCache:
             # отсутствие ответа ничего не говорит о наличии баров. Разрыв остаётся
             # открытым, и поиск повторяется на следующих тиках.
             return
+        event = self._next_contract_event(now) if self._next_contract_event is not None else None
+        if event is not None and now < _naive(event) <= self._gap_search_ceiling(now) and (resume is None or _naive(event) <= resume):
+            self._pending_calendar = event
+            self._empty_ticks = 0
+            return
         self._gap = None
         if resume is None:
             horizon_end = self._gap_search_ceiling(now)
@@ -672,7 +727,7 @@ class MarketDataCache:
         best: pd.Timestamp | None = None
         failed = False
         for key, frame in list(self._frames.items()):
-            if key[2] != timeframe or frame is None or frame.empty:
+            if key[2] != timeframe or not self._active_key(key):
                 continue
             try:
                 probe = self._load(
@@ -712,7 +767,7 @@ class MarketDataCache:
 
     def _driver_timeframe(self) -> str | None:
         """Мельчайший активный таймфрейм: по нему считаются тик прогона и пропуски."""
-        timeframes = {key[2] for key in self._frames}
+        timeframes = {key[2] for key in self._frames if self._active_key(key)}
         if not timeframes:
             return None
         now = self._timeline.now()
@@ -725,7 +780,7 @@ class MarketDataCache:
             return None
         last: pd.Timestamp | None = None
         for key, frame in self._frames.items():
-            if key[2] != target or frame is None or frame.empty:
+            if key[2] != target or not self._active_key(key) or frame is None or frame.empty:
                 continue
             closed = self._closed_only(frame, target)
             if closed.empty:
