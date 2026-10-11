@@ -404,6 +404,10 @@ class EmulatorClientProvider(ClientProvider):
     def base_url(self) -> str:
         return self._base_url
 
+    @property
+    def snapshot_generation(self) -> int | None:
+        return self._snapshot_generation
+
     def client_context(self, token=None) -> HistoricalClient:
         return HistoricalClient(
             self._base_url, timeout=self._timeout,

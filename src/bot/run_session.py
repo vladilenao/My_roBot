@@ -67,6 +67,29 @@ class HistoricalRunSession(RunSession):
         self._exhaustion = None
         self._gaps_skipped = 0
         self._contract_failure = ""
+        self.boundary_checks = ()
+        self.terminal_gap = None
+        self._source_failed = False
+        self._drivers_complete = True
+
+    def update_data_status(self, *, source_failed, drivers_complete):
+        self._source_failed = source_failed
+        self._drivers_complete = drivers_complete
+
+    def set_boundary_checks(self, checks):
+        self.boundary_checks = tuple(checks)
+
+    def complete_terminal_gap(self, gap):
+        if self._data_exhausted_at is not None or gap.end != self.end:
+            return False
+        # Cache проверяет источник/снимок и фактические обработанные хвосты;
+        # сессия принимает только собственное доказательство предпроверки.
+        if not gap.checks or any(not item.ok or item.role != "end" or item.boundary != self.end or
+            not any(item.identity == own.identity and item == own for own in self.boundary_checks) for item in gap.checks):
+            return False
+        self.terminal_gap = gap
+        self._clock.jump_to(self.end)
+        return True
 
     def mark_contract_failure(self, reason):
         self._contract_failure = reason
@@ -82,7 +105,8 @@ class HistoricalRunSession(RunSession):
     @property
     def covered(self) -> bool:
         """Дошёл ли прогон до правой границы диапазона (полный охват)."""
-        return not self._contract_failure and self._data_exhausted_at is None and self._clock.finished
+        return (not self._contract_failure and not self._source_failed and self._drivers_complete
+                and self._data_exhausted_at is None and self._clock.finished)
 
     @property
     def exhaustion(self):
@@ -147,6 +171,10 @@ class HistoricalRunSession(RunSession):
                 f"[{horizon}], до конца диапазона ({_stamp(self.end)}) прогон не дошёл"
             )
         if self._clock.finished:
+            if self._source_failed or not self._drivers_complete:
+                return "конец диапазона достигнут, но обязательный проверенный хвост не обработан или источник ответил ошибкой; неполный охват"
+            if self.terminal_gap is not None:
+                return "конец диапазона внутри подтверждённого перерыва"
             return (
                 f"диапазон [{_stamp(self.start)} — {_stamp(self.end)}) обработан полностью"
             )
@@ -156,8 +184,9 @@ class HistoricalRunSession(RunSession):
         """Сколько тиков рыночного времени уже отработано."""
         if self._clock.now() <= self._clock.start:
             return 0
+        processed_until = self._clock.now() if self.terminal_gap is None else self.terminal_gap.last_processed_bar+self._clock.step
         return int(
-            (self._clock.now() - self._clock.start).total_seconds()
+            (processed_until - self._clock.start).total_seconds()
             // self._clock.step.total_seconds()
         )
 

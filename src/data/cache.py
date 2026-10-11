@@ -11,6 +11,7 @@ import pandas as pd
 from src.api.retry import DEFAULT_BASE_DELAY, rate_limit_reset_secs
 from src.data.timeutil import to_naive
 from src.instruments.model import instrument_key
+from src.history.source import source_identity
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -92,6 +93,13 @@ class DataExhaustion:
     horizon_limited: bool = False
 
 
+@dataclass(frozen=True)
+class TerminalGap:
+    end: pd.Timestamp
+    last_processed_bar: pd.Timestamp
+    checks: tuple
+
+
 class MarketDataCache:
     """Кэш истории свечей: дозагрузка только новых закрытых баров, отдача закрытых свечей.
 
@@ -154,6 +162,95 @@ class MarketDataCache:
         self._active_pairs = None
         self._next_contract_event = None
         self._pending_calendar = None
+        self._boundary_checks = ()
+        self._processed_drivers = {}
+        self._pending_terminal_gap = None
+        self._terminal_gap_counted = False
+        self._failed_reads = set()
+
+    @property
+    def history_source_failed(self):
+        return bool(self._failed_reads)
+
+    def set_boundary_checks(self, checks):
+        self._boundary_checks = tuple(checks)
+
+    @property
+    def last_processed_bar(self):
+        return max(self._processed_drivers.values(), default=None)
+
+    def note_driver_processed(self):
+        """Вызывается после обработки тика, а не при прогреве/чтении свечей."""
+        if not self._history:
+            return
+        tf = self._driver_timeframe()
+        for key, frame in self._frames.items():
+            if key[2] != tf or not self._active_key(key) or frame is None or frame.empty:
+                continue
+            closed = self._closed_only(frame, tf)
+            closed = closed.loc[(closed["datetime"] >= self._clock.start) & (closed["datetime"] < self._clock.end)]
+            if closed.empty:
+                continue
+            uid = self._uids.get(key) or getattr(self._instruments[key], "uid", None)
+            identity = (uid, key[1], key[2])
+            self._processed_drivers[identity] = _naive(closed["datetime"].max())
+
+    def take_terminal_gap(self):
+        gap, self._pending_terminal_gap = self._pending_terminal_gap, None
+        return gap
+
+    def _end_driver_checks(self):
+        if not self._boundary_checks or self._failed_reads:
+            return ()
+        end, tf = self._history_range_end(), self._driver_timeframe()
+        if end is None or tf is None:
+            return ()
+        source, snapshot = source_identity(self._client_provider)
+        checks = [item for item in self._boundary_checks if item.role == "end" and item.boundary == end and item.pair.timeframe == tf]
+        indexed = {(item.pair.instrument_id, item.pair.instrument_type, tf): item for item in checks}
+        active = {(self._uids.get(key) or getattr(instrument, "uid", None), key[1], tf)
+                  for key, instrument in self._instruments.items() if key[2] == tf and self._active_key(key)}
+        required = set(indexed) | active
+        if not required:
+            return ()
+        for identity in required:
+            item = indexed.get(identity)
+            if item is None or not item.ok or item.source_id != source or item.snapshot_generation != snapshot or not identity[0]:
+                return ()
+            processed = self._processed_drivers.get(identity)
+            if processed is None or item.last_before is None or processed < item.last_before:
+                return ()
+        return tuple(checks)
+
+    def final_drivers_processed(self):
+        return not self._boundary_checks or bool(self._end_driver_checks())
+
+    def _confirm_terminal_gap(self, now):
+        if self._terminal_gap_counted:
+            return False
+        checks = self._end_driver_checks()
+        if not checks or not any(item.status == "confirmed_gap" for item in checks):
+            return False
+        end, tf = self._history_range_end(), self._driver_timeframe()
+        # Все возможные события до end должны сначала пройти обычный контур.
+        event = self._next_contract_event(now) if self._next_contract_event is not None else None
+        if event is not None and now < _naive(event) < _naive(end):
+            return False
+        last = max(_naive(item.last_before) for item in checks)
+        period = pd.Timedelta(seconds=self._tf_period_secs(tf))
+        lower = last+period
+        if now < lower:
+            return False
+        span = max(pd.Timedelta(0), _naive(end)-lower)
+        if span > pd.Timedelta(0):
+            self._missed_bars += int(-(-span.value // period.value))
+            self._gaps += 1
+            self._longest_gap = max(self._longest_gap, span)
+        self._gap = None
+        self._empty_ticks = 0
+        self._terminal_gap_counted = True
+        self._pending_terminal_gap = TerminalGap(_naive(end), last, tuple(checks))
+        return True
 
     def set_active_instruments(self, instruments, *, next_event=None, active_pairs=None):
         self._active_tickers = {instrument_key(item) for item in instruments}
@@ -241,19 +338,31 @@ class MarketDataCache:
         """
         key = self._key(instrument, timeframe)
         self._last_api_attempt = _naive(self._timeline.now())
-        df, instrument_id = self._loader(
-            ticker=instrument.ticker,
-            instrument_type=instrument.instrument_type,
-            timeframe=timeframe,
-            start_date=start_date,
-            end_date=end_date,
-            token=self._token,
-            instrument_id=self._uids.get(key) or getattr(instrument, "uid", None),
-            **self._source_kwargs(),
-        )
+        if self._history and (end_date is not None or _naive(self._timeline.now()) > _naive(self._clock.end)):
+            end_date = min(_naive(end_date or self._timeline.now()), _naive(self._clock.end))
+        try:
+            df, instrument_id = self._loader(
+                ticker=instrument.ticker,
+                instrument_type=instrument.instrument_type,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                token=self._token,
+                instrument_id=self._uids.get(key) or getattr(instrument, "uid", None),
+                **self._source_kwargs(),
+            )
+        except Exception:
+            if self._history:
+                self._failed_reads.add(key)
+            raise
+        self._failed_reads.discard(key)
         if instrument_id is not None:
             self._uids[key] = instrument_id
         if df is not None and not df.empty and "datetime" in df.columns:
+            if self._history:
+                df = df.copy()
+                df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(None)
+                df = df.loc[df["datetime"] < _naive(self._clock.end)]
             df = df.sort_values("datetime").reset_index(drop=True)
             if self._market_store is not None and instrument_id:
                 self._market_store.record_candles(
@@ -636,6 +745,8 @@ class MarketDataCache:
             self._pending_calendar = event
             self._empty_ticks = 0
             return
+        if resume is None and self._confirm_terminal_gap(now):
+            return
         self._gap = None
         if resume is None:
             horizon_end = self._gap_search_ceiling(now)
@@ -738,12 +849,13 @@ class MarketDataCache:
                 )
             except Exception as exc:
                 log.warning("Не удалось найти следующий бар для %s: %s", key, exc)
+                self._failed_reads.add(key)
                 failed = True
                 continue
             if probe is None or probe.empty or "datetime" not in probe.columns:
                 continue
             stamps = _naive_series(probe["datetime"])
-            later = stamps[(stamps > now) & (stamps <= ceiling)]
+            later = stamps[(stamps > now) & (stamps < ceiling)]
             if later.empty:
                 continue
             candidate = later.min()

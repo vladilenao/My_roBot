@@ -198,10 +198,21 @@ class TradingBot:
                 except Exception as exc:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             self._data_cache.close_tick()
+            if self._run.is_virtual and callable(getattr(self._data_cache, "final_drivers_processed", None)):
+                self._run.update_data_status(source_failed=self._data_cache.history_source_failed,
+                                             drivers_complete=self._data_cache.final_drivers_processed())
             calendar = getattr(self._data_cache, "take_calendar_event", None)
             event = calendar() if self._contract_lifecycle.automatic and callable(calendar) else None
             if event is not None:
                 self._run.clock.jump_to(event)
+                self._timeline.reanchor()
+                if getattr(self._run, "boundary_checks", ()):
+                    self._contract_lifecycle.before_tick(event)
+                    self._contract_lifecycle.after_execution(event)
+                return
+            terminal = getattr(self._data_cache, "take_terminal_gap", None)
+            completion = terminal() if self._run.is_virtual and callable(terminal) else None
+            if completion is not None and self._run.complete_terminal_gap(completion):
                 self._timeline.reanchor()
                 return
             if getattr(self._data_cache, "data_exhausted", False):
@@ -220,10 +231,17 @@ class TradingBot:
             # may calculate a new entry. One lagging pair must not block the
             # available minutes of other instruments behind the global TF gate.
             if self._post_tick is not None:
-                self._post_tick({self._protection_timeframe})
+                execution_complete = self._post_tick({self._protection_timeframe}) is not False
+            else:
+                execution_complete = True
             if self._contract_lifecycle.automatic:
                 self._contract_lifecycle.after_execution(self._timeline.now())
                 self._instruments = list(self._contract_lifecycle.market_instruments())
+            note_processed = getattr(self._data_cache, "note_driver_processed", None)
+            if self._run.is_virtual and execution_complete and callable(note_processed):
+                note_processed()
+                self._run.update_data_status(source_failed=self._data_cache.history_source_failed,
+                                             drivers_complete=self._data_cache.final_drivers_processed())
             if not ready_tfs:
                 return
             entry_candidates: list[_EntryCandidate] = []

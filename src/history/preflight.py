@@ -5,24 +5,27 @@
 перечисляются пользователю целиком: прогон не начинается, пока есть хотя бы
 одна непрочитанная пара «инструмент, таймфрейм».
 
-Границы проверяются по правилам самой пары: хвост должен дотягиваться до бара
-``конец − период`` этой пары, а не до минуты конца, поэтому старший таймфрейм
-не требует данных там, где их и не бывает. Начало в нерабочей точке календаря
-(праздник, выходной) не отвергает прогон: если ближайшая свеча нашлась в
-``LOOKAHEAD`` и сдвиг даёт покрытый прогрев, начало переносится на неё, а
-сдвиг попадает в отчёт. Данных, начинающихся заметно позже, это не касается —
-такое расхождение остаётся ошибкой, чтобы опечатка в диапазоне не прошла молча.
+Правая граница проверяется по сетке пары или ограниченному перерыву,
+подтверждённому соседними барами той же пары и снимка. Начало в нерабочей точке календаря
+(праздник, выходной) не отвергает прогон: начало задаёт драйверный (наименьший
+активный) таймфрейм, и если его ближайшая свеча нашлась в ``LOOKAHEAD``, начало
+переносится ровно на неё, а прогрев проверяется отдельно. Старшие таймфреймы
+берут контекст из прогрева и старт не двигают. Данных, начинающихся заметно
+позже, это не касается — такое расхождение остаётся ошибкой, чтобы опечатка в
+диапазоне не прошла молча.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 from src.data.timeutil import to_naive
 from src.logging_setup import get_logger
+from src.scheduler.timing import CandleScheduler
+from src.history.source import source_identity
 
 log = get_logger(__name__)
 
@@ -74,9 +77,134 @@ class Pair:
     ticker: str
     instrument_type: str
     timeframe: str
+    instrument_id: str | None = field(default=None, compare=False)
+    short_name: str | None = field(default=None, compare=False)
 
     def __str__(self) -> str:
-        return f"{self.ticker} {self.timeframe}"
+        name = self.short_name or (self.ticker if self.instrument_type == "share" else "контракт не указан")
+        return f"{name} {self.timeframe}"
+
+
+@dataclass(frozen=True)
+class BoundaryCheck:
+    """Доказательство границы содержит только метки и идентичности, без OHLCV."""
+
+    pair: Pair
+    source_id: str
+    snapshot_generation: int | None
+    role: str
+    boundary: datetime
+    expected: datetime
+    left_window: tuple[datetime, datetime]
+    status: str = "failed"
+    last_before: datetime | None = None
+    first_after: datetime | None = None
+    right_window: tuple[datetime, datetime] | None = None
+    gap_seconds: float = 0
+    error: str | None = None
+
+    @property
+    def ok(self):
+        return self.status in {"covered", "confirmed_gap"}
+
+    @property
+    def identity(self):
+        return (self.pair.instrument_id, self.pair.instrument_type, self.pair.timeframe,
+                self.source_id, self.snapshot_generation, self.role, self.boundary)
+
+    def message(self):
+        windows = f"[{self.left_window[0]}, {self.left_window[1]})"
+        if self.right_window is not None:
+            windows += f" / [{self.right_window[0]}, {self.right_window[1]})"
+        prefix = f"{self.pair}: граница {self.boundary}, ожидался бар {self.expected}; поиск {windows}"
+        if self.status == "covered":
+            return f"{prefix}: граница покрыта фактическим баром {self.last_before}"
+        if self.status == "confirmed_gap":
+            return (f"{prefix}: перерыв на границе подтверждён соседними барами "
+                    f"{self.last_before} и {self.first_after}, разрыв {_span(timedelta(seconds=self.gap_seconds))}")
+        return f"{prefix}: конец диапазона не покрыт — {self.error}"
+
+    def payload(self):
+        def stamp(value):
+            return None if value is None else value.isoformat()+"Z"
+
+        result = asdict(self)
+        result["pair"] = {"instrument_id": self.pair.instrument_id, "instrument_type": self.pair.instrument_type,
+                          "contract": self.pair.short_name or (self.pair.ticker if self.pair.instrument_type == "share" else "контракт не указан"),
+                          "timeframe": self.pair.timeframe}
+        for key in ("boundary", "expected", "last_before", "first_after"):
+            result[key] = stamp(getattr(self, key))
+        for key in ("left_window", "right_window"):
+            value = getattr(self, key)
+            result[key] = None if value is None else [stamp(item) for item in value]
+        return result
+
+
+def _boundary_frame(frame, lower, upper, pair):
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["datetime"])
+    frame = frame.copy()
+    for column, expected in (("instrument_id", pair.instrument_id), ("timeframe", pair.timeframe)):
+        if column in frame and expected is not None and not frame[column].eq(expected).all():
+            raise ValueError(f"данные другой пары: {column}")
+    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True, format="mixed").dt.tz_convert(None)
+    if "is_complete" in frame:
+        frame = frame.loc[frame["is_complete"].astype(bool)]
+    return frame.loc[(frame["datetime"] >= lower) & (frame["datetime"] < upper)].sort_values(
+        "datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
+
+
+def check_right_boundary(pair, *, start, boundary, load_candles, client_provider=None, clock=None,
+                         deadline=None, role="end", initial_tail=None):
+    start, boundary = to_naive(start).to_pydatetime(), to_naive(boundary).to_pydatetime()
+    lower = max(start, boundary-LOOKAHEAD)
+    upper = min(boundary+LOOKAHEAD, to_naive(deadline).to_pydatetime()) if deadline is not None else boundary+LOOKAHEAD
+    expected = CandleScheduler(pair.timeframe).previous_candle_start(boundary)
+    source, snapshot = source_identity(client_provider)
+    result = BoundaryCheck(pair, source, snapshot, role, boundary, expected, (lower, boundary))
+
+    def fetch(left, right):
+        frame, uid = load_candles(ticker=pair.ticker, instrument_type=pair.instrument_type, timeframe=pair.timeframe,
+            start_date=left, end_date=right, instrument_id=pair.instrument_id, client_provider=client_provider, clock=clock)
+        if pair.instrument_id is not None and uid != pair.instrument_id:
+            raise ValueError("источник вернул другую идентичность инструмента")
+        return _boundary_frame(frame, left, right, pair)
+
+    try:
+        if initial_tail is not None:
+            frame, initial_lower = initial_tail
+            result = replace(result, left_window=(initial_lower, boundary))
+            tail = _boundary_frame(frame, initial_lower, boundary, pair)
+        else:
+            tail = fetch(lower, boundary)
+        if not tail.empty and tail["datetime"].max() >= expected:
+            return replace(result, status="covered", last_before=tail["datetime"].max().to_pydatetime())
+        if initial_tail is not None and initial_lower > lower:
+            if not tail.empty:
+                result = replace(result, last_before=tail["datetime"].max().to_pydatetime())
+            result = replace(result, left_window=(lower, boundary))
+            tail = fetch(lower, boundary)
+        if tail.empty:
+            return replace(result, error="не покрывают конец диапазона: пустой рабочий хвост")
+        last = tail["datetime"].max().to_pydatetime()
+        if last >= expected:
+            return replace(result, status="covered", last_before=last)
+        result = replace(result, last_before=last, right_window=(boundary, upper))
+        if not pair.instrument_id:
+            return replace(result, error="не разрешена устойчивая идентичность пары")
+        if upper <= boundary:
+            return replace(result, error="нет допустимого окна продолжения до границы обращения")
+        right = fetch(boundary, upper)
+        if right.empty:
+            return replace(result, error="нет допустимого бара-продолжения")
+        following = right["datetime"].min().to_pydatetime()
+        gap = max(timedelta(0), following-(last+_period(pair.timeframe)))
+        result = replace(result, first_after=following, gap_seconds=gap.total_seconds())
+        if gap > LOOKAHEAD:
+            return replace(result, error="разрыв целиком превышает семь суток")
+        return replace(result, status="confirmed_gap")
+    except Exception as exc:
+        return replace(result, error=f"ошибка обязательного диагностического чтения: {exc}")
 
 
 def active_pairs(
@@ -100,7 +228,9 @@ def active_pairs(
         timeframes = {assignment.timeframe for assignment in assignments}
         timeframes.add(protection_timeframe)
         for timeframe in sorted(timeframes, key=lambda tf: _period(tf)):
-            pairs.append(Pair(instrument.ticker, instrument.instrument_type, timeframe))
+            uid, name = getattr(instrument, "uid", None), getattr(instrument, "short_name", None)
+            pairs.append(Pair(instrument.ticker, instrument.instrument_type, timeframe,
+                              uid if isinstance(uid, str) else None, name if isinstance(name, str) else None))
     return tuple(pairs)
 
 
@@ -114,6 +244,7 @@ class PreflightReport:
     shift_to: datetime | None = None
     checked_pairs: int = 0
     detail: list[str] = field(default_factory=list)
+    boundaries: tuple[BoundaryCheck, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -135,6 +266,7 @@ class PreflightReport:
             lines.append("")
             lines.append("Проверенные пары:")
             lines.extend(f"  - {line}" for line in self.detail)
+        lines.extend(f"  {item.message()}" for item in self.boundaries if item.status == "confirmed_gap")
         return "\n".join(lines)
 
 
@@ -218,6 +350,7 @@ def run_preflight(
             shift_to=None,
             checked_pairs=shifted.checked_pairs,
             detail=shifted.detail,
+            boundaries=shifted.boundaries,
         )
     elif not report.ok:
         return report
@@ -254,7 +387,9 @@ def _with_continuity_note(
     """
     try:
         note = _scan_continuity(
-            pairs,
+            [replace(pair, instrument_id=next((item.pair.instrument_id for item in report.boundaries
+                if (item.pair.ticker, item.pair.instrument_type, item.pair.timeframe) ==
+                   (pair.ticker, pair.instrument_type, pair.timeframe)), pair.instrument_id)) for pair in pairs],
             start_dt=start_dt,
             end_dt=end_dt,
             load_candles=load_candles,
@@ -273,6 +408,7 @@ def _with_continuity_note(
         shift_to=report.shift_to,
         checked_pairs=report.checked_pairs,
         detail=report.detail,
+        boundaries=report.boundaries,
     )
 
 
@@ -311,7 +447,7 @@ def _scan_continuity(
                 timeframe=pair.timeframe,
                 start_date=start_dt,
                 end_date=scan_end,
-                instrument_id=None,
+                instrument_id=pair.instrument_id,
                 client_provider=client_provider,
                 clock=clock,
             )
@@ -363,9 +499,12 @@ def _check_all(
     """Один проход по всем парам: границы диапазона и отметка о недоступном источнике."""
     problems: list[str] = []
     detail: list[str] = []
+    boundaries = []
     if ping_problem is not None:
         problems.append(ping_problem)
 
+    driver_period = min((_period(pair.timeframe) for pair in pairs), default=timedelta(minutes=1))
+    driver_pairs = [pair for pair in pairs if _period(pair.timeframe) == driver_period]
     shift_candidates: list[datetime] = []
     for pair in pairs:
         line, pair_problems, shift_to = _check_pair(
@@ -376,28 +515,33 @@ def _check_all(
             load_candles=load_candles,
             client_provider=client_provider,
             clock=clock,
+            boundary_results=boundaries,
+            is_driver=_period(pair.timeframe) == driver_period,
         )
         detail.append(line)
         problems.extend(pair_problems)
         if shift_to is not None:
             shift_candidates.append(shift_to)
 
-    shift_to = _align_up(max(shift_candidates), pairs) if shift_candidates else None
+    # Сдвиг выравнивается по драйверному потоку, а не по самому старшему
+    # таймфрейму: старший не должен переносить начало на свой следующий бар.
+    shift_to = _align_up(max(shift_candidates), driver_pairs) if shift_candidates else None
     return PreflightReport(
         problems=tuple(problems),
         start=start_dt,
         shift_to=shift_to,
         checked_pairs=len(pairs),
         detail=detail,
+        boundaries=tuple(boundaries),
     )
 
 
 def _align_up(moment: datetime, pairs) -> datetime | None:
-    """Округляет предложенное начало вверх до сетки старшего таймфрейма.
+    """Округляет момент вверх до сетки переданных пар.
 
-    Сдвиг по самой мелкой паре может попасть внутрь бара старшей: тот тогда не
-    увидит свечи в окне прогрева. Округление вверх (а не вниз) сохраняет и
-    начало прогрева мелкой пары — там свечи появляются до любой границы её бара.
+    Для сдвига начала передаётся драйверный (наименьший активный) таймфрейм:
+    начало должно совпасть с баром драйверного потока, а не со старшим баром.
+    Округление вверх (а не вниз) не заводит начало раньше доступного бара.
     """
     grid = max((_period(pair.timeframe) for pair in pairs), default=timedelta(minutes=1))
     seconds = int(grid.total_seconds())
@@ -414,26 +558,37 @@ def _check_pair(
     load_candles,
     client_provider,
     clock,
+    boundary_results=None,
+    is_driver: bool = True,
 ) -> tuple[str, list[str], datetime | None]:
     """Проверяет одну пару и возвращает строку отчёта, проблемы и возможный сдвиг.
 
     Хвост сверяется с ``конец − период`` пары: у 1h свой бар, а не минута конца,
     поэтому вечерняя пауза в старшем таймфрейме не отвергает прогон.
+
+    ``is_driver`` отмечает наименьший активный таймфрейм: только он задаёт
+    начало диапазона и может предложить сдвиг. Старший таймфрейм берёт контекст
+    из закрытого прогрева до начала, поэтому бар, открывшийся до начала, его не
+    переносит.
     """
     period = _period(pair.timeframe)
     warmup_span = max(1, warmup_bars) * period
     head_from = start_dt - warmup_span
     try:
-        head, _ = load_candles(
+        head, uid = load_candles(
             ticker=pair.ticker,
             instrument_type=pair.instrument_type,
             timeframe=pair.timeframe,
             start_date=head_from,
             end_date=start_dt + period,
-            instrument_id=None,
+            instrument_id=pair.instrument_id,
             client_provider=client_provider,
             clock=clock,
         )
+        if pair.instrument_id is not None and uid != pair.instrument_id:
+            raise ValueError("источник вернул другую идентичность инструмента")
+        if isinstance(uid, str) and uid:
+            pair = replace(pair, instrument_id=uid)
     except Exception as exc:
         return f"{pair}: загрузка не удалась ({exc})", [
             f"{pair}: инструмент не разрешается или данные недоступны ({exc})"
@@ -443,53 +598,49 @@ def _check_pair(
     try:
         first_seen, head_last = _frame_bounds(head)
     except LookupError:
-        ahead = _nearest_after(pair, start_dt, load_candles, client_provider, clock)
+        # Сдвиг начала — только по драйверному потоку: он задаёт шаг рыночного
+        # времени. Старший таймфрейм без свечей в начале не тянет за собой весь
+        # прогон, если прогрев и конец диапазона покрыты.
+        ahead = _nearest_after(pair, start_dt, load_candles, client_provider, clock) if is_driver else None
         hint = f" — ближайшая свеча {ahead:%Y-%m-%d %H:%M}" if ahead else ""
-        # Сдвиг берёт не первую свечу, а первую плюс прогрев: иначе прогон
-        # стартовал бы с пустой историей, ради которой проверка и стоит.
-        shift_to = ahead + warmup_span if ahead is not None else None
         return f"{pair}: нет свечей в начале диапазона{hint}", [
             f"{pair}: свечи не покрывают начало диапазона {start_dt:%Y-%m-%d %H:%M}{hint}"
-        ], shift_to
+        ], ahead
 
-    if head_last < start_dt:
-        problems.append(
-            f"{pair}: нет бара, открывшегося в {start_dt:%Y-%m-%d %H:%M} — начало диапазона не покрыто"
-        )
+    if is_driver and head_last < start_dt:
+        # Начало задаёт драйверный поток: переносим его ровно на ближайший
+        # доступный бар — так повторная проверка не сдвигает начало снова.
+        ahead = _nearest_after(pair, start_dt, load_candles, client_provider, clock)
+        hint = f" — ближайшая свеча {ahead:%Y-%m-%d %H:%M}" if ahead else ""
+        return f"{pair}: нет бара, открывшегося в {start_dt:%Y-%m-%d %H:%M}{hint}", [
+            f"{pair}: нет бара, открывшегося в {start_dt:%Y-%m-%d %H:%M} — начало диапазона не покрыто{hint}"
+        ], ahead
     if first_seen > head_from + period:
         problems.append(
             f"{pair}: прогрев не покрыт — данные начинаются с {first_seen:%Y-%m-%d %H:%M}, "
             f"нужно с {head_from:%Y-%m-%d %H:%M} ({warmup_bars} бар(ов) {pair.timeframe})"
         )
 
-    expected_last = end_dt - period
+    expected_last = CandleScheduler(pair.timeframe).previous_candle_start(end_dt)
+    tail_from = max(expected_last-period, start_dt)
     try:
-        _, tail_last = _frame_bounds(
-            load_candles(
-                ticker=pair.ticker,
-                instrument_type=pair.instrument_type,
-                timeframe=pair.timeframe,
-                start_date=max(expected_last - period, start_dt),
-                end_date=end_dt,
-                instrument_id=None,
-                client_provider=client_provider,
-                clock=clock,
-            )[0]
-        )
-    except LookupError:
+        tail, tail_uid = load_candles(ticker=pair.ticker, instrument_type=pair.instrument_type,
+            timeframe=pair.timeframe, start_date=tail_from, end_date=end_dt,
+            instrument_id=pair.instrument_id, client_provider=client_provider, clock=clock)
+        if pair.instrument_id is not None and tail_uid != pair.instrument_id:
+            raise ValueError("источник вернул другую идентичность инструмента")
+        check = check_right_boundary(pair, start=start_dt, boundary=end_dt, load_candles=load_candles,
+            client_provider=client_provider, clock=clock, initial_tail=(tail, tail_from))
+    except Exception as exc:
+        check = BoundaryCheck(pair, *source_identity(client_provider), "end", end_dt, expected_last,
+                              (tail_from, end_dt), error=f"ошибка обязательного чтения: {exc}")
+    if boundary_results is not None:
+        boundary_results.append(check)
+    if not check.ok:
         behind = _nearest_before(pair, expected_last, load_candles, client_provider, clock)
         hint = f" — ближайшая свеча {behind:%Y-%m-%d %H:%M}" if behind else ""
-        return f"{pair}: нет свечей в конце диапазона{hint}", [
-            f"{pair}: свечи не покрывают конец диапазона {end_dt:%Y-%m-%d %H:%M} "
-            f"(ожидался бар {expected_last:%Y-%m-%d %H:%M}){hint}"
-        ], None
-
-    if tail_last < expected_last:
-        problems.append(
-            f"{pair}: последний бар {tail_last:%Y-%m-%d %H:%M} раньше ожидаемого "
-            f"{expected_last:%Y-%m-%d %H:%M} — конец диапазона не покрыт"
-        )
-    return f"{pair}: {first_seen:%Y-%m-%d %H:%M} … {tail_last:%Y-%m-%d %H:%M}", problems, None
+        problems.append(check.message()+hint)
+    return f"{pair}: {first_seen:%Y-%m-%d %H:%M} … {check.last_before or 'хвост не подтверждён'}", problems, None
 
 
 def _nearest_after(pair: Pair, moment: datetime, load_candles, client_provider, clock):
@@ -539,6 +690,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         fixed_pairs=(), fixed_warmup=1):
     """Проверить назначенные участки, не требуя годы истории каждого выпуска."""
     problems, notes, detail = [], [], []
+    boundaries = []
     checked = 0
     shifted = to_naive(start).to_pydatetime()
     if fixed_pairs:
@@ -548,6 +700,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
         problems.extend(fixed.problems)
         notes.extend(fixed.notes)
         detail.extend(fixed.detail)
+        boundaries.extend(fixed.boundaries)
         checked += fixed.checked_pairs
         shifted = max(shifted, fixed.start or shifted)
     elif ping is not None:
@@ -560,17 +713,18 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
             card = segment.card
 
             def fetch(tf, lower, upper):
-                frame, _ = load_candles(ticker=card.ticker, instrument_type="future", timeframe=tf,
+                frame, uid = load_candles(ticker=card.ticker, instrument_type="future", timeframe=tf,
                     start_date=lower, end_date=upper, instrument_id=card.uid,
                     client_provider=client_provider, clock=clock)
-                if frame is None or frame.empty:
-                    return pd.DataFrame()
-                frame = frame.sort_values("datetime").drop_duplicates("datetime", keep="last")
-                stamps = pd.to_datetime(frame["datetime"])
-                return frame.loc[(stamps >= lower) & (stamps < upper)].reset_index(drop=True)
+                if uid != card.uid:
+                    raise ValueError("источник вернул другую идентичность инструмента")
+                return _boundary_frame(frame, lower, upper, Pair(card.ticker, "future", tf, card.uid, card.short_name))
 
-            for tf, needed in requirements(card.family).items():
+            required = requirements(card.family)
+            driver_tf = min(required, key=_period) if required else None
+            for tf, needed in required.items():
                 checked += 1
+                is_driver = tf == driver_tf
                 period = _period(tf)
                 label = f"{card.short_name or 'контракт не указан'} {tf}"
                 try:
@@ -589,20 +743,23 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                     if len(prior) < needed:
                         raise LookupError(f"прогрев: нужно {needed} закрытых баров, имеется {len(prior)}")
                     trading = times[(times >= segment.start) & (times < segment.end)]
-                    if trading.empty:
+                    if is_driver and trading.empty:
                         raise LookupError("нет рабочего бара в начале участка")
-                    first = to_naive(trading.min()).to_pydatetime()
-                    if segment.start == start and first > segment.start:
+                    first = to_naive(trading.min()).to_pydatetime() if not trading.empty else None
+                    # Начало диапазона двигает только драйверный поток. Старший
+                    # таймфрейм берёт контекст из прогрева и не переносит старт
+                    # на свой следующий бар.
+                    if is_driver and first is not None and segment.start == start and first > segment.start:
                         shifted = max(shifted, first)
-                    if first > segment.start:
+                    if first is not None and first > segment.start:
                         notes.append(f"{label}: первый рабочий бар после границы {first:%Y-%m-%d %H:%M}")
-                    tail = fetch(tf, max(segment.start, segment.end-LOOKAHEAD), segment.end)
-                    if tail.empty:
-                        raise LookupError("нет свечей в конце участка")
-                    from src.scheduler.timing import CandleScheduler
-                    expected_last = CandleScheduler(tf).previous_candle_start(segment.end)
-                    if pd.to_datetime(tail["datetime"]).max() < expected_last:
-                        raise LookupError(f"конец участка не покрыт: ожидается бар {expected_last}")
+                    check = check_right_boundary(Pair(card.ticker, "future", tf, card.uid, card.short_name),
+                        start=segment.start, boundary=segment.end, load_candles=load_candles,
+                        client_provider=client_provider, clock=clock, deadline=segment.deadline,
+                        role="end" if segment.end == end else "cutoff")
+                    boundaries.append(check)
+                    if not check.ok:
+                        raise LookupError(f"конец участка не покрыт: {check.message()}")
                     detail.append(f"{label}: участок {segment.start:%Y-%m-%d %H:%M} — {segment.end:%Y-%m-%d %H:%M}, прогрев {len(prior)}/{needed}")
                     if tf == "1m":
                         scan_end = min(segment.end, segment.start+CONTINUITY_SCAN_BUDGET*period)
@@ -626,4 +783,4 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
     if shifted > start:
         notes.append(f"начало диапазона сдвинуто с {start} на {shifted}: первая доступная рабочая свеча")
     return PreflightReport(problems=tuple(problems), notes=tuple(notes), start=shifted,
-                           checked_pairs=checked, detail=detail)
+                           checked_pairs=checked, detail=detail, boundaries=tuple(boundaries))
