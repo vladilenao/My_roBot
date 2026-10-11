@@ -7,6 +7,7 @@ from src.market_context import (
 from src import __version__
 from datetime import datetime, timedelta
 from decimal import Decimal
+from dataclasses import replace
 from pathlib import Path
 from shutil import rmtree
 import sys
@@ -54,16 +55,22 @@ from src.config import (
     runtime_dir,
     run_dir_name,
     HIST_DIR,
+    HISTORICAL_ROLLOVER,
+    TIMEFRAMES,
 )
 from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
-from src.history.preflight import active_pairs, run_preflight, smallest_period
+from src.history.preflight import active_pairs, run_preflight, run_chain_preflight, smallest_period
+from src.history.selection import HistorySelection
+from src.history.warmup import warmup_requirements
+from src.history.contract_lifecycle import ConstantContractLifecycle, RolloverLifecycle
 from src.history.report import (
     MarketDataSync,
     REPORT_TXT,
     RunMetrics,
     collect_result,
+    collect_rollover,
     completion_line,
     crash_line,
     write_report,
@@ -82,6 +89,7 @@ from src.events.bus import EventBus
 from src.events.event import Event
 from src.events.types import EventType
 from src.instruments import Instrument, normalize_instrument
+from src.instruments.model import instrument_key
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
 from src.notifier import build_channels, close_channels
@@ -376,26 +384,47 @@ def _launch(
             validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
             client_provider=client_provider,
             market_now=None if clock is None else clock.now(),
+            historical=history,
         ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-        instruments = [normalize_instrument(item) for item in instruments]
+        if not isinstance(instruments, HistorySelection):
+            instruments = [normalize_instrument(item) for item in instruments]
+
+    selection = instruments if isinstance(instruments, HistorySelection) else None
+    if selection is not None:
+        try:
+            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS)
+        except ValueError as exc:
+            print(f"Прогон невозможен — контрактная цепочка: {exc}")
+            return 2, None, selection
+        selection.save(state_dir)
+        session.contract_selection = selection
+        instruments = selection.instruments
 
     if history:
-        report = run_preflight(
-            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-            start=session.start,
-            end=session.end,
-            warmup_bars=_warmup_bars(),
-            load_candles=load_candles,
-            client_provider=client_provider,
-            clock=clock,
-            ping=_source_ping(client_provider),
-        )
+        if selection is not None and selection.families:
+            report = run_chain_preflight(selection,
+                requirements=_family_warmup, start=session.start, end=session.end,
+                load_candles=load_candles, client_provider=client_provider, clock=clock,
+                ping=_source_ping(client_provider),
+                fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+                fixed_warmup=_warmup_bars())
+        else:
+            report = run_preflight(
+                active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+                start=session.start,
+                end=session.end,
+                warmup_bars=_warmup_bars(),
+                load_candles=load_candles,
+                client_provider=client_provider,
+                clock=clock,
+                ping=_source_ping(client_provider),
+            )
         if not report.ok:
             print(report.message())
-            return 2, None, instruments
+            return 2, None, selection or instruments
         if report.start != session.start:
             print(report.message())
-            return 3, report.start, instruments
+            return 3, report.start, selection or instruments
         if report.notes:
             print(report.message())
 
@@ -460,7 +489,12 @@ def _launch(
                 storage, session, data_cache, timeline, state_dir, market_data_sync
             )
         close_channels(channels)
-    return 0, None, instruments
+    return 0, None, selection or instruments
+
+
+def _family_warmup(family):
+    return warmup_requirements(family, FUTURE_STRATEGIES, _strategy_map(),
+                              TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
 
 
 def _finish_history(
@@ -470,8 +504,14 @@ def _finish_history(
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
+    original_reason = session.stop_reason()
+    lifecycle = getattr(session, "contract_lifecycle", None)
+    if isinstance(lifecycle, RolloverLifecycle):
+        lifecycle.finish(timeline.now())
+        if any(state["phase"] == "DRAINING" for state in lifecycle.states.values()):
+            session.mark_contract_failure("старые обязательства не завершены к концу прогона")
     reason = session.stop_reason()
-    crashed = not reason
+    crashed = not original_reason
     longest_gap = getattr(data_cache, "longest_gap", None)
     exhaustion = getattr(session, "exhaustion", None)
     metrics = RunMetrics(
@@ -489,6 +529,7 @@ def _finish_history(
         horizon_end=None if exhaustion is None else exhaustion.horizon_end,
         horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
         market_data_sync=market_data_sync or MarketDataSync(),
+        rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -517,17 +558,19 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> N
         signal_filter=SignalFilter(),
         post_tick=runtime.post_tick,
         trade_manager=runtime.trade_manager,
+        contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
     ).run()
 
 
 class _Runtime:
-    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None) -> None:
+    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None, contract_lifecycle=None) -> None:
         self.post_tick = post_tick
         self.trade_manager = trade_manager
         self.action_executor = action_executor
         self.storage = storage
+        self.contract_lifecycle = contract_lifecycle
 
 
 def _build_runtime(
@@ -543,7 +586,8 @@ def _build_runtime(
     instruments = [
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
     ]
-    if not trading_enabled():
+    historical = isinstance(clock, HistoricalClock)
+    if not trading_enabled() and not historical:
         log.info("Торговый режим выключен — NotifyOnly.")
         return _Runtime()
 
@@ -569,11 +613,14 @@ def _build_runtime(
             contract_names=_instrument_names(instruments),
         )
     except Exception as exc:
+        if historical:
+            raise RuntimeError(f"Не удалось создать исторический симулятор/журнал: {exc}") from exc
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime()
 
     risk_limits = _risk_limits()
     names = _instrument_names(instruments)
+    costs = {"commission": 1.5, "slippage": 1.0} if historical else {}
 
     def publish_execution(execution, details):
         action = details["action_type"].split(":", 1)[0]
@@ -610,8 +657,8 @@ def _build_runtime(
         profiles_config=TRADE_MANAGEMENT_PROFILES,
         risk_limits=risk_limits,
         max_qty=RISK_LIMITS.get("max_qty"),
-        commission=RISK_LIMITS.get("commission"),
-        slippage=RISK_LIMITS.get("slippage"),
+        commission=RISK_LIMITS.get("commission", costs.get("commission")),
+        slippage=RISK_LIMITS.get("slippage", costs.get("slippage")),
         slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
         min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
         portfolio_pct=RISK_LIMITS.get("portfolio_pct", 2),
@@ -623,15 +670,35 @@ def _build_runtime(
         signal_filter=SignalFilter(),
         clock=clock,
     )
+    if historical:
+        trade_manager.initialize_account()
     trade_manager.restore()
     trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
-    contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
+    selection = getattr(session, "contract_selection", None)
+    if isinstance(selection, HistorySelection) and selection.families:
+        from src.portfolio.models import ContractMeta
+        contracts = _load_contracts_metadata(selection.fixed, client_provider=client_provider)
+        for chain in selection.chains:
+            for segment in chain:
+                card = segment.card
+                contracts[card.uid] = ContractMeta(card.uid, float(card.price_step), float(card.step_cost),
+                    float(card.go_buy), float(card.go_sell), currency=(card.currency or "RUB").upper(), expiration_date=card.expiration_date)
+    else:
+        contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
     storage.set_names(_instrument_names(instruments))
     broker.set_names(_instrument_names(instruments))
-    print_contract_metadata(contracts)
+    print_contract_metadata(contracts, _instrument_names(instruments))
+    lifecycle = ConstantContractLifecycle(instruments)
+    if isinstance(selection, HistorySelection) and selection.families:
+        lifecycle = RolloverLifecycle(selection, storage, trade_manager, data_cache, _family_warmup, session.end,
+            work_timeframes=lambda instrument: {pair.timeframe for pair in active_pairs([instrument], SHARE_STRATEGIES, FUTURE_STRATEGIES)})
+        trade_manager.contract_lifecycle = lifecycle
+        broker.increase_allowed = lifecycle.execution_increase_allowed
+        lifecycle.configure_cache()
+        session.contract_lifecycle = lifecycle
 
     # Cursors advance only after executions and observations of a minute have
     # committed. On restart SQLite provides the safe boundary of live state.
@@ -654,7 +721,7 @@ def _build_runtime(
         # продвинуться. При исключении pending_bar будет повторён.
         for ticker in prices:
             execution_cursors[ticker] = (stamp, False)
-            instrument = next((item for item in instruments if item.ticker == ticker), None)
+            instrument = next((item for item in instruments if instrument_key(item) == ticker), None)
             mark_processed = getattr(data_cache, "mark_processed", None)
             if instrument is not None and callable(mark_processed):
                 mark_processed(instrument, "1m", stamp)
@@ -669,7 +736,7 @@ def _build_runtime(
                 pending_bar = None
             batches = {}
             initial_boundaries = None
-            for instrument in instruments:
+            for instrument in lifecycle.execution_instruments():
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
                 except Exception as exc:
@@ -681,7 +748,7 @@ def _build_runtime(
                 if frame.empty:
                     continue
                 try:
-                    ticker = instrument.ticker
+                    ticker = instrument_key(instrument)
                     stamps = frame["datetime"].map(to_aware_utc)
                     boundary = execution_cursors.get(ticker)
                     if boundary is None:
@@ -724,6 +791,7 @@ def _build_runtime(
         trade_manager=trade_manager,
         action_executor=action_executor,
         storage=storage,
+        contract_lifecycle=lifecycle,
     )
 
 
@@ -784,7 +852,7 @@ def _instrument_ticker(instrument) -> str | None:
 
 
 def _instrument_names(instruments) -> dict[str, str]:
-    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов.
+    """Карта адрес контракта (UID/legacy ticker) → короткое имя.
 
     В карту попадают только настоящие короткие имена: тикер и полный label
     пользователю не показываются, для неизвестного контракта остаётся
@@ -792,7 +860,7 @@ def _instrument_names(instruments) -> dict[str, str]:
     """
     names: dict[str, str] = {}
     for instrument in instruments:
-        ticker = _instrument_ticker(instrument)
+        ticker = _instrument_ticker(instrument) if isinstance(instrument, (tuple, list)) else instrument_key(instrument)
         if not ticker:
             continue
         if isinstance(instrument, (tuple, list)):
@@ -859,6 +927,9 @@ def _load_contracts_metadata(instruments, client_provider=None):
     if missing:
         log.warning("Нет метаданных контрактов для: %s — входы отклонятся.", missing)
     log.info("Метаданные контрактов загружены: %s", sorted(contracts))
+    for instrument in instruments:
+        if isinstance(instrument, Instrument) and instrument.uid and instrument.ticker in contracts:
+            contracts[instrument_key(instrument)] = replace(contracts.pop(instrument.ticker), ticker=instrument_key(instrument))
     return contracts
 
 
@@ -877,11 +948,11 @@ def _instrument_type(instrument) -> str:
     return str(getattr(instrument, "instrument_type", "") or "")
 
 
-def print_contract_metadata(contracts) -> None:
+def print_contract_metadata(contracts, names=None) -> None:
     for ticker, meta in sorted(contracts.items()):
         log.info(
             "Контракт %s: шаг %.6f, стоимость шага %.4f, ГО(купли) %.2f, ГО(продажи) %.2f",
-            ticker, meta.price_step, meta.step_cost, meta.go_buy, meta.go_sell,
+            (names or {}).get(ticker) or "контракт не указан", meta.price_step, meta.step_cost, meta.go_buy, meta.go_sell,
         )
 
 

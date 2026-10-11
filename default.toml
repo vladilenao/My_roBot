@@ -24,6 +24,12 @@ export_port = 8101
 fallback_type = "future"
 fallback_ticker = "NGU6"
 
+# Автоматическая историческая цепочка. Без lead_days семейство наследует
+# trading.contract_expiry_block_days; индивидуальный срок может быть только больше.
+[historical.rollover]
+policy = "calendar"
+# Пример: [historical.rollover.families.BR] lead_days = 3
+
 [notifier]
 # Каналы доставки уведомлений в порядке подписки: "console" | "telegram".
 # Старый ключ channel = "telegram" поддерживается как channels = ["telegram"].
@@ -181,8 +187,8 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
-    { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10 },
+    { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "basic_levels", priority = 10 },
 ]
 
 [strategies.future.BR]

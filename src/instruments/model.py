@@ -5,6 +5,12 @@ from dataclasses import dataclass
 SHARE_INSTRUMENT_TYPE = "share"
 
 
+def instrument_key(instrument) -> str:
+    """Адрес контракта: UID при наличии, иначе прежний биржевой тикер."""
+    uid = getattr(instrument, "uid", None)
+    return uid if isinstance(uid, str) and uid else instrument.ticker
+
+
 @dataclass(frozen=True)
 class Instrument:
     """Нормализованное представление финансового инструмента."""
@@ -13,6 +19,12 @@ class Instrument:
     ticker: str
     instrument_type: str
     short_name: str | None = None
+    uid: str | None = None
+    family: str | None = None
+
+    @property
+    def contract_id(self) -> str:
+        return instrument_key(self)
 
 
 def normalize_instrument(item) -> Instrument:

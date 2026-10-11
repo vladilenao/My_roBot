@@ -6,6 +6,7 @@ from src.market_context.models import MarketContext
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
 from src.logging_setup import get_logger
+from src.instruments.model import instrument_key
 
 log = get_logger(__name__)
 
@@ -67,6 +68,8 @@ class MarketContextCache:
 
     @staticmethod
     def _key(instrument, timeframe: str) -> tuple:
+        if isinstance(getattr(instrument, "uid", None), str) and instrument.uid:
+            return (instrument_key(instrument), timeframe)
         base = getattr(instrument, "base_code", None) or getattr(instrument, "ticker", None) or str(instrument)
         return (base, timeframe)
 

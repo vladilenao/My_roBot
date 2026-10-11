@@ -122,6 +122,7 @@ REASON_LABELS = {
     "next-bar": "вход перенесён на следующий бар",
     "entry-timeout": "вход не исполнен в отведённое время",
     "contract-expiring": "контракт истекает",
+    "contract-rollover": "переход на следующий контракт",
     "profile-entry": "вход по профилю",
     "protective": "стоп",
     "tp": "цель по цене",

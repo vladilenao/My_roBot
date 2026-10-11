@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
+from src.instruments.futures import FAMILIES
 
 CONFIG_FILENAME = "robot.toml"
 BUNDLED_FILENAME = "default.toml"
@@ -51,6 +52,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
     },
+    "historical": {"rollover": "historical_rollover"},
     "notifier": {
         "channels": "notifier_channels",
         "channel": "notifier",
@@ -128,6 +130,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "directions": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
+    "historical_rollover": dict,
 }
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
@@ -531,6 +534,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "directions":
             cleaned[key] = _validate_directions(value, path)
             continue
+        if key == "historical_rollover":
+            cleaned[key] = _validate_rollover(value, path)
+            continue
         if key == "initial_deposit":
             if isinstance(value, bool):
                 raise ConfigError(
@@ -571,6 +577,32 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
     return cleaned
+
+
+def _validate_rollover(value: dict, path: Path) -> dict:
+    where = "historical.rollover"
+    if set(value) - {"policy", "families"}:
+        raise ConfigError(f"{path}: [{where}] незнакомые ключи {sorted(set(value)-{'policy', 'families'})}")
+    if value.get("policy", "calendar") != "calendar":
+        raise ConfigError(f"{path}: [{where}] policy поддерживает только calendar")
+    families = value.get("families", {})
+    if not isinstance(families, dict):
+        raise ConfigError(f"{path}: [{where}] families должна быть таблицей")
+    normalized = {}
+    for key, settings in families.items():
+        canonical = key.upper()
+        prefix = f"{path}: [{where}.families.{key}]"
+        if canonical not in FAMILIES or canonical in normalized:
+            raise ConfigError(f"{prefix} неизвестное или повторяющееся семейство")
+        if not isinstance(settings, dict) or set(settings)-{"lead_days"}:
+            raise ConfigError(f"{prefix} допустим только ключ lead_days")
+        days = settings.get("lead_days")
+        if days is not None and (type(days) is not int or days < 0):
+            raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
+        if "lead_days" in settings and days is None:
+            raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
+        normalized[canonical] = dict(settings)
+    return {"policy": "calendar", "families": normalized}
 
 
 _CLEARING_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -743,6 +775,10 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
 def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
     """Validate constraints that span TOML sections and configuration files."""
     assignment_ids: set[str] = set()
+    floor = config.get("contract_expiry_block_days", 2)
+    for family, settings in config.get("historical_rollover", {}).get("families", {}).items():
+        if settings.get("lead_days", floor) < floor:
+            raise ConfigError(f"{path}: [historical.rollover.families.{family}] lead_days не может быть меньше contract_expiry_block_days ({floor})")
     assignments: list[dict[str, Any]] = []
     for source in ("share_strategies", "future_strategies"):
         for table in config.get(source, {}).values():

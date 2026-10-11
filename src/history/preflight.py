@@ -89,7 +89,12 @@ def active_pairs(
     pairs: list[Pair] = []
     for instrument in instruments:
         if instrument.instrument_type == "future":
-            assignments = future_strategies.get(instrument.ticker[:2].upper(), [])
+            family = getattr(instrument, "family", None)
+            if isinstance(family, str):
+                from src.instruments.futures import FAMILIES
+                assignments = future_strategies.get(family, future_strategies.get(FAMILIES[family][0], []))
+            else:
+                assignments = future_strategies.get(instrument.ticker[:2].upper(), [])
         else:
             assignments = share_strategies.get(instrument.ticker, [])
         timeframes = {assignment.timeframe for assignment in assignments}
@@ -527,3 +532,98 @@ def _nearest_before(pair: Pair, moment: datetime, load_candles, client_provider,
         return _frame_bounds(frame)[1]
     except LookupError:
         return None
+
+
+def run_chain_preflight(selection, *, requirements, start, end, load_candles,
+                        client_provider=None, clock=None, ping=None,
+                        fixed_pairs=(), fixed_warmup=1):
+    """Проверить назначенные участки, не требуя годы истории каждого выпуска."""
+    problems, notes, detail = [], [], []
+    checked = 0
+    shifted = to_naive(start).to_pydatetime()
+    if fixed_pairs:
+        fixed = run_preflight(fixed_pairs, start=start, end=end, warmup_bars=fixed_warmup,
+                              load_candles=load_candles, client_provider=client_provider,
+                              clock=clock, ping=ping)
+        problems.extend(fixed.problems)
+        notes.extend(fixed.notes)
+        detail.extend(fixed.detail)
+        checked += fixed.checked_pairs
+        shifted = max(shifted, fixed.start or shifted)
+    elif ping is not None:
+        try:
+            ping()
+        except Exception as exc:
+            problems.append(f"источник данных недоступен: {exc}")
+    for chain in selection.chains:
+        for segment in chain:
+            card = segment.card
+
+            def fetch(tf, lower, upper):
+                frame, _ = load_candles(ticker=card.ticker, instrument_type="future", timeframe=tf,
+                    start_date=lower, end_date=upper, instrument_id=card.uid,
+                    client_provider=client_provider, clock=clock)
+                if frame is None or frame.empty:
+                    return pd.DataFrame()
+                frame = frame.sort_values("datetime").drop_duplicates("datetime", keep="last")
+                stamps = pd.to_datetime(frame["datetime"])
+                return frame.loc[(stamps >= lower) & (stamps < upper)].reset_index(drop=True)
+
+            for tf, needed in requirements(card.family).items():
+                checked += 1
+                period = _period(tf)
+                label = f"{card.short_name or 'контракт не указан'} {tf}"
+                try:
+                    # Расширяем окно назад по числу реально закрытых баров.
+                    span = max(LOOKAHEAD, needed*period)
+                    while True:
+                        lower = max(card.first_trade_date, segment.start-span)
+                        head = fetch(tf, lower, min(segment.end, segment.start+LOOKAHEAD))
+                        if head.empty:
+                            raise LookupError("нет свечей в начале участка")
+                        times = pd.to_datetime(head["datetime"])
+                        prior = head.loc[times+period <= segment.start]
+                        if len(prior) >= needed or lower == card.first_trade_date:
+                            break
+                        span *= 2
+                    if len(prior) < needed:
+                        raise LookupError(f"прогрев: нужно {needed} закрытых баров, имеется {len(prior)}")
+                    trading = times[(times >= segment.start) & (times < segment.end)]
+                    if trading.empty:
+                        raise LookupError("нет рабочего бара в начале участка")
+                    first = to_naive(trading.min()).to_pydatetime()
+                    if segment.start == start and first > segment.start:
+                        shifted = max(shifted, first)
+                    if first > segment.start:
+                        notes.append(f"{label}: первый рабочий бар после границы {first:%Y-%m-%d %H:%M}")
+                    tail = fetch(tf, max(segment.start, segment.end-LOOKAHEAD), segment.end)
+                    if tail.empty:
+                        raise LookupError("нет свечей в конце участка")
+                    from src.scheduler.timing import CandleScheduler
+                    expected_last = CandleScheduler(tf).previous_candle_start(segment.end)
+                    if pd.to_datetime(tail["datetime"]).max() < expected_last:
+                        raise LookupError(f"конец участка не покрыт: ожидается бар {expected_last}")
+                    detail.append(f"{label}: участок {segment.start:%Y-%m-%d %H:%M} — {segment.end:%Y-%m-%d %H:%M}, прогрев {len(prior)}/{needed}")
+                    if tf == "1m":
+                        scan_end = min(segment.end, segment.start+CONTINUITY_SCAN_BUDGET*period)
+                        scan = fetch(tf, segment.start, scan_end)
+                        holes = pd.to_datetime(scan["datetime"]).diff().dropna()
+                        holes = holes[holes > period]
+                        scope = "весь участок" if scan_end == segment.end else f"участок до {scan_end}, хвост не проверен"
+                        notes.append(f"{label}: проверен {scope}; разрывов {len(holes)}, самый длинный {_span(holes.max()-period) if len(holes) else '0 м'}")
+                except Exception as exc:
+                    problems.append(f"{label}: {exc}")
+            if segment.end == segment.cutoff and segment.cutoff < end:
+                try:
+                    exit_end = min(segment.deadline, end)
+                    # Команда создана на закрытии тика, не ранее календарной границы.
+                    exit_from = _align_up(segment.cutoff, [Pair(card.ticker, "future", "1m")])
+                    exits = fetch("1m", exit_from, exit_end) if exit_from < exit_end else pd.DataFrame()
+                    if exits.empty:
+                        raise LookupError("нет причинно допустимого минутного бара закрытия до deadline/конца")
+                except Exception as exc:
+                    problems.append(f"{card.short_name or 'контракт не указан'}: {exc}")
+    if shifted > start:
+        notes.append(f"начало диапазона сдвинуто с {start} на {shifted}: первая доступная рабочая свеча")
+    return PreflightReport(problems=tuple(problems), notes=tuple(notes), start=shifted,
+                           checked_pairs=checked, detail=detail)
