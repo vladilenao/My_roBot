@@ -17,6 +17,25 @@ from src.trade_management.audit import (
 )
 
 
+def _write_entry_fill(connection, now):
+    connection.execute(
+        "INSERT INTO outbox VALUES ('entry-command', 'trade-1', '{}', 'SENT', ?, NULL)", (now,),
+    )
+    connection.execute(
+        "INSERT INTO orders VALUES ('entry-order', 'trade-1', 'entry-command', 'OPEN', 'FILLED', "
+        "2, 2, '100', ?, ?)", (now, now),
+    )
+    connection.execute(
+        "INSERT INTO fills (fill_id,order_id,trade_id,command_id,execution_id,quantity,price,fee,executed_at) "
+        "VALUES ('entry-fill', 'entry-order', 'trade-1', 'entry-command', 'entry-exec', 2, '100', '0', ?)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT INTO events (event_id,trade_id,order_id,command_id,event_type,payload_json,occurred_at) "
+        "VALUES ('entry-exec', 'trade-1', 'entry-order', 'entry-command', 'FILL', '{}', ?)", (now,),
+    )
+
+
 def _write_snapshot(storage):
     now = "2026-01-01T00:00:00+00:00"
     with storage.transaction() as connection:
@@ -29,11 +48,7 @@ def _write_snapshot(storage):
             "INSERT INTO positions VALUES ('trade-1', 'BUY', 2, '100', '0', '0', '0', ?)",
             (now,),
         )
-        connection.execute(
-            "INSERT INTO events (event_id, trade_id, event_type, payload_json, occurred_at) "
-            "VALUES ('event-1', 'trade-1', 'FILL', '{}', ?)",
-            (now,),
-        )
+        _write_entry_fill(connection, now)
 
 
 def _read_csv(path):
@@ -58,6 +73,7 @@ def _write_reason_fill(storage, reason):
             "INSERT INTO positions VALUES ('trade-1', 'SELL', 0, '100', '0', '0', '0', ?)",
             (now,),
         )
+        _write_entry_fill(connection, now)
         connection.execute(
             "INSERT INTO outbox (command_id, trade_id, payload_json, status, created_at) "
             "VALUES ('cmd-1', 'trade-1', '{}', 'SENT', ?)",
@@ -91,21 +107,21 @@ def _export_reason_rows(tmp_path, reason):
 def test_reason_labels_render_known_codes_in_russian(tmp_path):
     journal_rows, position_rows = _export_reason_rows(tmp_path, "opposite-signal-management")
 
-    assert journal_rows[0]["Причина"] == "управление по встречному сигналу"
+    assert journal_rows[-1]["Причина"] == "управление по встречному сигналу"
     assert position_rows[0]["Финальная причина"] == "управление по встречному сигналу"
 
 
 def test_stale_state_revision_reason_is_russian(tmp_path):
     journal_rows, position_rows = _export_reason_rows(tmp_path, "stale-state-revision")
 
-    assert journal_rows[0]["Причина"] == "устарела ревизия состояния"
+    assert journal_rows[-1]["Причина"] == "устарела ревизия состояния"
     assert position_rows[0]["Финальная причина"] == "устарела ревизия состояния"
 
 
 def test_reason_labels_pass_through_unknown_codes(tmp_path):
     journal_rows, position_rows = _export_reason_rows(tmp_path, "custom-machine-code")
 
-    assert journal_rows[0]["Причина"] == "custom-machine-code"
+    assert journal_rows[-1]["Причина"] == "custom-machine-code"
     assert position_rows[0]["Финальная причина"] == "custom-machine-code"
 
 
