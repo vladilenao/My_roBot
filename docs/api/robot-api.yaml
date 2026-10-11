@@ -1,0 +1,844 @@
+openapi: 3.0.3
+info:
+  title: My Robot — единый REST API
+  version: 0.2.0-draft
+  description: |
+    Целевой контракт одного постоянно доступного API робота. Это проект,
+    маршруты из этого файла пока не реализованы. Действующий экспорт рыночных
+    данных описан отдельно в docs/market-data/openapi.yaml.
+
+    Клиент начинает с GET /api/v1, затем использует ссылки и действия из
+    ответов Siren (application/vnd.siren+json). Адреса отдельных ресурсов
+    и непрозрачные ссылки на страницы клиент не составляет самостоятельно.
+    Внешний API не принимает брокерские UID, внутренние курсоры, идентификаторы
+    стратегий и состояния рабочего цикла как параметры команд.
+servers:
+  - url: /
+    description: Адрес постоянно запущенного API робота.
+tags:
+  - name: Навигация
+    description: Точка входа и ссылки на доступные разделы.
+  - name: Торговля инструментами
+    description: Поиск инструмента и управление разрешением новых входов.
+  - name: Рыночные данные
+    description: Выдача изменений эмулятору по ссылкам на страницы.
+paths:
+  /api/v1:
+    get:
+      tags: [Навигация]
+      summary: Получить точку входа API
+      operationId: getApiHome
+      x-implementation-status: planned
+      description: |
+        Ссылки в ответе зависят от прав клиента. UI видит поиск инструментов
+        и текущую торговлю, эмулятор — поток рыночных данных.
+      security:
+        - ControlToken: []
+        - ExportToken: []
+      responses:
+        '200':
+          description: Состояние робота и разрешённые переходы.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/RobotHome'
+              examples:
+                operator:
+                  summary: Ответ для UI с правом управления
+                  value:
+                    class: [robot]
+                    properties:
+                      status: ready
+                      openTrades: 2
+                      tradingInstruments: 1
+                    links:
+                      - rel: [self]
+                        href: /api/v1
+                      - rel: ['https://github.com/vladilenao/My_roBot/blob/main/docs/api/README.md#rel-trading-activations']
+                        href: /api/v1/trading-activations
+                    actions:
+                      - name: search-instruments
+                        title: Найти инструмент
+                        method: GET
+                        href: /api/v1/instruments
+                        type: application/x-www-form-urlencoded
+                        fields:
+                          - name: q
+                            type: search
+                            title: Тикер или название
+                emulator:
+                  summary: Ответ для эмулятора с правом экспорта
+                  value:
+                    class: [robot]
+                    properties:
+                      status: ready
+                    links:
+                      - rel: [self]
+                        href: /api/v1
+                      - rel: ['https://github.com/vladilenao/My_roBot/blob/main/docs/api/README.md#rel-market-data']
+                        href: /api/v1/market-data
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/instruments:
+    get:
+      tags: [Торговля инструментами]
+      summary: Найти инструмент по тикеру или названию
+      operationId: searchInstruments
+      x-implementation-status: planned
+      description: |
+        Адрес поиска и имя поля q клиент получает из действия
+        search-instruments в точке входа. Результат содержит ссылки на
+        инструменты, а не брокерские идентификаторы.
+      security:
+        - ControlToken: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Текст, введённый пользователем для поиска.
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Найденные инструменты со ссылками для перехода.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/InstrumentCollection'
+              example:
+                class: [collection, instruments]
+                properties:
+                  query: SBER
+                entities:
+                  - rel: [item]
+                    href: /api/v1/instruments/i-7k2m
+                    title: Сбербанк, SBER
+                links:
+                  - rel: [self]
+                    href: /api/v1/instruments?q=SBER
+                  - rel: [up]
+                    href: /api/v1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/instruments/{instrument_ref}:
+    get:
+      tags: [Торговля инструментами]
+      summary: Получить карточку инструмента и доступные действия
+      operationId: getInstrument
+      x-implementation-status: planned
+      description: |
+        Начать торговлю можно только при наличии действия start-trading.
+        При восстановлении после перезапуска или отсутствии подходящей
+        стратегии сервер не предлагает это действие. Уже открытые сделки
+        продолжают сопровождаться независимо от наличия действия.
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/InstrumentRef'
+      responses:
+        '200':
+          description: Публичные сведения об инструменте и возможные действия.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/Instrument'
+              examples:
+                stopped:
+                  summary: Торговля выключена; можно включить
+                  value:
+                    class: [instrument]
+                    properties:
+                      ticker: SBER
+                      name: Сбербанк
+                      type: share
+                      trading: off
+                      openTrades: 0
+                    links:
+                      - rel: [self]
+                        href: /api/v1/instruments/i-7k2m
+                      - rel: [up]
+                        href: /api/v1
+                    actions:
+                      - name: start-trading
+                        title: Включить торговлю
+                        method: PUT
+                        href: /api/v1/instruments/i-7k2m/trading-activation
+                active:
+                  summary: Торговля включена; можно выключить новые входы
+                  value:
+                    class: [instrument]
+                    properties:
+                      ticker: SBER
+                      name: Сбербанк
+                      type: share
+                      trading: on
+                      openTrades: 1
+                    links:
+                      - rel: [self]
+                        href: /api/v1/instruments/i-7k2m
+                      - rel: ['https://github.com/vladilenao/My_roBot/blob/main/docs/api/README.md#rel-trading-activation']
+                        href: /api/v1/instruments/i-7k2m/trading-activation
+                    actions:
+                      - name: stop-trading
+                        title: Выключить новые входы
+                        method: DELETE
+                        href: /api/v1/instruments/i-7k2m/trading-activation
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/trading-activations:
+    get:
+      tags: [Торговля инструментами]
+      summary: Получить инструменты с включённой или переходящей торговлей
+      operationId: listTradingActivations
+      x-implementation-status: planned
+      description: |
+        Ссылки на инструменты и их разрешения. Это публичное представление,
+        а не список внутренних задач или объектов торгового цикла.
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Коллекция ссылок на действующие разрешения.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/ActivationCollection'
+              example:
+                class: [collection, trading-activations]
+                properties: {}
+                entities:
+                  - rel: [item]
+                    href: /api/v1/instruments/i-7k2m/trading-activation
+                    title: SBER
+                links:
+                  - rel: [self]
+                    href: /api/v1/trading-activations
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/instruments/{instrument_ref}/trading-activation:
+    get:
+      tags: [Торговля инструментами]
+      summary: Посмотреть применение включения или выключения
+      operationId: getTradingActivation
+      x-implementation-status: planned
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/InstrumentRef'
+      responses:
+        '200':
+          description: Текущее состояние разрешения на новые входы.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/TradingActivation'
+              example:
+                class: [trading-activation]
+                properties:
+                  status: 'on'
+                links:
+                  - rel: [self]
+                    href: /api/v1/instruments/i-7k2m/trading-activation
+                  - rel: ['https://github.com/vladilenao/My_roBot/blob/main/docs/api/README.md#rel-instrument']
+                    href: /api/v1/instruments/i-7k2m
+                actions:
+                  - name: stop-trading
+                    title: Выключить новые входы
+                    method: DELETE
+                    href: /api/v1/instruments/i-7k2m/trading-activation
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Торговля инструментами]
+      summary: Разрешить новые сделки с инструментом
+      operationId: startInstrumentTrading
+      x-implementation-status: planned
+      description: |
+        Вызывается только по действию start-trading из карточки инструмента.
+        Тело запроса не требуется. Сервер сохраняет команду и последовательно
+        подготавливает инструмент. Повторный PUT не создаёт второго включения.
+        После перезапуска незавершённые сделки восстанавливаются отдельно от
+        этого разрешения на новые входы.
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/InstrumentRef'
+      responses:
+        '200':
+          description: Торговля уже разрешена; возвращено текущее состояние.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/TradingActivation'
+        '202':
+          description: Команда принята; состояние перехода можно читать по Location.
+          headers:
+            Location:
+              description: Адрес разрешения на торговлю.
+              schema:
+                type: string
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/TradingActivation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      tags: [Торговля инструментами]
+      summary: Запретить новые сделки с инструментом
+      operationId: stopInstrumentTrading
+      x-implementation-status: planned
+      description: |
+        Вызывается по действию stop-trading из карточки инструмента или
+        разрешения. После принятия команды новые входы не допускаются.
+        Уже отправленные заявки сверяются с исполнениями. Незавершённые
+        сделки и защитные действия продолжаются, в том числе после
+        перезапуска робота. Повторный DELETE безопасен.
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/InstrumentRef'
+      responses:
+        '202':
+          description: Выключение принято; сопровождение незавершённых сделок продолжается.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/TradingActivation'
+        '204':
+          description: Разрешения на новые входы уже нет.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/market-data:
+    get:
+      tags: [Рыночные данные]
+      summary: Получить точку входа в поток рыночных изменений
+      operationId: getMarketDataFeed
+      x-implementation-status: planned
+      description: |
+        Эмулятор получает ссылку на первую доступную страницу. Его токен
+        определяет потребителя; идентификатор потребителя и курсор не входят
+        в параметры запроса. Ссылка на следующую страницу приходит в ответе.
+      security:
+        - ExportToken: []
+      responses:
+        '200':
+          description: Описание потока и ссылка на страницу.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/MarketDataFeed'
+              example:
+                class: [market-data-feed]
+                properties:
+                  stream: stream-a8e
+                links:
+                  - rel: [self]
+                    href: /api/v1/market-data
+                  - rel: [first]
+                    href: /api/v1/market-data/pages/p-w8x
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/market-data/pages/{page_ref}:
+    get:
+      tags: [Рыночные данные]
+      summary: Получить страницу изменений по выданной сервером ссылке
+      operationId: getMarketDataPage
+      x-implementation-status: planned
+      description: |
+        page_ref — непрозрачная публичная часть ссылки, а не номер записи БД.
+        Эмулятор сохраняет полученные события до вызова acknowledge-page.
+        Если ссылка больше не действительна, он возвращается к точке входа.
+      security:
+        - ExportToken: []
+      parameters:
+        - $ref: '#/components/parameters/PageRef'
+      responses:
+        '200':
+          description: Страница данных со ссылкой next и действием acknowledge-page.
+          content:
+            application/vnd.siren+json:
+              schema:
+                $ref: '#/components/schemas/MarketDataPage'
+              example:
+                class: [market-data-page]
+                properties:
+                  events:
+                    - event: event-204
+                      kind: candle-updated
+                      recorded_at: '2026-10-09T09:02:03Z'
+                      candle:
+                        source: tbank_exchange
+                        instrument_uid: e6123145-6bd5-43d9-8e7d-33b1a331ce43
+                        interval: 1m
+                        open_time_utc: '2026-10-09T09:01:00Z'
+                        open: '301.50'
+                        high: '302.00'
+                        low: '301.25'
+                        close: '301.75'
+                        volume: 412
+                        is_complete: true
+                        revision: 1
+                        received_at: '2026-10-09T09:02:03Z'
+                links:
+                  - rel: [self]
+                    href: /api/v1/market-data/pages/p-w8x
+                  - rel: [next]
+                    href: /api/v1/market-data/pages/p-w8y
+                actions:
+                  - name: acknowledge-page
+                    title: Подтвердить сохранение страницы
+                    method: PUT
+                    href: /api/v1/market-data/pages/p-w8x/acknowledgement
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '410':
+          $ref: '#/components/responses/ExpiredLink'
+  /api/v1/market-data/pages/{page_ref}/acknowledgement:
+    put:
+      tags: [Рыночные данные]
+      summary: Подтвердить сохранение страницы эмулятором
+      operationId: acknowledgeMarketDataPage
+      x-implementation-status: planned
+      description: |
+        Эмулятор вызывает действие acknowledge-page только после сохранения
+        событий в собственной БД. Тело запроса не требуется. Повторный PUT
+        не сдвигает подтверждение назад. Потребитель определяется токеном.
+      security:
+        - ExportToken: []
+      parameters:
+        - $ref: '#/components/parameters/PageRef'
+      responses:
+        '204':
+          description: Страница подтверждена, в том числе при повторном запросе.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '410':
+          $ref: '#/components/responses/ExpiredLink'
+components:
+  securitySchemes:
+    ControlToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Секретный ключ UI для чтения состояния и управления торговлей.
+    ExportToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Отдельный ключ эмулятора; не даёт права управлять торговлей.
+  parameters:
+    InstrumentRef:
+      name: instrument_ref
+      in: path
+      required: true
+      description: |
+        Непрозрачная публичная ссылка на ресурс. UI берёт весь href из ответа
+        и не составляет адрес из тикера или брокерского UID.
+      schema:
+        type: string
+        minLength: 1
+    PageRef:
+      name: page_ref
+      in: path
+      required: true
+      description: Непрозрачная ссылка на страницу, выданная сервером.
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    BadRequest:
+      description: Некорректный пользовательский запрос.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Ключ доступа отсутствует или не подходит.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Ресурс не найден.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Сейчас нельзя начать торговлю этим инструментом.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: Необходимый источник данных временно недоступен.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ExpiredLink:
+      description: Ссылка на страницу устарела; получить новую через точку входа.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    SirenLink:
+      type: object
+      required: [rel, href]
+      properties:
+        rel:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        href:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+    SirenField:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        title:
+          type: string
+    SirenAction:
+      type: object
+      required: [name, href, method]
+      properties:
+        name:
+          type: string
+        title:
+          type: string
+        method:
+          type: string
+          enum: [GET, PUT, DELETE]
+        href:
+          type: string
+          format: uri-reference
+        type:
+          type: string
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenField'
+    SirenEntityLink:
+      type: object
+      required: [rel, href]
+      properties:
+        rel:
+          type: array
+          items:
+            type: string
+        href:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+    RobotHome:
+      type: object
+      required: [class, properties, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [recovering, ready, degraded]
+            openTrades:
+              type: integer
+              minimum: 0
+            tradingInstruments:
+              type: integer
+              minimum: 0
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenLink'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenAction'
+    InstrumentCollection:
+      type: object
+      required: [class, properties, entities, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          properties:
+            query:
+              type: string
+        entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenEntityLink'
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenLink'
+    Instrument:
+      type: object
+      required: [class, properties, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          required: [ticker, name, type, trading, openTrades]
+          properties:
+            ticker:
+              type: string
+            name:
+              type: string
+            type:
+              type: string
+              enum: [share, future]
+            trading:
+              type: string
+              enum: [off, starting, on, stopping, unavailable]
+            openTrades:
+              type: integer
+              minimum: 0
+            notice:
+              type: string
+              description: Понятная пользователю причина недоступности действия.
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenLink'
+        actions:
+          type: array
+          description: Только действительно доступные сейчас действия.
+          items:
+            $ref: '#/components/schemas/SirenAction'
+    ActivationCollection:
+      type: object
+      required: [class, properties, entities, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+        entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenEntityLink'
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenLink'
+    TradingActivation:
+      type: object
+      required: [class, properties, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [starting, on, stopping, failed]
+            notice:
+              type: string
+              description: Сообщение для UI при ошибке перехода.
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenLink'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SirenAction'
+    MarketDataFeed:
+      type: object
+      required: [class, properties, links]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          required: [stream]
+          properties:
+            stream:
+              type: string
+              description: Публичный непрозрачный идентификатор потока для обнаружения его смены.
+        links:
+          type: array
+          description: Включает ссылку first-page, выбранную сервером для потребителя.
+          items:
+            $ref: '#/components/schemas/SirenLink'
+    MarketDataPage:
+      type: object
+      required: [class, properties, links, actions]
+      properties:
+        class:
+          type: array
+          items:
+            type: string
+        properties:
+          type: object
+          required: [events]
+          properties:
+            events:
+              type: array
+              description: Завершённые свечи и изменения покрытия из рыночного журнала.
+              items:
+                $ref: '#/components/schemas/MarketEvent'
+        links:
+          type: array
+          description: Содержит self и next при наличии следующей страницы.
+          items:
+            $ref: '#/components/schemas/SirenLink'
+        actions:
+          type: array
+          description: Содержит acknowledge-page, доступное после сохранения страницы.
+          items:
+            $ref: '#/components/schemas/SirenAction'
+    MarketEvent:
+      oneOf:
+        - $ref: '#/components/schemas/CandleEvent'
+        - $ref: '#/components/schemas/IntervalStatusEvent'
+    CandleEvent:
+      type: object
+      required: [event, kind, recorded_at, candle]
+      properties:
+        event:
+          type: string
+          description: Публичный стабильный идентификатор события для удаления дублей.
+        kind:
+          type: string
+          enum: [candle-updated]
+        recorded_at:
+          type: string
+          format: date-time
+        candle:
+          $ref: '#/components/schemas/CompleteCandle'
+    IntervalStatusEvent:
+      type: object
+      required: [event, kind, recorded_at, interval_status]
+      properties:
+        event:
+          type: string
+          description: Публичный стабильный идентификатор события для удаления дублей.
+        kind:
+          type: string
+          enum: [interval-status-changed]
+        recorded_at:
+          type: string
+          format: date-time
+        interval_status:
+          $ref: '#/components/schemas/IntervalStatus'
+    CompleteCandle:
+      type: object
+      required: [source, instrument_uid, interval, open_time_utc, open, high, low, close, volume, is_complete, revision, received_at]
+      properties:
+        source:
+          type: string
+        instrument_uid:
+          type: string
+          description: Идентификатор инструмента у поставщика рыночных данных; часть экспортируемого события, не параметр команды UI.
+        interval:
+          type: string
+          example: 1m
+        open_time_utc:
+          type: string
+          format: date-time
+        open:
+          $ref: '#/components/schemas/DecimalPrice'
+        high:
+          $ref: '#/components/schemas/DecimalPrice'
+        low:
+          $ref: '#/components/schemas/DecimalPrice'
+        close:
+          $ref: '#/components/schemas/DecimalPrice'
+        volume:
+          type: integer
+          format: int64
+          minimum: 0
+        is_complete:
+          type: boolean
+          enum: [true]
+        revision:
+          type: integer
+          minimum: 1
+        received_at:
+          type: string
+          format: date-time
+    DecimalPrice:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]+)?$'
+      description: Десятичное число строкой для сохранения точности.
+    IntervalStatus:
+      type: object
+      required: [source, instrument_uid, interval, open_time_utc, state, observed_at, evidence]
+      properties:
+        source:
+          type: string
+        instrument_uid:
+          type: string
+        interval:
+          type: string
+        open_time_utc:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [received, scheduled_closed, confirmed_no_trade, pending, unresolved]
+        observed_at:
+          type: string
+          format: date-time
+        evidence:
+          type: string
+          description: Основание классификации интервала.
+    Problem:
+      type: object
+      required: [title, status]
+      properties:
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
