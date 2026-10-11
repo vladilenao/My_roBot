@@ -272,7 +272,7 @@ class CsvExporter:
                     "avg_price_after": self._money(after_avg) if after_avg is not None else "",
                     "reason": reason_label(payload.get("reason")),
                 })
-            position_rows = []
+            cards: list[tuple[datetime, str, dict[str, object]]] = []
             for row in self._rows(
                 """
 SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at, trades.phase,
@@ -281,12 +281,20 @@ SELECT trades.trade_id, trades.instrument_id, positions.side, trades.created_at,
        positions.realized_pnl, positions.fees, positions.updated_at
 FROM positions
 JOIN trades ON trades.trade_id = positions.trade_id
-ORDER BY positions.trade_id
                 """
             ):
+                trade_id = str(row["trade_id"])
+                entries, exits = self._fills(trade_id)
+                if not entries:
+                    continue
                 ticker = str(row.get("instrument_id") or "")
                 meta = self._contracts.get(ticker)
-                position_rows.append(self._summary_row(row, meta))
+                cards.append((
+                    self._utc(entries[0]["executed_at"]), trade_id,
+                    self._summary_row(row, meta, entries, exits),
+                ))
+            cards.sort(key=lambda card: (card[0], card[1]))
+            position_rows = [card[2] for card in cards]
         finally:
             self._connection.rollback()
         return revision, journal_rows, position_rows
@@ -319,12 +327,14 @@ ORDER BY positions.trade_id
             return remaining, average_before if remaining else None
         return quantity_before, average_before
 
-    def _summary_row(self, row: Mapping[str, object], meta: object | None) -> dict[str, object]:
+    def _summary_row(
+        self, row: Mapping[str, object], meta: object | None,
+        entries: list[dict[str, object]], exits: list[dict[str, object]],
+    ) -> dict[str, object]:
         """Build one trader card from normalized fills and the immutable plan."""
         trade_id = str(row["trade_id"])
         plan = self._payload(row.get("plan_json"))
         side = str(row.get("side") or "").upper()
-        entries, exits = self._fills(trade_id)
         first_entry = entries[0] if entries else None
         last_exit = exits[-1] if exits else None
         entry_qty = sum(int(fill["quantity"]) for fill in entries[:1])
@@ -411,15 +421,17 @@ ORDER BY positions.trade_id
     def _fills(self, trade_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         entries: list[dict[str, object]] = []
         exits: list[dict[str, object]] = []
-        for row in self._rows(
+        rows = self._rows(
             """
-            SELECT f.quantity, f.price, f.executed_at, COALESCE(e.payload_json, '{}') AS payload_json,
+            SELECT f.fill_id, f.quantity, f.price, f.executed_at, COALESCE(e.payload_json, '{}') AS payload_json,
                    o.action_type
             FROM fills f JOIN orders o ON o.order_id = f.order_id
             LEFT JOIN events e ON e.event_id = f.execution_id
-            WHERE f.trade_id = ? ORDER BY f.executed_at, f.fill_id
+            WHERE f.trade_id = ?
             """, (trade_id,)
-        ):
+        )
+        rows.sort(key=lambda fill: (self._utc(fill["executed_at"]), str(fill["fill_id"])))
+        for row in rows:
             action = str(row["action_type"] or "").upper().split(":", 1)[0]
             payload = self._payload(row["payload_json"])
             value = dict(row)
@@ -445,11 +457,11 @@ ORDER BY positions.trade_id
         ).fetchone()
         return Decimal(str(row[0])) if row and row[0] not in (None, "") else None
 
-    @staticmethod
-    def _duration(first: Mapping[str, object] | None, last: Mapping[str, object] | None) -> str:
+    @classmethod
+    def _duration(cls, first: Mapping[str, object] | None, last: Mapping[str, object] | None) -> str:
         if not first or not last:
             return ""
-        delta = datetime.fromisoformat(str(last["executed_at"])) - datetime.fromisoformat(str(first["executed_at"]))
+        delta = cls._utc(last["executed_at"]) - cls._utc(first["executed_at"])
         return f"{int(delta.total_seconds() // 60)} мин"
 
     @staticmethod
@@ -608,13 +620,18 @@ ORDER BY positions.trade_id
         return value if isinstance(value, dict) else {}
 
     @staticmethod
-    def _msk(text: object) -> str:
-        if not text:
-            return ""
+    def _utc(text: object) -> datetime:
+        """Compare execution instants without losing offsets or subsecond precision."""
         stamp = datetime.fromisoformat(str(text))
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
-        return stamp.astimezone(_MSK).strftime("%Y-%m-%d %H:%M:%S")
+        return stamp.astimezone(timezone.utc)
+
+    @classmethod
+    def _msk(cls, text: object) -> str:
+        if not text:
+            return ""
+        return cls._utc(text).astimezone(_MSK).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _money(text: object) -> str:

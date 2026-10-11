@@ -100,13 +100,14 @@ def test_gap_is_partial_without_interpolation_and_repeated_bar_is_idempotent(tmp
         assert card(tmp_path)["MFE (R)"] == "0.75"
 
 
-def test_no_entry_means_unavailable_not_zero_excursions(tmp_path):
+def test_no_entry_has_no_summary_card_or_holding_observations(tmp_path):
     storage, manager, broker = system(tmp_path)
     with storage:
         bar(manager, broker, (102, 101, 103, 102), 1)
-        row = card(tmp_path)
-        assert row["MAE (R)"] == "" and row["MFE (R)"] == ""
-        assert row["Полнота экстремумов"] == "нет наблюдений"
+        with (tmp_path / "summary.csv").open(newline="", encoding="utf-8") as stream:
+            assert list(csv.DictReader(stream)) == []
+        assert storage.connection.execute("SELECT COUNT(*) FROM fills").fetchone() == (0,)
+        assert storage.connection.execute("SELECT COUNT(*) FROM trade_market_observations").fetchone() == (0,)
 
 
 def test_favourable_only_held_bars_do_not_turn_into_adverse_excursion(tmp_path):
