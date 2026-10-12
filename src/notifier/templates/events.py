@@ -365,6 +365,8 @@ def ingestion_summary(ingestion) -> str:
     hold = ingestion.get("data_hold")
     if hold:
         parts.append(_DATA_HOLDS.get(hold, hold))
+    if ingestion.get("pre_cutover_gaps"):
+        parts.append(f"пробелов до запуска без подтверждения: {ingestion['pre_cutover_gaps']}")
     return "Источник данных: " + " · ".join(parts)
 
 

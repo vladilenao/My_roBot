@@ -42,14 +42,15 @@ class Strategy:
         return Decision(SignalType.BUY, float(values["close"].iloc[-1]))
 
 
-def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=None):
+def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=None, cutover=None):
     clock = [now]
     timeline = MultiTimeframeScheduler(["1h", "15m", "1m"], clock=lambda: clock[0])
     data = {(name, tf): frame(end, tf) for name in ("SBER", "GAZP") for tf in ("1h", "15m", "1m")}
     def loader(**kwargs):
         return data[kwargs["ticker"], kwargs["timeframe"]], kwargs["ticker"]
     store = MarketDataStore(Path(tempfile.mkdtemp()) / "market.sqlite3")
-    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store)
+    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
+                            live_cutover=cutover)
     worker = IngestionWorker(cache)
     events = []
     class Channel:
@@ -98,7 +99,9 @@ def test_weekend_session_is_chosen_instead_of_friday():
 
 
 def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates():
-    live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00")
+    # Робот работает с 06:00: минуты до закрытия бара 10:00 — после запуска.
+    live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00",
+                                             cutover=datetime(2026, 10, 12, 6, 0))
     live.bootstrap()
     incoming = frame("2026-10-12 09:00")
     # Источник публикует новые данные; GAZP остаётся отстающим.
@@ -214,6 +217,12 @@ def test_overview_cache_ignores_hole_before_required_tail_but_not_inside():
     cache._market_reconciler = SimpleNamespace(interval_state=lambda **kw:
         "unresolved" if kw["open_time"] == hole else "scheduled_closed")
     with_old_hole = pd.concat([df.iloc[:1], df.iloc[2:]], ignore_index=True)
+    # Вариант «б»: пробел до запуска без доказательства не блокирует расчёт,
+    # но виден в диагностике.
+    assert cache.coverage_for(instrument, "1h", with_old_hole)
+    assert cache.pair_status(instrument, "1h")["pre_cutover_gaps"] == 1
+    # После запуска пробел внутри требуемого хвоста блокирует строго.
+    cache._live_cutover = pd.Timestamp("2026-09-01")
     assert not cache.coverage_for(instrument, "1h", with_old_hole)
     assert cache.coverage_for(instrument, "1h", with_old_hole.tail(50))
     hole = df["datetime"].iloc[-3]

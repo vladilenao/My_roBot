@@ -61,6 +61,9 @@ def test_critical_gap_of_one_uid_does_not_stop_healthy_uid(tmp_path):
                             request_budget=RequestBudget(lambda: now, 0), market_store=store)
     a, b = (Instrument(name, name, "share", name, name.lower()) for name in ("AAA", "BBB"))
     for item in (a, b):
+        # Сохранённые обязательства передаются до приёма данных, как в run.py:
+        # граница исполнения строгая и не заменяется cutover запуска.
+        cache.note_execution_lower(item, pd.Timestamp("2026-10-12 12:00"))
         cache.register_live_pair(item, item.uid, "1m")
         cache.mark_live_history(item.uid, "1m", done=True)
     cache.accept_rpc_frame("aaa", "1m", bars("2026-10-12 12:00", 1).iloc[[0]], received_at=now)
@@ -137,7 +140,9 @@ def test_end_to_end_stream_startup_overlap_internal_and_trailing_gap(tmp_path):
         if kwargs["end_date"] is not None:
             keep &= frame["datetime"] < pd.Timestamp(kwargs["end_date"])
         return frame[keep].reset_index(drop=True), "u"
-    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store)
+    # Робот работает с 11:30: внутренняя дыра — пропуск во время работы.
+    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
+                            live_cutover=datetime(2026, 10, 12, 11, 30))
     item = Instrument("SBER", "SBER", "share", "SBER", "u")
     cache.prepare_live_history(item, "1m", 30)
     settings = MarketDataSettings(live_transport="stream", candle_publication_timeout_secs=30,

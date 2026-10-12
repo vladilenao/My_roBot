@@ -246,3 +246,9 @@ def test_new_high_water_does_not_clear_deadline_of_internal_gap():
                           timeout_secs=60, received_bar=close + timedelta(minutes=2), resolved_bar=close - timedelta(minutes=1))
     assert later.expected_bar == close and later.publication_deadline == close + timedelta(seconds=60)
     assert later.data_state == "delayed"
+
+
+def test_status_line_shows_unconfirmed_gaps_before_start():
+    from src.notifier.templates.events import ingestion_summary
+    line = ingestion_summary({"transport": "polling", "data_hold": "READY", "pre_cutover_gaps": 2})
+    assert line == "Источник данных: опрос · готово · пробелов до запуска без подтверждения: 2"

@@ -128,7 +128,7 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, request_budget=None, recovery_retry_seconds=65) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
@@ -185,6 +185,13 @@ class MarketDataCache:
         self._owned_live_ingestion = self.live_session_enabled
         self._live_conflicts = set()
         self._pending_execution_lower = {}
+        # Решение владельца (вариант «б», проба 8.5): прошлые даты брокер не
+        # отдаёт, поэтому без сохранённых обязательств непрерывность
+        # доказывается от момента запуска; строгой остаётся 1m-граница
+        # исполнения сохранённых обязательств.
+        self._live_cutover = (None if not self.live_session_enabled
+                              else _naive(live_cutover if live_cutover is not None else timeline.now()))
+        self._pre_cutover_gaps = {}
         self._live_members = {}
         self._live_evidence = {}
         self._live_generation = 0
@@ -477,6 +484,13 @@ class MarketDataCache:
                 self._data_changed.notify_all()
             return results
 
+    def live_floor(self, uid, timeframe):
+        """Нижняя граница проверки непрерывности пары или None (строго)."""
+        member = self._live_members.get((uid, timeframe))
+        if self._live_cutover is None or (member is not None and member["execution_lower"] is not None):
+            return None
+        return _naive(self._timeline.grid(timeframe).previous_candle_start(self._live_cutover))
+
     def _advance_live_coverage(self, uid, timeframe, member):
         """Непрерывный префикс от meaningful lower; ночи и перерывы — по календарю.
 
@@ -500,12 +514,15 @@ class MarketDataCache:
         resolved = cursor.get("resolved_through")
         resolved = None if resolved is None else pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None)
         lower = min(lowers)
+        floor = self.live_floor(uid, timeframe)
+        if floor is not None:
+            lower = max(lower, floor)
         if member.get("coverage_lower") is None:
             stored = self._market_store.live_state(kind="pair", source=self._market_source,
                                                    instrument_uid=uid, interval=timeframe).get("coverage_lower")
             member["coverage_lower"] = None if stored is None else _naive(stored)
         existing = member.get("coverage_lower")
-        if existing is not None and (resolved is None or resolved < lower):
+        if existing is not None and (floor is None or existing >= floor) and (resolved is None or resolved < lower):
             # Граница не поднимается через недоказанный участок: новый
             # high-water не прячет внутреннюю/хвостовую дыру (задача 2.5).
             lower = min(existing, lower)
@@ -742,7 +759,9 @@ class MarketDataCache:
                     "received_through": cursors.get("received_through"),
                     "resolved_through": cursors.get("resolved_through"),
                     "processed_through": cursors.get("processed_through"),
-                    "incident": held.get("incident")}
+                    "incident": held.get("incident"),
+                    "cutover": None if self.live_floor(uid, timeframe) is None else self._live_cutover.isoformat(),
+                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0)}
 
     def input_ready_at(self, instrument, timeframe, open_time):
         """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""
@@ -759,6 +778,12 @@ class MarketDataCache:
         status = self.pair_status(instrument, "1m")
         if status["state"] in {"INTEGRITY_HOLD", "BOOTSTRAPPING"}:
             return False
+        uid = status.get("uid")
+        floor = self.live_floor(uid, "1m") if uid else None
+        if floor is not None and _naive(through) < floor:
+            # Вариант «б»: минуты до запуска без обязательств доказать нельзя
+            # и не нужно — исполнение начнётся только после cutover.
+            return True
         resolved = status.get("resolved_through")
         if resolved is None:
             return False
@@ -1094,14 +1119,24 @@ class MarketDataCache:
             return False
         period = pd.Timedelta(seconds=self._tf_period_secs(timeframe))
         stamps = list(frame["datetime"])
+        floor = self.live_floor(uid, timeframe) if self._owned_live_ingestion else None
+        unconfirmed = 0
         for left, right in zip(stamps, stamps[1:]):
             probe = _naive(left) + period
+            gap_unconfirmed = False
             while probe < _naive(right):
                 state = self._market_reconciler.interval_state(instrument_uid=uid,
                     interval=timeframe, open_time=probe, now=self._timeline.now())
                 if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
-                    return False
+                    if floor is None or probe >= floor:
+                        return False
+                    # До запуска: доказательства нет и получить его нельзя —
+                    # пробел виден в диагностике, но расчёт не блокирует.
+                    gap_unconfirmed = True
                 probe += period
+            unconfirmed += gap_unconfirmed
+        if floor is not None:
+            self._pre_cutover_gaps[uid, timeframe] = unconfirmed
         return True
 
     def calendar_for(self, instrument):

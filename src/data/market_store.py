@@ -518,9 +518,12 @@ class MarketDataStore:
                     "SELECT received_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
                     (source, instrument_uid, interval),
                 ).fetchone()
-                if pair.get("coverage_lower") and cursor is not None and cursor[0] is not None:
+                horizon = None if cursor is None or cursor[0] is None else max(stamp, cursor[0])
+                # Граница может быть позже горизонта (cutover запуска): тогда
+                # пересчитывать префикс нечего, запись состояния не падает.
+                if pair.get("coverage_lower") and horizon is not None and horizon >= _utc_text(pair["coverage_lower"]):
                     self._resolve_contiguous_prefix(conn, source, instrument_uid, interval,
-                                                    pair["coverage_lower"], max(stamp, cursor[0]))
+                                                    pair["coverage_lower"], horizon)
                 conn.commit()
                 return change_id
             except Exception:

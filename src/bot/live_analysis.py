@@ -108,7 +108,8 @@ class LiveAnalysis:
                 "data_hold": status.get("state"), "received_through": status.get("received_through"),
                 "resolved_through": status.get("resolved_through"), "processed_through": status.get("processed_through"),
                 "gap": status.get("gap"), "incident": status.get("incident"),
-                "history_error": status.get("history_error") or ""}
+                "history_error": status.get("history_error") or "",
+                "cutover": status.get("cutover"), "pre_cutover_gaps": status.get("pre_cutover_gaps", 0)}
 
     def _hold_reason(self, instrument, tf, ingestion, close):
         state = ingestion.get("data_hold")

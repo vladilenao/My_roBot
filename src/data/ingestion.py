@@ -270,6 +270,9 @@ class IngestionWorker:
                 lower = (pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None) if resolved is not None
                          else last if last is not None else horizon)
                 lower = min(_naive(lower), horizon)
+                floor = self._cache.live_floor(uid, timeframe)
+                if floor is not None:
+                    lower = min(max(lower, floor), horizon)
                 try:
                     self._load_range(pair["instrument"], timeframe, lower, grid.bar_close(horizon))
                 except RequestDeferred:
@@ -476,6 +479,7 @@ class IngestionWorker:
         for pair in self._cache.live_pairs():
             if pair["history"] != "done":
                 continue
+            self._clip_to_floor(pair)
             missing, horizon = self._first_missing(pair, now)
             if missing is not None:
                 self._merge_range(pair["uid"], pair["timeframe"], missing, horizon, now)
@@ -483,6 +487,17 @@ class IngestionWorker:
                 book = self._load_book(pair["uid"], pair["timeframe"])
                 if book is not None and book.upper <= (horizon or book.upper):
                     self._clear_range(pair["uid"], pair["timeframe"])
+
+    def _clip_to_floor(self, pair):
+        """Сохранённая область прошлого запуска не уходит за cutover."""
+        floor = self._cache.live_floor(pair["uid"], pair["timeframe"])
+        book = self._load_book(pair["uid"], pair["timeframe"]) if floor is not None else None
+        if book is None or book.lower >= floor:
+            return
+        if book.upper < floor:
+            return self._clear_range(pair["uid"], pair["timeframe"])
+        book.lower, book.checkpoint = floor, max(book.checkpoint, floor)
+        self._save_book(pair["uid"], pair["timeframe"], book)
 
     def _horizon(self, key, now):
         """Последний ожидаемый закрытый интервал, чей срок публикации истёк."""
@@ -505,6 +520,9 @@ class IngestionWorker:
                 if not state.get("coverage_lower"):
                     return None, horizon
                 lower = _naive(state["coverage_lower"])
+        floor = self._cache.live_floor(uid, timeframe)
+        if floor is not None:
+            lower = max(_naive(lower), floor)  # вариант «б»: не раньше запуска
         probe, steps = _naive(lower), 0
         frame = self._cache._closed_member_frame(self._cache._live_members[uid, timeframe], timeframe)
         received = set(frame.loc[frame["datetime"] >= probe, "datetime"]) if not frame.empty else set()

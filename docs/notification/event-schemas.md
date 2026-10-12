@@ -104,7 +104,9 @@ warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
 (BOOTSTRAPPING/RECONCILING/READY/GAP_HOLD/CONFLICT_HOLD/INTEGRITY_HOLD),
 границы `received_through`/`resolved_through`/`processed_through` (UTC ISO8601
 открытия бара), `gap` (lower/upper/state active|parked/attempts/next_retry_at/reason
-или null), `incident` (integrity-инцидент или null) и `history_error`.
+или null), `incident` (integrity-инцидент или null), `history_error`, `cutover`
+(момент запуска, от которого проверяется непрерывность пары без обязательств)
+и `pre_cutover_gaps` (пробелы прогрева до запуска без доказательства расписания).
 Удержание не означает потерю данных или отсутствие сделок.
 
 ```json

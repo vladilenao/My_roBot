@@ -33,6 +33,8 @@
 - [x] 2.5 Разделить received high-water, computed contiguous coverage, analysis и external processed frontiers; meaningful lower учитывает existing исполнение/прогрев, не только latest timestamp.
 - [x] 2.6 Добавить freeze/pin revision refs начатого пакета и сохранение consumed-input reference в market-state; проверить correction во время обработки и crash между financial commit и market-marker без replay новой версии.
 
+- [x] 2.7 По итогам пробы 8.5: запрос TradingSchedules не раньше текущей даты; решение владельца «б» — для пары без сохранённых обязательств непрерывность от cutover запуска, неподтверждённые пробелы прогрева до него видны в диагностике и не блокируют расчёт; строгий 1m-префикс от границы исполнения сохранённых обязательств (design 7b).
+
 ## 3. MVP: stream-session и жизненный цикл
 
 - [x] 3.1 Добавить узкую API stream-session factory на текущем Client/Services с bounded request iterator, owned lifetime/cancel/close и explicit model family; новые модули обосновывать отсутствующим контрактом и преимущественно расширять существующие. Не вводить новую версию SDK без результатов пункта1.1/согласования.
@@ -89,7 +91,7 @@
 - [x] 8.2 Добавить fault tests buffer overflow, forgotten subscription, invalid source/interval/auth/quota, stale generation, blocked read-stop, correction during commit и restart after financial commit; проверить все обязательные scenarios delta-specs.
 - [x] 8.3 Публиковать existing log/market_data_status/error/heartbeat diagnostics из design: ACK/generation, profile, timestamps, frontier/gap/retry, buffer/loss, correction/incident/fallback; короткие имена контрактов и отсутствие секретов.
 - [x] 8.4 Запустить при реализации релевантные unit/integration и existing snapshot/backtest регрессии без обновления эталонов ради транспортной фичи; tests только в разрешённых подкаталогах, текущий этап propose их не запускает.
-- [ ] 8.5 После отдельного разрешения владельца перед stream-rollout выполнить контролируемую read-only broker compatibility проверку ACK нужных UID/ТФ, source-equivalence/edge semantics и доступных квот; измерить publication/health/ACK latency, cold-start/RAM/correction peak и сверить provisional профиль с допустимой актуальностью решений. Зафиксировать наблюдения/ограничения без реальных ордеров. При несовместимости обновить план, не обещать исправленную причину сегодняшних пропусков.
+- [ ] 8.5 (заход 1 выполнен 2026-10-12: ACK, границы, источники, холодный старт, расписание — см. research.md; осталось: заход 2 в основную сессию) После отдельного разрешения владельца перед stream-rollout выполнить контролируемую read-only broker compatibility проверку ACK нужных UID/ТФ, source-equivalence/edge semantics и доступных квот; измерить publication/health/ACK latency, cold-start/RAM/correction peak и сверить provisional профиль с допустимой актуальностью решений. Зафиксировать наблюдения/ограничения без реальных ордеров. При несовместимости обновить план, не обещать исправленную причину сегодняшних пропусков.
 - [x] 8.6 Подготовить рабочую архитектурную/операционную документацию на этапе реализации: различие live-data/simulation/real-executor, per-dependency hold/сохранение состояния, opt-in/fallback/rollback, separate publication/recovery/status и provisional numeric profile, fixed snapshot для replay; `_manage`/`_calculate` явно остаётся отдельной проблемой. Не менять рабочую документацию в данной ревизии.
 
 ## 9. Отложенные улучшения — отдельные будущие changes, не критерии MVP
