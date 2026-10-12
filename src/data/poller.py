@@ -33,6 +33,13 @@ class LiveMarketDataPoller:
 
     def _run(self) -> None:
         while not self._stopped.is_set():
+            if getattr(self._cache, "live_session_enabled", False) is True:
+                try:
+                    self._cache.refresh_live()
+                except Exception as exc:
+                    log.warning("Фоновое обновление live-пар не удалось: %s", exc)
+                self._stopped.wait(self._poll_seconds)
+                continue
             for timeframe in self._timeframes:
                 if self._stopped.is_set():
                     return

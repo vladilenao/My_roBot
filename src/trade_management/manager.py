@@ -37,7 +37,7 @@ from src.trade_management.audit import (
     TraceOutcome,
     calculation_trace,
 )
-from src.trade_management.economics import plan_economics
+from src.trade_management.economics import plan_economics, entry_price_deviation
 from src.trade_management.models import (
     PlanEconomics, PortfolioBudgetPolicy, SignalAdmission, TradePhase, TradePlan, rebase_on_average, rejection_message, rejection_reason,
 )
@@ -180,6 +180,8 @@ class TradeManager:
         min_risk_cost_ratio: Decimal | float | str = Decimal("2"),
         min_net_payoff: Decimal | float | str = Decimal("1.5"),
         max_slippage_r: Decimal | float | str = Decimal("0.25"),
+        max_entry_deviation_r: Decimal | float | str = Decimal("0.25"),
+        live_market_provider=None,
         clock: Clock | Callable[[], datetime] | None = None,
     ) -> None:
         self._storage = storage
@@ -218,6 +220,8 @@ class TradeManager:
         self._min_risk_cost_ratio = Decimal(str(min_risk_cost_ratio))
         self._min_net_payoff = Decimal(str(min_net_payoff))
         self._max_slippage_r = Decimal(str(max_slippage_r))
+        self._max_entry_deviation_r = Decimal(str(max_entry_deviation_r))
+        self._live_market_provider = live_market_provider
         self._equity_unknown = False
         self.contract_lifecycle = None
 
@@ -1036,6 +1040,15 @@ class TradeManager:
         return tuple(submitted)
 
     def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
+        live_market = None
+        if self._live_market_provider is not None:
+            live_market = self._live_market_provider(instrument)
+            if not live_market.get("valid"):
+                return SignalAdmission(rejections=(rejection_reason("current-price-unavailable",
+                    message=live_market.get("reason", "Текущая цена недоступна")),))
+            if self.contract_has_obligations(instrument_key(instrument)) and not live_market.get("execution_ready"):
+                return SignalAdmission(rejections=(rejection_reason("execution-coverage-blocked",
+                    message="Исполнительный курсор остановлен перед неразрешённым базовым интервалом"),))
         instrument_type = getattr(instrument, "instrument_type", None)
         allowed = self._direction_limits.get(instrument_type) if instrument_type is not None else None
         if allowed is not None:
@@ -1073,9 +1086,12 @@ class TradeManager:
                 "min_risk_cost_ratio": self._min_risk_cost_ratio,
                 "min_net_payoff": self._min_net_payoff,
                 "max_slippage_r": self._max_slippage_r,
+                **({"max_entry_deviation_r": self._max_entry_deviation_r} if live_market is not None else {}),
             },
         )
         trade_id = decision.event_id or f"{assignment.id}:{timeframe}:{decision.signal_type.value}"
+        if live_market is not None:
+            market["live_market"] = dict(live_market)
         profile = profile_cls()
         plan, plan_trace = profile.plan_with_trace(
             PlanningContext(
@@ -1097,6 +1113,23 @@ class TradeManager:
                 rejections=(rejection_reason(code),),
             )
         plan = replace(plan, timeframe=timeframe or "")
+        if live_market is not None:
+            deviation = entry_price_deviation(plan.side, live_market["current_price"],
+                plan.reference_entry, plan.stop_price)
+            reason = "entry-price-deviation" if deviation is None or deviation > self._max_entry_deviation_r else "current-entry-price-allowed"
+            self._traces.record(calculation_trace("portfolio.current-entry-price",
+                inputs={"market": MeasuredValue(dict(live_market), "market-snapshot"),
+                        "entry": MeasuredValue(plan.reference_entry, "price"),
+                        "stop": MeasuredValue(plan.stop_price, "price"),
+                        "max_entry_deviation_r": MeasuredValue(self._max_entry_deviation_r, "ratio")},
+                result=MeasuredValue(deviation, "ratio"), reason=reason,
+                outcome=TraceOutcome.REJECTED if reason == "entry-price-deviation" else TraceOutcome.ACCEPTED,
+                formula="max(0,direction*(current-entry))/abs(entry-stop)",
+                links=TraceLinks(assignment_id=assignment.id, signal_id=plan.signal_id)))
+            if reason == "entry-price-deviation":
+                return SignalAdmission(rejections=(rejection_reason(reason,
+                    message=f"Цена {live_market['current_price']} ухудшает плановый вход {plan.reference_entry}: "
+                            f"отклонение {deviation if deviation is not None else 'неизвестно'}R, предел {self._max_entry_deviation_r}R"),))
         if self._storage.connection.execute(
             "SELECT 1 FROM processed_signals WHERE assignment_id=? AND signal_id=?",
             (plan.assignment_id, plan.signal_id),

@@ -1,7 +1,7 @@
 """Русское представление Telegram. Консольные шаблоны сюда не обращаются."""
 from decimal import Decimal
 from html import escape
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.events.types import EventType
 from src.events.visual import utc
@@ -149,6 +149,42 @@ def _history(visual, step, unit, offset):
 def render(event, *, root=False, tz_offset_hours=0):
     visual = event.get("visual")
     instrument = escape(event.instrument or "контракт не указан")
+    if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:
+        def dated(value):
+            if value is None:
+                return "неизвестно"
+            stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            zone = "МСК" if tz_offset_hours == 3 else "UTC" if tz_offset_hours == 0 else f"UTC{tz_offset_hours:+g}"
+            return stamp.astimezone(timezone(timedelta(hours=tz_offset_hours))).strftime("%d.%m.%Y %H:%M:%S") + " " + zone
+        if event.type is EventType.STARTUP_ANALYSIS:
+            lines = [f"<b>{instrument} · Стартовый обзор · {escape(event.timeframe)}</b>",
+                     "Свеча закрылась: " + dated(event.bar_time),
+                     "Опубликовано: " + dated(event.get("published_at")),
+                     "Информационный результат, не принятая сделка",
+                     f"Прогрев: {event.get('available_bars')}/{event.get('required_bars')}"]
+            labels = {"HOLD": "Нет сигнала", "BUY": "Покупка (обзор)", "SELL": "Продажа (обзор)", "FILTERED": "Отклонено фильтром"}
+            for row in event.get("results", ()):
+                lines.append(escape(f"{row['strategy']} / {row['filter_profile']}: " + (row["reason"] or labels.get(row["outcome"], row["outcome"]))))
+                if row["indicators"]:
+                    lines.append(escape(row["indicators"]))
+        else:
+            labels = {"warming_up": "Прогрев", "waiting_bar": "Ожидание свечи", "delayed": "Задержка данных",
+                      "coverage_blocked": "Неполное покрытие", "current": "Данные актуальны", "rate_limited": "Ожидание лимита API"}
+            status = labels.get(event.get("data_state"), event.get("data_state"))
+            if event.get("session") == "waiting_session":
+                status = "Рынок закрыт, ожидаем возобновления торгов · " + status
+            lines = [f"<b>{instrument} · {escape(event.timeframe)} · {escape(status)}</b>",
+                     "Наблюдение: " + dated(event.get("observed_at")),
+                     "Полученная свеча: " + dated(event.get("received_bar")),
+                     "Последний анализ: " + dated(event.get("analyzed_bar")),
+                     "Ожидаемый интервал: " + dated(event.get("expected_bar"))]
+            if event.get("next_open"):
+                lines.append("Следующее открытие: " + dated(event.get("next_open")))
+        if event.get("reason"):
+            lines.append("Причина: " + escape(event.get("reason")))
+        return "\n".join(lines)
     if not visual:
         role = event_role(event)
         side = "ПОКУПКА" if event.get("side") == "BUY" else "ПРОДАЖА" if event.get("side") == "SELL" else ""

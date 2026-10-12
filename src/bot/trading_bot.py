@@ -126,6 +126,8 @@ class TradingBot:
 
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча активного ТФ» ──
     def _loop(self) -> None:
+        if getattr(self._data_cache, "live_session_enabled", False) is True:
+            return self._loop_live()
         first = True
         while not self._run.should_stop():
             try:
@@ -155,6 +157,20 @@ class TradingBot:
                 else:
                     time.sleep(self._timeline.fallback_secs())
         log.info("Прогон завершён: %s", self._run.stop_reason())
+
+    def _loop_live(self):
+        from src.bot.live_analysis import LiveAnalysis
+        live = LiveAnalysis(self)
+        try:
+            live.bootstrap()
+            while not self._run.should_stop():
+                try:
+                    live.step()
+                except Exception as exc:
+                    self._report_error(exc, "обработка live-пар")
+                self._timeline.wait_live_poll(self._tick_poll_secs)
+        except KeyboardInterrupt:
+            log.info("Бот остановлен.")
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
@@ -557,6 +573,7 @@ class TradingBot:
         filter_profile: str = "",
         filtered_out: bool = False,
         timeframe: str = "",
+        analysis_mode: str = "",
     ) -> None:
         """Publish the strategy outcome; the channel decides how it reads."""
         if filtered_out:
@@ -575,6 +592,7 @@ class TradingBot:
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
                 event_id=decision.event_id or "",
+                analysis_mode=analysis_mode,
             )
         )
 

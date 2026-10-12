@@ -126,9 +126,9 @@ def test_to_dict_is_json_serializable_shape() -> None:
 
 
 def test_catalog_has_nineteen_notifications_two_controls_and_nine_lifecycle_types() -> None:
-    assert len(EventType) == 21
-    assert len(ALL_EVENT_TYPES) == 21
-    assert len(NOTIFICATION_EVENT_TYPES) == 19
+    assert len(EventType) == 23
+    assert len(ALL_EVENT_TYPES) == 23
+    assert len(NOTIFICATION_EVENT_TYPES) == 21
     assert CONTROL_EVENT_TYPES == frozenset({EventType.TICK_STARTED, EventType.TICK_FINISHED})
     assert TRADING_EVENT_TYPES == frozenset(
         {

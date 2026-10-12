@@ -34,6 +34,40 @@ def _client_context(client_provider: ClientProvider | None = None, token=None):
     return client_context(token)
 
 
+_CATALOG_METHODS = {"share": "shares", "future": "futures", "etf": "etfs", "currency": "currencies"}
+
+
+def _catalog_instrument_id(client, ticker, instrument_type, *, request_budget=None,
+                           wait_for_budget=True, market_now=None):
+    """UID инструмента по каталогу: один дешёвый RPC без стрима свечей."""
+    if request_budget is None:
+        return find_working_instrument(client, ticker, instrument_type, market_now=market_now)
+    from t_tech.invest import InstrumentStatus
+    method = _CATALOG_METHODS.get(instrument_type)
+    if method is None:
+        raise ValueError(f"Неподдерживаемый тип инструмента: {instrument_type}")
+    if instrument_type not in request_budget.catalogs:
+        request_budget.catalogs[instrument_type] = request_budget.call(
+            getattr(client.instruments, method),
+            instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE,
+            key=("catalog", instrument_type), wait=wait_for_budget).instruments
+    card = next((card for card in request_budget.catalogs[instrument_type] if card.ticker == ticker), None)
+    if card is None:
+        raise ValueError(f"Инструмент {ticker} не найден в каталоге")
+    return card.uid
+
+
+def resolve_instrument_id(*, ticker, instrument_type, token=None, client_provider=None,
+                          request_budget=None, wait_for_budget=True, clock=None):
+    """Дешёвый UID инструмента (только каталог) для прогрева из локальной базы."""
+    market_now = _market_now(clock)
+    with _client_context(client_provider, token) as client:
+        return _catalog_instrument_id(
+            client, ticker, instrument_type, request_budget=request_budget,
+            wait_for_budget=wait_for_budget, market_now=market_now,
+        )
+
+
 def load_candles(
     ticker,
     instrument_type,
@@ -44,6 +78,9 @@ def load_candles(
     instrument_id=None,
     client_provider=None,
     clock=None,
+    request_budget=None,
+    wait_for_budget=True,
+    single_attempt=False,
 ):
 
 
@@ -76,8 +113,9 @@ def load_candles(
 
     with _client_context(client_provider, token) as client:
         if instrument_id is None:
-            instrument_id = find_working_instrument(
-                client, ticker, instrument_type, market_now=market_now
+            instrument_id = _catalog_instrument_id(
+                client, ticker, instrument_type, request_budget=request_budget,
+                wait_for_budget=wait_for_budget, market_now=market_now,
             )
 
         # Итерация по get_all_candles тоже может падать с RESOURCE_EXHAUSTED —
@@ -88,13 +126,35 @@ def load_candles(
         candles_from = start_date
         while True:
             try:
-                for candle in api_call_with_retry(
+                if request_budget is not None:
+                    from t_tech.invest.utils import get_intervals
+
+                    def bounded_candles():
+                        seen = set()
+                        first_page = True
+                        for lower, upper in get_intervals(TIMEFRAMES[timeframe], candles_from, end_date):
+                            response = request_budget.call(
+                                client.market_data.get_candles, instrument_id=instrument_id,
+                                from_=lower, to=upper, interval=TIMEFRAMES[timeframe],
+                                key=(instrument_id, timeframe, lower, upper), wait=wait_for_budget,
+                                pace=first_page,
+                            )
+                            first_page = False
+                            for candle in response.candles:
+                                if candle.time not in seen:
+                                    seen.add(candle.time)
+                                    yield candle
+                    stream = bounded_candles()
+                else:
+                    stream = api_call_with_retry(
                     client.get_all_candles,
                     instrument_id=instrument_id,
                     from_=candles_from,
                     to=end_date,
                     interval=TIMEFRAMES[timeframe],
-                ):
+                    max_retries=0 if single_attempt else DEFAULT_MAX_RETRIES,
+                    )
+                for candle in stream:
                     simple_df.append([
                     candle.time,
                     candle.open.units + candle.open.nano / 1e9,
@@ -109,7 +169,7 @@ def load_candles(
                     ])
                 break
             except Exception as exc:
-                if not _is_rate_limited(exc) or retries >= DEFAULT_MAX_RETRIES:
+                if single_attempt or not _is_rate_limited(exc) or retries >= DEFAULT_MAX_RETRIES:
                     raise
                 retries += 1
                 reset = rate_limit_reset_secs(exc)

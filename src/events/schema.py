@@ -21,6 +21,8 @@ FINANCIAL_PAYLOAD_FIELDS = (
 )
 
 _REQUIRED: dict[EventType, tuple[str, ...]] = {
+    EventType.STARTUP_ANALYSIS: ("published_at", "results", "available_bars", "required_bars", "coverage_complete", "reason"),
+    EventType.MARKET_DATA_STATUS: ("session", "data_state", "observed_at", "reason"),
     EventType.DECISION: ("outcome", "side"),
     EventType.SIGNAL: ("side", "quantity", "entry", "stop"),
     EventType.REJECTED: ("reason",),
@@ -31,7 +33,10 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
 }
 
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
-    EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id"),
+    EventType.STARTUP_ANALYSIS: (),
+    EventType.MARKET_DATA_STATUS: ("received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
+                                 "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete"),
+    EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id", "analysis_mode"),
     EventType.SIGNAL: (
         "targets", "expected_r", "strategy", "filter_profile", "trade_id",
         "risk_amount", "reward_amount", "costs_amount", "payoff_ratio",
@@ -114,6 +119,9 @@ for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION
 
 
 _JSON_TYPES: dict[str, str] = {
+    "available_bars": "number",
+    "required_bars": "number",
+    "coverage_complete": "boolean",
     "quantity": "number",
     "positions": "number",
     "tick_count": "number",
@@ -137,6 +145,13 @@ def _property(name: str) -> dict[str, Any]:
     """
     if name == "visual":
         return {"$ref": SCHEMA_ID}
+    if name == "results":
+        return {"type": "array", "items": {
+            "type": "object", "required": ["assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason"],
+            "properties": {field: {"type": "string"} for field in
+                           ("assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason")},
+            "additionalProperties": False,
+        }}
     json_type = _JSON_TYPES.get(name, "string")
     if json_type == "array":
         return {"type": "array", "items": {"type": "string"}}

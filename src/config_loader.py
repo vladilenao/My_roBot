@@ -162,6 +162,7 @@ _RISK_DEFAULTS = {
     "min_risk_cost_ratio": 2.0,
     "min_net_payoff": 1.5,
     "max_slippage_r": 0.25,
+    "max_entry_deviation_r": 0.25,
 }
 _RISK_LIMIT_KEYS = set(_RISK_DEFAULTS) | {"max_qty", "slippage_tolerance"}
 _ALLOWED_DIRECTIONS = frozenset({"long", "short"})
@@ -379,7 +380,7 @@ def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
     if unknown:
         raise ConfigError(f"{path}: [trading.risk_limits] незнакомые ключи {sorted(unknown)}")
     value = {**_RISK_DEFAULTS, **value}
-    for key in ("portfolio_pct", "commission", "slippage", "slippage_tolerance", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r"):
+    for key in ("portfolio_pct", "commission", "slippage", "slippage_tolerance", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r", "max_entry_deviation_r"):
         if key in value:
             _finite_number(value[key], f"[trading.risk_limits] {key}", path, non_negative=True)
     if value["portfolio_pct"] > 100:

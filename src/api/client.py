@@ -2,6 +2,7 @@ from t_tech.invest import Client
 
 from src.config import TINKOFF_TOKEN
 from src.logging_setup import get_logger
+from src.api.deadline import RpcDeadline
 
 log = get_logger(__name__)
 
@@ -21,7 +22,7 @@ class TinkoffClientProvider(ClientProvider):
     """Боевой режим: аутентифицированный клиент T-Банка Invest API."""
 
     def client_context(self, token=None):
-        return Client(token or TINKOFF_TOKEN)
+        return Client(token or TINKOFF_TOKEN, interceptors=[RpcDeadline()])
 
 
 _DEFAULT_PROVIDER = TinkoffClientProvider()

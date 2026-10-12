@@ -153,6 +153,17 @@ class MarketDataStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(source, instrument_uid, interval)
                 );
+                CREATE TABLE IF NOT EXISTS recovery_attempts (
+                    source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                    open_time_utc TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    attempted_at TEXT NOT NULL, next_attempt_at TEXT NOT NULL,
+                    PRIMARY KEY(source,instrument_uid,interval,open_time_utc)
+                );
+                CREATE TABLE IF NOT EXISTS analysis_cursors (
+                    source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
+                    PRIMARY KEY(source,instrument_uid,interval,assignment_id)
+                );
                 """
             )
             # SQLite не умеет добавить значение в CHECK. Ранняя версия change
@@ -352,16 +363,55 @@ class MarketDataStore:
             ).fetchone()
         return None if row is None else str(row["state"])
 
-    def first_recovery_candidate(self, *, source: str, instrument_uid: str, interval: str) -> pd.Timestamp | None:
+    def first_recovery_candidate(self, *, source: str, instrument_uid: str, interval: str, now=None) -> pd.Timestamp | None:
         """Самая старая дыра, которую нужно запросить отдельным backfill-ом."""
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                """SELECT open_time_utc FROM interval_coverage
-                WHERE source=? AND instrument_uid=? AND interval=? AND state IN ('pending','unresolved')
-                ORDER BY open_time_utc LIMIT 1""",
-                (source, instrument_uid, interval),
+                """SELECT c.open_time_utc FROM interval_coverage c
+                LEFT JOIN recovery_attempts r USING(source,instrument_uid,interval,open_time_utc)
+                WHERE c.source=? AND c.instrument_uid=? AND c.interval=? AND c.state IN ('pending','unresolved')
+                AND (? IS NULL OR r.next_attempt_at IS NULL OR r.next_attempt_at<=?)
+                ORDER BY c.open_time_utc LIMIT 1""",
+                (source, instrument_uid, interval, None if now is None else _utc_text(now),
+                 None if now is None else _utc_text(now)),
             ).fetchone()
         return None if row is None else pd.Timestamp(row["open_time_utc"]).tz_localize(None)
+
+    def record_recovery_attempt(self, *, source, instrument_uid, interval, open_time, now, next_attempt):
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO recovery_attempts VALUES(?,?,?,?,1,?,?)
+                ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
+                attempts=recovery_attempts.attempts+1,attempted_at=excluded.attempted_at,
+                next_attempt_at=excluded.next_attempt_at""",
+                (source, instrument_uid, interval, _utc_text(open_time), _utc_text(now), _utc_text(next_attempt)))
+
+    def observations(self, *, source, instrument_uid, kind, limit=20):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT payload_json,observed_at FROM source_observations
+                WHERE source=? AND instrument_uid=? AND kind=? ORDER BY observation_id DESC LIMIT ?""",
+                (source, instrument_uid, kind, limit)).fetchall()
+        return [(json.loads(row[0]), pd.Timestamp(row[1]).tz_localize(None)) for row in rows]
+
+    def analysis_cursor(self, *, source, instrument_uid, interval, assignment_id):
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT open_time_utc FROM analysis_cursors WHERE source=? AND instrument_uid=? AND interval=? AND assignment_id=?",
+                (source, instrument_uid, interval, assignment_id)).fetchone()
+        return pd.Timestamp(row[0]).tz_localize(None) if row else None
+
+    def mark_analyzed(self, *, source, instrument_uid, interval, assignment_id, open_time):
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO analysis_cursors VALUES(?,?,?,?,?)
+                ON CONFLICT(source,instrument_uid,interval,assignment_id) DO UPDATE SET
+                open_time_utc=MAX(analysis_cursors.open_time_utc,excluded.open_time_utc)""",
+                (source, instrument_uid, interval, assignment_id, _utc_text(open_time)))
+
+    def unresolved_between(self, *, source, instrument_uid, interval, start, end, limit=1000):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT open_time_utc FROM interval_coverage WHERE
+                source=? AND instrument_uid=? AND interval=? AND state IN ('pending','unresolved')
+                AND open_time_utc>=? AND open_time_utc<? ORDER BY open_time_utc LIMIT ?""",
+                (source, instrument_uid, interval, _utc_text(start), _utc_text(end), limit)).fetchall()
+        return [pd.Timestamp(row[0]).tz_localize(None) for row in rows]
 
     def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object) -> None:
         """Продвигает границу симуляции после внешнего durable commit."""

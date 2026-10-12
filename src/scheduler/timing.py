@@ -373,6 +373,11 @@ class MultiTimeframeScheduler:
         self._last_tick = now
         self._pending = {}
 
+    def wait_live_poll(self, poll_secs):
+        """Live-пары проверяются независимо, без общего окна ожидания ТФ."""
+        if not self._clock.is_virtual:
+            self._sleep(max(0.1, float(poll_secs)))
+
     def _candidates(self, now: datetime, wait_boundary: bool) -> dict[str, datetime]:
         """ТФ-кандидаты тика с границами, которые ждём: pending + пройденные.
 

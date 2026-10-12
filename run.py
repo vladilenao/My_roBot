@@ -439,9 +439,12 @@ def _launch(
         clock=clock,
     )
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
+    from src.data.request_budget import RequestBudget
+    request_budget = None if history else RequestBudget(timeline.now, DATA_REFRESH_MIN_INTERVAL)
     market_reconciler = None if market_store is None else MarketDataReconciler(
         market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
         client_provider=client_provider,
+        request_budget=request_budget,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
@@ -454,6 +457,8 @@ def _launch(
         client_provider=client_provider,
         market_store=market_store,
         market_reconciler=market_reconciler,
+        request_budget=request_budget,
+        recovery_retry_seconds=TICK_TIMEOUT_SECS,
     )
     if history:
         data_cache.set_boundary_checks(report.boundaries)
@@ -672,6 +677,8 @@ def _build_runtime(
         min_risk_cost_ratio=RISK_LIMITS.get("min_risk_cost_ratio", 2),
         min_net_payoff=RISK_LIMITS.get("min_net_payoff", 1.5),
         max_slippage_r=RISK_LIMITS.get("max_slippage_r", 0.25),
+        max_entry_deviation_r=RISK_LIMITS.get("max_entry_deviation_r", 0.25),
+        live_market_provider=None if historical else data_cache.entry_market if getattr(data_cache, "live_session_enabled", False) is True else None,
         contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
         direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
