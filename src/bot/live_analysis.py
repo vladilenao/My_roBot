@@ -23,7 +23,8 @@ class LiveAnalysis:
         self.states = {}
         self.cursors = {}
         self.requirements = {}
-        self.cadence = StatusCadence(max(60, bot._tick_timeout_secs))
+        self.settings = bot._market_data_settings
+        self.cadence = StatusCadence(self.settings.status_repeat_interval_secs)
 
     def _key(self, instrument, tf):
         return instrument_key(instrument), tf
@@ -163,7 +164,7 @@ class LiveAnalysis:
                 state = replace(state, expected_bar=None, publication_deadline=None)
         close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
         state = state.observe(now=now, session=session, expected_bar=expected,
-            timeout_secs=self.bot._tick_timeout_secs, received_bar=close, next_open=next_open)
+            timeout_secs=self.settings.candle_publication_timeout_secs, received_bar=close, next_open=next_open)
         required = state.required_bars
         reason = "" if len(frame) >= required else f"Недостаточно истории: {len(frame)}/{required} свечей"
         if not reason and not self.cache.coverage_for(instrument, tf, frame.tail(required)):

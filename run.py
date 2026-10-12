@@ -23,6 +23,7 @@ from src.config import (
     MARKET_DATA_EXPORT_ENABLED,
     MARKET_DATA_EXPORT_HOST,
     MARKET_DATA_EXPORT_PORT,
+    MARKET_DATA_SETTINGS,
     MARKET_DATA_EXPORT_TOKEN,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
@@ -458,7 +459,7 @@ def _launch(
         market_store=market_store,
         market_reconciler=market_reconciler,
         request_budget=request_budget,
-        recovery_retry_seconds=TICK_TIMEOUT_SECS,
+        recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
     )
     if history:
         data_cache.set_boundary_checks(report.boundaries)
@@ -562,6 +563,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> N
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
+        market_data_settings=MARKET_DATA_SETTINGS,
         context_cache=MarketContextCache(
             data_cache=data_cache,
             trend_analyzer=TrendAnalyzer(),

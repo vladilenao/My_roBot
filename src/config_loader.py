@@ -21,6 +21,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.data.ingestion_settings import SettingError, setting_names, validate_combination, validate_setting
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
@@ -47,6 +48,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "export_enabled": "market_data_export_enabled",
         "export_host": "market_data_export_host",
         "export_port": "market_data_export_port",
+        **{name: f"market_data_{name}" for name in setting_names()},
     },
     "instruments": {
         "fallback_type": "instrument_type",
@@ -132,6 +134,8 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contract_expiry_block_days": int,
     "historical_rollover": dict,
 }
+
+_INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 _NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
@@ -502,6 +506,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
     """Проверка типов и допустимых значений ключей конфигурации."""
     cleaned: dict[str, Any] = {}
     for key, value in flat.items():
+        if key in _INGESTION_KEYS:
+            try:
+                cleaned[key] = validate_setting(key.removeprefix("market_data_"), value)
+            except SettingError as exc:
+                raise ConfigError(f"{path}: [market_data] {exc}") from None
+            continue
         expected = _EXPECTED_TYPES[key]
         if not isinstance(value, expected):
             raise ConfigError(
@@ -775,6 +785,10 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
 
 def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
     """Validate constraints that span TOML sections and configuration files."""
+    try:
+        validate_combination({key.removeprefix("market_data_"): value for key, value in config.items() if key in _INGESTION_KEYS})
+    except SettingError as exc:
+        raise ConfigError(f"{path}: [market_data] {exc}") from None
     assignment_ids: set[str] = set()
     floor = config.get("contract_expiry_block_days", 2)
     for family, settings in config.get("historical_rollover", {}).get("families", {}).items():

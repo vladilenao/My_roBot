@@ -9,6 +9,7 @@ from uuid import uuid4
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
+from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
 from src.events.event import Event
@@ -90,6 +91,7 @@ class TradingBot:
         protection_timeframe: str = "1m",
         run=None,
         contract_lifecycle=None,
+        market_data_settings=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -102,6 +104,9 @@ class TradingBot:
         self._heartbeat_every = heartbeat_every_ticks or 0
         self._tick_poll_secs = tick_poll_secs
         self._tick_timeout_secs = tick_timeout_secs
+        # Live-ожидание публикации и повтор статуса настраиваются отдельно от
+        # legacy-таймаута такта (design 7a).
+        self._market_data_settings = market_data_settings or MarketDataSettings()
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
