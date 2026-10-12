@@ -19,6 +19,7 @@ def make_candle(hours, o=1, h=2, low=0, c=3, volume=10, nano=500000000):
         low=price(low),
         close=price(c),
         volume=volume,
+        is_complete=True,
     )
 
 

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from t_tech.invest import Client
 from t_tech.invest.utils import now
 from src.config import TIMEFRAMES
-from src.api.client import ClientProvider, client_context
+from src.api.client import ClientProvider, LIVE_CANDLE_SOURCE, client_context
 from src.api.instruments import find_working_instrument
 from src.api.retry import (
     DEFAULT_BASE_DELAY,
@@ -88,6 +88,7 @@ def load_candles(
     Загружает исторические свечи. Полностью повторяет вашу функцию main().
     """
     simple_df = []
+    actual_sources = {}
     market_now = _market_now(clock)
 
     if timeframe not in TIMEFRAMES:
@@ -135,7 +136,8 @@ def load_candles(
                         for lower, upper in get_intervals(TIMEFRAMES[timeframe], candles_from, end_date):
                             response = request_budget.call(
                                 client.market_data.get_candles, instrument_id=instrument_id,
-                                from_=lower, to=upper, interval=TIMEFRAMES[timeframe],
+                                 from_=lower, to=upper, interval=TIMEFRAMES[timeframe],
+                                 candle_source_type=LIVE_CANDLE_SOURCE,
                                 key=(instrument_id, timeframe, lower, upper), wait=wait_for_budget,
                                 pace=first_page,
                             )
@@ -151,10 +153,14 @@ def load_candles(
                     instrument_id=instrument_id,
                     from_=candles_from,
                     to=end_date,
-                    interval=TIMEFRAMES[timeframe],
+                     interval=TIMEFRAMES[timeframe],
+                     candle_source_type=LIVE_CANDLE_SOURCE,
                     max_retries=0 if single_attempt else DEFAULT_MAX_RETRIES,
                     )
                 for candle in stream:
+                    actual_source = getattr(candle, "candle_source", None)
+                    if isinstance(actual_source, int) and not isinstance(actual_source, bool):
+                        actual_sources[to_aware_utc(candle.time).tz_localize(None).isoformat()] = int(actual_source)
                     simple_df.append([
                     candle.time,
                     candle.open.units + candle.open.nano / 1e9,
@@ -165,7 +171,7 @@ def load_candles(
                     # Брокер может отдать текущую незавершённую свечу. Она
                     # сохраняется для диагностики, но не должна попасть в
                     # стратегию и экспорт завершённых данных.
-                    bool(getattr(candle, "is_complete", True)),
+                     getattr(candle, "is_complete", None) is True,
                     ])
                 break
             except Exception as exc:
@@ -189,5 +195,6 @@ def load_candles(
         return pd.DataFrame(), instrument_id
 
     df = pd.DataFrame(simple_df, columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'is_complete'])
-    df['datetime'] = df['datetime'].dt.tz_localize(None)
+    df['datetime'] = pd.to_datetime(df['datetime'], utc=True).dt.tz_localize(None)
+    df.attrs["actual_candle_sources"] = actual_sources
     return df, instrument_id

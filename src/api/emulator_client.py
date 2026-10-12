@@ -299,6 +299,9 @@ class HistoricalClient:
             low=_quotation(row.get("low")),
             close=_quotation(row.get("close")),
             volume=int(row.get("volume") or 0),
+            # Эмулятор хранит только завершённые свечи (импорт отвергает
+            # незавершённые), а загрузчик не считает отсутствие флага закрытием.
+            is_complete=True,
         )
 
     def _catalog(self, instrument_type: str, schema) -> tuple:

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Sequence
 from uuid import uuid4
+from contextlib import contextmanager
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
 from src.logging_setup import get_logger
@@ -71,6 +72,25 @@ DEFAULT_SLIPPAGE_TOLERANCE = Decimal("0.005")
 BUDGET_REJECTION_CODES = frozenset(
     {"risk-budget", "margin-committed-by-pending-orders", "margin-budget"}
 )
+
+
+@dataclass(frozen=True)
+class DispatchDataEvidence:
+    """Read-only допуск данных; None актуальности не означает разрешение.
+
+    Инспектор и его guard предоставляет composition. Здесь нет зависимости
+    от gRPC, автоматического TTL или самостоятельного чтения market API.
+    """
+
+    execution_ready: bool
+    work_ready: bool
+    intent_current: bool | None = None
+
+    def __post_init__(self):
+        if type(self.execution_ready) is not bool or type(self.work_ready) is not bool:
+            raise ValueError("Data evidence требует явные boolean признаки готовности")
+        if self.intent_current is not None and type(self.intent_current) is not bool:
+            raise ValueError("Актуальность должна быть boolean либо unknown")
 
 
 @dataclass(frozen=True)
@@ -303,7 +323,39 @@ class TradeManager:
         if callable(resume):
             for trade in recovered:
                 resume(trade)
+        # A gap-entry guard first queues CloseTrade at revision N and then marks
+        # its still-live trade REJECTED at N+1. It is the sole terminal snapshot
+        # whose broker state must be restored for that durable close to survive
+        # restart; it remains absent from the ordinary active recovery result.
+        resume_guard = getattr(self._broker, "resume_gap_entry_guard_close", None)
+        if callable(register) and callable(resume) and callable(resume_guard):
+            for trade in self._storage.load_trades(include_terminal=True):
+                if trade.state.phase is not TradePhase.REJECTED or trade.state.quantity <= 0:
+                    continue
+                for action in self._pending_proven_gap_guard_closes(trade):
+                    register(trade.plan)
+                    resume(trade)
+                    resume_guard(trade, action)
         return recovered
+
+    def _pending_proven_gap_guard_closes(self, trade: RecoveredTrade) -> tuple[CloseTrade, ...]:
+        rows = self._storage.connection.execute(
+            "SELECT b.payload_json FROM outbox b JOIN orders o ON o.command_id=b.command_id "
+            "WHERE b.trade_id=? AND b.status='PENDING' AND o.action_type='CLOSE' AND o.status='PENDING'",
+            (trade.plan.trade_id,),
+        ).fetchall()
+        actions = []
+        for (payload,) in rows:
+            try:
+                action = _action_from_payload(json.loads(payload))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            if self._proven_gap_guard_close(
+                self._storage.connection, action, trade.state.phase,
+                trade.state.state_revision, trade.state.quantity,
+            ):
+                actions.append(action)
+        return tuple(actions)
 
     def submit_plan(
         self,
@@ -630,6 +682,8 @@ class TradeManager:
 
     def dispatch(self, now: datetime, *, limit: int = 100) -> tuple[ExecutionEvent, ...]:
         """Deliver persisted outbox commands and immediately consume their outcomes."""
+        if self._storage.outbox_guard_configured:
+            return self._dispatch_guarded(now, limit=limit)
         events: list[ExecutionEvent] = []
         for command in self._storage.claim_outbox(limit):
             action = _action_from_payload(command.payload)
@@ -638,6 +692,160 @@ class TradeManager:
             self.consume(event)
             events.append(event)
         return tuple(events)
+
+    def configure_dispatch_eligibility(self, evidence_for, guard_factory) -> None:
+        """Один обязательный порт; прямой dispatch и прямой claim не обходят его."""
+        if self._storage.outbox_guard_configured:
+            raise ValueError("Обязательный outbox guard уже установлен")
+        if not callable(evidence_for) or not callable(guard_factory):
+            raise ValueError("Dispatch eligibility требует инспектор и data guard")
+        self._dispatch_evidence_for = evidence_for
+        self._dispatch_now = None
+        self.dispatch_block_reasons = {}
+        self._dispatch_reconciliations = set()
+
+        @contextmanager
+        def guarded():
+            with guard_factory():
+                yield self._dispatch_eligible
+        self._storage.configure_outbox_guard(guarded)
+
+    def _dispatch_guarded(self, now, *, limit):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be positive")
+        # Как старый batch, не отправлять новые команды, созданные consume
+        # в этом же вызове (например, slippage guard после входа).
+        boundary = self._storage.outbox_dispatch_boundary()
+        events = []
+        self._dispatch_now = as_aware(now)
+        try:
+            for _ in range(limit):
+                with self._storage.outbox_delivery_guard():
+                    commands = self._storage.claim_outbox(1, through_rowid=boundary)
+                    if not commands:
+                        break
+                    command = commands[0]
+                    if command.command_id in self._dispatch_reconciliations:
+                        event = None  # Подтверждённая доставка: не новый broker.submit.
+                    else:
+                        event = self._broker.submit(_action_from_payload(command.payload), now)
+                # Guard только до локальной доставки. Observer/Telegram и
+                # reducer не держат market lock и не фильтруются по hold.
+                self._storage.mark_outbox_sent(command.command_id, sent_at=now)
+                if event is not None:
+                    self.consume(event)
+                    events.append(event)
+        finally:
+            self._dispatch_now = None
+        return tuple(events)
+
+    def _dispatch_eligible(self, connection, command):
+        def deny(reason):
+            self.dispatch_block_reasons[command.command_id] = reason
+            return False
+
+        self._dispatch_reconciliations.discard(command.command_id)
+        try:
+            action = _action_from_payload(command.payload)
+        except (TypeError, ValueError, KeyError):
+            return deny("invalid-command")
+        if action.command_id != command.command_id or action.trade_id != command.trade_id:
+            return deny("command-identity-mismatch")
+        record = connection.execute(
+            "SELECT t.instrument_id,t.phase,t.state_revision,t.plan_json,p.quantity,o.status "
+            "FROM trades t JOIN positions p USING(trade_id) JOIN orders o USING(trade_id) "
+            "WHERE t.trade_id=? AND o.command_id=?", (action.trade_id, action.command_id),
+        ).fetchone()
+        if record is None:
+            return deny("unknown-trade-or-order")
+        instrument, phase, revision, plan_json, quantity, status = record
+        if connection.execute("SELECT 1 FROM events WHERE command_id=? AND trade_id=? LIMIT 1",
+                              (action.command_id, action.trade_id)).fetchone():
+            self._dispatch_reconciliations.add(action.command_id)
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if status != "PENDING":
+            return deny("order-state-unconfirmed")
+        protected = self._confirmed_guard_close(connection, action, phase, revision, quantity)
+        if action.state_revision != revision and not protected:
+            return deny("stale-state-revision")
+        if isinstance(action, OpenTrade):
+            phase_valid = phase == TradePhase.ENTRY_PENDING and quantity == 0
+        elif protected:
+            phase_valid = True  # Existing guard ставит REJECTED после enqueue.
+        else:
+            try:
+                self._validate_phase(action, TradePhase(phase))
+                phase_valid = True
+            except ValueError:
+                phase_valid = False
+        if not phase_valid:
+            return deny("stale-trade-phase")
+        if isinstance(action, (CloseTrade, ReduceTrade, MoveStop)) and quantity <= 0:
+            return deny("trade-not-open")
+        if isinstance(action, ReduceTrade) and action.quantity > quantity:
+            return deny("quantity-exceeds-trade-remainder")
+        evidence = self._dispatch_evidence_for(instrument, action, command)
+        if not isinstance(evidence, DispatchDataEvidence):
+            return deny("data-evidence-unconfirmed")
+        if protected:
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if not evidence.execution_ready:
+            return deny("execution-prefix-unconfirmed")
+        now = self._dispatch_now or as_aware(self._clock.now())
+        if isinstance(action, CancelEntry) and action.reason == "entry-timeout":
+            ack = connection.execute("SELECT updated_at FROM orders WHERE trade_id=? AND action_type='OPEN' "
+                                     "AND status='ACK' ORDER BY updated_at DESC LIMIT 1", (action.trade_id,)).fetchone()
+            if ack is None:
+                return deny("entry-ack-unconfirmed")
+            timeframe = json.loads(plan_json).get("timeframe", "")
+            if now - as_aware(datetime.fromisoformat(ack[0])) <= timedelta(seconds=_entry_ttl_seconds(timeframe)):
+                return deny("entry-timeout-not-due")
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if not evidence.work_ready:
+            return deny("work-input-unconfirmed")
+        if evidence.intent_current is not True:
+            return deny("freshness-unconfirmed" if evidence.intent_current is None else "stale-intent")
+        self.dispatch_block_reasons.pop(action.command_id, None)
+        return True
+
+    def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
+        """Proof существующего guard, не whitelist по строке reason."""
+        if not self._proven_gap_guard_close(connection, action, phase, revision, quantity):
+            return False
+        # Поддерживаемый runtime — свечной JournalBroker. Другой executor с
+        # неизвестными немедленными эффектами не объявляется безопасным.
+        from src.broker.journal_broker import JournalBroker
+        if not isinstance(self._broker, JournalBroker):
+            return False
+        state = self._broker.trade_state(action.trade_id)
+        if state is None:
+            return False
+        if state.revision == action.state_revision:
+            return True
+        return state.revision == action.state_revision + 1 and self._broker.has_recovery_guard_close(action)
+
+    @staticmethod
+    def _proven_gap_guard_close(connection, action, phase, revision, quantity):
+        if not isinstance(action, CloseTrade) or action.reason != GAP_ENTRY_REASON or quantity <= 0:
+            return False
+        if phase != TradePhase.REJECTED or revision != action.state_revision + 1:
+            return False
+        prefix = f"{action.trade_id}:{GAP_ENTRY_REASON}:"
+        if not action.command_id.startswith(prefix):
+            return False
+        original = action.command_id[len(prefix):]
+        filled = connection.execute("SELECT 1 FROM fills f JOIN orders o USING(order_id) "
+            "WHERE f.trade_id=? AND o.command_id=? AND o.action_type IN ('OPEN','ADD') AND f.quantity>0 LIMIT 1",
+            (action.trade_id, original)).fetchone()
+        traced = connection.execute("SELECT 1 FROM calculations WHERE trade_id=? "
+            "AND algorithm='execution.slippage_guard' AND reason=? AND outcome='REJECTED' LIMIT 1",
+            (action.trade_id, GAP_ENTRY_REASON)).fetchone()
+        if not filled or not traced:
+            return False
+        return True
 
     def consume(self, event: ExecutionEvent | FeeAdjustment) -> bool:
         """Reduce one broker event, then schedule post-fill risk/protection checks."""

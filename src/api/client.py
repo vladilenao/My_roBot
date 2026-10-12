@@ -1,10 +1,58 @@
-from t_tech.invest import Client
+from dataclasses import dataclass
+from types import MappingProxyType
+
+from t_tech.invest import Client, CandleInterval, SubscriptionInterval
+from t_tech.invest.schemas import CandleSource
 
 from src.config import TINKOFF_TOKEN
 from src.logging_setup import get_logger
 from src.api.deadline import RpcDeadline
 
 log = get_logger(__name__)
+
+# Совместимый профиль текущей истории: UNSPECIFIED, а не EXCHANGE-only.
+# Имя существующей БД tbank_exchange не меняет фактический состав источника.
+LIVE_CANDLE_SOURCE = CandleSource.CANDLE_SOURCE_UNSPECIFIED
+
+
+@dataclass(frozen=True)
+class NativeCandleInterval:
+    """Именованный контракт одного нативного ТФ двух транспортов."""
+
+    rpc: CandleInterval
+    stream: SubscriptionInterval
+
+
+# SDK helper поддерживает только 1m/5m. Числовое совпадение enum не является
+# контрактом: каждый используемый приложением ТФ указан явно по имени.
+NATIVE_CANDLE_INTERVALS = MappingProxyType({
+    "1m": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_1_MIN,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_ONE_MINUTE),
+    "5m": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_5_MIN,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_FIVE_MINUTES),
+    "15m": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_15_MIN,
+                               SubscriptionInterval.SUBSCRIPTION_INTERVAL_FIFTEEN_MINUTES),
+    "30m": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_30_MIN,
+                               SubscriptionInterval.SUBSCRIPTION_INTERVAL_30_MIN),
+    "1h": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_HOUR,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_ONE_HOUR),
+    "4h": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_4_HOUR,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_4_HOUR),
+    "1d": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_DAY,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_ONE_DAY),
+    "1w": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_WEEK,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_WEEK),
+    "1M": NativeCandleInterval(CandleInterval.CANDLE_INTERVAL_MONTH,
+                              SubscriptionInterval.SUBSCRIPTION_INTERVAL_MONTH),
+})
+
+
+def native_candle_interval(timeframe: str) -> NativeCandleInterval:
+    """Неподдержанный ТФ отклоняется, а не собирается скрыто из минут."""
+    try:
+        return NATIVE_CANDLE_INTERVALS[timeframe]
+    except KeyError:
+        raise ValueError(f"Нет нативного контракта свечей для ТФ {timeframe!r}") from None
 
 
 class ClientProvider:
@@ -23,6 +71,13 @@ class TinkoffClientProvider(ClientProvider):
 
     def client_context(self, token=None):
         return Client(token or TINKOFF_TOKEN, interceptors=[RpcDeadline()])
+
+    def stream_session(self, token=None, *, control_queue_max_messages=128):
+        """Необязательный live-порт; исторический provider остаётся unary."""
+        from src.api.market_data_stream import MarketDataStreamSession
+        return MarketDataStreamSession(
+            self.client_context(token), control_queue_max_messages=control_queue_max_messages,
+        )
 
 
 _DEFAULT_PROVIDER = TinkoffClientProvider()

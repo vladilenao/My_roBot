@@ -32,3 +32,21 @@ def binding_requirements(binding, strategy, profiles, triple_screen, ladder):
         required[middle], required[higher] = stoch.warmup+1, macd.warmup+2
     return required
 
+
+def live_data_requirements(bindings, strategies, profiles, triple_screen, ladder, *, saved_requirements=None):
+    """Union требований одного UID для main-thread roster, без финансовой БД.
+
+    Сохранённые потребности сопровождения передаёт вызывающая composition из
+    своего ledger/lifecycle; удалённая входная привязка не удаляет этот ТФ.
+    Один UID/ТФ имеет максимальный необходимый прогрев, не копию на binding.
+    """
+    requirements = {"1m": 1}
+    for timeframe, count in (saved_requirements or {}).items():
+        if timeframe not in ladder or isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("Некорректное сохранённое требование live-данных")
+        requirements[timeframe] = max(requirements.get(timeframe, 0), count)
+    for binding in bindings:
+        strategy = get_strategy(binding.strategy, strategies[binding.strategy])
+        for tf, count in binding_requirements(binding, strategy, profiles, triple_screen, ladder).items():
+            requirements[tf] = max(requirements.get(tf, 0), count)
+    return requirements

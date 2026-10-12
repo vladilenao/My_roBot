@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from src.scheduler.timing import tf_period_minutes
+
 SCHEMA_VERSION = 2
 SOURCE_TBANK = "tbank_exchange"
 INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "pending", "unresolved"})
@@ -208,6 +210,181 @@ class MarketDataStore:
     def producer_id(self) -> str:
         return self.source_info().producer_id
 
+    @staticmethod
+    def _live_key(kind, source, uid, interval="", open_time=None):
+        identity = [source, uid, interval]
+        if open_time is not None:
+            identity.append(_utc_text(open_time))
+        return "live:" + kind + ":" + json.dumps(identity, separators=(",", ":"))
+
+    @staticmethod
+    def _read_live(conn, key):
+        row = conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    @staticmethod
+    def _write_live(conn, key, value):
+        conn.execute("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, json.dumps(value, separators=(",", ":"), ensure_ascii=False)))
+
+    def live_state(self, *, kind, source, instrument_uid, interval="", open_time=None):
+        """Market-only факты; не меняют producer-id/schema/export контракт."""
+        with self._lock, self._connect() as conn:
+            return self._read_live(conn, self._live_key(kind, source, instrument_uid, interval, open_time))
+
+    def save_live_state(self, value, *, kind, source, instrument_uid, interval="", open_time=None):
+        with self._lock, self._connect() as conn:
+            self._write_live(conn, self._live_key(kind, source, instrument_uid, interval, open_time), value)
+
+    def accept_observation(self, observation, *, source=SOURCE_TBANK, reconcile_sequence=None):
+        """Единое атомарное принятие нормализованного stream/RPC наблюдения.
+
+        Различающийся поздний snapshot не выбирается по receipt-order. Его
+        версия сохраняется, а current остаётся прежним до свежего RPC recheck
+        с fence последней наблюдаемой версии. Preliminary не понижает closed.
+        """
+        uid, interval, stamp = observation.uid, observation.timeframe, _utc_text(observation.open_time)
+        candle = self._normalise_candle(observation.as_row(), source, uid, interval, observation.received_at)
+        identity = (source, uid, interval, stamp)
+        facts_key = self._live_key("candle", source, uid, interval, stamp)
+        uid_key = self._live_key("uid", source, uid)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                facts = self._read_live(conn, facts_key)
+                old = conn.execute("SELECT * FROM candle_current WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                                   identity).fetchone()
+                provenance = {"transport": observation.transport, "epoch": observation.epoch,
+                    "received_at": candle["received_at"], "closure_evidence": observation.closure_evidence,
+                    "requested_source": observation.requested_source, "actual_source": observation.actual_source,
+                    "last_trade_time": None if observation.last_trade_time is None else _utc_text(observation.last_trade_time)}
+                facts["last_observation"] = provenance
+                if not observation.closed:
+                    facts["last_preliminary"] = {**provenance, "candle": candle}
+                    self._write_live(conn, facts_key, facts)
+                    conn.commit()
+                    return {"state": "preliminary", "revision": None, "changed": False}
+
+                keys = ("open", "high", "low", "close", "volume", "is_complete")
+                content = tuple(candle[key] for key in keys)
+                same = old is not None and content == tuple(old[key] for key in keys)
+                previous_source = facts.get("canonical_source")
+                source_conflict = (previous_source not in (None, 0) and observation.actual_source not in (None, 0)
+                                   and previous_source != observation.actual_source)
+                signature = [*content, observation.actual_source]
+                fence_matches = (reconcile_sequence is not None and reconcile_sequence == facts.get("observed_sequence", 0)
+                                 and observation.transport == "rpc")
+                if signature != facts.get("last_signature"):
+                    facts["observed_sequence"] = facts.get("observed_sequence", 0) + 1
+                    facts["last_signature"] = signature
+                if same and not source_conflict:
+                    if fence_matches:
+                        facts.pop("conflict", None)
+                        facts["input_ready_at"] = candle["received_at"]
+                    facts.setdefault("observed_revision", old["revision"])
+                    facts.setdefault("published_at", old["received_at"])
+                    facts.setdefault("input_ready_at", old["received_at"])
+                    facts.setdefault("canonical_source", observation.actual_source)
+                    self._write_live(conn, facts_key, facts)
+                    conn.commit()
+                    return {"state": "conflict" if facts.get("conflict") else "accepted",
+                            "revision": old["revision"], "changed": False}
+
+                if signature == facts.get("observed_signature"):
+                    revision = facts["observed_revision"]
+                else:
+                    revision = conn.execute("SELECT COALESCE(MAX(revision),0)+1 FROM candle_versions WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                                            identity).fetchone()[0]
+                    payload = {**candle, "revision": revision}
+                    conn.execute("""INSERT INTO candle_versions(source,instrument_uid,interval,open_time_utc,revision,open,high,low,close,volume,is_complete,received_at)
+                        VALUES (:source,:instrument_uid,:interval,:open_time_utc,:revision,:open,:high,:low,:close,:volume,:is_complete,:received_at)""", payload)
+                    facts["observed_signature"] = signature
+                    facts["observed_revision"] = revision
+                self._advance_cursor(conn, source, uid, interval, received=stamp)
+
+                if old is not None and old["is_complete"] and not fence_matches:
+                    facts["conflict"] = {"candidate_revision": revision, "received_at": candle["received_at"],
+                                         "reason": "source_conflict" if source_conflict else "values_conflict"}
+                    cursor = conn.execute("SELECT processed_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                                          (source, uid, interval)).fetchone()
+                    pin = facts.get("input_reference")
+                    consumed = (pin is not None and pin.get("state") == "consumed"
+                                or cursor and cursor[0] is not None and stamp <= cursor[0])
+                    if interval == "1m" and consumed:
+                        held = self._read_live(conn, uid_key)
+                        held.update(integrity_hold=True, incident={"open_time": stamp, "candidate_revision": revision,
+                            "consumed_revision": None if pin is None else pin["revision"],
+                            "reason": "consumed_input_changed" if pin else "legacy_input_unconfirmed",
+                            "received_at": candle["received_at"]})
+                        self._write_live(conn, uid_key, held)
+                    elif interval == "1m" and pin is not None:
+                        # Начатый пакет ещё не подтверждён финансовым owner.
+                        # Замораживаем зависимые новые действия, но не выдаём
+                        # сам факт pin за уже исполненную минуту.
+                        held = self._read_live(conn, uid_key)
+                        pending = held.setdefault("pending_input_conflicts", {})
+                        pending[stamp] = {"revision": pin["revision"], "candidate_revision": revision}
+                        self._write_live(conn, uid_key, held)
+                    self._write_live(conn, facts_key, facts)
+                    conn.commit()
+                    return {"state": "conflict", "revision": revision, "changed": False}
+
+                payload = {**candle, "revision": revision}
+                conn.execute("""INSERT INTO candle_current(source,instrument_uid,interval,open_time_utc,open,high,low,close,volume,is_complete,revision,received_at)
+                    VALUES (:source,:instrument_uid,:interval,:open_time_utc,:open,:high,:low,:close,:volume,:is_complete,:revision,:received_at)
+                    ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
+                    open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,
+                    is_complete=excluded.is_complete,revision=excluded.revision,received_at=excluded.received_at""", payload)
+                self._upsert_coverage(conn, source, uid, interval, stamp, "received", observation.closure_evidence,
+                                      candle["received_at"], emit=False)
+                self._append_change(conn, "candle_upsert", {"candle": self._export_candle(payload)})
+                facts.pop("conflict", None)
+                facts.update(published_at=candle["received_at"], input_ready_at=candle["received_at"],
+                             canonical_source=observation.actual_source)
+                self._write_live(conn, facts_key, facts)
+                conn.commit()
+                return {"state": "accepted", "revision": revision, "changed": True}
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def pin_input(self, *, source, instrument_uid, interval, open_time):
+        """Закрепляет выбранную revision до внешней финансовой обработки."""
+        key = self._live_key("candle", source, instrument_uid, interval, open_time)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                facts = self._read_live(conn, key)
+                reference = facts.get("input_reference")
+                if reference is None:
+                    held = self._read_live(conn, self._live_key("uid", source, instrument_uid))
+                    if held.get("integrity_hold") or facts.get("conflict"):
+                        raise ValueError("Невозможно закрепить неподтверждённый рыночный вход")
+                    row = conn.execute("SELECT revision,is_complete FROM candle_current WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                        (source, instrument_uid, interval, _utc_text(open_time))).fetchone()
+                    if row is None or not row["is_complete"]:
+                        raise ValueError("Нет завершённой версии рыночного входа")
+                    reference = dict(source=source, instrument_uid=instrument_uid, interval=interval,
+                                     open_time_utc=_utc_text(open_time), revision=row["revision"], state="started")
+                    facts["input_reference"] = reference
+                    self._write_live(conn, key, facts)
+                conn.commit()
+                return dict(reference)
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def pinned_frame(self, reference):
+        """Вход ранее начатого пакета, независимо от изменяемого current."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM candle_versions WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=? AND revision=?",
+                tuple(reference[key] for key in ("source", "instrument_uid", "interval", "open_time_utc", "revision"))).fetchone()
+        if row is None or not row["is_complete"]:
+            raise ValueError("Закреплённая завершённая версия недоступна")
+        return {"datetime": pd.Timestamp(row["open_time_utc"]).tz_convert("UTC").tz_localize(None),
+                **{key: float(row[key]) for key in ("open", "high", "low", "close")},
+                "volume": row["volume"], "is_complete": True}
+
     def record_candles(
         self,
         *,
@@ -239,7 +416,10 @@ class MarketDataStore:
                     content = tuple(candle[key] for key in ("open", "high", "low", "close", "volume", "is_complete"))
                     if old is not None and content == tuple(old[key] for key in ("open", "high", "low", "close", "volume", "is_complete")):
                         continue
-                    revision = 1 if old is None else int(old["revision"]) + 1
+                    if old is not None and old["is_complete"] and not candle["is_complete"]:
+                        continue
+                    revision = conn.execute("SELECT COALESCE(MAX(revision),0)+1 FROM candle_versions WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                        (source, instrument_uid, interval, candle["open_time_utc"])).fetchone()[0]
                     payload = {**candle, "revision": revision}
                     conn.execute(
                         """INSERT INTO candle_current(source,instrument_uid,interval,open_time_utc,open,high,low,close,volume,is_complete,revision,received_at)
@@ -317,6 +497,14 @@ class MarketDataStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 change_id = self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True)
+                pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
+                cursor = conn.execute(
+                    "SELECT received_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                    (source, instrument_uid, interval),
+                ).fetchone()
+                if pair.get("coverage_lower") and cursor is not None and cursor[0] is not None:
+                    self._resolve_contiguous_prefix(conn, source, instrument_uid, interval,
+                                                    pair["coverage_lower"], max(stamp, cursor[0]))
                 conn.commit()
                 return change_id
             except Exception:
@@ -416,10 +604,72 @@ class MarketDataStore:
     def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object) -> None:
         """Продвигает границу симуляции после внешнего durable commit."""
         with self._lock, self._connect() as conn:
-            stamp = _utc_text(open_time)
-            self._advance_cursor(
-                conn, source, instrument_uid, interval, resolved=stamp, processed=stamp,
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                stamp = _utc_text(open_time)
+                key = self._live_key("candle", source, instrument_uid, interval, stamp)
+                facts = self._read_live(conn, key)
+                reference = facts.get("input_reference")
+                if reference is not None:
+                    reference["state"] = "consumed"
+                    self._write_live(conn, key, facts)
+                uid_key = self._live_key("uid", source, instrument_uid)
+                held = self._read_live(conn, uid_key)
+                pending = held.get("pending_input_conflicts", {})
+                conflict = pending.pop(stamp, None)
+                if conflict is not None:
+                    held.update(integrity_hold=True, incident={"open_time": stamp,
+                        "consumed_revision": conflict["revision"], "candidate_revision": conflict["candidate_revision"],
+                        "reason": "consumed_input_changed", "received_at": _utc_text()})
+                    self._write_live(conn, uid_key, held)
+                self._advance_cursor(conn, source, instrument_uid, interval, processed=stamp)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def mark_resolved(self, *, source, instrument_uid, interval, open_time):
+        """Computed coverage owner, отдельно от receipt/financial commit."""
+        with self._lock, self._connect() as conn:
+            self._advance_cursor(conn, source, instrument_uid, interval, resolved=_utc_text(open_time))
+
+    def resolve_contiguous_prefix(self, *, source, instrument_uid, interval, meaningful_lower, horizon):
+        """Продвигает coverage только по доказанно непрерывной последовательности.
+
+        ``meaningful_lower`` задаёт владелец ingestion из прогрева и/или
+        сохранённой execution boundary. Поэтому новый high-water никогда сам
+        не пропускает старую внутреннюю или хвостовую дыру.
+        """
+        with self._lock, self._connect() as conn:
+            resolved = self._resolve_contiguous_prefix(conn, source, instrument_uid, interval,
+                                                       meaningful_lower, horizon)
+        return None if resolved is None else pd.Timestamp(resolved).tz_localize(None)
+
+    @staticmethod
+    def _resolve_contiguous_prefix(conn, source, instrument_uid, interval, meaningful_lower, horizon):
+        lower, upper = _utc_text(meaningful_lower), _utc_text(horizon)
+        if upper < lower:
+            raise ValueError("Горизонт coverage не может быть раньше meaningful lower")
+        step = pd.Timedelta(minutes=tf_period_minutes(interval))
+        current = pd.Timestamp(lower)
+        if current.tzinfo is not None:
+            current = current.tz_convert("UTC").tz_localize(None)
+        end = pd.Timestamp(upper)
+        if end.tzinfo is not None:
+            end = end.tz_convert("UTC").tz_localize(None)
+        resolved = None
+        while current <= end:
+            row = conn.execute(
+                "SELECT state FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                (source, instrument_uid, interval, _utc_text(current)),
+            ).fetchone()
+            if row is None or row["state"] not in RESOLVED_INTERVAL_STATES:
+                break
+            resolved = _utc_text(current)
+            current += step
+        if resolved is not None:
+            MarketDataStore._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
+        return resolved
 
     def cursors(self, *, source: str, instrument_uid: str, interval: str) -> dict[str, str | None]:
         with self._lock, self._connect() as conn:

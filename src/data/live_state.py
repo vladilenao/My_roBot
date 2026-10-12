@@ -4,6 +4,101 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from math import isfinite
+from numbers import Integral
+
+import numpy as np
+
+from src.data.timeutil import to_utc_naive
+
+
+@dataclass(frozen=True)
+class StreamClosureEvidence:
+    """Доказательство конкретного acknowledged режима, не финальности OHLC."""
+
+    uid: str
+    timeframe: str
+    epoch: int
+    status: int
+    action: int
+    waiting_close: bool
+    requested_source: int = 0
+    echoed_source: int | None = None
+
+    def permits(self, uid, timeframe, epoch):
+        return (self.uid == uid and self.timeframe == timeframe and self.epoch == epoch
+                and self.status == 1 and self.action == 1 and self.waiting_close is True
+                and self.requested_source == 0 and self.echoed_source in (None, 0))
+
+
+@dataclass(frozen=True)
+class CandleObservation:
+    """Неизменяемый транспортный вход единственного владельца свечи."""
+
+    uid: str
+    timeframe: str
+    open_time: datetime
+    close_time: datetime
+    received_at: datetime
+    prices: tuple[float, float, float, float]
+    volume: int
+    closed: bool
+    transport: str
+    closure_evidence: str
+    actual_source: int | None
+    requested_source: int = 0
+    epoch: int = 0
+    last_trade_time: datetime | None = None
+
+    def as_row(self):
+        return dict(zip(("open", "high", "low", "close"), self.prices),
+                    datetime=self.open_time, volume=self.volume, is_complete=self.closed)
+
+
+def _observation(uid, timeframe, opening, received_at, prices, volume, *, closed, transport,
+                 closure_evidence, actual_source, epoch=0, last_trade_time=None):
+    from src.scheduler.timing import CandleScheduler
+    if not isinstance(uid, str) or not uid:
+        raise ValueError("Рыночное наблюдение требует UID")
+    opening, received = to_utc_naive(opening), to_utc_naive(received_at)
+    if opening is None or received is None or np.isnat(opening.to_datetime64()) or np.isnat(received.to_datetime64()):
+        raise ValueError("Рыночное наблюдение требует определённое UTC-время")
+    grid = CandleScheduler(timeframe)
+    if grid.current_candle_start(opening) != opening:
+        raise ValueError("Открытие свечи не совпадает с нативной UTC-сеткой")
+    values = tuple(float(value) for value in prices)
+    if len(values) != 4 or not all(isfinite(value) for value in values):
+        raise ValueError("Рыночное наблюдение требует конечные OHLC")
+    if isinstance(volume, bool) or not isinstance(volume, Integral) or volume < 0:
+        raise ValueError("Рыночное наблюдение требует неотрицательный целый объём")
+    if actual_source not in (None, 0, 1, 2):
+        raise ValueError("Несовместимый фактический источник свечи")
+    close = grid.bar_close(opening)
+    closed = bool(closed and close <= received)
+    return CandleObservation(uid, timeframe, opening, close, received, values, int(volume), closed,
+        transport, closure_evidence if closed else "not_closed", actual_source,
+        epoch=epoch, last_trade_time=None if last_trade_time is None else to_utc_naive(last_trade_time))
+
+
+def normalize_stream_candle(candle, *, evidence: StreamClosureEvidence | None, epoch, received_at):
+    """Stream не имеет is_complete: ACK режима и grid проверяются явно."""
+    if candle.timeframe is None:
+        raise ValueError("Неподдержанный нативный stream-интервал")
+    closed = evidence is not None and evidence.permits(candle.uid, candle.timeframe, epoch)
+    return _observation(candle.uid, candle.timeframe, candle.open_time, received_at,
+        candle.prices, candle.volume, closed=closed, transport="stream",
+        closure_evidence="ack_waiting_close_grid", actual_source=candle.source,
+        epoch=epoch, last_trade_time=candle.last_trade_time)
+
+
+def normalize_rpc_candle(row, *, uid, timeframe, received_at, actual_source=None):
+    """Завершённость RPC никогда не угадывается по отсутствующему полю."""
+    flag = row.get("is_complete")
+    closed = isinstance(flag, (bool, np.bool_)) and bool(flag)
+    return _observation(uid, timeframe, row["datetime"], received_at,
+        tuple(row[key] for key in ("open", "high", "low", "close")), row["volume"],
+        closed=closed, transport="rpc", closure_evidence="rpc_is_complete",
+        actual_source=actual_source)
 
 
 @dataclass(frozen=True)

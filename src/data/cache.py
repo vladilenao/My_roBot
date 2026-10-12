@@ -15,6 +15,7 @@ from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
 from src.data.request_budget import RequestDeferred
+from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)
 
@@ -180,6 +181,12 @@ class MarketDataCache:
         self._aux_at = pd.Timestamp.min
         self._live_errors = {}
         self._warmup_days = {}
+        self._owned_live_ingestion = False
+        self._live_members = {}
+        self._live_evidence = {}
+        self._live_generation = 0
+        self._data_changed = threading.Condition(self._lock)
+        self._pending_live_history = {}
 
     @property
     def history_source_failed(self):
@@ -330,6 +337,124 @@ class MarketDataCache:
     def _key(self, instrument, timeframe: str) -> tuple:
         return (instrument_key(instrument), instrument.instrument_type, timeframe)
 
+    def register_live_pair(self, instrument, uid, timeframe, min_bars=1):
+        """Main-thread UID/alias mapping; не читает финансовую БД или сеть."""
+        if self._history or self._market_store is None:
+            raise ValueError("Owned live-ingestion требует отдельного рыночного хранилища")
+        if not uid or isinstance(min_bars, bool) or not isinstance(min_bars, int) or min_bars <= 0:
+            raise ValueError("Live-пара требует UID и положительный прогрев")
+        with self._lock:
+            key = self._key(instrument, timeframe)
+            previous = self._uids.get(key)
+            if previous and previous != uid:
+                raise ValueError("Неоднозначный финансовый alias разных UID")
+            self._owned_live_ingestion = True
+            self._uids[key] = uid
+            self._instruments[key] = instrument
+            member = self._live_members.setdefault((uid, timeframe), {"keys": set(), "min_bars": 0,
+                                                                         "execution_lower": None})
+            member["keys"].add(key)
+            member["min_bars"] = max(member["min_bars"], min_bars)
+            if key not in self._frames:
+                # Market-only disk read, никакой implicit первичной RPC загрузки.
+                self._frames[key] = self._market_store.current_frame(
+                    source=self._market_source, instrument_uid=uid, interval=timeframe)
+                self._advance_live_coverage(uid, timeframe, member)
+
+    def set_live_execution_lower(self, uid, timeframe, open_time):
+        """Main-thread boundary сохранённых обязательств, не high-water receipt."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                raise ValueError("Execution boundary требует зарегистрированную live-пару")
+            stamp = _naive(open_time)
+            previous = member["execution_lower"]
+            member["execution_lower"] = stamp if previous is None else min(previous, stamp)
+            self._advance_live_coverage(uid, timeframe, member)
+
+    def accept_live_observation(self, observation, *, reconcile_sequence=None):
+        """Единственный accept/normalize/reconcile/publish путь live-транспортов."""
+        with self._lock:
+            member = self._live_members.get((observation.uid, observation.timeframe))
+            if member is None:
+                raise ValueError("Наблюдение не принадлежит зарегистрированному UID/ТФ")
+            result = self._market_store.accept_observation(observation, source=self._market_source,
+                                                           reconcile_sequence=reconcile_sequence)
+            if result["state"] == "accepted" and result["changed"]:
+                incoming = pd.DataFrame([observation.as_row()])
+                for key in member["keys"]:
+                    frame = self._frames.get(key)
+                    self._frames[key] = (incoming.copy() if frame is None or frame.empty else
+                                        self._merge_new_bars(frame, incoming, self._last_loaded.get(key)))
+                    self._last_loaded[key] = max(observation.open_time, self._last_loaded.get(key, pd.Timestamp.min))
+                self._advance_live_coverage(observation.uid, observation.timeframe, member)
+            if result["changed"] or result["state"] == "conflict" or (reconcile_sequence is not None and result["state"] == "accepted"):
+                self._live_generation += 1
+                self._data_changed.notify_all()
+            return result
+
+    def _advance_live_coverage(self, uid, timeframe, member):
+        """Coverage start выбирается по warmup и durable execution, не latest."""
+        frames = [self._frames.get(key) for key in member["keys"]]
+        frame = next((item for item in frames if item is not None and not item.empty), None)
+        if frame is None:
+            return
+        closed = self._closed_only(frame, timeframe).sort_values("datetime")
+        if len(closed) < member["min_bars"]:
+            return
+        warmup_lower = _naive(closed["datetime"].iloc[-member["min_bars"]])
+        lower = min(item for item in (warmup_lower, member["execution_lower"]) if item is not None)
+        self._market_store.save_live_state({"coverage_lower": _naive(lower).isoformat()}, kind="pair",
+                                           source=self._market_source, instrument_uid=uid, interval=timeframe)
+        self._market_store.resolve_contiguous_prefix(
+            source=self._market_source, instrument_uid=uid, interval=timeframe,
+            meaningful_lower=lower, horizon=_naive(closed["datetime"].iloc[-1]),
+        )
+
+    def accept_stream_candle(self, candle, *, epoch, received_at):
+        evidence = self._live_evidence.get((candle.uid, candle.timeframe))
+        observation = normalize_stream_candle(candle, evidence=evidence, epoch=epoch, received_at=received_at)
+        return self.accept_live_observation(observation)
+
+    def accept_rpc_frame(self, uid, timeframe, frame, *, received_at, fences=None):
+        """Worker передаёт страницу после RPC; network не входит в owner lock."""
+        results = []
+        sources = frame.attrs.get("actual_candle_sources", {})
+        for row in frame.to_dict("records"):
+            observation = normalize_rpc_candle(row, uid=uid, timeframe=timeframe, received_at=received_at,
+                actual_source=sources.get(pd.Timestamp(row["datetime"]).isoformat()))
+            results.append(self.accept_live_observation(observation,
+                reconcile_sequence=None if fences is None else fences.get(pd.Timestamp(observation.open_time).isoformat())))
+        return results
+
+    def reconciliation_fences(self, uid, timeframe, frame):
+        """Версии наблюдений ДО начала согласующего RPC, не после его ответа."""
+        return {pd.Timestamp(stamp).isoformat(): self._market_store.live_state(
+            kind="candle", source=self._market_source, instrument_uid=uid, interval=timeframe,
+            open_time=stamp).get("observed_sequence", 0) for stamp in frame["datetime"]}
+
+    def pin_execution_input(self, instrument, stamp):
+        with self._lock:
+            uid = self._uids.get(self._key(instrument, "1m"))
+            if not uid:
+                raise ValueError("Нет UID для закрепления исполнительного входа")
+            reference = self._market_store.pin_input(source=self._market_source, instrument_uid=uid,
+                                                    interval="1m", open_time=stamp)
+            return reference, self._market_store.pinned_frame(reference)
+
+    def wait_for_data_change(self, generation, timeout):
+        with self._data_changed:
+            self._data_changed.wait_for(lambda: self._live_generation != generation, timeout=timeout)
+            return self._live_generation
+
+    def request_live_history(self, instrument, timeframe, min_bars):
+        """Недостающая потребность передаётся worker без синхронной сети."""
+        with self._lock:
+            key = self._key(instrument, timeframe)
+            self._pending_live_history[key] = (instrument, max(min_bars,
+                self._pending_live_history.get(key, (None, 0))[1]))
+        return self.frame_for(instrument, timeframe)
+
     def _source_kwargs(self) -> dict:
         """Аргументы источника данных для загрузчика.
 
@@ -381,6 +506,10 @@ class MarketDataCache:
                 df = df.loc[df["datetime"] < _naive(self._clock.end)]
             df = df.sort_values("datetime").reset_index(drop=True)
             if self._market_store is not None and instrument_id:
+                if self._owned_live_ingestion:
+                    self.accept_rpc_frame(instrument_id, timeframe, df, received_at=self._timeline.now())
+                    with self._lock:
+                        return self._frames[key].copy()
                 self._market_store.record_candles(
                     source=self._market_source,
                     instrument_uid=instrument_id,
@@ -404,6 +533,10 @@ class MarketDataCache:
         return df
 
     def frame_for(self, instrument, timeframe: str) -> pd.DataFrame:
+        if self._owned_live_ingestion:
+            with self._lock:
+                frame = self._frames.get(self._key(instrument, timeframe))
+                return pd.DataFrame() if frame is None or frame.empty else self._closed_only(frame, timeframe)
         if not self.live_session_enabled:
             return self._frame_for_legacy(instrument, timeframe)
         self._live_initial(instrument, timeframe)
@@ -473,6 +606,9 @@ class MarketDataCache:
             )
 
     def ensure_loaded(self, instrument, timeframe: str) -> None:
+        if self._owned_live_ingestion:
+            self.request_live_history(instrument, timeframe, 1)
+            return
         if not self.live_session_enabled:
             return self._ensure_loaded_legacy(instrument, timeframe)
         self._live_initial(instrument, timeframe)
@@ -521,6 +657,8 @@ class MarketDataCache:
             self._note_new_bar(key, closed)
 
     def refresh_if_new_candle(self, timeframe: str, now=None, force: bool = False) -> None:
+        if self._owned_live_ingestion:
+            return
         if self.live_session_enabled:
             return self.refresh_live()
         return self._refresh_legacy(timeframe, now, force)
@@ -657,6 +795,8 @@ class MarketDataCache:
 
     def refresh_live(self):
         """Один свежий dispatch; после оборота — одна auxiliary/recovery задача."""
+        if self._owned_live_ingestion:
+            return
         if not self.live_session_enabled:
             return
         now = _naive(self._timeline.now())
@@ -797,6 +937,11 @@ class MarketDataCache:
             reconciler.service_calendar(now)
 
     def prepare_live_history(self, instrument, timeframe, min_bars, *, max_close=None):
+        if self._owned_live_ingestion:
+            frame = self.request_live_history(instrument, timeframe, min_bars)
+            if max_close is not None and not frame.empty:
+                frame = frame[frame["datetime"].apply(lambda stamp: self._timeline.grid(timeframe).bar_close(stamp) <= max_close)]
+            return frame
         self._live_initial(instrument, timeframe)
         key = self._key(instrument, timeframe)
         for days in (30, 60, 120, 240, 480, 960):
