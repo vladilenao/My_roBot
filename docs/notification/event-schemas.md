@@ -28,7 +28,7 @@
 }
 ```
 
-- `type` — один из 21 типов каталога: 19 пользовательских уведомлений и две служебные границы тика ([events.md](events.md)).
+- `type` — один из 23 типов каталога: 21 пользовательское уведомление и две служебные границы тика ([events.md](events.md)).
 - `instrument` — короткое имя контракта; пустая строка, если событие не про контракт.
 - `bar_time` — время закрытия бара в ISO8601 или `null`.
 - `timeframe` — таймфрейм сигнала или пустая строка.
@@ -59,6 +59,74 @@
 64 элементами с явными агрегатами ранних исполнений, не потерей общего результата.
 
 ## События анализа
+
+### `startup_analysis`
+
+Информационный обзор последней доступной сессии. `bar_time` — закрытие свечи,
+`published_at` — отдельное время публикации UTC. Результаты содержат все привязки,
+включая HOLD и причины неполного расчёта. Событие не является торговым допуском.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload startup_analysis",
+  "type": "object",
+  "required": ["published_at", "results", "available_bars", "required_bars", "coverage_complete", "reason"],
+  "properties": {
+    "published_at": {"type": "string"},
+    "results": {"type": "array", "items": {
+      "type": "object",
+      "required": ["assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason"],
+      "properties": {
+        "assignment_id": {"type": "string"}, "strategy": {"type": "string"},
+        "filter_profile": {"type": "string"}, "outcome": {"type": "string"},
+        "indicators": {"type": "string"}, "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    }},
+    "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
+    "coverage_complete": {"type": "boolean"}, "reason": {"type": "string"}
+  },
+  "additionalProperties": false
+}
+```
+
+### `market_data_status`
+
+Состояние сессии и данных независимо от торгового тика. Все временные поля — UTC
+ISO8601, границы баров означают закрытие. Неизвестная граница отсутствует, не равна
+времени опроса. `session`: open/waiting_session/unknown; `data_state`:
+warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
+
+Необязательный `ingestion` — технический срез владельца live-входа:
+`transport` (polling/stream), `epoch` (поколение stream или null), `fallback`
+(stream настроен, но пара обслуживается polling), `data_hold`
+(BOOTSTRAPPING/RECONCILING/READY/GAP_HOLD/CONFLICT_HOLD/INTEGRITY_HOLD),
+границы `received_through`/`resolved_through`/`processed_through` (UTC ISO8601
+открытия бара), `gap` (lower/upper/state active|parked/attempts/next_retry_at/reason
+или null), `incident` (integrity-инцидент или null), `history_error`, `cutover`
+(момент запуска, от которого проверяется непрерывность пары без обязательств)
+и `pre_cutover_gaps` (пробелы прогрева до запуска без доказательства расписания).
+Удержание не означает потерю данных или отсутствие сделок.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload market_data_status",
+  "type": "object",
+  "required": ["session", "data_state", "observed_at", "reason"],
+  "properties": {
+    "session": {"type": "string"}, "data_state": {"type": "string"},
+    "observed_at": {"type": "string"}, "reason": {"type": "string"},
+    "received_bar": {"type": "string"}, "analyzed_bar": {"type": "string"},
+    "analysis_mode": {"type": "string"}, "expected_bar": {"type": "string"},
+    "publication_deadline": {"type": "string"}, "next_open": {"type": "string"},
+    "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
+    "coverage_complete": {"type": "boolean"}, "ingestion": {"type": "object"}
+  },
+  "additionalProperties": false
+}
+```
 
 Публикует бот по итогам тика: решение каждой стратегии, рекомендация, прошедшая допуск,
 и отказ на допуске.
@@ -99,6 +167,9 @@
       "type": "boolean"
     },
     "event_id": {
+      "type": "string"
+    },
+    "analysis_mode": {
       "type": "string"
     }
   },

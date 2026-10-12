@@ -46,6 +46,42 @@ def test_each_contract_only_checks_its_assigned_days():
     assert len(result.detail) == 3
 
 
+def test_chain_does_not_read_segment_for_gap_statistics_without_coverage():
+    calls = []
+
+    def source(**kw):
+        calls.append((kw["instrument_id"], kw["start_date"], kw["end_date"]))
+        return loader(**kw)
+
+    result = check(source)
+
+    assert result.ok
+    segments = [segment for chain in selection().chains for segment in chain]
+    assert all(
+        sum(uid == segment.card.uid and start == segment.start and end == segment.end
+            for uid, start, end in calls) == 1
+        for segment in segments
+    )
+    assert not result.notes
+
+
+def test_chain_coverage_is_observational_only():
+    calls = []
+
+    def coverage(**kw):
+        calls.append(kw)
+        return {"count": 10}
+
+    result = run_chain_preflight(
+        selection(), requirements=lambda _: {"1m": 2}, start=datetime(2026, 7, 1),
+        end=datetime(2026, 7, 4), load_candles=loader, coverage=coverage,
+    )
+
+    assert result.ok
+    assert len(calls) == 3
+    assert all("внутренняя целостность не проверена" in note for note in result.notes)
+
+
 def test_missing_middle_contract_is_not_replaced():
     def source(**kw):
         return (pd.DataFrame(), "uid-2") if kw["instrument_id"] == "uid-2" else loader(**kw)

@@ -9,6 +9,7 @@ from uuid import uuid4
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
+from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
 from src.events.event import Event
@@ -90,6 +91,8 @@ class TradingBot:
         protection_timeframe: str = "1m",
         run=None,
         contract_lifecycle=None,
+        market_data_settings=None,
+        live_data_waiter=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -102,6 +105,11 @@ class TradingBot:
         self._heartbeat_every = heartbeat_every_ticks or 0
         self._tick_poll_secs = tick_poll_secs
         self._tick_timeout_secs = tick_timeout_secs
+        # Live-ожидание публикации и повтор статуса настраиваются отдельно от
+        # legacy-таймаута такта (design 7a).
+        self._market_data_settings = market_data_settings or MarketDataSettings()
+        # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
+        self._await_live_data = live_data_waiter
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
@@ -126,6 +134,8 @@ class TradingBot:
 
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча активного ТФ» ──
     def _loop(self) -> None:
+        if getattr(self._data_cache, "live_session_enabled", False) is True:
+            return self._loop_live()
         first = True
         while not self._run.should_stop():
             try:
@@ -155,6 +165,25 @@ class TradingBot:
                 else:
                     time.sleep(self._timeline.fallback_secs())
         log.info("Прогон завершён: %s", self._run.stop_reason())
+
+    def _loop_live(self):
+        from src.bot.live_analysis import LiveAnalysis
+        live = LiveAnalysis(self)
+        try:
+            live.bootstrap()
+            changed = getattr(self._data_cache, "wait_for_data_change", None)
+            while not self._run.should_stop():
+                # Поколение снимается до шага: данные, пришедшие во время
+                # обработки, разбудят следующий шаг без ожидания опроса.
+                generation = getattr(self._data_cache, "data_generation", None)
+                try:
+                    live.step()
+                except Exception as exc:
+                    self._report_error(exc, "обработка live-пар")
+                waiter = (lambda timeout: changed(generation, timeout)) if callable(changed) and generation is not None else None
+                self._timeline.wait_live_poll(self._tick_poll_secs, data_waiter=waiter, wake_at=live.next_wakeup())
+        except KeyboardInterrupt:
+            log.info("Бот остановлен.")
 
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
@@ -557,6 +586,7 @@ class TradingBot:
         filter_profile: str = "",
         filtered_out: bool = False,
         timeframe: str = "",
+        analysis_mode: str = "",
     ) -> None:
         """Publish the strategy outcome; the channel decides how it reads."""
         if filtered_out:
@@ -575,6 +605,7 @@ class TradingBot:
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
                 event_id=decision.event_id or "",
+                analysis_mode=analysis_mode,
             )
         )
 

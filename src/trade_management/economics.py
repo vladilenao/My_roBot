@@ -18,6 +18,16 @@ TWO_PLACES = Decimal("0.01")
 ZERO = Decimal("0")
 
 
+def entry_price_deviation(side, current_price, entry, stop):
+    """Неблагоприятное фактическое движение в R, отдельно от издержек."""
+    current, planned, stop_price = (Decimal(str(value)) for value in (current_price, entry, stop))
+    risk = abs(planned - stop_price)
+    if not all(value.is_finite() for value in (current, planned, stop_price)) or risk <= 0:
+        return None
+    direction = Decimal(1) if side == "BUY" else Decimal(-1)
+    return max(ZERO, direction * (current - planned)) / risk
+
+
 def value_per_point(price_step: Decimal | None, step_cost: Decimal | None) -> Decimal:
     """Currency value of a one-step price move, the basis of every conversion."""
     if price_step is None or price_step <= 0 or step_cost is None or step_cost <= 0:

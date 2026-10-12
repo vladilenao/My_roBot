@@ -49,6 +49,10 @@ class MarketContextCache:
     def invalidate(self, instrument, timeframe: str) -> None:
         self._cache.pop(self._key(instrument, timeframe), None)
 
+    def context_for_frame(self, instrument, timeframe, frame):
+        """Чистый контекст конкретного as-of кадра, включая поздние исправления."""
+        return self._compute_context(frame, instrument)
+
     def _compute_context(self, df: pd.DataFrame, instrument) -> MarketContext:
         trend = self._trend_analyzer.analyze(df)
         current_price = float(df["close"].iloc[-1])

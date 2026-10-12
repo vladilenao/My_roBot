@@ -173,7 +173,9 @@ def test_processed_cursor_advances_only_after_commit_marker(tmp_path):
     after = store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")
 
     assert before["processed_through"] is None
-    assert after["received_through"] == after["resolved_through"] == after["processed_through"] == "2026-10-10T12:01:00Z"
+    assert after["received_through"] == after["processed_through"] == "2026-10-10T12:01:00Z"
+    # Непрерывное разрешение вычисляет владелец покрытия, а не финансовый commit.
+    assert after["resolved_through"] is None
 
 
 def test_reconciler_persists_broker_schedule_and_trading_status(tmp_path):

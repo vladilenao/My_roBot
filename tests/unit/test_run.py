@@ -296,6 +296,8 @@ class TestRuntimeComposition:
             min_risk_cost_ratio=run.RISK_LIMITS.get("min_risk_cost_ratio", 2),
             min_net_payoff=run.RISK_LIMITS.get("min_net_payoff", 1.5),
             max_slippage_r=run.RISK_LIMITS.get("max_slippage_r", 0.25),
+            max_entry_deviation_r=run.RISK_LIMITS.get("max_entry_deviation_r", 0.25),
+            live_market_provider=None,
             contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
             direction_limits=run.TRADING_DIRECTIONS,
             clock=None,

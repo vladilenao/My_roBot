@@ -373,6 +373,24 @@ class MultiTimeframeScheduler:
         self._last_tick = now
         self._pending = {}
 
+    def wait_live_poll(self, poll_secs, *, data_waiter=None, wake_at=None):
+        """Live-пары проверяются независимо, без общего окна ожидания ТФ.
+
+        ``data_waiter(timeout)`` — уведомление owner о новых данных: будит
+        раньше опроса, но само тиком не является. ``wake_at`` — ближайший
+        дедлайн публикации/закрытие бара; сетки и часы не меняются.
+        """
+        if self._clock.is_virtual:
+            return
+        timeout = max(0.1, float(poll_secs))
+        if wake_at is not None:
+            remaining = (pd.Timestamp(wake_at) - pd.Timestamp(self.now())).total_seconds()
+            timeout = max(0.05, min(timeout, remaining))
+        if data_waiter is not None:
+            data_waiter(timeout)
+            return
+        self._sleep(timeout)
+
     def _candidates(self, now: datetime, wait_boundary: bool) -> dict[str, datetime]:
         """ТФ-кандидаты тика с границами, которые ждём: pending + пройденные.
 

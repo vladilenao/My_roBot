@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from decimal import Decimal
 from typing import Callable, Iterator, Mapping
+from threading import local
 
 from src.trade_journal.schema import initialize_schema
 from src.scheduler.clock import Clock, as_aware, as_clock
@@ -161,6 +162,8 @@ class Storage:
         if audit_path is not None and Path(database).resolve() == Path(audit_path).resolve():
             raise ValueError("database path must not match audit export path")
         self.connection = connect(database, initial_deposit=initial_deposit)
+        self._outbox_guard_factory = None
+        self._outbox_guard_local = local()
         self._clock = as_clock(clock)
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
@@ -398,7 +401,44 @@ class Storage:
             self._enqueue(connection, command_id, trade_id, payload, processed_at)
         return True
 
-    def claim_outbox(self, limit: int = 1) -> tuple[OutboxCommand, ...]:
+    @property
+    def outbox_guard_configured(self) -> bool:
+        return self._outbox_guard_factory is not None
+
+    def configure_outbox_guard(self, factory) -> None:
+        """Composition устанавливает один обязательный guard, не per-call bypass."""
+        if not callable(factory):
+            raise ValueError("outbox guard factory должна быть callable")
+        if self._outbox_guard_factory is not None:
+            raise ValueError("Обязательный outbox guard уже установлен")
+        self._outbox_guard_factory = factory
+
+    @contextmanager
+    def outbox_delivery_guard(self):
+        """Data lock до financial transaction; nested claim использует тот же срез."""
+        active = getattr(self._outbox_guard_local, "active", False)
+        if active:
+            yield self._outbox_guard_local.predicate
+            return
+        if self._outbox_guard_factory is None:
+            yield None
+            return
+        with self._outbox_guard_factory() as predicate:
+            if not callable(predicate):
+                raise ValueError("outbox guard должен предоставить eligibility predicate")
+            self._outbox_guard_local.active = True
+            self._outbox_guard_local.predicate = predicate
+            try:
+                yield predicate
+            finally:
+                self._outbox_guard_local.active = False
+                self._outbox_guard_local.predicate = None
+
+    def outbox_dispatch_boundary(self) -> int:
+        """Срез существовавших intents: consume не расширяет текущий batch."""
+        return self.connection.execute("SELECT COALESCE(MAX(rowid),0) FROM outbox").fetchone()[0]
+
+    def claim_outbox(self, limit: int = 1, *, through_rowid: int | None = None) -> tuple[OutboxCommand, ...]:
         """Claim pending intents for delivery without making a network guarantee.
 
         A process crash after this commit can redeliver the same ``command_id`` on
@@ -406,29 +446,30 @@ class Storage:
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
-        with self.transaction() as connection:
-            rows = connection.execute(
-                "SELECT command_id, trade_id, payload_json, created_at FROM outbox "
-                "WHERE status = 'PENDING' ORDER BY created_at, command_id LIMIT ?",
-                (limit,),
-            ).fetchall()
-            command_ids = [row[0] for row in rows]
-            if command_ids:
-                placeholders = ", ".join("?" for _ in command_ids)
-                connection.execute(
-                    f"UPDATE outbox SET status = 'CLAIMED' WHERE command_id IN ({placeholders}) "
-                    "AND status = 'PENDING'",
-                    command_ids,
+        with self.outbox_delivery_guard() as eligible:
+            with self.transaction() as connection:
+                cursor = connection.execute(
+                    "SELECT command_id, trade_id, payload_json, created_at FROM outbox "
+                    "WHERE status = 'PENDING' AND (? IS NULL OR rowid<=?) ORDER BY created_at, command_id",
+                    (through_rowid, through_rowid),
                 )
-            return tuple(
-                OutboxCommand(
-                    command_id=row[0],
-                    trade_id=row[1],
-                    payload=json.loads(row[2]),
-                    created_at=datetime.fromisoformat(row[3]),
-                )
-                for row in rows
-            )
+                commands = []
+                for row in cursor:
+                    command = OutboxCommand(row[0], row[1], json.loads(row[2]), datetime.fromisoformat(row[3]))
+                    # Проверка и переход статуса в одной BEGIN IMMEDIATE.
+                    # Удержанные головы очереди не расходуют limit здоровых UID.
+                    if eligible is None or eligible(connection, command):
+                        commands.append(command)
+                    if len(commands) >= limit:
+                        break
+                command_ids = [command.command_id for command in commands]
+                if command_ids:
+                    placeholders = ", ".join("?" for _ in command_ids)
+                    connection.execute(
+                        f"UPDATE outbox SET status = 'CLAIMED' WHERE command_id IN ({placeholders}) "
+                        "AND status = 'PENDING'", command_ids,
+                    )
+                return tuple(commands)
 
     def mark_outbox_sent(self, command_id: str, *, sent_at: datetime | None = None) -> bool:
         """Record a successful submission of a claimed command, not its execution."""

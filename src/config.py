@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
 import pandas as pd
 
+from src.data.ingestion_settings import MarketDataSettings
 from src.config_loader import (
     ConfigError,
     app_dir,
@@ -69,6 +70,9 @@ _DEFAULTS = {
     "market_data_export_enabled": False,
     "market_data_export_host": "127.0.0.1",
     "market_data_export_port": 8101,
+    # Live-ingestion: предварительный инженерный профиль design 11c. Значения
+    # не являются SLA брокера и не наследуются от [tick] timeout_secs.
+    **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
     # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
     "share_strategies": {
         "SBER": {
@@ -132,6 +136,9 @@ MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
 MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
+# Эффективные параметры live-ingestion: транспорт, сроки публикации/recovery,
+# лимиты stream и бюджет запросов. Исторический режим их не использует.
+MARKET_DATA_SETTINGS = MarketDataSettings.from_flat(_CONFIG)
 
 # Каналы уведомлений в порядке конфигурации: "console" | "telegram"
 NOTIFIER_CHANNELS: tuple[str, ...] = tuple(_CONFIG["notifier_channels"])
