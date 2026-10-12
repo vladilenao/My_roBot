@@ -157,7 +157,12 @@ class MarketDataReconciler:
                         self._source, tuple(to_naive(day) for day in payload.get("covered_dates", ()))))
             found = next((cal for cal in reversed(self._ranges[instrument_uid]) if cal.covers(point)), None)
             if found is None or (point >= current.normalize() and current - found.observed_at >= self._refresh):
-                lower = point.normalize() - pd.Timedelta(days=1)
+                if point.normalize() < current.normalize():
+                    # TradingSchedules отклоняет `from` раньше текущей даты
+                    # (INVALID_ARGUMENT 30003): прошлое доказывают только ранее
+                    # сохранённые наблюдения, заведомо отклоняемый RPC не нужен.
+                    return found
+                lower = current.normalize()
                 key = (instrument_uid, lower)
                 if key not in self._calendar_tasks and current >= self._calendar_retry.get(key, pd.Timestamp.min):
                     self._calendar_tasks[key] = {"stage": 0 if instrument_uid not in self._exchange else 1,
@@ -191,7 +196,7 @@ class MarketDataReconciler:
                 response = api_call_with_retry(
                     client.instruments.trading_schedules,
                     exchange=getattr(instrument, "exchange", ""),
-                    from_=to_aware_utc(current - pd.Timedelta(days=1)).to_pydatetime(),
+                    from_=to_aware_utc(current).to_pydatetime(),
                     to=to_aware_utc(current + pd.Timedelta(days=7)).to_pydatetime(),
                 )
                 calendar = _calendar_from_response(response, getattr(instrument, "exchange", ""), observed_at=current)
@@ -237,7 +242,7 @@ class MarketDataReconciler:
                         kind="trading_status", payload=_jsonable(response), observed_at=current)
                 else:
                     response = self._budget.call(client.instruments.trading_schedules,
-                        exchange=self._exchange[uid], from_=to_aware_utc(lower).to_pydatetime(),
+                        exchange=self._exchange[uid], from_=to_aware_utc(max(lower, current)).to_pydatetime(),
                         to=to_aware_utc(task["upper"]).to_pydatetime(), key=("schedule", key))
                     cal = _calendar_from_response(response, self._exchange[uid], observed_at=current)
                     if cal is None:

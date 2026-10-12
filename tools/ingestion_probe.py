@@ -241,8 +241,10 @@ def describe_day(day):
 def probe_schedule(client, instrument):
     now = utc_now()
     result = {"exchange": instrument["exchange"]}
-    for label, start, end in (("current", now - timedelta(days=3), now + timedelta(days=7)),
-                              ("past_60_days", now - timedelta(days=63), now - timedelta(days=56))):
+    # Брокер отклоняет `from` раньше текущей даты: текущее окно — от момента
+    # запуска; запрос за вчера оставлен как явная проверка этого ограничения.
+    for label, start, end in (("current", now, now + timedelta(days=7)),
+                              ("yesterday_rejected", now - timedelta(days=1), now + timedelta(days=1))):
         try:
             response = client.instruments.trading_schedules(exchange=instrument["exchange"], from_=start, to=end)
             result[label] = [{"exchange": schedule.exchange, "days": [describe_day(day) for day in schedule.days]}

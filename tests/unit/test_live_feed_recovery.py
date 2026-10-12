@@ -305,3 +305,34 @@ def test_permanent_old_gap_does_not_starve_fresh_pairs_and_cache_read(tmp_path):
         assert store.coverage_state(source="tbank_exchange", instrument_uid=item.uid, interval="1m",
                                     open_time="2026-09-11 21:00") == "unresolved"
         assert store.cursors(source="tbank_exchange", instrument_uid=item.uid, interval="1m")["processed_through"] is None
+
+
+def test_schedule_is_requested_from_now_and_past_dates_are_not_requested(tmp_path):
+    # Брокер отклоняет `from` раньше текущей даты (INVALID_ARGUMENT 30003, проба 8.5).
+    now = pd.Timestamp("2026-10-12 20:30")
+    budget = RequestBudget(lambda: now, 0)
+    requests = []
+    day = SimpleNamespace(date=now.normalize(), is_trading_day=True, intervals=[],
+                          start_time=now.normalize() + pd.Timedelta(hours=7), end_time=now.normalize() + pd.Timedelta(hours=21))
+    def schedules(**kwargs):
+        if pd.Timestamp(kwargs["from_"]).tz_convert(None) < now:
+            raise AssertionError("`from` can't be less than the current date")
+        requests.append(kwargs)
+        return SimpleNamespace(exchanges=[SimpleNamespace(exchange="MOEX", days=[day])])
+    client = SimpleNamespace(instruments=SimpleNamespace(
+        get_instrument_by=lambda **_: SimpleNamespace(instrument=SimpleNamespace(exchange="MOEX")),
+        trading_schedules=schedules),
+        market_data=SimpleNamespace(get_trading_status=lambda **_: SimpleNamespace(__annotations__={})))
+    class Provider:
+        @contextmanager
+        def client_context(self, token):
+            yield client
+    rec = MarketDataReconciler(MarketDataStore(tmp_path / "market.sqlite3"), source="s",
+                               request_budget=budget, client_provider=Provider())
+    assert rec.interval_state(instrument_uid="uid", interval="1m", open_time="2026-10-09 23:00", now=now) == "unresolved"
+    assert not rec._calendar_tasks  # за прошлую дату RPC не планируется
+    rec.session_calendar("uid", now)
+    while rec.service_calendar(now):
+        pass
+    assert requests and all(pd.Timestamp(item["from_"]).tz_convert(None) >= now for item in requests)
+    assert rec.session_calendar("uid", now).is_open(now)
