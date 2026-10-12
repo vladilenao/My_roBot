@@ -118,6 +118,36 @@ class Event:
         return cls(type=event_type, **kwargs)
 
     @classmethod
+    def startup_analysis(cls, instrument: str, *, published_at: datetime,
+                         results: list[Mapping[str, Any]] | tuple = (),
+                         available_bars: int, required_bars: int,
+                         coverage_complete: bool, reason: str = "",
+                         bar_time: Any = None, timeframe: str = "") -> "Event":
+        """Информационный обзор, не торговое решение или принятая заявка."""
+        return cls._make(EventType.STARTUP_ANALYSIS, instrument=instrument,
+                         bar_time=bar_time, timeframe=timeframe,
+                         payload={"published_at": published_at, "results": results,
+                                  "available_bars": available_bars, "required_bars": required_bars,
+                                  "coverage_complete": coverage_complete, "reason": reason})
+
+    @classmethod
+    def market_data_status(cls, instrument: str, *, timeframe: str, session: str,
+                           data_state: str, observed_at: datetime, reason: str = "",
+                           received_bar: Any = None, analyzed_bar: Any = None,
+                           analysis_mode: str = "", expected_bar: Any = None,
+                           publication_deadline: Any = None, next_open: Any = None,
+                           available_bars: int = 0, required_bars: int = 0,
+                           coverage_complete: bool = False, ingestion: dict | None = None) -> "Event":
+        return cls._make(EventType.MARKET_DATA_STATUS, instrument=instrument, timeframe=timeframe,
+                         payload={"session": session, "data_state": data_state,
+                                  "observed_at": observed_at, "reason": reason,
+                                  "received_bar": received_bar, "analyzed_bar": analyzed_bar,
+                                  "analysis_mode": analysis_mode, "expected_bar": expected_bar,
+                                  "publication_deadline": publication_deadline, "next_open": next_open,
+                                  "available_bars": available_bars, "required_bars": required_bars,
+                                  "coverage_complete": coverage_complete, "ingestion": ingestion})
+
+    @classmethod
     def decision(
         cls,
         instrument: str,
@@ -131,6 +161,7 @@ class Event:
         event_id: str = "",
         bar_time: Any = None,
         timeframe: str = "",
+        analysis_mode: str = "",
     ) -> "Event":
         """Исход анализа по контракту за тик."""
         return cls._make(
@@ -146,6 +177,7 @@ class Event:
                 "filter_profile": filter_profile,
                 "filtered_out": filtered_out,
                 "event_id": event_id,
+                "analysis_mode": analysis_mode or None,
             },
         )
 

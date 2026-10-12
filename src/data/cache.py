@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import threading
+from collections import deque
 from functools import wraps
 from dataclasses import dataclass
 from datetime import timedelta
@@ -13,6 +14,8 @@ from src.data.timeutil import to_naive
 from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
+from src.data.request_budget import RequestDeferred
+from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)
 
@@ -125,7 +128,7 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
@@ -167,6 +170,33 @@ class MarketDataCache:
         self._pending_terminal_gap = None
         self._terminal_gap_counted = False
         self._failed_reads = set()
+        self._request_budget = request_budget
+        self.live_session_enabled = request_budget is not None and not self._history
+        self._live_queue = deque()
+        self._recovery_queue = deque()
+        self._live_busy = set()
+        self._refresh_running = False
+        self._recovery_due = False
+        self._recovery_retry_seconds = max(recovery_retry_seconds, data_refresh_min_interval)
+        self._aux_at = pd.Timestamp.min
+        self._live_errors = {}
+        self._warmup_days = {}
+        # Live-режим всегда владеет входом через единый accept-путь.
+        self._owned_live_ingestion = self.live_session_enabled
+        self._live_conflicts = set()
+        self._pending_execution_lower = {}
+        # Решение владельца (вариант «б», проба 8.5): прошлые даты брокер не
+        # отдаёт, поэтому без сохранённых обязательств непрерывность
+        # доказывается от момента запуска; строгой остаётся 1m-граница
+        # исполнения сохранённых обязательств.
+        self._live_cutover = (None if not self.live_session_enabled
+                              else _naive(live_cutover if live_cutover is not None else timeline.now()))
+        self._pre_cutover_gaps = {}
+        self._live_members = {}
+        self._live_evidence = {}
+        self._live_generation = 0
+        self._data_changed = threading.Condition(self._lock)
+        self._pending_live_history = {}
 
     @property
     def history_source_failed(self):
@@ -317,6 +347,469 @@ class MarketDataCache:
     def _key(self, instrument, timeframe: str) -> tuple:
         return (instrument_key(instrument), instrument.instrument_type, timeframe)
 
+    # ── Live: единственный владелец рыночного входа (design 2, 6, 9) ──
+    # Торговый поток только читает неизменяемые копии кадров и регистрирует
+    # потребности. Сеть, прогрев, свежая дозагрузка и recovery выполняет
+    # фоновая полоса ingestion (src/data/ingestion.py) через accept-путь ниже.
+
+    def register_live_pair(self, instrument, uid, timeframe, min_bars=1):
+        """UID/alias mapping пары; не читает финансовую БД или сеть."""
+        if self._history or self._market_store is None:
+            raise ValueError("Owned live-ingestion требует отдельного рыночного хранилища")
+        if not uid or isinstance(min_bars, bool) or not isinstance(min_bars, int) or min_bars <= 0:
+            raise ValueError("Live-пара требует UID и положительный прогрев")
+        with self._lock:
+            key = self._key(instrument, timeframe)
+            previous = self._uids.get(key)
+            owners = {other for (other, tf), member in self._live_members.items()
+                      if tf == timeframe and key in member["keys"]}
+            if (previous and previous != uid) or owners - {uid}:
+                raise ValueError("Неоднозначный финансовый alias разных UID")
+            self._owned_live_ingestion = True
+            self._uids[key] = uid
+            self._instruments[key] = instrument
+            member = self._live_members.setdefault((uid, timeframe), {
+                "keys": set(), "min_bars": 0, "execution_lower": None, "instrument": instrument,
+                "history": "pending", "warmup_days": 0, "history_error": "", "state": "BOOTSTRAPPING",
+            })
+            member["keys"].add(key)
+            lower = self._pending_execution_lower.pop(instrument_key(instrument), None)
+            if lower is not None and timeframe == "1m":
+                previous = member["execution_lower"]
+                member["execution_lower"] = lower if previous is None else min(previous, lower)
+            if min_bars > member["min_bars"]:
+                member["min_bars"] = min_bars
+                if member["history"] == "done" and len(self._closed_member_frame(member, timeframe)) < min_bars:
+                    member["history"] = "pending"
+            if key not in self._frames:
+                # Market-only disk read, никакой implicit первичной RPC загрузки.
+                self._frames[key] = self._market_store.current_frame(
+                    source=self._market_source, instrument_uid=uid, interval=timeframe)
+                if not self._frames[key].empty:
+                    closed = self._closed_only(self._frames[key], timeframe)
+                    if not closed.empty:
+                        self._last_loaded[key] = _naive(closed["datetime"].max())
+            self._advance_live_coverage(uid, timeframe, member)
+            self._refresh_member_state(uid, timeframe, member)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+
+    def set_live_execution_lower(self, uid, timeframe, open_time):
+        """Main-thread boundary сохранённых обязательств, не high-water receipt."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                raise ValueError("Execution boundary требует зарегистрированную live-пару")
+            stamp = _naive(open_time)
+            previous = member["execution_lower"]
+            member["execution_lower"] = stamp if previous is None else min(previous, stamp)
+            self._advance_live_coverage(uid, timeframe, member)
+
+    def note_execution_lower(self, instrument, open_time):
+        """Граница сохранённых обязательств до регистрации пары (main thread)."""
+        with self._lock:
+            uid = self._uids.get(self._key(instrument, "1m"))
+            if not uid or (uid, "1m") not in self._live_members:
+                self._pending_execution_lower[instrument_key(instrument)] = _naive(open_time)
+                return
+        self.set_live_execution_lower(uid, "1m", open_time)
+
+    def set_stream_evidence(self, uid, timeframe, evidence):
+        """ACK текущего поколения: доказательство режима закрытия stream-свечей."""
+        with self._lock:
+            if evidence is None:
+                self._live_evidence.pop((uid, timeframe), None)
+            else:
+                self._live_evidence[uid, timeframe] = evidence
+            member = self._live_members.get((uid, timeframe))
+            if member is not None:
+                self._refresh_member_state(uid, timeframe, member)
+
+    def set_live_handoff(self, uid, timeframe, *, transport, epoch=None, ready):
+        """Supervisor закрывает/открывает handoff пары после ACK и overlap."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                return
+            member["transport"] = transport
+            member["epoch"] = epoch
+            member["handoff_ready"] = bool(ready)
+            self._refresh_member_state(uid, timeframe, member)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+
+    def accept_live_observation(self, observation, *, reconcile_sequence=None):
+        """Единственный accept/normalize/reconcile/publish путь live-транспортов."""
+        return self._accept_batch([observation], [reconcile_sequence])[0]
+
+    def _accept_batch(self, observations, sequences):
+        """Одна транзакция store, одно слияние кадра и одно продвижение префикса."""
+        with self._lock:
+            members = {}
+            for item in observations:
+                member = self._live_members.get((item.uid, item.timeframe))
+                if member is None:
+                    raise ValueError("Наблюдение не принадлежит зарегистрированному UID/ТФ")
+                members[item.uid, item.timeframe] = member
+            if not observations:
+                return []
+            results = self._market_store.accept_observations(observations, source=self._market_source,
+                                                             reconcile_sequences=sequences)
+            changed, notify = {}, False
+            for item, sequence, result in zip(observations, sequences, results):
+                pair, stamp = (item.uid, item.timeframe), _naive(item.open_time)
+                if result["state"] == "accepted" and result["changed"]:
+                    changed.setdefault(pair, []).append(item)
+                if result["state"] == "conflict":
+                    self._live_conflicts.add((*pair, stamp))
+                elif result["state"] == "accepted" and sequence is not None:
+                    self._live_conflicts.discard((*pair, stamp))
+                if result["changed"] or result["state"] == "conflict" or (sequence is not None and result["state"] == "accepted"):
+                    notify = True
+            for pair, items in changed.items():
+                member = members[pair]
+                incoming = pd.DataFrame([item.as_row() for item in items])
+                closed_opens = [_naive(item.open_time) for item in items if item.closed]
+                for key in member["keys"]:
+                    frame = self._frames.get(key)
+                    self._frames[key] = (incoming.sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
+                                         if frame is None or frame.empty else self._merge_new_bars(frame, incoming, self._last_loaded.get(key)))
+                    if closed_opens:
+                        self._last_loaded[key] = max(max(closed_opens), self._last_loaded.get(key, pd.Timestamp.min))
+                self._advance_live_coverage(*pair, member)
+            for pair, member in members.items():
+                self._refresh_member_state(*pair, member)
+            if notify:
+                self._live_generation += 1
+                self._data_changed.notify_all()
+            return results
+
+    def live_floor(self, uid, timeframe):
+        """Нижняя граница проверки непрерывности пары или None (строго)."""
+        member = self._live_members.get((uid, timeframe))
+        if self._live_cutover is None or (member is not None and member["execution_lower"] is not None):
+            return None
+        return _naive(self._timeline.grid(timeframe).previous_candle_start(self._live_cutover))
+
+    def _advance_live_coverage(self, uid, timeframe, member):
+        """Непрерывный префикс от meaningful lower; ночи и перерывы — по календарю.
+
+        Нижняя граница выбирается по прогреву и durable execution, не по
+        latest receipt. Сканирование инкрементально: от уже разрешённой
+        границы, с прыжком через подтверждённые календарём перерывы.
+        """
+        frames = [self._frames.get(key) for key in member["keys"]]
+        frame = next((item for item in frames if item is not None and not item.empty), None)
+        if frame is None:
+            return None
+        closed = self._closed_only(frame, timeframe).sort_values("datetime")
+        lowers = []
+        if len(closed) >= member["min_bars"] and not closed.empty:
+            lowers.append(_naive(closed["datetime"].iloc[-member["min_bars"]]))
+        if member["execution_lower"] is not None:
+            lowers.append(member["execution_lower"])
+        if not lowers:
+            return None
+        cursor = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe)
+        resolved = cursor.get("resolved_through")
+        resolved = None if resolved is None else pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None)
+        lower = min(lowers)
+        floor = self.live_floor(uid, timeframe)
+        if floor is not None:
+            lower = max(lower, floor)
+        if member.get("coverage_lower") is None:
+            stored = self._market_store.live_state(kind="pair", source=self._market_source,
+                                                   instrument_uid=uid, interval=timeframe).get("coverage_lower")
+            member["coverage_lower"] = None if stored is None else _naive(stored)
+        existing = member.get("coverage_lower")
+        if existing is not None and (floor is None or existing >= floor) and (resolved is None or resolved < lower):
+            # Граница не поднимается через недоказанный участок: новый
+            # high-water не прячет внутреннюю/хвостовую дыру (задача 2.5).
+            lower = min(existing, lower)
+        if member.get("coverage_lower") != lower:
+            member["coverage_lower"] = lower
+            self._market_store.save_live_state({"coverage_lower": lower.isoformat()}, kind="pair",
+                source=self._market_source, instrument_uid=uid, interval=timeframe)
+        grid = self._timeline.grid(timeframe)
+        opens = _naive_series(closed["datetime"])
+        if resolved is not None and resolved >= lower:
+            previous, probe = resolved, _naive(grid.bar_close(resolved))
+        elif bool((opens == lower).any()):
+            previous, probe = lower, _naive(grid.bar_close(lower))
+        else:
+            previous, probe = None, lower
+        # Только свечи после уже доказанной границы: без O(n) на каждую свечу.
+        stamps = [_naive(stamp) for stamp in opens[opens >= probe]]
+        now = self._timeline.now()
+        for stamp in stamps:
+            if stamp < probe:
+                continue
+            while probe < stamp:
+                jump = self._resolved_jump(uid, timeframe, probe, now)
+                if jump is None:
+                    break
+                probe = jump
+            if probe < stamp:
+                break
+            previous, probe = stamp, _naive(grid.bar_close(stamp))
+        if previous is not None and (resolved is None or previous > resolved):
+            self._market_store.mark_resolved(source=self._market_source, instrument_uid=uid,
+                                             interval=timeframe, open_time=previous)
+        return previous
+
+    def _resolved_jump(self, uid, timeframe, probe, now):
+        """Следующая проверяемая точка после разрешённого интервала либо None."""
+        grid = self._timeline.grid(timeframe)
+        reconciler = self._market_reconciler
+        if reconciler is None:
+            state = self._market_store.coverage_state(source=self._market_source, instrument_uid=uid,
+                                                      interval=timeframe, open_time=probe)
+        else:
+            state = reconciler.interval_state(instrument_uid=uid, interval=timeframe, open_time=probe, now=now)
+        if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+            return None
+        following = _naive(grid.bar_close(probe))
+        if state == "scheduled_closed" and reconciler is not None:
+            calendar = reconciler.session_calendar(uid, now)
+            if calendar is not None and calendar.covers(probe):
+                opening = calendar.next_open(probe)
+                if opening is not None and calendar.covers(opening):
+                    following = max(following, _naive(grid.current_candle_start(opening)))
+        return following
+
+    def _closed_member_frame(self, member, timeframe):
+        frames = [self._frames.get(key) for key in member["keys"]]
+        frame = next((item for item in frames if item is not None and not item.empty), None)
+        return pd.DataFrame() if frame is None else self._closed_only(frame, timeframe)
+
+    def _refresh_member_state(self, uid, timeframe, member):
+        """Data-state отдельно от транспорта (design 9)."""
+        held = self._market_store.live_state(kind="uid", source=self._market_source, instrument_uid=uid)
+        if held.get("integrity_hold"):
+            state = "INTEGRITY_HOLD"
+        elif any(item[:2] == (uid, timeframe) for item in self._live_conflicts):
+            state = "CONFLICT_HOLD"
+        elif member["history"] != "done":
+            state = "BOOTSTRAPPING"
+        elif member.get("transport") == "stream" and not member.get("handoff_ready"):
+            state = "RECONCILING"
+        elif member.get("gap"):
+            state = "GAP_HOLD"
+        else:
+            state = "READY"
+        member["state"] = state
+        return state
+
+    def accept_stream_candle(self, candle, *, epoch, received_at):
+        evidence = self._live_evidence.get((candle.uid, candle.timeframe))
+        observation = normalize_stream_candle(candle, evidence=evidence, epoch=epoch, received_at=received_at)
+        return self.accept_live_observation(observation)
+
+    def accept_rpc_frame(self, uid, timeframe, frame, *, received_at, fences=None):
+        """Worker передаёт страницу после RPC; network не входит в owner lock."""
+        sources = frame.attrs.get("actual_candle_sources", {})
+        observations = [normalize_rpc_candle(row, uid=uid, timeframe=timeframe, received_at=received_at,
+                            actual_source=sources.get(pd.Timestamp(row["datetime"]).isoformat()))
+                        for row in frame.to_dict("records")]
+        sequences = [None if fences is None else fences.get(pd.Timestamp(item.open_time).isoformat())
+                     for item in observations]
+        return self._accept_batch(observations, sequences)
+
+    def reconciliation_fences(self, uid, timeframe, frame):
+        """Версии наблюдений ДО начала согласующего RPC, не после его ответа."""
+        return {pd.Timestamp(stamp).isoformat(): self._market_store.live_state(
+            kind="candle", source=self._market_source, instrument_uid=uid, interval=timeframe,
+            open_time=stamp).get("observed_sequence", 0) for stamp in frame["datetime"]}
+
+    def live_conflicts(self):
+        with self._lock:
+            return sorted(self._live_conflicts)
+
+    def pin_execution_input(self, instrument, stamp):
+        with self._lock:
+            uid = self._uids.get(self._key(instrument, "1m"))
+            if not uid:
+                raise ValueError("Нет UID для закрепления исполнительного входа")
+            reference = self._market_store.pin_input(source=self._market_source, instrument_uid=uid,
+                                                    interval="1m", open_time=stamp)
+            return reference, self._market_store.pinned_frame(reference)
+
+    def resume_execution_marker(self, instrument, financial_boundary):
+        """После сбоя между financial commit и market-marker: без replay минуты.
+
+        Финансовая граница уже подтверждена; отмечается обработанной только
+        ранее закреплённая версия начатого пакета. Исправленная current-версия
+        не проигрывается, а конфликт с ней превращается в integrity-hold.
+        """
+        with self._lock:
+            uid = self._uids.get(self._key(instrument, "1m"))
+            if not uid or financial_boundary is None:
+                return None
+            stamp = _naive(financial_boundary)
+            processed = self._market_store.cursors(source=self._market_source, instrument_uid=uid,
+                                                   interval="1m").get("processed_through")
+            if processed is not None and pd.Timestamp(processed).tz_convert("UTC").tz_localize(None) >= stamp:
+                return None
+            self._market_store.mark_processed(source=self._market_source, instrument_uid=uid,
+                                              interval="1m", open_time=stamp)
+            return stamp
+
+    def wait_for_data_change(self, generation, timeout):
+        with self._data_changed:
+            self._data_changed.wait_for(lambda: self._live_generation != generation, timeout=timeout)
+            return self._live_generation
+
+    @property
+    def data_generation(self):
+        with self._lock:
+            return self._live_generation
+
+    def request_live_history(self, instrument, timeframe, min_bars):
+        """Недостающая потребность передаётся worker без синхронной сети."""
+        with self._lock:
+            key = self._key(instrument, timeframe)
+            self._instruments.setdefault(key, instrument)
+            uid = self._uids.get(key)
+            member = self._live_members.get((uid, timeframe)) if uid else None
+            if member is not None and member["history"] == "done" and member["min_bars"] >= min_bars:
+                return self._closed_member_frame(member, timeframe)
+            previous = self._pending_live_history.get(key, (None, 0))[1]
+            self._pending_live_history[key] = (instrument, max(min_bars, previous))
+            frame = self._frames.get(key)
+            return pd.DataFrame() if frame is None or frame.empty else self._closed_only(frame, timeframe)
+
+    def live_needs(self):
+        """Снимок потребностей прогрева/регистрации для фонового worker."""
+        with self._lock:
+            return [(key, instrument, min_bars) for key, (instrument, min_bars) in self._pending_live_history.items()]
+
+    def finish_live_need(self, key, min_bars):
+        with self._lock:
+            current = self._pending_live_history.get(key)
+            if current is not None and current[1] <= min_bars:
+                self._pending_live_history.pop(key, None)
+
+    def live_pairs(self):
+        """Снимок зарегистрированных пар: worker не держит owner lock во время RPC."""
+        with self._lock:
+            return [self._pair_snapshot(uid, tf, member) for (uid, tf), member in sorted(self._live_members.items())]
+
+    def live_pair(self, uid, timeframe):
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            return None if member is None else self._pair_snapshot(uid, timeframe, member)
+
+    def _pair_snapshot(self, uid, timeframe, member):
+        key = min(member["keys"])
+        frame = next((self._frames.get(item) for item in member["keys"]
+                      if self._frames.get(item) is not None and not self._frames[item].empty), None)
+        return dict(uid=uid, timeframe=timeframe, instrument=member["instrument"], min_bars=member["min_bars"],
+                    history=member["history"], warmup_days=member["warmup_days"], state=member["state"],
+                    transport=member.get("transport"), key=key,
+                    closed=0 if frame is None else self._closed_count(frame, timeframe),
+                    last_closed=self._last_loaded.get(key))
+
+    def _closed_count(self, frame, timeframe):
+        boundary = _naive(self._timeline.grid(timeframe).current_candle_start(self._timeline.now()))
+        mask = frame["datetime"] < boundary
+        if "is_complete" in frame.columns:
+            mask &= frame["is_complete"].astype(bool)
+        return int(mask.sum())
+
+    def mark_live_history(self, uid, timeframe, *, days=None, done=None, error=None):
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                return
+            if days is not None:
+                member["warmup_days"] = max(member["warmup_days"], days)
+            if error is not None:
+                member["history_error"] = error
+            if done is not None:
+                member["history"] = "done" if done else "pending"
+                if done and error is None:
+                    member["history_error"] = ""
+            self._advance_live_coverage(uid, timeframe, member)
+            self._refresh_member_state(uid, timeframe, member)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+
+    def set_live_gap(self, uid, timeframe, gap):
+        """Recovery-владелец сообщает об активном/парковочном диапазоне пары."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                return
+            member["gap"] = gap
+            self._refresh_member_state(uid, timeframe, member)
+
+    def pair_status(self, instrument, timeframe):
+        """Read-only факты готовности пары для анализа, допуска и диагностики."""
+        with self._lock:
+            uid = self._uids.get(self._key(instrument, timeframe))
+            member = self._live_members.get((uid, timeframe)) if uid else None
+            if member is None:
+                return {"state": "BOOTSTRAPPING", "uid": uid, "reason": "Пара ещё не зарегистрирована ingestion"}
+            state = self._refresh_member_state(uid, timeframe, member)
+            cursors = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe)
+            held = self._market_store.live_state(kind="uid", source=self._market_source, instrument_uid=uid)
+            return {"state": state, "uid": uid, "transport": member.get("transport") or "polling",
+                    "epoch": member.get("epoch"), "history": member["history"],
+                    "history_error": member["history_error"], "gap": member.get("gap"),
+                    "received_through": cursors.get("received_through"),
+                    "resolved_through": cursors.get("resolved_through"),
+                    "processed_through": cursors.get("processed_through"),
+                    "incident": held.get("incident"),
+                    "cutover": None if self.live_floor(uid, timeframe) is None else self._live_cutover.isoformat(),
+                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0)}
+
+    def input_ready_at(self, instrument, timeframe, open_time):
+        """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not uid or self._market_store is None:
+            return None
+        facts = self._market_store.live_state(kind="candle", source=self._market_source, instrument_uid=uid,
+                                              interval=timeframe, open_time=open_time)
+        value = facts.get("input_ready_at")
+        return None if not value else pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+
+    def execution_ready(self, instrument, through):
+        """Критический 1m барьер UID: доказанный префикс исполнения до ``through``."""
+        status = self.pair_status(instrument, "1m")
+        if status["state"] in {"INTEGRITY_HOLD", "BOOTSTRAPPING"}:
+            return False
+        uid = status.get("uid")
+        floor = self.live_floor(uid, "1m") if uid else None
+        if floor is not None and _naive(through) < floor:
+            # Вариант «б»: минуты до запуска без обязательств доказать нельзя
+            # и не нужно — исполнение начнётся только после cutover.
+            return True
+        resolved = status.get("resolved_through")
+        if resolved is None:
+            return False
+        return pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None) >= _naive(through)
+
+    def expected_live_open(self, key, now):
+        """Открытие последнего ожидаемого закрытого бара пары по календарю."""
+        grid = self._timeline.grid(key[2])
+        expected = _naive(grid.previous_candle_start(now))
+        reconciler = self._market_reconciler
+        uid = self._uids.get(key)
+        cal = reconciler.session_calendar(uid, now) if uid and reconciler else None
+        if cal is None or not cal.covers(now):
+            return expected
+        starts = []
+        for lower, upper in cal.intervals:
+            if lower > now:
+                continue
+            stamp = min(expected, _naive(grid.current_candle_start(upper - pd.Timedelta(microseconds=1))))
+            if grid.bar_close(stamp) <= now and grid.bar_close(stamp) > lower:
+                starts.append(stamp)
+        return max(starts, default=None)
+
+    # Совместимое имя для существующих вызовов/тестов live-session.
+    _expected_live_open = expected_live_open
+
     def _source_kwargs(self) -> dict:
         """Аргументы источника данных для загрузчика.
 
@@ -328,7 +821,8 @@ class MarketDataCache:
             return {}
         return {"client_provider": self._client_provider, "clock": self._clock}
 
-    def _load(self, instrument, timeframe: str, start_date=None, end_date=None) -> pd.DataFrame:
+    def _load(self, instrument, timeframe: str, start_date=None, end_date=None, *, wait_for_budget=True,
+              pace=True, fences=None) -> pd.DataFrame:
         """Дозагрузка кадра по окну ``[start_date, end_date)``.
 
         Обычная дозагрузка ``end_date`` не задаёт: в историческом прогоне загрузчик
@@ -349,6 +843,9 @@ class MarketDataCache:
                 end_date=end_date,
                 token=self._token,
                 instrument_id=self._uids.get(key) or getattr(instrument, "uid", None),
+                **({"request_budget": self._request_budget, "wait_for_budget": wait_for_budget,
+                    "single_attempt": True, "client_provider": self._client_provider,
+                    "clock": self._timeline.clock, "pace": pace} if self.live_session_enabled else {}),
                 **self._source_kwargs(),
             )
         except Exception:
@@ -365,11 +862,23 @@ class MarketDataCache:
                 df = df.loc[df["datetime"] < _naive(self._clock.end)]
             df = df.sort_values("datetime").reset_index(drop=True)
             if self._market_store is not None and instrument_id:
+                if self._owned_live_ingestion:
+                    # fences вычислены вызывающим ДО начала согласующего RPC.
+                    self.accept_rpc_frame(instrument_id, timeframe, df, received_at=self._timeline.now(), fences=fences)
+                    with self._lock:
+                        current = self._frames[key].copy()
+                    if self._market_reconciler is not None:
+                        # Доказательства пропусков между полученными свечами
+                        # (pending/unresolved) экспортируются как прежде.
+                        self._market_reconciler.reconcile(instrument_uid=instrument_id, interval=timeframe,
+                                                          candles=current, now=self._timeline.now())
+                    return current
                 self._market_store.record_candles(
                     source=self._market_source,
                     instrument_uid=instrument_id,
                     interval=timeframe,
                     candles=df,
+                    received_at=self._timeline.now(),
                 )
                 # Стратегия читает тот же подтверждённый локальный слепок,
                 # который экспортируется эмулятору. Это позволяет пережить
@@ -386,8 +895,25 @@ class MarketDataCache:
                     )
         return df
 
-    @_synchronized
     def frame_for(self, instrument, timeframe: str) -> pd.DataFrame:
+        if self._owned_live_ingestion:
+            # Чтение торгового тика: копия из памяти, никакой сети. Неизвестная
+            # пара регистрируется фоновому worker. Получение не обрезается
+            # из-за старой дыры: исполнительный барьер проверяет
+            # contiguous_after, анализ — coverage_for необходимого хвоста.
+            with self._lock:
+                key = self._key(instrument, timeframe)
+                uid = self._uids.get(key)
+                if self.live_session_enabled and (uid is None or (uid, timeframe) not in self._live_members):
+                    self._instruments.setdefault(key, instrument)
+                    previous = self._pending_live_history.get(key, (None, 0))[1]
+                    self._pending_live_history[key] = (instrument, max(1, previous))
+                frame = self._frames.get(key)
+                return pd.DataFrame() if frame is None or frame.empty else self._closed_only(frame, timeframe)
+        return self._frame_for_legacy(instrument, timeframe)
+
+    @_synchronized
+    def _frame_for_legacy(self, instrument, timeframe: str) -> pd.DataFrame:
         """Готовые (закрытые) свечи пары (инструмент, ТФ); ленивая первичная загрузка."""
         key = self._key(instrument, timeframe)
         if key not in self._frames:
@@ -406,7 +932,8 @@ class MarketDataCache:
         ещё и already durable курсор исполнения, который может быть раньше
         первого нового ряда после перезапуска.
         """
-        if self._market_reconciler is None or frame.empty or timeframe != "1m" or last_bar is None:
+        owned_barrier = self._owned_live_ingestion and self._market_store is not None
+        if (self._market_reconciler is None and not owned_barrier) or frame.empty or timeframe != "1m" or last_bar is None:
             return frame
         key = self._key(instrument, timeframe)
         instrument_id = self._uids.get(key)
@@ -418,10 +945,13 @@ class MarketDataCache:
             stamp = _naive(row["datetime"])
             probe = previous + pd.Timedelta(minutes=1)
             while probe < stamp:
-                state = self._market_reconciler.interval_state(
+                # Live-барьер действует и без календаря: тогда состояние
+                # интервала — только доказательство из рыночного хранилища.
+                state = (self._market_reconciler.interval_state(
                     instrument_uid=instrument_id, interval=timeframe,
                     open_time=probe, now=self._timeline.now(),
-                )
+                ) if self._market_reconciler is not None else self._market_store.coverage_state(
+                    source=self._market_source, instrument_uid=instrument_id, interval=timeframe, open_time=probe))
                 if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
                     self._report_coverage_block(key, probe, state)
                     return frame.loc[allowed].copy()
@@ -442,8 +972,14 @@ class MarketDataCache:
                 interval=timeframe, open_time=stamp,
             )
 
-    @_synchronized
     def ensure_loaded(self, instrument, timeframe: str) -> None:
+        if self._owned_live_ingestion:
+            self.request_live_history(instrument, timeframe, 1)
+            return
+        return self._ensure_loaded_legacy(instrument, timeframe)
+
+    @_synchronized
+    def _ensure_loaded_legacy(self, instrument, timeframe: str) -> None:
         """Гарантирует актуальность кадра пары (инструмент, ТФ) по требованию.
 
         Используется для таймфреймов вне активного ритма (старшие ТФ фильтров):
@@ -484,8 +1020,13 @@ class MarketDataCache:
             self._last_loaded[key] = _naive(closed["datetime"].max())
             self._note_new_bar(key, closed)
 
-    @_synchronized
     def refresh_if_new_candle(self, timeframe: str, now=None, force: bool = False) -> None:
+        if self._owned_live_ingestion:
+            return
+        return self._refresh_legacy(timeframe, now, force)
+
+    @_synchronized
+    def _refresh_legacy(self, timeframe: str, now=None, force: bool = False) -> None:
         """Инкрементально дозагружает новые закрытые бары таймфрейма, если граница сместилась.
 
         ``force=True`` заставляет повторно дозагружать поверх кэша даже если граница
@@ -555,6 +1096,95 @@ class MarketDataCache:
                 progressed += 1
         if self._history:
             self._collect_tick(timeframe, progressed, len(candidates))
+
+    def refresh_live(self):
+        """В live сеть принадлежит ingestion-полосе: торговый вызов ничего не грузит."""
+        return None
+
+    def prepare_live_history(self, instrument, timeframe, min_bars, *, max_close=None):
+        """Read-only кадр прогрева; недостаток регистрируется фоновому worker."""
+        frame = self.request_live_history(instrument, timeframe, min_bars)
+        if max_close is not None and not frame.empty:
+            grid = self._timeline.grid(timeframe)
+            frame = frame[frame["datetime"].apply(lambda stamp: grid.bar_close(stamp) <= max_close)]
+        return frame
+
+    def coverage_for(self, instrument, timeframe, frame):
+        if frame.empty:
+            return False
+        if self._market_reconciler is None:
+            return True
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not uid:
+            return False
+        period = pd.Timedelta(seconds=self._tf_period_secs(timeframe))
+        stamps = list(frame["datetime"])
+        floor = self.live_floor(uid, timeframe) if self._owned_live_ingestion else None
+        unconfirmed = 0
+        for left, right in zip(stamps, stamps[1:]):
+            probe = _naive(left) + period
+            gap_unconfirmed = False
+            while probe < _naive(right):
+                state = self._market_reconciler.interval_state(instrument_uid=uid,
+                    interval=timeframe, open_time=probe, now=self._timeline.now())
+                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    if floor is None or probe >= floor:
+                        return False
+                    # До запуска: доказательства нет и получить его нельзя —
+                    # пробел виден в диагностике, но расчёт не блокирует.
+                    gap_unconfirmed = True
+                probe += period
+            unconfirmed += gap_unconfirmed
+        if floor is not None:
+            self._pre_cutover_gaps[uid, timeframe] = unconfirmed
+        return True
+
+    def calendar_for(self, instrument):
+        uid = self._uids.get(self._key(instrument, "1m")) or getattr(instrument, "uid", None)
+        return self._market_reconciler.session_calendar(uid, self._timeline.now()) if uid and self._market_reconciler else None
+
+    def analysis_cursor(self, instrument, timeframe, assignment_id):
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not uid or self._market_store is None:
+            return None
+        return self._market_store.analysis_cursor(source=self._market_source, instrument_uid=uid,
+            interval=timeframe, assignment_id=assignment_id)
+
+    def mark_analyzed(self, instrument, timeframe, assignment_id, open_time):
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if uid and self._market_store is not None:
+            self._market_store.mark_analyzed(source=self._market_source, instrument_uid=uid,
+                interval=timeframe, assignment_id=assignment_id, open_time=open_time)
+
+    def entry_market(self, instrument):
+        """Самодостаточный актуальный снимок для отдельного допуска входа."""
+        frame = self.frame_for(instrument, "1m")
+        if frame.empty:
+            return {"valid": False, "reason": "Нет завершённых базовых данных для текущей цены"}
+        stamp = _naive(frame["datetime"].iloc[-1])
+        now = _naive(self._timeline.now())
+        if now - (stamp + pd.Timedelta(minutes=1)) > pd.Timedelta(seconds=max(60, self._freshness_tolerance_bars * 60 + 60)):
+            return {"valid": False, "reason": "Базовая оценка текущей цены устарела"}
+        if not self.coverage_for(instrument, "1m", frame.tail(3)):
+            return {"valid": False, "reason": "Неполное покрытие базовых данных текущей цены"}
+        cal = self.calendar_for(instrument)
+        if cal is not None and cal.covers(now) and not cal.is_open(now):
+            return {"valid": False, "reason": "Торговая сессия закрыта"}
+        current = float(frame["close"].iloc[-1])
+        previous = None
+        if cal is not None:
+            lower = next((a for a, b in cal.intervals if a <= now < b), None)
+            if lower is not None:
+                prior = frame[frame["datetime"] < lower]
+                if not prior.empty:
+                    previous = float(prior["close"].iloc[-1])
+        uid = self._uids.get(self._key(instrument, "1m"))
+        cursors = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m") if self._market_store and uid else {}
+        processed = cursors.get("processed_through")
+        return {"valid": True, "current_price": current, "price_time": (stamp + pd.Timedelta(minutes=1)).isoformat(),
+            "source": self._market_source, "previous_session_close": previous,
+            "session_gap": None if previous is None else current - previous,
+            "execution_ready": processed is not None and _naive(pd.Timestamp(processed).tz_localize(None)) >= stamp}
 
     def _collect_tick(self, timeframe: str, progressed: int, expected: int) -> None:
         """Копит итог текущего рыночного тика по всем таймфреймам.

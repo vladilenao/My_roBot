@@ -116,6 +116,7 @@ class ConsoleChannel(Channel):
             event.type is EventType.DECISION
             and event.get("outcome") == "no_signal"
             and not event.get("filtered_out")
+            and event.get("analysis_mode") != "historical"
         )
 
     def _begin_tick(self, tick_id: str) -> None:

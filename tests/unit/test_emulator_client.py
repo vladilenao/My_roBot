@@ -201,6 +201,16 @@ class TestCandlesConversion:
         assert candle.high.units > candle.open.units
         assert candle.low.units < candle.open.units
 
+    def test_emulator_candle_is_explicitly_complete(self):
+        # Загрузчик не считает отсутствие флага закрытием; архив эмулятора
+        # содержит только завершённые свечи и сообщает это явно.
+        candle, = self._candles(
+            [{"datetime": "2024-01-01 00:00:00", "open": 1.0, "high": 1.0,
+              "low": 1.0, "close": 1.0, "volume": 1}]
+        )
+
+        assert candle.is_complete is True
+
     def test_time_is_tz_aware_utc(self):
         candle, = self._candles(
             [{"datetime": "2024-01-01 00:00:00", "open": 1.0, "high": 1.0,

@@ -19,6 +19,10 @@ database_file = "market-data.sqlite3"
 export_enabled = false
 export_host = "127.0.0.1"
 export_port = 8101
+# Транспорт live-свечей: "polling" или "stream" (подписка с резервным опросом).
+# Параметры приёма и восстановления — docs/market-data/live-ingestion.md; их
+# значения по умолчанию — инженерный профиль, а не гарантия брокера.
+live_transport = "polling"
 
 [instruments]
 fallback_type = "future"
@@ -41,7 +45,7 @@ channels = ["console","telegram"]
 events = [
     "clearing_done", "decision", "error", "heartbeat", "order_accepted", "order_rejected",
     "position_added", "protection_armed", "rate_limited", "rejected", "reservation_changed",
-    "risk_limit_hit", "signal", "stop_hit", "stop_moved", "target_hit", "trade_cancelled",
+    "risk_limit_hit", "signal", "startup_analysis", "market_data_status", "stop_hit", "stop_moved", "target_hit", "trade_cancelled",
     "trade_closed", "trade_opened"
 ]
 
@@ -305,6 +309,7 @@ future = ["long", "short"]     # фьючерсы: и лонг, и шорт
 share  = ["long"]              # акции: только лонг
 
 [trading.risk_limits]
+max_entry_deviation_r = 0.25 # неблагоприятное движение от входа / расстояние вход–стоп
 portfolio_pct = 2.0     # единый риск всех открытых остатков и pending-входов, % от min(balance, equity)
 # Старые trade_pct, instrument_pct и groups нужно удалить из robot.toml:
 # отдельные процентные квоты заменены единым portfolio_pct, молчаливой миграции нет.

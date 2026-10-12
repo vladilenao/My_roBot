@@ -43,8 +43,12 @@ class HtfFrameProvider:
         resolver = getattr(self._cache, "instrument_for", None)
         if isinstance(instrument, str) and callable(resolver):
             instrument = resolver(instrument)
-        self._cache.ensure_loaded(instrument, timeframe)
-        frame = self._cache.frame_for(instrument, timeframe)
+        live = getattr(self._cache, "live_session_enabled", False) is True
+        if live:
+            frame = self._cache.prepare_live_history(instrument, timeframe, min_bars, max_close=max_close)
+        else:
+            self._cache.ensure_loaded(instrument, timeframe)
+            frame = self._cache.frame_for(instrument, timeframe)
         if frame is None or frame.empty:
             return pd.DataFrame()
 
@@ -64,4 +68,8 @@ class HtfFrameProvider:
                 len(frame),
                 min_bars,
             )
+        if live and not frame.empty and not self._cache.coverage_for(instrument, timeframe, frame.tail(min_bars or len(frame))):
+            return frame.iloc[:0].copy()
+        if live and min_bars:
+            frame = frame.tail(min_bars).reset_index(drop=True)
         return frame
