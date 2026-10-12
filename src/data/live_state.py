@@ -118,20 +118,24 @@ class LivePairState:
     required_bars: int = 0
     coverage_complete: bool = False
     reason: str = ""
+    ingestion: dict | None = None
 
     def observe(self, *, now: datetime, session: str, expected_bar: datetime | None,
                 timeout_secs: float, received_bar: datetime | None = None,
-                next_open: datetime | None = None) -> "LivePairState":
+                next_open: datetime | None = None, resolved_bar: datetime | None = None) -> "LivePairState":
         """Дедлайн привязан к первому неразрешённому закрытию, а не к опросу.
 
         Все времена — UTC; expected_bar/received_bar означают закрытие свечи.
         Календарный перерыв не отменяет незавершённое ожидание конца сессии.
+        ``resolved_bar`` — закрытие непрерывно разрешённого префикса: новый
+        high-water через внутреннюю дыру не снимает её срок (задача 5.5).
         """
         received = received_bar if received_bar is not None else self.received_bar
+        progress = resolved_bar if resolved_bar is not None else received
         expected, deadline = self.expected_bar, self.publication_deadline
-        if expected is not None and received is not None and received >= expected:
+        if expected is not None and progress is not None and progress >= expected:
             expected, deadline = None, None
-        if expected is None and expected_bar is not None and (received is None or received < expected_bar):
+        if expected is None and expected_bar is not None and (progress is None or progress < expected_bar):
             expected = expected_bar
             deadline = expected + timedelta(seconds=timeout_secs)
         state = "current" if received is not None else "warming_up"
@@ -152,7 +156,7 @@ class LivePairState:
                 "analysis_mode": self.analysis_mode, "expected_bar": self.expected_bar,
                 "publication_deadline": self.publication_deadline, "next_open": self.next_open,
                 "available_bars": self.available_bars, "required_bars": self.required_bars,
-                "coverage_complete": self.coverage_complete}
+                "coverage_complete": self.coverage_complete, "ingestion": self.ingestion}
 
 
 class StatusCadence:

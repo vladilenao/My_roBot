@@ -98,6 +98,15 @@ ISO8601, границы баров означают закрытие. Неизв
 времени опроса. `session`: open/waiting_session/unknown; `data_state`:
 warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
 
+Необязательный `ingestion` — технический срез владельца live-входа:
+`transport` (polling/stream), `epoch` (поколение stream или null), `fallback`
+(stream настроен, но пара обслуживается polling), `data_hold`
+(BOOTSTRAPPING/RECONCILING/READY/GAP_HOLD/CONFLICT_HOLD/INTEGRITY_HOLD),
+границы `received_through`/`resolved_through`/`processed_through` (UTC ISO8601
+открытия бара), `gap` (lower/upper/state active|parked/attempts/next_retry_at/reason
+или null), `incident` (integrity-инцидент или null) и `history_error`.
+Удержание не означает потерю данных или отсутствие сделок.
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -111,7 +120,7 @@ warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
     "analysis_mode": {"type": "string"}, "expected_bar": {"type": "string"},
     "publication_deadline": {"type": "string"}, "next_open": {"type": "string"},
     "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
-    "coverage_complete": {"type": "boolean"}
+    "coverage_complete": {"type": "boolean"}, "ingestion": {"type": "object"}
   },
   "additionalProperties": false
 }

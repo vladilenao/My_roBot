@@ -222,7 +222,16 @@ class StreamSupervisor:
         return len(self._control_sent) + count <= self.settings.stream_control_requests_per_minute
 
     def _subscribe(self, session, epoch):
-        pending = sorted(pair for pair in self._desired if self.pairs[pair]["status"] == "desired")
+        now = self._clock()
+        for info in self.pairs.values():
+            # Отказ по частоте control-запросов: конечная пауза, затем повтор.
+            if info["status"] == "failed" and info["reason"] == "too_many_requests" and now >= info.get("retry_at", 0):
+                info["status"] = "desired"
+        # При нехватке ёмкости первыми подписываются базовая 1m и рабочие ТФ;
+        # оставшиеся пары объявленно обслуживает polling (не теряются).
+        rank = {"1m": 0, "5m": 1, "15m": 1, "30m": 2, "1h": 1, "4h": 2, "1d": 2, "1w": 3, "1M": 3}
+        pending = sorted((pair for pair in self._desired if self.pairs[pair]["status"] == "desired"),
+                         key=lambda pair: (rank.get(pair[1], 4), pair))
         capacity = self.settings.stream_subscription_soft_limit
         active = sum(1 for info in self.pairs.values() if info["status"] in {"sent", "acknowledged", "ready"} and info["epoch"] == epoch)
         for pair in pending[max(0, capacity - active):]:
@@ -293,7 +302,10 @@ class StreamSupervisor:
         if ack.action != SUBSCRIPTION_ACTION_SUBSCRIBE:
             return
         if ack.status != SUBSCRIPTION_STATUS_SUCCESS:
-            return self._fail(pair, SUBSCRIPTION_FAILURES.get(ack.status, f"status_{ack.status}"))
+            reason = SUBSCRIPTION_FAILURES.get(ack.status, f"status_{ack.status}")
+            if reason == "too_many_requests":
+                info["retry_at"] = self._clock() + self.settings.stream_control_cooldown_secs
+            return self._fail(pair, reason)
         if not ack.waiting_close or ack.source not in (None, 0):
             # Иной режим закрытия или source-profile не подтверждает закрытие.
             return self._fail(pair, "invalid_source" if ack.source not in (None, 0) else "waiting_close_not_confirmed")

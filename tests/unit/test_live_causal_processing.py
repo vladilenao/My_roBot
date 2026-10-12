@@ -184,3 +184,65 @@ def test_virtual_clock_ignores_live_wakeup():
     waited = []
     timeline.wait_live_poll(1, data_waiter=waited.append)
     assert waited == []
+
+
+def test_market_data_status_carries_ingestion_diagnostics_and_hold_reason(tmp_path):
+    from src.bot import TradingBot
+    from src.bot.live_analysis import LiveAnalysis
+    from src.events import ALL_EVENT_TYPES, EventBus, EventType
+    from src.notifier.templates import render
+    from src.notifier.telegram_templates import render as telegram_render
+    from src.strategies.contracts import Assignment, Decision, SignalType
+
+    class Strategy:
+        def required_history(self):
+            return 1
+
+        def compute(self, values):
+            return values
+
+        def decide(self, values, timeframe=""):
+            return Decision(SignalType.HOLD, float(values["close"].iloc[-1]))
+
+    cache, store, clock = live_cache(tmp_path, "1m", "15m")
+    cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100)), received_at=NOW)
+    cache.set_live_gap(UID, "1m", {"lower": "2026-10-12T12:01:00", "upper": "2026-10-12T12:02:00",
+                                   "state": "parked", "attempts": 5, "next_retry_at": "2026-10-12T12:10:00",
+                                   "reason": "expected_missing"})
+    events = []
+
+    class Channel:
+        supported_types = ALL_EVENT_TYPES
+
+        def handle(self, event):
+            events.append(event)
+
+    bus = EventBus()
+    bus.subscribe(Channel())
+    binding = Assignment(id="b", strategy="macd_rsi_stoch", management="levels_rr", filter_profile="raw", timeframe="15m")
+    bot = TradingBot([ITEM], bus, {"macd_rsi_stoch": object()}, cache, cache._timeline,
+                     strategy_factory=lambda *a, **k: Strategy(), share_strategies={"SBER": [binding]})
+    bot._validate()
+    live = LiveAnalysis(bot)
+    live.requirements[binding.id] = {"15m": 1}
+    from src.data.live_state import LivePairState
+    live.states[live._key(ITEM, "1m")] = LivePairState("tbank_exchange", UID, "1m", required_bars=1)
+    live.publish_status(ITEM, "1m", cache.frame_for(ITEM, "1m"))
+    status = next(event for event in events if event.type is EventType.MARKET_DATA_STATUS)
+    ingestion = status.get("ingestion")
+    assert ingestion["transport"] == "polling" and ingestion["data_hold"] == "GAP_HOLD"
+    assert ingestion["gap"]["state"] == "parked" and ingestion.get("processed_through") is None
+    assert "не восстановлен" in status.get("reason")
+    assert "Источник данных: опрос · удержание: пропуск" in render(status, 3)
+    assert "удержание: пропуск" in telegram_render(status, tz_offset_hours=3)
+    assert "token" not in str(status.to_dict()).lower()
+
+
+def test_new_high_water_does_not_clear_deadline_of_internal_gap():
+    from src.data.live_state import LivePairState
+    close = datetime(2026, 10, 12, 12, 2)
+    state = LivePairState("s", UID, "1m").observe(now=close, session="open", expected_bar=close, timeout_secs=60)
+    later = state.observe(now=close + timedelta(minutes=3), session="open", expected_bar=close + timedelta(minutes=2),
+                          timeout_secs=60, received_bar=close + timedelta(minutes=2), resolved_bar=close - timedelta(minutes=1))
+    assert later.expected_bar == close and later.publication_deadline == close + timedelta(seconds=60)
+    assert later.data_state == "delayed"

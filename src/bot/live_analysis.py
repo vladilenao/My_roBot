@@ -96,6 +96,41 @@ class LiveAnalysis:
             return ""
         return f"Удержано: базовая 1m не подтверждена до {last_minute:%d.%m.%Y %H:%M} UTC"
 
+    def _ingestion(self, instrument, tf):
+        """Технический срез owner для market_data_status (design 11, задача 8.3)."""
+        status_of = getattr(self.cache, "pair_status", None)
+        if not callable(status_of):
+            return None
+        status = status_of(instrument, tf)
+        transport = status.get("transport") or "polling"
+        return {"transport": transport, "epoch": status.get("epoch"),
+                "fallback": self.settings.live_transport == "stream" and transport != "stream",
+                "data_hold": status.get("state"), "received_through": status.get("received_through"),
+                "resolved_through": status.get("resolved_through"), "processed_through": status.get("processed_through"),
+                "gap": status.get("gap"), "incident": status.get("incident"),
+                "history_error": status.get("history_error") or ""}
+
+    def _hold_reason(self, instrument, tf, ingestion, close):
+        state = ingestion.get("data_hold")
+        if state == "INTEGRITY_HOLD":
+            incident = ingestion.get("incident") or {}
+            return f"Удержано: изменена уже исполненная минута {incident.get('open_time', '')}".strip()
+        if state == "CONFLICT_HOLD":
+            return "Удержано: расхождение версий свечи, идёт согласующая проверка"
+        if state == "GAP_HOLD":
+            gap = ingestion.get("gap") or {}
+            if gap.get("state") == "parked":
+                return (f"Пропуск {gap.get('lower')}–{gap.get('upper')} не восстановлен; "
+                        f"следующая проверка {gap.get('next_retry_at')}")
+            return f"Восстановление пропуска {gap.get('lower')}–{gap.get('upper')}"
+        if state == "RECONCILING":
+            return "Согласование потока с историей"
+        if state == "BOOTSTRAPPING" and ingestion.get("history_error"):
+            return "Прогрев: " + ingestion["history_error"]
+        if tf != self.bot._protection_timeframe and close is not None and self.current(instrument, tf, close):
+            return self._execution_barrier(instrument, close)
+        return ""
+
     def next_wakeup(self):
         """Ближайший дедлайн публикации или закрытие бара активных пар."""
         now = pd.Timestamp(self.timeline.now())
@@ -221,20 +256,33 @@ class LiveAnalysis:
             if calendar.covers(probe) and not any(a < state.expected_bar and b > probe for a, b in calendar.intervals):
                 state = replace(state, expected_bar=None, publication_deadline=None)
         close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
+        ingestion = self._ingestion(instrument, tf)
+        resolved = ingestion.get("resolved_through") if ingestion else None
+        resolved_close = (self.timeline.grid(tf).bar_close(pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None))
+                          if resolved else None)
         state = state.observe(now=now, session=session, expected_bar=expected,
-            timeout_secs=self.settings.candle_publication_timeout_secs, received_bar=close, next_open=next_open)
+            timeout_secs=self.settings.candle_publication_timeout_secs, received_bar=close, next_open=next_open,
+            resolved_bar=resolved_close)
         required = state.required_bars
         reason = "" if len(frame) >= required else f"Недостаточно истории: {len(frame)}/{required} свечей"
         if not reason and not self.cache.coverage_for(instrument, tf, frame.tail(required)):
             reason = "Неразрешённый пробел в диапазоне прогрева"
+        unknown_schedule = "Применимое торговое расписание неизвестно"
         state = replace(state, available_bars=len(frame), coverage_complete=not bool(reason), reason=reason)
         if reason:
             state = replace(state, data_state="warming_up" if len(frame) < required else "coverage_blocked")
         elif session == "unknown":
-            state = replace(state, reason="Применимое торговое расписание неизвестно")
+            state = replace(state, reason=unknown_schedule)
         error = self.cache._live_errors.get(self.cache._key(instrument, tf))
         if error:
             state = replace(state, reason=error.replace(instrument.ticker, self.bot._display_name(instrument)))
+        if ingestion and state.reason in {"", unknown_schedule}:
+            hold = self._hold_reason(instrument, tf, ingestion, close)
+            if hold:
+                # Удержание блокирует торговлю и важнее общей пометки о
+                # расписании; причины прогрева/покрытия остаются первыми.
+                state = replace(state, reason=hold + ("; расписание неизвестно" if state.reason == unknown_schedule else ""))
+        state = replace(state, ingestion=ingestion)
         budget = self.cache._request_budget
         if budget.retry_after is not None and now < budget.retry_after:
             state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API")

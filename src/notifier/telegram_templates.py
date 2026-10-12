@@ -4,6 +4,7 @@ from html import escape
 from datetime import datetime, timedelta, timezone
 
 from src.events.types import EventType
+from src.notifier.templates.events import ingestion_summary
 from src.events.visual import utc
 
 PHASES = {"PLANNED": "План создан", "ENTRY_PENDING": "В работе, ждёт подтверждения",
@@ -182,6 +183,9 @@ def render(event, *, root=False, tz_offset_hours=0):
                      "Ожидаемый интервал: " + dated(event.get("expected_bar"))]
             if event.get("next_open"):
                 lines.append("Следующее открытие: " + dated(event.get("next_open")))
+            summary = ingestion_summary(event.get("ingestion"))
+            if summary:
+                lines.append(escape(summary))
         if event.get("reason"):
             lines.append("Причина: " + escape(event.get("reason")))
         return "\n".join(lines)

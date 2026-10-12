@@ -35,7 +35,8 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.STARTUP_ANALYSIS: (),
     EventType.MARKET_DATA_STATUS: ("received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
-                                 "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete"),
+                                 "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete",
+                                 "ingestion"),
     EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id", "analysis_mode"),
     EventType.SIGNAL: (
         "targets", "expected_r", "strategy", "filter_profile", "trade_id",
@@ -134,6 +135,7 @@ _JSON_TYPES: dict[str, str] = {
     "fixed_quantity": "number",
     "quantity_remaining": "number",
     "fees_known": "boolean",
+    "ingestion": "object",
 }
 
 

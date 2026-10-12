@@ -137,7 +137,7 @@ class Event:
                            analysis_mode: str = "", expected_bar: Any = None,
                            publication_deadline: Any = None, next_open: Any = None,
                            available_bars: int = 0, required_bars: int = 0,
-                           coverage_complete: bool = False) -> "Event":
+                           coverage_complete: bool = False, ingestion: dict | None = None) -> "Event":
         return cls._make(EventType.MARKET_DATA_STATUS, instrument=instrument, timeframe=timeframe,
                          payload={"session": session, "data_state": data_state,
                                   "observed_at": observed_at, "reason": reason,
@@ -145,7 +145,7 @@ class Event:
                                   "analysis_mode": analysis_mode, "expected_bar": expected_bar,
                                   "publication_deadline": publication_deadline, "next_open": next_open,
                                   "available_bars": available_bars, "required_bars": required_bars,
-                                  "coverage_complete": coverage_complete})
+                                  "coverage_complete": coverage_complete, "ingestion": ingestion})
 
     @classmethod
     def decision(

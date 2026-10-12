@@ -347,6 +347,27 @@ def _dated(value, offset):
     return local.strftime("%d.%m.%Y %H:%M:%S") + " " + zone
 
 
+_DATA_HOLDS = {"BOOTSTRAPPING": "прогрев", "RECONCILING": "согласование с историей", "READY": "готово",
+               "GAP_HOLD": "удержание: пропуск", "CONFLICT_HOLD": "удержание: расхождение версий",
+               "INTEGRITY_HOLD": "удержание: изменена исполненная минута"}
+
+
+def ingestion_summary(ingestion) -> str:
+    """Одна строка о транспорте и готовности входа; пусто без среза owner."""
+    if not ingestion:
+        return ""
+    transport = "поток" if ingestion.get("transport") == "stream" else "опрос"
+    parts = [transport]
+    if ingestion.get("transport") == "stream" and ingestion.get("epoch") is not None:
+        parts.append(f"поколение {ingestion['epoch']}")
+    if ingestion.get("fallback"):
+        parts.append("резервный опрос вместо потока")
+    hold = ingestion.get("data_hold")
+    if hold:
+        parts.append(_DATA_HOLDS.get(hold, hold))
+    return "Источник данных: " + " · ".join(parts)
+
+
 def _live_information(event, offset):
     if event.type is EventType.STARTUP_ANALYSIS:
         details = [f"Период: {event.timeframe}", f"Свеча закрылась: {_dated(event.bar_time, offset)}",
@@ -380,6 +401,9 @@ def _live_information(event, offset):
             details.append(f"Задержка после срока публикации: {max(0, int((observed-due).total_seconds()))} с")
     if event.get("next_open"):
         details.append(f"Следующее открытие: {_dated(event.get('next_open'), offset)}")
+    summary = ingestion_summary(event.get("ingestion"))
+    if summary:
+        details.append(summary)
     if event.get("reason"):
         details.append("Причина: " + event.get("reason"))
     return Block(_dated(event.get("observed_at"), offset), event.instrument, label,
