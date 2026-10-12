@@ -205,7 +205,16 @@ class IngestionWorker:
                 if uid is None:
                     self._need_retry_at[key] = now + self._backoff(self._need_attempts[key])
                     continue
-            self._cache.register_live_pair(instrument, uid, timeframe, min_bars)
+            try:
+                self._cache.register_live_pair(instrument, uid, timeframe, min_bars)
+            except ValueError as exc:
+                # Неоднозначный alias UID: данные не смешиваются, пара
+                # удерживается неготовой с причиной, без быстрого повтора.
+                self._cache._live_errors[key] = str(exc)
+                self._need_attempts[key] = self._need_attempts.get(key, 0) + 1
+                self._cache.finish_live_need(key, min_bars)
+                log.warning("Live-пара %s удержана: %s", key, exc)
+                continue
             self._need_attempts.setdefault(key, 0)
             pair = self._pair(uid, timeframe)
             if pair["closed"] >= min_bars and pair["history"] == "done":

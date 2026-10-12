@@ -517,6 +517,16 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     settings = MARKET_DATA_SETTINGS
     log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
     worker = IngestionWorker(data_cache, settings=settings)
+    # Roster уважает роли lifecycle: инструменты исполнения (в том числе
+    # DRAINING с обязательствами) и рынка, без автоматического rollover.
+    lifecycle = getattr(runtime, "contract_lifecycle", None)
+    roster = list(instruments)
+    for source in ("execution_instruments", "market_instruments"):
+        extra = getattr(lifecycle, source, None)
+        for instrument in (extra() if callable(extra) else ()):
+            if instrument_key(instrument) not in {instrument_key(item) for item in roster}:
+                roster.append(instrument)
+    instruments = roster
     storage = runtime.storage
     if storage is not None:
         trades = storage.load_trades()

@@ -354,7 +354,9 @@ class MarketDataCache:
         with self._lock:
             key = self._key(instrument, timeframe)
             previous = self._uids.get(key)
-            if previous and previous != uid:
+            owners = {other for (other, tf), member in self._live_members.items()
+                      if tf == timeframe and key in member["keys"]}
+            if (previous and previous != uid) or owners - {uid}:
                 raise ValueError("Неоднозначный финансовый alias разных UID")
             self._owned_live_ingestion = True
             self._uids[key] = uid
