@@ -19,6 +19,10 @@ database_file = "market-data.sqlite3"
 export_enabled = false
 export_host = "127.0.0.1"
 export_port = 8101
+# Транспорт live-свечей: "polling" или "stream" (подписка с резервным опросом).
+# Параметры приёма и восстановления — docs/market-data/live-ingestion.md; их
+# значения по умолчанию — инженерный профиль, а не гарантия брокера.
+live_transport = "polling"
 
 [instruments]
 fallback_type = "future"
