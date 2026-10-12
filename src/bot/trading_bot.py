@@ -171,12 +171,17 @@ class TradingBot:
         live = LiveAnalysis(self)
         try:
             live.bootstrap()
+            changed = getattr(self._data_cache, "wait_for_data_change", None)
             while not self._run.should_stop():
+                # Поколение снимается до шага: данные, пришедшие во время
+                # обработки, разбудят следующий шаг без ожидания опроса.
+                generation = getattr(self._data_cache, "data_generation", None)
                 try:
                     live.step()
                 except Exception as exc:
                     self._report_error(exc, "обработка live-пар")
-                self._timeline.wait_live_poll(self._tick_poll_secs)
+                waiter = (lambda timeout: changed(generation, timeout)) if callable(changed) and generation is not None else None
+                self._timeline.wait_live_poll(self._tick_poll_secs, data_waiter=waiter, wake_at=live.next_wakeup())
         except KeyboardInterrupt:
             log.info("Бот остановлен.")
 

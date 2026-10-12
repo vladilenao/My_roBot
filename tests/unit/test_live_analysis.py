@@ -108,6 +108,14 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
     before = len(events)
     live.step()
     decisions = [e for e in events[before:] if e.type is EventType.DECISION and e.instrument == "SBER" and e.timeframe == "1h"]
+    # Текущий бар ждёт непрерывную базовую 1m UID и не теряется (задача 6.3).
+    assert [e.bar_time.hour for e in decisions] == [8, 9]
+    assert "базовая 1m" in live.states["SBER", "1h"].reason
+    data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
+    clock[0] += timedelta(seconds=5)
+    live.worker.run_until_idle()
+    live.step()
+    decisions = [e for e in events[before:] if e.type is EventType.DECISION and e.instrument == "SBER" and e.timeframe == "1h"]
     assert [e.bar_time.hour for e in decisions] == [8, 9, 10]
     assert [e.get("analysis_mode") for e in decisions] == ["historical", "historical", "live"]
     assert not any(e.type is EventType.DECISION and e.instrument == "GAZP" for e in events[before:])

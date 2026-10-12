@@ -10,6 +10,7 @@ from decimal import Decimal
 from dataclasses import replace
 from pathlib import Path
 from shutil import rmtree
+import json
 import sys
 
 from src.decision import SignalFilter
@@ -77,7 +78,7 @@ from src.history.report import (
     crash_line,
     write_report,
 )
-from src.scheduler.clock import HistoricalClock
+from src.scheduler.clock import HistoricalClock, as_aware
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
@@ -730,6 +731,13 @@ def _build_runtime(
     if historical:
         trade_manager.initialize_account()
     trade_manager.restore()
+    # Live: общий outbox доставляется только по read-only рыночным фактам
+    # owner (design 9a). Начало торгового шага отличает текущее намерение
+    # от удержанного раньше, актуальность которого не доказана.
+    intent_since = [None]
+    if not historical and getattr(data_cache, "live_session_enabled", False) is True:
+        trade_manager.configure_dispatch_eligibility(
+            _dispatch_evidence(data_cache, instruments, storage, intent_since), lambda: data_cache._lock)
     trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
     selection = getattr(session, "contract_selection", None)
@@ -790,6 +798,7 @@ def _build_runtime(
 
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
+        intent_since[0] = as_aware(trade_manager._clock.now())
         try:
             # The simulator has already advanced if a durable write failed.
             # Retry those same events before asking it to execute another bar.
@@ -870,6 +879,30 @@ def _build_runtime(
         storage=storage,
         contract_lifecycle=lifecycle,
     )
+
+
+def _dispatch_evidence(data_cache, instruments, storage, intent_since):
+    """Готовность входа для допуска доставки; без сети и без stream-reader.
+
+    Вызывается в финансовом потоке под guard кэша: срез качества не меняется
+    между проверкой и локальной доставкой.
+    """
+    from src.trade_management.manager import DispatchDataEvidence
+    by_key = {instrument_key(item): item for item in instruments}
+
+    def inspect(instrument_id, action, command):
+        instrument = by_key.get(instrument_id)
+        if instrument is None:
+            return None
+        execution = data_cache.pair_status(instrument, "1m")["state"] == "READY"
+        row = storage.connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (command.trade_id,)).fetchone()
+        timeframe = json.loads(row[0]).get("timeframe", "") if row else ""
+        work = bool(timeframe) and data_cache.pair_status(instrument, timeframe)["state"] == "READY"
+        since = intent_since[0]
+        current = True if since is not None and as_aware(command.created_at) >= since else None
+        return DispatchDataEvidence(execution, work, current)
+
+    return inspect
 
 
 class _OutboxExecutor:

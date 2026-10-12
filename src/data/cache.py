@@ -742,6 +742,16 @@ class MarketDataCache:
                     "processed_through": cursors.get("processed_through"),
                     "incident": held.get("incident")}
 
+    def input_ready_at(self, instrument, timeframe, open_time):
+        """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not uid or self._market_store is None:
+            return None
+        facts = self._market_store.live_state(kind="candle", source=self._market_source, instrument_uid=uid,
+                                              interval=timeframe, open_time=open_time)
+        value = facts.get("input_ready_at")
+        return None if not value else pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+
     def execution_ready(self, instrument, through):
         """Критический 1m барьер UID: доказанный префикс исполнения до ``through``."""
         status = self.pair_status(instrument, "1m")
@@ -895,7 +905,8 @@ class MarketDataCache:
         ещё и already durable курсор исполнения, который может быть раньше
         первого нового ряда после перезапуска.
         """
-        if self._market_reconciler is None or frame.empty or timeframe != "1m" or last_bar is None:
+        owned_barrier = self._owned_live_ingestion and self._market_store is not None
+        if (self._market_reconciler is None and not owned_barrier) or frame.empty or timeframe != "1m" or last_bar is None:
             return frame
         key = self._key(instrument, timeframe)
         instrument_id = self._uids.get(key)
@@ -907,10 +918,13 @@ class MarketDataCache:
             stamp = _naive(row["datetime"])
             probe = previous + pd.Timedelta(minutes=1)
             while probe < stamp:
-                state = self._market_reconciler.interval_state(
+                # Live-барьер действует и без календаря: тогда состояние
+                # интервала — только доказательство из рыночного хранилища.
+                state = (self._market_reconciler.interval_state(
                     instrument_uid=instrument_id, interval=timeframe,
                     open_time=probe, now=self._timeline.now(),
-                )
+                ) if self._market_reconciler is not None else self._market_store.coverage_state(
+                    source=self._market_source, instrument_uid=instrument_id, interval=timeframe, open_time=probe))
                 if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
                     self._report_coverage_block(key, probe, state)
                     return frame.loc[allowed].copy()

@@ -67,6 +67,44 @@ class LiveAnalysis:
                 return f"Неполное покрытие прогрева {tf}"
         return ""
 
+    def _input_ready(self, instrument, binding, frame, close):
+        """Публикация использованных версий рабочего и старших баров (design 4)."""
+        ready_at = getattr(self.cache, "input_ready_at", None)
+        if not callable(ready_at):
+            return None
+        stamps = [ready_at(instrument, binding.timeframe, frame["datetime"].iloc[-1])]
+        for tf in self._required(binding):
+            if tf in {binding.timeframe, self.bot._protection_timeframe}:
+                continue
+            higher = self.cache.frame_for(instrument, tf)
+            if higher.empty:
+                continue
+            grid = self.timeline.grid(tf)
+            used = higher[higher["datetime"].apply(lambda stamp: grid.bar_close(stamp) <= close)]
+            if not used.empty:
+                stamps.append(ready_at(instrument, tf, used["datetime"].iloc[-1]))
+        stamps = [pd.Timestamp(stamp) for stamp in stamps if stamp is not None]
+        return max(stamps) if stamps else None
+
+    def _execution_barrier(self, instrument, close):
+        """Критический 1m-префикс UID должен быть доказан до закрытия бара."""
+        ready = getattr(self.cache, "execution_ready", None)
+        if not callable(ready):
+            return ""
+        last_minute = pd.Timestamp(close) - pd.Timedelta(minutes=1)
+        if ready(instrument, last_minute):
+            return ""
+        return f"Удержано: базовая 1m не подтверждена до {last_minute:%d.%m.%Y %H:%M} UTC"
+
+    def next_wakeup(self):
+        """Ближайший дедлайн публикации или закрытие бара активных пар."""
+        now = pd.Timestamp(self.timeline.now())
+        moments = [pd.Timestamp(state.publication_deadline) for state in self.states.values()
+                   if state.publication_deadline is not None and pd.Timestamp(state.publication_deadline) > now]
+        for _, tf in self.states:
+            moments.append(pd.Timestamp(self.timeline.grid(tf).next_candle_close(now)))
+        return min(moments, default=None)
+
     def _calculate(self, instrument, binding, frame):
         tf = binding.timeframe
         frame = frame.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
@@ -74,7 +112,14 @@ class LiveAnalysis:
         ta = strategy.compute(frame)
         raw = strategy.decide(ta, timeframe=tf)
         close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1])
-        raw = replace(raw, bar_time=close, available_at=raw.available_at or close,
+        # Эффективная доступность не раньше закрытия, исходной доступности
+        # стратегии и публикации использованного входа; bar_time — закрытие.
+        candidates = [pd.Timestamp(item) for item in (raw.available_at, close) if item is not None]
+        published = self._input_ready(instrument, binding, frame, close)
+        if published is not None:
+            candidates.append(published)
+        available = max(candidates).to_pydatetime() if candidates else close
+        raw = replace(raw, bar_time=close, available_at=available,
             strategy_name=binding.strategy,
             event_id=f"{binding.id}:{instrument_key(instrument)}:{tf}:{pd.Timestamp(close).isoformat()}:{raw.signal_type.value}")
         context = self._context(instrument, tf, frame)
@@ -243,6 +288,15 @@ class LiveAnalysis:
                             reason = self._quality(instrument, binding, asof)
                             if reason:
                                 break
+                            close = self.timeline.grid(tf).bar_close(stamp)
+                            if stamp == frame["datetime"].iloc[-1] and self.current(instrument, tf, close):
+                                barrier = self._execution_barrier(instrument, close)
+                                if barrier:
+                                    # Курсор не двигается: решение дождётся
+                                    # непрерывной базовой 1m, а не потеряется.
+                                    key = self._key(instrument, tf)
+                                    self.states[key] = replace(self.states[key], reason=barrier)
+                                    break
                             try:
                                 decision, context, _, filtered = self._calculate(instrument, binding, asof)
                                 current = self.current(instrument, tf, decision.bar_time) and stamp == frame["datetime"].iloc[-1]
