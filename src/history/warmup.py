@@ -19,10 +19,29 @@ def warmup_requirements(family, assignments, strategies, profiles, triple_screen
     return requirements
 
 
+def management_requirement(parameters):
+    """Прогрев сопровождения профиля: ATR и медленная MA плюс запас."""
+    return max(15, parameters.get("atr_period", 14)+1, parameters.get("ma_slow_period", 0)+1)
+
+
+def obligation_requirements(trades):
+    """ТФ сопровождения сохранённых сделок: удаление привязки их не отменяет."""
+    requirements = {}
+    for trade in trades:
+        plan = trade.plan
+        if not plan.timeframe:
+            continue
+        count = management_requirement(dict(plan.profile.parameters))
+        requirements[plan.timeframe] = max(requirements.get(plan.timeframe, 0), count)
+    if requirements:
+        requirements["1m"] = max(requirements.get("1m", 0), 1)
+    return requirements
+
+
 def binding_requirements(binding, strategy, profiles, triple_screen, ladder):
     trend, sr = TrendAnalyzer(), SRLevelsCalculator()
     profile = profiles.get(binding.management, {})
-    management = max(15, profile.get("atr_period", 14)+1, profile.get("ma_slow_period", 0)+1)
+    management = management_requirement(profile)
     required = {binding.timeframe: max(strategy.required_history(), management,
         trend.ema_long, trend.adx_period*2, sr.fractal_bars)}
     if binding.filter_profile == "triple_screen":

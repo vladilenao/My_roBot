@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from datetime import timedelta
 
 from src.api.retry import _is_rate_limited, rate_limit_reset_secs, DEFAULT_BASE_DELAY
@@ -14,7 +15,7 @@ class RequestDeferred(Exception):
 
 
 class RequestBudget:
-    def __init__(self, now, interval: float, sleep=time.sleep):
+    def __init__(self, now, interval: float, sleep=time.sleep, per_minute=None):
         self._now = now
         self._interval = max(0, interval)
         self._sleep = sleep
@@ -23,6 +24,13 @@ class RequestBudget:
         self.retry_after = None
         self._inflight = set()
         self.catalogs = {}
+        # Локальный потолок фактических unary RPC в минуту: каждая страница,
+        # включая pace=False, расходует окно (design 8, задача 5.4).
+        if per_minute is not None and (isinstance(per_minute, bool) or not isinstance(per_minute, int) or per_minute <= 0):
+            raise ValueError("per_minute должен быть положительным целым")
+        self._per_minute = per_minute
+        self._sent = deque()
+        self.calls = 0
 
     def call(self, fn, *args, key=None, wait=False, pace=True, **kwargs):
         """Выполняет RPC через общий арбитр.
@@ -38,13 +46,20 @@ class RequestBudget:
                 now = self._now()
                 if key in self._inflight:
                     raise RequestDeferred("Запрос этого диапазона уже выполняется")
-                gates = [value for value in (self.retry_after, self._next_at if pace else None)
+                window = now - timedelta(minutes=1)
+                while self._sent and self._sent[0] <= window:
+                    self._sent.popleft()
+                quota = (self._sent[0] + timedelta(minutes=1)
+                         if self._per_minute is not None and len(self._sent) >= self._per_minute else None)
+                gates = [value for value in (self.retry_after, self._next_at if pace else None, quota)
                          if value is not None]
                 until = max(gates, default=now)
                 delay = max(0, (until - now).total_seconds())
                 if delay == 0:
                     if pace:
                         self._next_at = now + timedelta(seconds=self._interval)
+                    self._sent.append(now)
+                    self.calls += 1
                     self._inflight.add(key)
                     break
             if not wait:

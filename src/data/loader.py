@@ -81,6 +81,7 @@ def load_candles(
     request_budget=None,
     wait_for_budget=True,
     single_attempt=False,
+    pace=True,
 ):
 
 
@@ -132,7 +133,7 @@ def load_candles(
 
                     def bounded_candles():
                         seen = set()
-                        first_page = True
+                        first_page = pace
                         for lower, upper in get_intervals(TIMEFRAMES[timeframe], candles_from, end_date):
                             response = request_budget.call(
                                 client.market_data.get_candles, instrument_id=instrument_id,

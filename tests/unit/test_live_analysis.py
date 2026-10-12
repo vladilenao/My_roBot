@@ -3,6 +3,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 import io
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from src.bot import TradingBot
 from src.bot.live_analysis import LiveAnalysis
 from src.data.cache import MarketDataCache
+from src.data.ingestion import IngestionWorker
 from src.data.request_budget import RequestBudget
 from src.data.reconciliation import SessionCalendar
 from src.data.reconciliation import MarketDataReconciler
@@ -45,7 +48,9 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
     data = {(name, tf): frame(end, tf) for name in ("SBER", "GAZP") for tf in ("1h", "15m", "1m")}
     def loader(**kwargs):
         return data[kwargs["ticker"], kwargs["timeframe"]], kwargs["ticker"]
-    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0))
+    store = MarketDataStore(Path(tempfile.mkdtemp()) / "market.sqlite3")
+    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store)
+    worker = IngestionWorker(cache)
     events = []
     class Channel:
         supported_types = ALL_EVENT_TYPES
@@ -57,9 +62,12 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
         for tf in ("1h", "15m")] for name in ("SBER", "GAZP")}
     bot = TradingBot([Instrument(name, name, "share", name, name) for name in bindings], bus,
         {"macd_rsi_stoch": object()}, cache, timeline, strategy_factory=lambda *args, **kw: Strategy(),
-        share_strategies=bindings, trade_manager=manager, post_tick=Mock(return_value=True), heartbeat_every_ticks=2)
+        share_strategies=bindings, trade_manager=manager, post_tick=Mock(return_value=True), heartbeat_every_ticks=2,
+        live_data_waiter=worker.run_until_idle)
     bot._validate()
     live = LiveAnalysis(bot)
+    # Фоновая ingestion-полоса в тесте выполняется синхронно.
+    live.worker = worker
     return live, cache, data, events, clock
 
 
@@ -92,11 +100,11 @@ def test_weekend_session_is_chosen_instead_of_friday():
 def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates():
     live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00")
     live.bootstrap()
-    key = cache._key(live.bot._instruments[0], "1h")
     incoming = frame("2026-10-12 09:00")
-    cache._live_merge(key, incoming)
-    # Источник также знает новые данные; GAZP остаётся отстающим.
+    # Источник публикует новые данные; GAZP остаётся отстающим.
     data["SBER", "1h"] = incoming
+    clock[0] += timedelta(seconds=5)  # следующий шаг ритма опроса
+    live.worker.run_until_idle()
     before = len(events)
     live.step()
     decisions = [e for e in events[before:] if e.type is EventType.DECISION and e.instrument == "SBER" and e.timeframe == "1h"]
@@ -108,7 +116,7 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
     assert len([e for e in events if e.type is EventType.DECISION]) == before
     # Старое исправление не генерирует новый сигнал.
     corrected = incoming.iloc[-3:-2].assign(close=110)
-    cache._live_merge(key, corrected)
+    cache.accept_rpc_frame("SBER", "1h", corrected, received_at=clock[0])
     live.step()
     assert len([e for e in events if e.type is EventType.DECISION]) == before
 
@@ -164,18 +172,29 @@ def test_informational_events_are_rendered_by_console_without_hold_aggregation()
     assert "Полученная свеча" in text
 
 
-def test_incomplete_warmup_expands_finitely_and_reports_available_count():
+def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path):
     now = datetime(2026, 10, 12, 7)
     timeline = MultiTimeframeScheduler(["1h"], clock=lambda: now)
     calls = []
     def loader(**kwargs):
-        calls.append(kwargs["start_date"])
+        calls.append((kwargs["start_date"], kwargs["end_date"]))
         return frame("2026-10-09 19:00", count=3), "uid"
-    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0))
-    result = cache.prepare_live_history(Instrument("SBER", "SBER", "share"), "1h", 100)
+    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0),
+                            market_store=MarketDataStore(tmp_path / "market.sqlite3"))
+    instrument = Instrument("SBER", "SBER", "share", "SBER", "uid")
+    assert cache.prepare_live_history(instrument, "1h", 100).empty  # торговое чтение без сети
+    assert calls == []
+    IngestionWorker(cache).run_until_idle()
+    result = cache.prepare_live_history(instrument, "1h", 100)
     assert len(result) == 3
-    assert len(calls) == 6  # initial 30 дней и расширения 60..960, без повтора 30
-    assert [int((pd.Timestamp(now)-stamp).days) for stamp in calls[1:]] == [60, 120, 240, 480, 960]
+    # Начальные 30 дней и одно расширение: 60 дней не дали более ранних свечей,
+    # значит достигнут предел доступной истории и 120..960 не запрашиваются.
+    lowers = sorted({(pd.Timestamp(now)-start).days for start, _ in calls
+                     if (pd.Timestamp(now)-start) % pd.Timedelta(days=1) == pd.Timedelta(0)})
+    assert lowers == [30, 60]
+    assert len(calls) == len(set(calls))
+    status = cache.pair_status(instrument, "1h")
+    assert status["history"] == "done" and "3/100" in status["history_error"]
 
 
 def test_overview_cache_ignores_hole_before_required_tail_but_not_inside():
@@ -210,10 +229,18 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
             "1h": frame("2026-10-09 19:00", "1h")}
     calls = []
     def loader(**kwargs):
-        calls.append((kwargs["timeframe"], kwargs["end_date"]))
-        return (pd.DataFrame() if kwargs["end_date"] is not None else data[kwargs["timeframe"]]), "uid"
+        calls.append((kwargs["timeframe"], kwargs["start_date"], kwargs["end_date"]))
+        source = data[kwargs["timeframe"]]
+        start, end = kwargs["start_date"], kwargs["end_date"]
+        keep = pd.Series(True, index=source.index)
+        if start is not None:
+            keep &= source["datetime"] >= pd.Timestamp(start)
+        if end is not None:
+            keep &= source["datetime"] < pd.Timestamp(end)
+        return source[keep].reset_index(drop=True), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
                            market_reconciler=rec, recovery_retry_seconds=65)
+    worker = IngestionWorker(cache)
     store.set_interval_state(source="tbank_exchange", instrument_uid="uid", interval="1m",
         open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
     events, operations = [], []
@@ -230,7 +257,8 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
         strategy_factory=lambda *args, **kw: Strategy(), trade_manager=manager,
         share_strategies={"SBER": [Assignment(id=tf, strategy="macd_rsi_stoch", management="levels_rr", filter_profile="raw", timeframe=tf)
                                   for tf in ("15m", "1h")]},
-        post_tick=lambda _: operations.append("protect") or True, heartbeat_every_ticks=2)
+        post_tick=lambda _: operations.append("protect") or True, heartbeat_every_ticks=2,
+        live_data_waiter=worker.run_until_idle)
     bot._validate()
     live = LiveAnalysis(bot)
     live.bootstrap()
@@ -242,8 +270,7 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
         new["datetime"] = pd.to_datetime(stamps)
         data[tf] = pd.concat([data[tf], new], ignore_index=True)
     def poll():
-        for _ in range(10):
-            cache.refresh_live()
+        worker.run_until_idle()
         operations.clear()
         live.step()
         assert operations[0] == "protect"
@@ -275,7 +302,8 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
     statuses = [e for e in events if e.type is EventType.MARKET_DATA_STATUS and e.timeframe == "15m"]
     assert statuses[-1].get("data_state") == "current"
     assert statuses[-1].get("received_bar") == datetime(2026, 10, 12, 8, 15)
-    assert any(end is not None for _, end in calls)  # старую дыру пытались восстановить
+    # Старую несвязанную дыру пытались восстановить отдельным бюджетом.
+    assert any(start == pd.Timestamp("2026-09-11 21:00") for _, start, _ in calls)
     assert store.coverage_state(source="tbank_exchange", instrument_uid="uid", interval="1m",
         open_time="2026-09-11 21:00") == "unresolved"
     assert store.cursors(source="tbank_exchange", instrument_uid="uid", interval="1m")["processed_through"] is None

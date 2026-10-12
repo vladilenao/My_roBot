@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from src.data.cache import MarketDataCache
+from src.data.ingestion import IngestionWorker
 from src.data.market_store import MarketDataStore
 from src.data.reconciliation import MarketDataReconciler, SessionCalendar, _calendar_from_response
 from src.data.request_budget import RequestBudget, RequestDeferred
@@ -134,7 +135,10 @@ def test_cold_start_warmup_reads_local_store_without_candle_stream(tmp_path):
 
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
                             market_source="tbank_exchange", client_provider=Provider())
-    result = cache.prepare_live_history(Instrument("SBER", "SBER", "share"), "1h", 1)
+    instrument = Instrument("SBER", "SBER", "share")
+    assert cache.prepare_live_history(instrument, "1h", 1).empty  # торговое чтение без сети
+    IngestionWorker(cache).run_until_idle()
+    result = cache.prepare_live_history(instrument, "1h", 1)
     assert len(result) == 1
     assert catalogs  # UID узнан дешёвым запросом каталога
     assert streams == []  # свечи при прогреве из базы из API не тянулись
@@ -158,7 +162,13 @@ def test_same_inflight_rpc_is_not_sent_twice():
         thread.join(2)
 
 
-def test_bounded_window_in_middle_of_hour_includes_last_closed_hour():
+def _registered(cache, store, item, timeframe, stamps):
+    store.record_candles(source="tbank_exchange", instrument_uid=item.uid, interval=timeframe, candles=candles(*stamps))
+    cache.register_live_pair(item, item.uid, timeframe)
+    cache.mark_live_history(item.uid, timeframe, done=True)
+
+
+def test_bounded_window_in_middle_of_hour_includes_last_closed_hour(tmp_path):
     now = datetime(2026, 10, 12, 9, 30)
     timeline = MultiTimeframeScheduler(["1h"], clock=lambda: now)
     calls = []
@@ -166,19 +176,17 @@ def test_bounded_window_in_middle_of_hour_includes_last_closed_hour():
         calls.append(kwargs["start_date"])
         data = candles("2026-10-12 08:00")
         return data[data["datetime"] >= kwargs["start_date"]], "uid"
+    store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0),
-                           data_backfill_window_seconds=3600)
+                           data_backfill_window_seconds=3600, market_store=store)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
-    key = cache._key(item, "1h")
-    cache._frames[key] = candles("2026-10-12 07:00")
-    cache._instruments[key], cache._uids[key] = item, "uid"
-    cache._last_loaded[key] = pd.Timestamp("2026-10-12 07:00")
-    cache.refresh_live()
+    _registered(cache, store, item, "1h", ["2026-10-12 07:00"])
+    IngestionWorker(cache).run_until_idle()
     assert calls == [pd.Timestamp("2026-10-12 08:00")]
     assert cache.frame_for(item, "1h")["datetime"].max() == pd.Timestamp("2026-10-12 08:00")
 
 
-def test_closed_session_finalization_requests_only_that_bar():
+def test_closed_session_finalization_requests_only_that_bar(tmp_path):
     now = datetime(2026, 10, 13, 6)
     timeline = MultiTimeframeScheduler(["1h"], clock=lambda: now)
     cal = SessionCalendar("MOEX", ((pd.Timestamp("2026-10-12 07:00"), pd.Timestamp("2026-10-12 20:50")),),
@@ -187,14 +195,16 @@ def test_closed_session_finalization_requests_only_that_bar():
     def loader(**kwargs):
         calls.append((kwargs["start_date"], kwargs["end_date"]))
         return candles("2026-10-12 20:00"), "uid"
-    cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0),
-        market_reconciler=SimpleNamespace(session_calendar=lambda *args: cal), data_backfill_window_seconds=3600)
+    store = MarketDataStore(tmp_path / "market.sqlite3")
+    budget = RequestBudget(lambda: now, 0)
+    rec = MarketDataReconciler(store, source="tbank_exchange", request_budget=budget)
+    rec._ranges["uid"] = [cal]
+    rec.service_calendar = lambda _: False
+    cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
+        market_reconciler=rec, data_backfill_window_seconds=3600)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
-    key = cache._key(item, "1h")
-    cache._frames[key] = candles("2026-10-12 19:00")
-    cache._instruments[key], cache._uids[key] = item, "uid"
-    cache._last_loaded[key] = pd.Timestamp("2026-10-12 19:00")
-    cache.refresh_live()
+    _registered(cache, store, item, "1h", ["2026-10-12 19:00"])
+    IngestionWorker(cache).run_until_idle()
     assert calls == [(pd.Timestamp("2026-10-12 20:00"), pd.Timestamp("2026-10-12 21:00"))]
 
 
@@ -255,14 +265,15 @@ def test_permanent_old_gap_does_not_starve_fresh_pairs_and_cache_read(tmp_path):
     rec = MarketDataReconciler(store, source="tbank_exchange", request_budget=budget)
     # Изолируем сетевой календарь: покрытие текущего дня известно.
     rec.service_calendar = lambda _: False
-    cal = SessionCalendar("MOEX", ((pd.Timestamp("2026-10-12 07:00"), pd.Timestamp("2026-10-12 20:00")),),
-                          pd.Timestamp("2026-10-12"), pd.Timestamp("2026-10-13"), pd.Timestamp(clock[0]))
+    cal = SessionCalendar("MOEX", ((pd.Timestamp("2026-10-09 07:00"), pd.Timestamp("2026-10-09 20:00")),
+                                   (pd.Timestamp("2026-10-12 07:00"), pd.Timestamp("2026-10-12 20:00"))),
+                          pd.Timestamp("2026-10-09"), pd.Timestamp("2026-10-13"), pd.Timestamp(clock[0]))
     calls = []
     entered, release = threading.Event(), threading.Event()
     def loader(**kwargs):
-        calls.append((kwargs["ticker"], kwargs["timeframe"], kwargs["end_date"]))
-        if kwargs["end_date"] is not None:
-            return pd.DataFrame(), kwargs["instrument_id"]
+        calls.append((kwargs["ticker"], kwargs["timeframe"], kwargs["start_date"], kwargs["end_date"]))
+        if pd.Timestamp(kwargs["start_date"]) < pd.Timestamp("2026-09-30"):
+            return pd.DataFrame(), kwargs["instrument_id"]  # старая дыра всегда пуста
         if len(calls) == 1:
             entered.set()
             assert release.wait(3)
@@ -270,27 +281,27 @@ def test_permanent_old_gap_does_not_starve_fresh_pairs_and_cache_read(tmp_path):
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store, market_reconciler=rec)
     instruments = [Instrument(name, name, "share", name, "uid-"+name) for name in ("A", "B", "C")]
     for item in instruments:
-        for tf in ("1m", "1h"):
-            key = cache._key(item, tf)
-            cache._frames[key] = candles("2026-10-09 19:00")
-            cache._instruments[key] = item
-            cache._uids[key] = item.uid
-            cache._last_loaded[key] = pd.Timestamp("2026-10-09 19:00")
         rec._ranges[item.uid] = [cal]
+        for tf in ("1m", "1h"):
+            _registered(cache, store, item, tf, ["2026-10-09 19:00"])
         store.set_interval_state(source="tbank_exchange", instrument_uid=item.uid, interval="1m",
             open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
-    worker = threading.Thread(target=cache.refresh_live)
-    worker.start()
+    worker = IngestionWorker(cache)
+    lane = threading.Thread(target=worker.step)
+    lane.start()
     assert entered.wait(1)
     assert not cache.frame_for(instruments[0], "1m").empty  # сеть не держит lock кэша
     release.set()
-    worker.join(3)
-    for _ in range(12):
-        cache.refresh_live()
+    lane.join(3)
+    for _ in range(40):
+        worker.step()
         clock[0] += timedelta(seconds=1)
-    assert {name for name, tf, end in calls if end is None} == {"A", "B", "C"}
-    assert {tf for name, tf, end in calls if end is None} == {"1m", "1h"}
-    assert any(end is not None for _, _, end in calls)
+    fresh = {(name, tf) for name, tf, _, end in calls if end is None}  # свежее окно без верхней границы
+    assert {name for name, _ in fresh} == {"A", "B", "C"}
+    assert {tf for _, tf in fresh} == {"1m", "1h"}
+    assert any(pd.Timestamp(start) == pd.Timestamp("2026-09-11 21:00") for _, _, start, _ in calls)
     for item in instruments:
         assert cache.frame_for(item, "1m")["datetime"].max() == pd.Timestamp("2026-10-12 08:04")
+        assert store.coverage_state(source="tbank_exchange", instrument_uid=item.uid, interval="1m",
+                                    open_time="2026-09-11 21:00") == "unresolved"
         assert store.cursors(source="tbank_exchange", instrument_uid=item.uid, interval="1m")["processed_through"] is None

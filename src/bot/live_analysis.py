@@ -85,7 +85,20 @@ class LiveAnalysis:
         filtered = raw.signal_type is not SignalType.HOLD and decision.signal_type is SignalType.HOLD
         return decision, context, ta, filtered
 
+    def register_needs(self):
+        """Потребности прогрева без сети: owner передаёт их фоновой полосе."""
+        for instrument in self.bot._instruments:
+            self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1)
+            for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
+                for binding in self._bindings(instrument, tf):
+                    for need_tf, count in self._required(binding).items():
+                        self.cache.prepare_live_history(instrument, need_tf, count)
+
     def bootstrap(self):
+        self.register_needs()
+        waiter = getattr(self.bot, "_await_live_data", None)
+        if callable(waiter):
+            waiter()
         for instrument in self.bot._instruments:
             try:
                 self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1)

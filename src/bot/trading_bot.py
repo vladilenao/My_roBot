@@ -92,6 +92,7 @@ class TradingBot:
         run=None,
         contract_lifecycle=None,
         market_data_settings=None,
+        live_data_waiter=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -107,6 +108,8 @@ class TradingBot:
         # Live-ожидание публикации и повтор статуса настраиваются отдельно от
         # legacy-таймаута такта (design 7a).
         self._market_data_settings = market_data_settings or MarketDataSettings()
+        # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
+        self._await_live_data = live_data_waiter
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick

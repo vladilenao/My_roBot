@@ -59,12 +59,13 @@ from src.config import (
     HISTORICAL_ROLLOVER,
     TIMEFRAMES,
 )
+from src.api.client import default_client_provider
 from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
 from src.history.preflight import active_pairs, run_preflight, run_chain_preflight, smallest_period
 from src.history.selection import HistorySelection
-from src.history.warmup import warmup_requirements
+from src.history.warmup import obligation_requirements, warmup_requirements
 from src.history.contract_lifecycle import ConstantContractLifecycle, RolloverLifecycle
 from src.history.report import (
     MarketDataSync,
@@ -84,6 +85,8 @@ from src.data.market_store import MarketDataStore
 from src.data.export_api import MarketDataExportServer
 from src.data.reconciliation import MarketDataReconciler
 from src.data.poller import LiveMarketDataPoller
+from src.data.ingestion import IngestionWorker
+from src.data.stream_ingestion import StreamSupervisor
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
 from src.events.bus import EventBus
@@ -441,7 +444,8 @@ def _launch(
     )
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
     from src.data.request_budget import RequestBudget
-    request_budget = None if history else RequestBudget(timeline.now, DATA_REFRESH_MIN_INTERVAL)
+    request_budget = None if history else RequestBudget(
+        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute)
     market_reconciler = None if market_store is None else MarketDataReconciler(
         market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
         client_provider=client_provider,
@@ -473,9 +477,6 @@ def _launch(
     export_server = None
     market_poller = None
     try:
-        if not history:
-            market_poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS)
-            market_poller.start()
         if not history and MARKET_DATA_EXPORT_ENABLED:
             export_server = MarketDataExportServer(
                 market_store, MARKET_DATA_EXPORT_TOKEN or "",
@@ -487,7 +488,11 @@ def _launch(
             client_provider=client_provider,
         )
         storage = runtime.storage
-        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
+        live_waiter = None
+        if not history:
+            market_poller = _start_live_ingestion(data_cache, runtime, instruments, client_provider)
+            live_waiter = market_poller.wait_startup
+        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
     finally:
         if market_poller is not None:
             market_poller.close()
@@ -499,6 +504,41 @@ def _launch(
             )
         close_channels(channels)
     return 0, None, selection or instruments
+
+
+def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
+    """Сеть live-данных принадлежит фоновым полосам; бот только читает кэш.
+
+    Main thread передаёт owner неизменяемые потребности сохранённых
+    обязательств и execution boundary до старта полос: reader не читает
+    финансовую SQLite из другого потока.
+    """
+    settings = MARKET_DATA_SETTINGS
+    log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
+    worker = IngestionWorker(data_cache, settings=settings)
+    storage = runtime.storage
+    if storage is not None:
+        trades = storage.load_trades()
+        boundaries = storage.execution_bar_boundaries()
+        for instrument in instruments:
+            key = instrument_key(instrument)
+            for timeframe, count in obligation_requirements([t for t in trades if t.plan.instrument_id == key]).items():
+                data_cache.request_live_history(instrument, timeframe, count)
+            if key in boundaries:
+                data_cache.note_execution_lower(instrument, boundaries[key][0])
+    stream = None
+    if settings.live_transport == "stream":
+        provider = client_provider or default_client_provider()
+        factory = getattr(provider, "stream_session", None)
+        if factory is None:
+            log.warning("Live-stream недоступен у провайдера %s — используется polling", type(provider).__name__)
+        else:
+            stream = StreamSupervisor(data_cache, worker, lambda: factory(
+                TINKOFF_TOKEN, control_queue_max_messages=settings.stream_control_queue_max_messages),
+                settings=settings)
+    poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
+    poller.start()
+    return poller
 
 
 def _family_warmup(family):
@@ -551,7 +591,7 @@ def _finish_history(
 
 
 
-def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> None:
+def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None) -> None:
     TradingBot(
         instruments=instruments,
         bus=bus,
@@ -564,6 +604,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> N
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
         market_data_settings=MARKET_DATA_SETTINGS,
+        live_data_waiter=live_waiter,
         context_cache=MarketContextCache(
             data_cache=data_cache,
             trend_analyzer=TrendAnalyzer(),
@@ -721,6 +762,11 @@ def _build_runtime(
     execution_cursors = storage.execution_bar_boundaries()
     execution_closes = {}
     pending_bar = None
+    # Live owner: каждая исполняемая минута закрепляется до симуляции, а после
+    # рестарта рыночный marker догоняет уже durable финансовую границу.
+    pin_input = getattr(data_cache, "pin_execution_input", None)
+    pinned_execution = getattr(data_cache, "live_session_enabled", False) is True and callable(pin_input)
+    resumed_markers = set()
 
     def commit_bar(stamp, prices, addressed, broker_events):
         instrument_bar_times = {ticker: stamp for ticker in prices}
@@ -772,6 +818,10 @@ def _build_runtime(
                             initial_boundaries = storage.execution_bar_boundaries()
                         boundary = initial_boundaries.get(ticker, (stamps.max(), True))
                     last, inclusive = boundary
+                    if pinned_execution and ticker not in resumed_markers:
+                        resumed_markers.add(ticker)
+                        if not inclusive:
+                            data_cache.resume_execution_marker(instrument, last)
                     fresh = frame.loc[stamps >= last if inclusive else stamps > last]
                     fresh = fresh.sort_values("datetime").drop_duplicates("datetime", keep="last")
                     contiguous = getattr(data_cache, "contiguous_after", None)
@@ -784,9 +834,18 @@ def _build_runtime(
                             fresh = protected
                     for row in fresh.itertuples(index=False):
                         stamp = to_aware_utc(row.datetime).to_pydatetime()
-                        batches.setdefault(stamp, {})[ticker] = (
-                            float(row.open), float(row.low), float(row.high), float(row.close),
-                        )
+                        values = (float(row.open), float(row.low), float(row.high), float(row.close))
+                        if pinned_execution:
+                            try:
+                                _, pinned = pin_input(instrument, row.datetime)
+                            except ValueError as exc:
+                                # Конфликт/integrity-hold: не выдумываем OHLC и
+                                # не перескакиваем минуту; healthy UID идут дальше.
+                                log.warning("Исполнение %s удержано перед %s: %s",
+                                            _instrument_ticker(instrument), stamp, exc)
+                                break
+                            values = tuple(float(pinned[key]) for key in ("open", "low", "high", "close"))
+                        batches.setdefault(stamp, {})[ticker] = values
                 except Exception as exc:
                     log.warning(
                         "Сбой подготовки минутных баров по %s: %s",
