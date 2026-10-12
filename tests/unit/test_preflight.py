@@ -640,3 +640,70 @@ class TestContinuityScan:
 
         assert report.ok is False
         assert not any("разрыв" in note for note in report.notes)
+
+
+class TestCoverageProbe:
+    """При наличии coverage полнота диапазона оценивается без выгрузки свечей."""
+
+    @staticmethod
+    def _probe(*, count=1440, first="2024-01-01 00:00:00", last="2024-01-01 23:59:00", error=None):
+        calls = []
+
+        def coverage(*, instrument_id, timeframe, start_date, end_date):
+            calls.append((instrument_id, timeframe, start_date, end_date))
+            if error is not None:
+                raise RuntimeError(error)
+            return {"count": count, "from": first, "to": last}
+
+        return coverage, calls
+
+    def test_reports_count_without_scanning(self):
+        seen = []
+        source = _candles({HEAD_WINDOW: _head(), TAIL_WINDOW: _tail()}, seen=seen)
+        coverage, calls = self._probe(count=1440)
+
+        report = _run(load_candles=source, coverage=coverage)
+
+        assert report.ok is True
+        note = report.notes[-1]
+        assert "покрытие диапазона" in note
+        assert "свечей 1440" in note
+        assert "разрыв" not in note
+        assert calls and all(tf == "1m" for _, tf, _, _ in calls)
+        assert not any((pd.Timestamp(s), pd.Timestamp(e)) == SCAN_WINDOW for _, s, e in seen)
+
+    def test_reports_absent_data(self):
+        coverage, _ = self._probe(count=0, first=None, last=None)
+
+        report = _run(load_candles=_full_source(), coverage=coverage)
+
+        assert report.ok is True
+        assert "свечей нет" in report.notes[-1]
+
+    def test_failure_is_a_warning_not_a_problem(self):
+        coverage, _ = self._probe(error="источник молчит")
+
+        report = _run(load_candles=_full_source(), coverage=coverage)
+
+        assert report.ok is True
+        assert "не проверено: SBER 1m (источник молчит)" in report.notes[-1]
+
+    def test_probed_only_for_smallest_timeframe(self):
+        hour = timedelta(hours=1)
+        source = _candles(
+            {
+                (pd.Timestamp(START) - 2 * timedelta(minutes=1), pd.Timestamp(START) + timedelta(minutes=1)): _head(),
+                (pd.Timestamp(START) - 2 * hour, pd.Timestamp(START) + hour): _hourly(
+                    "2023-12-31 23:00:00", "2024-01-01 00:00:00"
+                ),
+                (pd.Timestamp(END) - 2 * timedelta(minutes=1), pd.Timestamp(END)): _tail(),
+                (pd.Timestamp(END) - 2 * hour, pd.Timestamp(END)): _hourly("2024-01-01 23:00:00"),
+            }
+        )
+        coverage, calls = self._probe(count=10)
+        pairs = (Pair("SBER", "share", "1m"), Pair("SBER", "share", "1h"))
+
+        report = _run(pairs=pairs, load_candles=source, coverage=coverage)
+
+        assert report.ok is True
+        assert [tf for _, tf, _, _ in calls] == ["1m"]

@@ -287,6 +287,7 @@ def run_preflight(
     client_provider=None,
     clock=None,
     ping=None,
+    coverage=None,
 ) -> PreflightReport:
     """Проверяет источник, разрешение инструментов и покрытие диапазона.
 
@@ -294,7 +295,9 @@ def run_preflight(
     использует кэш, поэтому проверка говорит ровно о тех данных, которые увидит
     прогон. ``client_provider`` и ``clock`` уходят в загрузчик так же, как в
     кэше, иначе проверка считала бы границы от «сейчас». ``ping`` —
-    необязательная проверка живости источника.
+    необязательная проверка живости источника. ``coverage`` — необязательный
+    счётный запрос покрытия к источнику: при его наличии полнота диапазона
+    оценивается без выгрузки свечей, иначе применяется сканирование разрывов.
 
     Начало в нерабочей точке календаря — один повтор проверки: если предложенный
     сдвиг даёт покрытый прогрев, он возвращается в ``start``, а ``notes`` объясняет
@@ -365,6 +368,7 @@ def run_preflight(
         load_candles=load_candles,
         client_provider=client_provider,
         clock=clock,
+        coverage=coverage,
     )
 
 
@@ -377,6 +381,7 @@ def _with_continuity_note(
     load_candles,
     client_provider,
     clock,
+    coverage=None,
 ) -> PreflightReport:
     """Дополняет отчёт предупреждением о разрывах внутри диапазона.
 
@@ -384,20 +389,30 @@ def _with_continuity_note(
     запуске остаётся за пользователем. Ошибка сканирования тоже остаётся
     предупреждением — молча пропустить проверку нельзя, но и отменять из-за неё
     прогон незачем.
+
+    При наличии ``coverage`` полнота диапазона оценивается счётным запросом к
+    источнику, без сплошного чтения свечей; иначе — сканированием разрывов.
     """
+    resolved = [
+        replace(pair, instrument_id=next((item.pair.instrument_id for item in report.boundaries
+            if (item.pair.ticker, item.pair.instrument_type, item.pair.timeframe) ==
+               (pair.ticker, pair.instrument_type, pair.timeframe)), pair.instrument_id))
+        for pair in pairs
+    ]
     try:
-        note = _scan_continuity(
-            [replace(pair, instrument_id=next((item.pair.instrument_id for item in report.boundaries
-                if (item.pair.ticker, item.pair.instrument_type, item.pair.timeframe) ==
-                   (pair.ticker, pair.instrument_type, pair.timeframe)), pair.instrument_id)) for pair in pairs],
-            start_dt=start_dt,
-            end_dt=end_dt,
-            load_candles=load_candles,
-            client_provider=client_provider,
-            clock=clock,
-        )
-    except Exception as exc:  # noqa: BLE001 — сканирование не должно ломать проверку
-        log.warning("Сканирование разрывов не выполнено: %s", exc)
+        if coverage is not None:
+            note = _coverage_note(resolved, start_dt=start_dt, end_dt=end_dt, coverage=coverage)
+        else:
+            note = _scan_continuity(
+                resolved,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                load_candles=load_candles,
+                client_provider=client_provider,
+                clock=clock,
+            )
+    except Exception as exc:  # noqa: BLE001 — проверка не должна ломать прогон
+        log.warning("Проверка покрытия диапазона не выполнена: %s", exc)
         note = f"разрывы внутри диапазона не проверены: {exc}"
     if note is None:
         return report
@@ -410,6 +425,61 @@ def _with_continuity_note(
         detail=report.detail,
         boundaries=report.boundaries,
     )
+
+
+def _coverage_note(
+    pairs,
+    *,
+    start_dt: datetime,
+    end_dt: datetime,
+    coverage,
+) -> str | None:
+    """Отметка о покрытии по счётному запросу к источнику, без чтения свечей.
+
+    Один запрос на пару мельчайшего ТФ вместо сплошного сканирования диапазона:
+    источник возвращает фактические границы и число сохранённых свечей, чего
+    достаточно для предупреждения о полноте. Точный список разрывов считается
+    отдельно на стороне источника; старшие таймфреймы не запрашиваются — их
+    покрытие следует из мельчайшего.
+    """
+    driver = smallest_period(pair.timeframe for pair in pairs)
+    scanned = [pair for pair in pairs if _period(pair.timeframe) == driver]
+    if not scanned:
+        return None
+
+    total = 0
+    first_seen: str | None = None
+    last_seen: str | None = None
+    failed: list[str] = []
+    for pair in scanned:
+        if not pair.instrument_id:
+            failed.append(f"{pair} (не разрешена идентичность)")
+            continue
+        try:
+            data = coverage(instrument_id=pair.instrument_id, timeframe=pair.timeframe,
+                            start_date=start_dt, end_date=end_dt)
+        except Exception as exc:  # noqa: BLE001 — неполная отметка попадёт в сообщение
+            failed.append(f"{pair} ({exc})")
+            continue
+        total += int(data.get("count") or 0)
+        first, last = data.get("from"), data.get("to")
+        if isinstance(first, str) and (first_seen is None or first < first_seen):
+            first_seen = first
+        if isinstance(last, str) and (last_seen is None or last > last_seen):
+            last_seen = last
+
+    if total:
+        span = f", данные {first_seen} … {last_seen}" if first_seen and last_seen else ""
+        found = f"свечей {total}{span}"
+    else:
+        found = "свечей нет"
+    note = (
+        f"таймфрейм {scanned[0].timeframe}, покрытие диапазона "
+        f"{start_dt:%Y-%m-%d %H:%M} — {end_dt:%Y-%m-%d %H:%M}: {found}"
+    )
+    if failed:
+        note += f"; не проверено: {', '.join(failed)}"
+    return note
 
 
 def _scan_continuity(
@@ -687,7 +757,7 @@ def _nearest_before(pair: Pair, moment: datetime, load_candles, client_provider,
 
 def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         client_provider=None, clock=None, ping=None,
-                        fixed_pairs=(), fixed_warmup=1):
+                        fixed_pairs=(), fixed_warmup=1, coverage=None):
     """Проверить назначенные участки, не требуя годы истории каждого выпуска."""
     problems, notes, detail = [], [], []
     boundaries = []
@@ -696,7 +766,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
     if fixed_pairs:
         fixed = run_preflight(fixed_pairs, start=start, end=end, warmup_bars=fixed_warmup,
                               load_candles=load_candles, client_provider=client_provider,
-                              clock=clock, ping=ping)
+                              clock=clock, ping=ping, coverage=coverage)
         problems.extend(fixed.problems)
         notes.extend(fixed.notes)
         detail.extend(fixed.detail)
@@ -763,11 +833,19 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                     detail.append(f"{label}: участок {segment.start:%Y-%m-%d %H:%M} — {segment.end:%Y-%m-%d %H:%M}, прогрев {len(prior)}/{needed}")
                     if tf == "1m":
                         scan_end = min(segment.end, segment.start+CONTINUITY_SCAN_BUDGET*period)
-                        scan = fetch(tf, segment.start, scan_end)
-                        holes = pd.to_datetime(scan["datetime"]).diff().dropna()
-                        holes = holes[holes > period]
                         scope = "весь участок" if scan_end == segment.end else f"участок до {scan_end}, хвост не проверен"
-                        notes.append(f"{label}: проверен {scope}; разрывов {len(holes)}, самый длинный {_span(holes.max()-period) if len(holes) else '0 м'}")
+                        if coverage is not None:
+                            try:
+                                data = coverage(instrument_id=card.uid, timeframe=tf,
+                                                start_date=segment.start, end_date=scan_end)
+                                notes.append(f"{label}: покрытие {scope}; свечей {int(data.get('count') or 0)}")
+                            except Exception as exc:  # noqa: BLE001 — отметка не отменяет прогон
+                                notes.append(f"{label}: покрытие не проверено ({exc})")
+                        else:
+                            scan = fetch(tf, segment.start, scan_end)
+                            holes = pd.to_datetime(scan["datetime"]).diff().dropna()
+                            holes = holes[holes > period]
+                            notes.append(f"{label}: проверен {scope}; разрывов {len(holes)}, самый длинный {_span(holes.max()-period) if len(holes) else '0 м'}")
                 except Exception as exc:
                     problems.append(f"{label}: {exc}")
             if segment.end == segment.cutoff and segment.cutoff < end:

@@ -218,6 +218,22 @@ class HistoricalClient:
             raise EmulatorError("INVALID_RESPONSE", "Эмулятор не вернул объект JSON")
         return result
 
+    def coverage(self, *, instrument_id: str, timeframe: str, from_=None, to=None) -> dict:
+        """Границы и число свечей пары «инструмент × интервал» без выгрузки свечей.
+
+        Один счётный запрос ``GET /api/v1/coverage``: эмулятор отвечает, сколько
+        свечей реально сохранено в диапазоне и где начинается и заканчивается
+        история. Заменяет сплошное чтение диапазона на стороне робота.
+        """
+        params = {"instrument_id": instrument_id, "interval": timeframe}
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
+        if from_ is not None:
+            params["from"] = _bounds(from_)
+        if to is not None:
+            params["to"] = _bounds(to)
+        return self._get("/api/v1/coverage", params)
+
     def get_all_candles(
         self,
         *,
