@@ -494,14 +494,23 @@ class MarketDataCache:
             lowers.append(member["execution_lower"])
         if not lowers:
             return None
+        cursor = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe)
+        resolved = cursor.get("resolved_through")
+        resolved = None if resolved is None else pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None)
         lower = min(lowers)
+        if member.get("coverage_lower") is None:
+            stored = self._market_store.live_state(kind="pair", source=self._market_source,
+                                                   instrument_uid=uid, interval=timeframe).get("coverage_lower")
+            member["coverage_lower"] = None if stored is None else _naive(stored)
+        existing = member.get("coverage_lower")
+        if existing is not None and (resolved is None or resolved < lower):
+            # Граница не поднимается через недоказанный участок: новый
+            # high-water не прячет внутреннюю/хвостовую дыру (задача 2.5).
+            lower = min(existing, lower)
         if member.get("coverage_lower") != lower:
             member["coverage_lower"] = lower
             self._market_store.save_live_state({"coverage_lower": lower.isoformat()}, kind="pair",
                 source=self._market_source, instrument_uid=uid, interval=timeframe)
-        cursor = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe)
-        resolved = cursor.get("resolved_through")
-        resolved = None if resolved is None else pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None)
         grid = self._timeline.grid(timeframe)
         opens = _naive_series(closed["datetime"])
         if resolved is not None and resolved >= lower:

@@ -110,6 +110,8 @@ class IngestionWorker:
         self._old_queue = deque()
         self._conflict_at = {}
         self._fresh_at = {}
+        self._need_attempts = {}
+        self._need_retry_at = {}
         self._detect_at = pd.Timestamp.min
         self._attempted = set()
         self.errors = {}
@@ -152,8 +154,12 @@ class IngestionWorker:
         self._merge_range(uid, timeframe, lower, horizon, now, reason=reason, immediate=True)
 
     def startup_complete(self):
-        """Каждая потребность хотя бы раз обслужена; READY решает кэш."""
-        if self._cache.live_needs():
+        """Каждая потребность хотя бы раз обслужена; READY решает кэш.
+
+        Неудачная попытка тоже завершает ожидание старта: пара остаётся
+        неготовой с видимой причиной, а повторы идут в фоне с backoff.
+        """
+        if any(key not in self._need_attempts for key, _, _ in self._cache.live_needs()):
             return False
         return all(pair["history"] == "done" or (pair["uid"], pair["timeframe"]) in self._attempted
                    for pair in self._cache.live_pairs())
@@ -189,13 +195,18 @@ class IngestionWorker:
     # ── потребности прогрева и регистрации ──
     def _service_need(self, now):
         for key, instrument, min_bars in self._cache.live_needs():
+            if now < self._need_retry_at.get(key, pd.Timestamp.min):
+                continue
             timeframe = key[2]
             uid = self._cache._uids.get(key) or getattr(instrument, "uid", None)
             if not uid:
+                self._need_attempts[key] = self._need_attempts.get(key, 0) + 1
                 uid = self._resolve_uid(instrument)
                 if uid is None:
+                    self._need_retry_at[key] = now + self._backoff(self._need_attempts[key])
                     continue
             self._cache.register_live_pair(instrument, uid, timeframe, min_bars)
+            self._need_attempts.setdefault(key, 0)
             pair = self._pair(uid, timeframe)
             if pair["closed"] >= min_bars and pair["history"] == "done":
                 self._cache.finish_live_need(key, min_bars)
@@ -211,6 +222,7 @@ class IngestionWorker:
                 self._cache.finish_live_need(key, min_bars)
                 continue
             self._attempted.add((uid, timeframe))
+            self._need_attempts[key] = self._need_attempts.get(key, 0) + 1
             earliest = self._earliest(uid, timeframe)
             try:
                 self._load_range(instrument, timeframe, now - timedelta(days=days), now, wait=True)
@@ -219,6 +231,7 @@ class IngestionWorker:
             except Exception as exc:
                 self.errors[uid, timeframe] = str(exc)
                 self._cache.mark_live_history(uid, timeframe, error=str(exc))
+                self._need_retry_at[key] = now + self._backoff(self._need_attempts[key])
                 log.warning("Прогрев %s %s: %s", uid, timeframe, exc)
                 return True
             self._cache.mark_live_history(uid, timeframe, days=days)
@@ -523,12 +536,16 @@ class IngestionWorker:
         if book is None:
             book = RecoveryRange(lower, upper, now, now, lower, reason=reason)
         else:
-            extended = upper > book.upper or lower < book.lower
+            cursor = self._store.cursors(source=self._source, instrument_uid=uid, interval=timeframe)
+            high_water = cursor.get("received_through")
+            resumed = (high_water is not None
+                       and pd.Timestamp(high_water).tz_convert("UTC").tz_localize(None) > book.upper)
             book.lower, book.upper = min(book.lower, lower), max(book.upper, upper)
             book.checkpoint = min(book.checkpoint, lower)
-            if book.state == "parked" and (immediate or extended):
-                # Новое доказательство (обрыв/новый пропуск) открывает новый
-                # ограниченный раунд, не продлевая прежний по времени.
+            if book.state == "parked" and (immediate or resumed):
+                # Значимое новое доказательство — обрыв/reconnect или снова
+                # публикуемые позже области свечи — открывает новый раунд.
+                # Удлинение того же обрыва раунд не перезапускает.
                 book.state, book.attempts, book.round_started_at = "active", 0, now
                 book.next_retry_at, book.reason = now, reason
             elif immediate:
