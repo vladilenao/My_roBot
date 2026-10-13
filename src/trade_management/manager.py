@@ -917,7 +917,13 @@ class TradeManager:
             connection.execute("BEGIN")
             try:
                 plan_row = connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
-                timeframe = json.loads(plan_row[0]).get("timeframe", "")
+                saved_plan = json.loads(plan_row[0])
+                timeframe = saved_plan.get("timeframe", "")
+                if action.startswith("TARGET:"):
+                    target_id = action.partition(":")[2]
+                    details["target_number"] = next(
+                        (index for index, target in enumerate(saved_plan.get("targets", ()), 1)
+                         if target.get("target_id") == target_id), None)
                 market = self._visual_markets.get((instrument, timeframe))
                 if market is not None:
                     grid = CandleScheduler(timeframe)

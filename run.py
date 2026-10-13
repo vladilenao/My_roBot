@@ -840,7 +840,7 @@ def _build_runtime(
              execution_id=execution.execution_id, status=str(execution.status),
              visual=details.get("visual"),
              timeframe=details["visual"].data["timeframe"] if details.get("visual") else "",
-             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining", "target_number",
                                             "requested_quantity", "selected_quantity", "limiting_constraint")
                 if key in details and str(execution.status) in {"fill", "partial"}}))
 

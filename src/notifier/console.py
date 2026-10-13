@@ -19,6 +19,7 @@ from src.events.types import CONTROL_EVENT_TYPES, NOTIFICATION_EVENT_TYPES, Even
 from src.logging_setup import get_logger
 from src.notifier.channel import Channel
 from src.notifier.templates import render
+from src.notifier.templates.console_view import render_status_group, status_label
 from src.notifier.templates.decision import idle_tick_summary
 
 log = get_logger(__name__)
@@ -80,11 +81,16 @@ class ConsoleChannel(Channel):
         self._write_lock = Lock()
         self._disabled = False
         self._active_tick_id: str | None = None
-        self._hold_count = 0
-        self._hold_instruments: dict[str, None] = {}
+        self._hold_pairs: set[tuple[str, str]] = set()
         self._printed_in_tick = False
         self._api_limit_active = False
+        self._api_limit_anchor: tuple[str, str] | None = None
         self._last_live_notice: dict[tuple[str, str], tuple[str, str, datetime]] = {}
+        self._pending_statuses: dict[tuple[str, str, str], Event] = {}
+        self._has_output = False
+        self._last_type: EventType | None = None
+        self._last_trade_id = ""
+        self._last_decision_id = ""
 
     def handle(self, event: Event) -> None:
         if self._disabled:
@@ -97,39 +103,99 @@ class ConsoleChannel(Channel):
             return
         if event.type not in self.notification_types:
             return
+        if event.type is EventType.STARTUP_ANALYSIS:
+            return
         if event.type is EventType.MARKET_DATA_STATUS:
-            state = event.get("data_state")
-            if state == "rate_limited" and self._api_limit_active:
-                return
-            if state != "rate_limited":
-                self._api_limit_active = False
-            key = (event.instrument, event.timeframe)
-            if state in {"current", "waiting_bar"} and not event.get("reason"):
-                self._last_live_notice.pop(key, None)
-            elif state != "rate_limited":
-                previous = self._last_live_notice.get(key)
-                now = self._now()
-                if previous and previous[:2] == (state, event.get("reason") or "") and now - previous[2] < timedelta(minutes=15):
-                    return
+            self._handle_status(event)
+            return
+        if event.type is EventType.HEARTBEAT:
+            self._flush_statuses()
         if self._is_clean_hold(event):
             self._remember_hold(event)
             return
+        linked = (event.type in {EventType.SIGNAL, EventType.REJECTED}
+                  and self._last_type is EventType.DECISION
+                  and bool(self._last_decision_id)
+                  and event.get("event_id") == self._last_decision_id)
+        if event.type is EventType.ORDER_REJECTED:
+            # Вторичный ОРДЕР продолжает блок своей сделки; иначе он самостоятельный.
+            linked = (self._last_type in {EventType.TRADE_CLOSED, EventType.TARGET_HIT}
+                      and bool(event.get("trade_id")) and event.get("trade_id") == self._last_trade_id)
         stream = self._stream if self._stream is not None else sys.stdout
-        text = render(
+        rendered = render(
             event, self._tz_offset_hours, now=self._now(),
             width=shutil.get_terminal_size(fallback=(96, 24)).columns,
-            color=_supports_color(stream),
+            color=_supports_color(stream), linked=linked,
         )
-        if text is None:
+        if rendered is None:
             return
-        printed = self._write(text, separate_after=event.type is not EventType.HEARTBEAT)
-        if printed and event.type is EventType.MARKET_DATA_STATUS and event.get("data_state") == "rate_limited":
-            self._api_limit_active = True
-        if printed and event.type is EventType.MARKET_DATA_STATUS and event.get("data_state") != "rate_limited":
-            self._last_live_notice[(event.instrument, event.timeframe)] = (
-                event.get("data_state"), event.get("reason") or "", self._now())
+        join = linked or (event.type is EventType.DECISION and self._last_type is EventType.DECISION)
+        printed = self._write(rendered, join=join)
         if printed and self._active_tick_id is not None:
             self._printed_in_tick = True
+        if printed:
+            self._last_type = event.type
+            self._last_trade_id = event.get("trade_id") or ""
+            self._last_decision_id = (event.get("event_id") or "") if event.type is EventType.DECISION else ""
+
+    def _handle_status(self, event: Event) -> None:
+        state = event.get("data_state")
+        key = (event.instrument, event.timeframe)
+        if state == "rate_limited":
+            if self._api_limit_active:
+                return
+            self._api_limit_active = True
+            self._api_limit_anchor = key
+        elif key == self._api_limit_anchor:
+            self._api_limit_active = False
+            self._api_limit_anchor = None
+        if state in {"current", "waiting_bar"} and not event.get("reason"):
+            previous = self._last_live_notice.pop(key, None)
+            if previous is None or previous[0] in {"current", "waiting_bar", "recovered"}:
+                return
+            event = Event.market_data_status(event.instrument, timeframe=event.timeframe,
+                session=event.get("session") or "unknown", data_state="recovered",
+                observed_at=event.get("observed_at"), reason="",
+                received_bar=event.get("received_bar"), analyzed_bar=event.get("analyzed_bar"))
+            state = "recovered"
+        elif state != "rate_limited":
+            previous = self._last_live_notice.get(key)
+            if previous and previous[:2] == (state, event.get("reason") or "") and self._now() - previous[2] < timedelta(minutes=15):
+                return
+        if status_label(event) is None:
+            return
+        if self._active_tick_id is not None:
+            self._pending_statuses[(status_label(event) or "", *key)] = event
+        else:
+            self._print_statuses((event,))
+
+    def _print_statuses(self, events: Iterable[Event]) -> None:
+        groups: dict[str, list[Event]] = {}
+        for event in events:
+            label = status_label(event)
+            if label is not None:
+                groups.setdefault(label, []).append(event)
+        stream = self._stream if self._stream is not None else sys.stdout
+        for label, items in groups.items():
+            rendered = render_status_group(items, self._tz_offset_hours,
+                width=shutil.get_terminal_size(fallback=(96, 24)).columns,
+                color=_supports_color(stream))
+            if rendered is None or not self._write(rendered):
+                continue
+            if self._active_tick_id is not None:
+                self._printed_in_tick = True
+            self._last_type = EventType.MARKET_DATA_STATUS
+            self._last_decision_id = ""
+            for event in items:
+                if event.get("data_state") != "rate_limited":
+                    self._last_live_notice[(event.instrument, event.timeframe)] = (
+                        event.get("data_state"), event.get("reason") or "", self._now())
+
+    def _flush_statuses(self) -> None:
+        if self._pending_statuses:
+            pending = tuple(self._pending_statuses.values())
+            self._pending_statuses.clear()
+            self._print_statuses(pending)
 
     @staticmethod
     def _is_clean_hold(event: Event) -> bool:
@@ -141,43 +207,43 @@ class ConsoleChannel(Channel):
         )
 
     def _begin_tick(self, tick_id: str) -> None:
+        self._flush_statuses()
         self._active_tick_id = tick_id
-        self._hold_count = 0
-        self._hold_instruments.clear()
+        self._hold_pairs.clear()
         self._printed_in_tick = False
 
     def _remember_hold(self, event: Event) -> None:
         if self._active_tick_id is None:
             return
-        self._hold_count += 1
-        self._hold_instruments.setdefault(event.instrument or "контракт не указан", None)
+        self._hold_pairs.add((event.instrument or "контракт не указан", event.timeframe))
 
     def _finish_tick(self, tick_id: str, completed: bool) -> None:
         if tick_id != self._active_tick_id:
             return
         try:
-            if completed and self._hold_count and not self._printed_in_tick:
+            self._flush_statuses()
+            if completed and self._hold_pairs and not self._printed_in_tick:
                 moment = self._now()
                 if moment.tzinfo is None:
                     moment = moment.replace(tzinfo=timezone.utc)
                 moscow = moment.astimezone(timezone(timedelta(hours=3)))
                 stream = self._stream if self._stream is not None else sys.stdout
                 self._write(idle_tick_summary(
-                    moscow, self._hold_count, self._hold_instruments,
+                    moscow, len(self._hold_pairs),
                     color=_supports_color(stream),
                 ))
         finally:
             self._active_tick_id = None
-            self._hold_count = 0
-            self._hold_instruments.clear()
+            self._hold_pairs.clear()
             self._printed_in_tick = False
 
-    def _write(self, text: str, *, separate_after: bool = False) -> bool:
+    def _write(self, text: str, *, join: bool = False) -> bool:
         try:
             with self._write_lock:
                 stream = self._stream if self._stream is not None else sys.stdout
-                stream.write(text + ("\n\n" if separate_after else "\n"))
+                stream.write(("\n" if self._has_output and not join else "") + text + "\n")
                 stream.flush()
+                self._has_output = True
             return True
         except (OSError, ValueError):
             # Закрытый stdout (запуск из-под мёртвого терминала, `head` и т.п.):
@@ -187,7 +253,7 @@ class ConsoleChannel(Channel):
             return False
 
     def close(self) -> None:
+        self._flush_statuses()
         self._active_tick_id = None
-        self._hold_count = 0
-        self._hold_instruments.clear()
+        self._hold_pairs.clear()
         self._printed_in_tick = False

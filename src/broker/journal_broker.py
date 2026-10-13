@@ -960,6 +960,8 @@ class JournalBroker(BrokerPort):
                     instrument=self._display(trade.plan.instrument_id),
                     quantity=filled,
                     price=target.price,
+                    target_number=next((index for index, planned in enumerate(trade.plan.targets, 1)
+                                        if planned.target_id == target.target_id), None),
                 )
                 if position.qty == 0:
                     self.manager.positions.pop(trade.plan.trade_id, None)

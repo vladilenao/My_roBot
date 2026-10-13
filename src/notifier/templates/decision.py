@@ -3,20 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable
-
-
-
-def idle_tick_summary(when: datetime, count: int, instruments: Iterable[str] = (), *, color: bool = False) -> str:
-    """Число проверок отражает решения, а не уникальные инструменты."""
+def idle_tick_summary(when: datetime, count: int, *, color: bool = False) -> str:
+    """Число проверенных пар «инструмент + таймфрейм»."""
     remainder = count % 100
     if 11 <= remainder <= 14:
-        word = "проверок"
+        word = "пар"
     elif count % 10 == 1:
-        word = "проверка"
+        word = "пара"
     elif 2 <= count % 10 <= 4:
-        word = "проверки"
+        word = "пары"
     else:
-        word = "проверок"
-    line = f"{when:%H:%M}  СКАН       Сигналов нет · {count} {word}"
+        word = "пар"
+    line = f"{when:%H:%M}  СКАНИРОВАНИЕ  Сигналов нет · проверено {count} {word}"
     return f"\x1b[90m{line}\x1b[0m" if color else line

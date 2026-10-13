@@ -281,7 +281,7 @@ class TestCancelEventInstrument:
         assert len(events) == 1
         assert events[0].instrument == "NG-10.26"
         text = self._console_text(events[0])
-        assert "NG-10.26   ОТМЕНА" in text and "Причина: risk_cap" in text
+        assert "ОТМЕНА        NG-10.26 · risk_cap" in text
         assert "None" not in text and "контракт не указан" not in text and "❌" not in text
 
     def test_expire_order_carries_short_name(self, tmp_path):
@@ -292,7 +292,7 @@ class TestCancelEventInstrument:
         events = [e for e in broker.drain_events() if e.type is EventType.TRADE_CANCELLED]
         assert events and events[0].instrument == "NG-10.26"
         text = self._console_text(events[0])
-        assert "NG-10.26   ОТМЕНА" in text and "Причина: истёк срок TTL" in text
+        assert "ОТМЕНА        NG-10.26 · истёк срок заявки" in text
         assert "None" not in text and "❌" not in text
 
 

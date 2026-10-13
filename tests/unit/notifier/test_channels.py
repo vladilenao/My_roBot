@@ -1,6 +1,7 @@
 """Unit-тесты каналов: консоль, порт канала, Telegram-очередь."""
 
 import io
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -64,13 +65,87 @@ class TestConsoleChannel:
 
         for instrument in ("SBER", "PHOR", "VTBR"):
             channel.handle(status(instrument, "rate_limited"))
-        assert stream.getvalue() == "14:30  СИСТЕМА    ЛИМИТ API · ждём сброса\n\n"
+        assert stream.getvalue() == "14:30  СИСТЕМА       Лимит API · ожидание сброса\n"
 
         clock[0] += timedelta(minutes=2)
         channel.handle(status("SBER", "current"))
-        assert stream.getvalue().count("ЛИМИТ API") == 1
+        assert stream.getvalue().count("Лимит API") == 1
         channel.handle(status("SBER", "rate_limited"))
-        assert stream.getvalue().count("ЛИМИТ API") == 2
+        assert stream.getvalue().count("Лимит API") == 2
+
+    def test_api_limit_inside_batch_is_one_system_line_next_to_grouped_states(self, monkeypatch) -> None:
+        monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
+        observed = datetime(2026, 10, 13, 13, 15)
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+        channel.handle(Event.tick_started(tick_id="cycle"))
+        for instrument in ("SBER", "PHOR", "VTBR"):
+            channel.handle(Event.market_data_status(instrument, timeframe="15m", session="open",
+                data_state="rate_limited", observed_at=observed, reason="Ожидание сброса общего лимита API"))
+        channel.handle(Event.market_data_status("MOEX", timeframe="15m", session="open",
+            data_state="warming_up", observed_at=observed, available_bars=12, required_bars=60))
+        assert stream.getvalue() == ""
+        channel.handle(Event.tick_finished(tick_id="cycle", completed=True))
+        assert stream.getvalue() == (
+            "16:15  СИСТЕМА       Лимит API · ожидание сброса\n"
+            "\n"
+            "16:15  ПРОГРЕВ           1 пара\n"
+            "                        MOEX · 15м · 12/60 свечей\n"
+        )
+
+    def test_close_flushes_unfinished_status_batch(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+        channel.handle(Event.tick_started(tick_id="interrupted"))
+        channel.handle(Event.market_data_status("SBER", timeframe="15m", session="open",
+            data_state="delayed", observed_at=datetime(2026, 10, 13, 13, 15),
+            expected_bar=datetime(2026, 10, 13, 13, 0)))
+        assert stream.getvalue() == ""
+        channel.close()
+        assert "ЗАДЕРЖКА ДАННЫХ  1 пара" in stream.getvalue()
+        assert "SBER · 15м · не получена свеча 16:00" in stream.getvalue()
+
+    def test_startup_overview_between_visible_events_leaves_no_trace(self) -> None:
+        def run(with_overview: bool) -> str:
+            stream = io.StringIO()
+            channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc))
+            channel.handle(Event.heartbeat(tick_count=60, error_count=0))
+            if with_overview:
+                for outcome in ("HOLD", "BUY", "SELL", "FILTERED", "ERROR"):
+                    channel.handle(Event.startup_analysis("SBER", published_at=datetime(2026, 10, 13, 12, 0),
+                        results=({"outcome": outcome},), available_bars=1, required_bars=60,
+                        coverage_complete=False, reason="прогрев"))
+            channel.handle(Event.tick_started(tick_id="t"))
+            channel.handle(Event.decision("SBER", outcome="no_signal", side="HOLD", timeframe="15m"))
+            channel.handle(Event.tick_finished(tick_id="t", completed=True))
+            return stream.getvalue()
+
+        assert run(with_overview=True) == run(with_overview=False)
+        assert "проверено 1 пара" in run(with_overview=True)
+
+    def test_secondary_order_joins_trade_but_standalone_order_has_time(self) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 13, 12, 37, tzinfo=timezone.utc))
+        channel.handle(Event.broker_event(EventType.ORDER_REJECTED, trade_id="other", instrument="SBER",
+            side="BUY", reason="trade-not-open"))
+        channel.handle(Event.broker_event(EventType.TRADE_CLOSED, trade_id="br", instrument="BR–11.26",
+            quantity=2, price="103.57", quantity_remaining=0))
+        channel.handle(Event.broker_event(EventType.ORDER_REJECTED, trade_id="br", instrument="BR–11.26",
+            side="SELL", reason="trade-not-open"))
+        lines = stream.getvalue().splitlines()
+        assert lines[0].startswith("15:37  ОРДЕР         SBER · покупка отклонена")
+        assert lines[1] == ""
+        assert lines[2].startswith("15:37  СДЕЛКА        BR–11.26")
+        assert lines[3].startswith("       ОРДЕР         BR–11.26 · продажа отклонена")
+
+    def test_direct_print_outside_channel_is_not_intercepted(self, capsys) -> None:
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream)
+        print("прямой вывод")
+        channel.handle(Event.heartbeat(tick_count=1, error_count=0))
+        print("ещё строка")
+        assert capsys.readouterr().out == "прямой вывод\nещё строка\n"
+        assert "СИСТЕМА" in stream.getvalue() and "прямой вывод" not in stream.getvalue()
 
     def test_repeated_pair_warning_is_throttled_but_recovery_resets_it(self) -> None:
         clock = [datetime(2026, 10, 13, 11, 30, tzinfo=timezone.utc)]
@@ -125,7 +200,7 @@ class TestConsoleChannel:
         ConsoleChannel(stream=terminal, now=now).handle(event)
         ConsoleChannel(stream=plain, now=now).handle(event)
         assert "\x1b[35m" in terminal.getvalue()
-        assert terminal.getvalue().endswith("\x1b[0m\n\n")
+        assert terminal.getvalue().endswith("\x1b[35mПРОДАЖА\x1b[0m · цена 100.000\n")
         assert terminal.getvalue().replace("\x1b[35m", "").replace("\x1b[0m", "") == plain.getvalue()
 
     def test_quiet_scan_is_muted_only_in_terminal(self, monkeypatch) -> None:
@@ -140,13 +215,13 @@ class TestConsoleChannel:
         channel.handle(Event.tick_started(tick_id="one"))
         channel.handle(Event.decision("SBER", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
-        assert stream.getvalue() == "\x1b[90m10:15  СКАН       Сигналов нет · 1 проверка\x1b[0m\n"
+        assert stream.getvalue() == "\x1b[90m10:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 1 пара\x1b[0m\n"
 
     def test_prints_rendered_text(self, capsys) -> None:
         ConsoleChannel(now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc)).handle(
             Event.heartbeat(tick_count=1, error_count=0))
 
-        assert capsys.readouterr().out == "10:15  СИСТЕМА    1 такт работы · 0 ошибок\n"
+        assert capsys.readouterr().out == "10:15  СИСТЕМА       1 такт работы · 0 ошибок\n"
 
     def test_writes_to_given_stream(self) -> None:
         import io
@@ -196,7 +271,7 @@ class TestConsoleChannel:
         channel = ConsoleChannel(stream=stream)
         channel.handle(Event.error(operation="анализ сделки"))
         assert stream.writes == 1
-        assert stream.getvalue().count("\n") == 4
+        assert stream.getvalue().count("\n") == 2
 
     def test_quiet_tick_prints_one_summary_through_bus(self) -> None:
         stream = io.StringIO()
@@ -217,7 +292,7 @@ class TestConsoleChannel:
                 ))
         bus.publish(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 8 проверок\n"
+        assert stream.getvalue() == "10:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 4 пары\n"
 
     def test_printed_event_suppresses_quiet_tick_summary(self) -> None:
         stream = io.StringIO()
@@ -228,7 +303,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("SBER", outcome="signal_buy", side="BUY", price=100))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "10:15  SBER       ПОКУПКА · 100.000\n\n"
+        assert stream.getvalue() == "10:15  СИГНАЛ        SBER · ПОКУПКА · цена 100.000\n"
 
     def test_decision_plan_and_rejection_keep_publication_order(self) -> None:
         stream = io.StringIO()
@@ -238,9 +313,9 @@ class TestConsoleChannel:
         channel.handle(Event.rejected("SBER", reason="лимит риска", side="BUY"))
 
         text = stream.getvalue()
-        assert text.index("ПОКУПКА · 100.000") < text.index("ПЛАН · ПОКУПКА") < text.index("ОТКЛОНЕНО")
-        assert text.count("10:15  SBER") == 3
-        assert text.count("\n\n") == 3
+        assert text.index("СИГНАЛ") < text.index("ПЛАН") < text.index("ОТКЛОНЕНО")
+        assert text.count("10:15  ") == 3
+        assert text.count("SBER") == 3
 
     def test_filtered_hold_is_printed_and_suppresses_summary(self) -> None:
         stream = io.StringIO()
@@ -251,7 +326,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("SBER", outcome="filtered", side="HOLD", filtered_out=True))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue().endswith("SBER       ОТКЛОНЕНО\n       Причина: отклонено фильтром\n\n")
+        assert stream.getvalue().endswith("ОТКЛОНЕНО ФИЛЬТРОМ  SBER\n")
 
     def test_holds_for_different_timeframes_and_profiles_count_separately(self) -> None:
         stream = io.StringIO()
@@ -264,7 +339,7 @@ class TestConsoleChannel:
             ))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 3 проверки\n"
+        assert stream.getvalue() == "10:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 2 пары\n"
 
     def test_disabled_decisions_do_not_produce_summary(self) -> None:
         stream = io.StringIO()
@@ -299,11 +374,11 @@ class TestConsoleChannel:
         )
 
         channel.handle(Event.tick_started(tick_id="one"))
-        for _ in range(21):
-            channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
+        for index in range(21):
+            channel.handle(Event.decision(f"GAZP{index}", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "01:15  СКАН       Сигналов нет · 21 проверка\n"
+        assert stream.getvalue() == "01:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 21 пара\n"
 
     @pytest.mark.parametrize("event", [Event.error(operation="тик"), Event.heartbeat(tick_count=1, error_count=0)])
     def test_printed_system_event_suppresses_summary(self, event) -> None:
@@ -329,7 +404,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="two", completed=True))
 
-        assert stream.getvalue().endswith("10:15  СКАН       Сигналов нет · 1 проверка\n")
+        assert stream.getvalue().endswith("10:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 1 пара\n")
 
     def test_event_without_text_does_not_suppress_summary(self) -> None:
         stream = io.StringIO()
@@ -340,7 +415,7 @@ class TestConsoleChannel:
         channel.handle(Event.decision("GAZP", outcome="no_signal", side="HOLD"))
         channel.handle(Event.tick_finished(tick_id="one", completed=True))
 
-        assert stream.getvalue() == "10:15  СКАН       Сигналов нет · 1 проверка\n"
+        assert stream.getvalue() == "10:15  СКАНИРОВАНИЕ  Сигналов нет · проверено 1 пара\n"
 
     @pytest.mark.parametrize(
         "event",

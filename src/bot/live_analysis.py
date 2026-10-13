@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 from uuid import uuid4
 import pandas as pd
 
@@ -188,6 +189,16 @@ class LiveAnalysis:
                                                         max_close=self._warmup_close(instrument, need_tf))
 
     def bootstrap(self):
+        """Стартовый пакет состояний имеет явную границу для консольной группировки."""
+        batch_id = "bootstrap-" + uuid4().hex[:8]
+        self.bot._bus.publish(Event.tick_started(tick_id=batch_id))
+        try:
+            self._bootstrap()
+        finally:
+            # completed=False запрещает сводку HOLD; накопленные состояния всё же выводятся.
+            self.bot._bus.publish(Event.tick_finished(tick_id=batch_id, completed=False))
+
+    def _bootstrap(self):
         self.register_needs()
         waiter = getattr(self.bot, "_await_live_data", None)
         if callable(waiter):
@@ -403,29 +414,40 @@ class LiveAnalysis:
                                     key = self._key(instrument, tf)
                                     self.states[key] = replace(self.states[key], reason=barrier)
                                     break
+                            publish = None
                             try:
                                 decision, context, _, filtered = self._calculate(instrument, binding, asof)
                                 current = self.current(instrument, tf, decision.bar_time) and stamp == frame["datetime"].iloc[-1]
+                                publish = partial(self.bot._publish_decision, decision, instrument,
+                                    filter_profile=binding.filter_profile, filtered_out=filtered, timeframe=tf,
+                                    analysis_mode="live" if current else "historical")
                                 # Информационный старый результат не вызывает manage/actions_for_signal.
-                                self.bot._publish_decision(decision, instrument, filter_profile=binding.filter_profile,
-                                    filtered_out=filtered, timeframe=tf, analysis_mode="live" if current else "historical")
                                 if current and execution_complete:
                                     work_frame = asof.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
                                     management_key = instrument_key(instrument), tf, stamp
                                     if management_key not in managed:
                                         self.bot._manage(instrument, bindings, work_frame, context, tf)
                                         managed.add(management_key)
-                                    candidates.append(_EntryCandidate(binding, decision, instrument, work_frame, context, tf))
+                                    # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО
+                                    # идут в консоли одним блоком с СИГНАЛ.
+                                    candidates.append((_EntryCandidate(binding, decision, instrument, work_frame, context, tf), publish))
+                                    publish = None
+                                else:
+                                    pending, publish = publish, None
+                                    pending()
                                 self.cursors[cursor_key] = stamp
                                 self.cache.mark_analyzed(instrument, tf, binding.id, stamp)
                                 state = self.states[self._key(instrument, tf)].with_analysis(decision.bar_time, mode="live" if current else "historical")
                                 self.states[self._key(instrument, tf)] = state
                                 completed = True
                             except Exception as exc:
+                                if publish is not None:
+                                    publish()
                                 self.bot._report_error(exc, f"Анализ {self.bot._display_name(instrument)} {tf}")
                                 break
-            for candidate in sorted(candidates, key=_EntryCandidate.sort_key):
+            for candidate, publish in sorted(candidates, key=lambda item: item[0].sort_key()):
                 try:
+                    publish()
                     self.bot._admit_candidate(candidate)
                 except Exception as exc:
                     self.bot._report_error(exc, f"Допуск {self.bot._display_name(candidate.instrument)} {candidate.timeframe}")

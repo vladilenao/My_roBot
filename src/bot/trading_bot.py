@@ -287,6 +287,11 @@ class TradingBot:
                     self._report_error(exc, f"анализ {instrument.label}")
             for candidate in sorted(entry_candidates, key=_EntryCandidate.sort_key):
                 try:
+                    # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО
+                    # идут в консоли одним блоком с СИГНАЛ.
+                    self._emit(candidate.instrument, candidate.assignment.strategy, candidate.decision,
+                               filter_profile=candidate.assignment.filter_profile,
+                               filtered_out=False, timeframe=candidate.timeframe)
                     self._admit_candidate(candidate)
                 except _OperationError as err:
                     self._report_error(err.cause, err.operation)
@@ -398,16 +403,13 @@ class TradingBot:
                             assignment, decision, instrument, frame, context, tf,
                         )
                         if entry_candidates is None:
+                            self._emit(instrument, name, decision,
+                                filter_profile=assignment.filter_profile,
+                                filtered_out=False, timeframe=tf)
                             self._admit_candidate(candidate)
                         else:
                             entry_candidates.append(candidate)
                         summaries.append(f"{name}={decision.signal_type.name}")
-                        self._emit(
-                            instrument, name, decision,
-                            filter_profile=assignment.filter_profile,
-                            filtered_out=False,
-                            timeframe=tf,
-                        )
                         continue
                 filtered_out = False
                 if context is not None:
@@ -650,6 +652,7 @@ class TradingBot:
                 strategy=plan.profile.name,
                 timeframe=timeframe or plan.timeframe,
                 trade_id=plan.trade_id,
+                event_id=plan.signal_id,
                 bar_time=as_of,
                 visual=visual,
             )
@@ -679,6 +682,7 @@ class TradingBot:
                 filter_profile=filter_profile,
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
+                event_id=decision.event_id or "",
             )
         )
 

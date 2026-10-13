@@ -17,7 +17,7 @@ from src.data.request_budget import RequestBudget
 from src.data.reconciliation import SessionCalendar
 from src.data.reconciliation import MarketDataReconciler
 from src.data.market_store import MarketDataStore
-from src.trade_management.models import SignalAdmission
+from src.trade_management.models import RejectionReason, SignalAdmission
 from src.events import EventBus, EventType, ALL_EVENT_TYPES
 from src.instruments import Instrument
 from src.notifier.console import ConsoleChannel
@@ -80,8 +80,8 @@ def test_friday_overview_is_immediate_dated_and_read_only():
     assert len(reviews) == 4
     assert all(event.get("results")[0]["outcome"] == "BUY" for event in reviews)
     assert reviews[0].bar_time.date() == datetime(2026, 10, 9).date()
-    assert "09.10.2026" in render(reviews[0], 3)
-    assert "только обзор" in render(reviews[0], 3)
+    assert render(reviews[0], 3) is None
+    assert "09.10.2026" in telegram_render(reviews[0], tz_offset_hours=3)
     assert "Стартовый обзор" in telegram_render(reviews[0], tz_offset_hours=3)
     manager.actions_for_signal.assert_not_called()
     manager.manage.assert_not_called()
@@ -132,6 +132,30 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
     assert len([e for e in events if e.type is EventType.DECISION]) == before
 
 
+def test_live_decision_is_published_once_right_before_its_admission():
+    manager = Mock()
+    manager.manage.return_value = ()
+    manager.actions_for_signal.return_value = SignalAdmission(
+        rejections=(RejectionReason(code="zero-quantity", message="Размер позиции ниже минимального"),))
+    live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00",
+                                             cutover=datetime(2026, 10, 12, 6, 0), manager=manager)
+    live.bootstrap()
+    data["SBER", "1h"] = frame("2026-10-12 09:00")
+    data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
+    clock[0] += timedelta(seconds=5)
+    live.worker.run_until_idle()
+    before = len(events)
+    live.step()
+    trading = [e for e in events[before:] if e.type in {EventType.DECISION, EventType.REJECTED}
+               and e.instrument == "SBER" and e.timeframe == "1h"]
+    live_decisions = [e for e in trading if e.type is EventType.DECISION and e.get("analysis_mode") == "live"]
+    assert len(live_decisions) == 1
+    # Отказ идёт сразу за своим решением и связан с ним ключом, без повторного СИГНАЛ.
+    index = trading.index(live_decisions[0])
+    assert trading[index + 1].type is EventType.REJECTED
+    assert trading[index + 1].get("event_id") == live_decisions[0].get("event_id") != ""
+
+
 def test_state_messages_continue_without_successful_analysis_and_do_not_spam():
     live, cache, data, events, clock = setup()
     live.bootstrap()
@@ -178,8 +202,8 @@ def test_informational_events_show_only_useful_overviews_in_console():
     for event in events:
         console.handle(event)
     text = stream.getvalue()
-    assert "СТАРТОВЫЙ ОБЗОР" in text
-    assert "09.10.2026" in text
+    assert "СТАРТОВЫЙ ОБЗОР" not in text
+    assert "09.10.2026" not in text
     assert "Полученная свеча" not in text
     assert "Источник данных" not in text
     assert "ДАННЫЕ АКТУАЛЬНЫ" not in text

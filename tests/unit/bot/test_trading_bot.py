@@ -410,6 +410,10 @@ class TestTradingBot:
         assert len(rejections) == 1
         assert rejections[0].get("reason") == "Размер позиции ниже минимального"
         assert len(_decisions(channel)) == 1
+        # Решение идёт непосредственно перед своим отказом и связано с ним ключом.
+        kinds = [e.type for e in channel.events if e.type in {EventType.DECISION, EventType.REJECTED}]
+        assert kinds == [EventType.DECISION, EventType.REJECTED]
+        assert rejections[0].get("event_id") == _decisions(channel)[0].get("event_id") != ""
 
     def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
         signal_filter = MagicMock()
