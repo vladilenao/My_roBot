@@ -375,6 +375,9 @@ class MarketDataCache:
                 "history": "pending", "warmup_days": 0, "history_error": "", "state": "BOOTSTRAPPING",
             })
             member["keys"].add(key)
+            # Пара сохранённого состава, затем выбранная пользователем: дальше
+            # обслуживается выбранным инструментом (семейство, полное имя).
+            member["instrument"] = instrument
             lower = self._pending_execution_lower.pop(instrument_key(instrument), None)
             if lower is not None and timeframe == "1m":
                 previous = member["execution_lower"]
@@ -395,6 +398,26 @@ class MarketDataCache:
             self._refresh_member_state(uid, timeframe, member)
             self._live_generation += 1
             self._data_changed.notify_all()
+
+    def unregister_live_pair(self, uid, timeframe):
+        """Снимает пару, не выбранную в этом запуске и без обязательств.
+
+        Данные в рыночной базе остаются; снимается только обслуживание:
+        свежий опрос, подписка и полосы её больше не видят.
+        """
+        with self._lock:
+            member = self._live_members.pop((uid, timeframe), None)
+            if member is None:
+                return False
+            for key in member["keys"]:
+                self._uids.pop(key, None)
+                self._instruments.pop(key, None)
+                self._frames.pop(key, None)
+                self._last_loaded.pop(key, None)
+            self._live_evidence.pop((uid, timeframe), None)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+            return True
 
     def set_live_execution_lower(self, uid, timeframe, open_time):
         """Main-thread boundary сохранённых обязательств, не high-water receipt."""

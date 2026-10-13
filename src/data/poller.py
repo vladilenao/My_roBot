@@ -55,6 +55,12 @@ class LiveMarketDataPoller:
             self._threads.append(thread)
             thread.start()
 
+    def attach_stream(self, stream) -> None:
+        """Поток подключается после выбора инструментов, до старта живой полосы."""
+        if self._live_started:
+            raise RuntimeError("Поток подключается до старта живой полосы")
+        self._stream = stream
+
     def start(self) -> None:
         self.start_background()
         if self._live_started:

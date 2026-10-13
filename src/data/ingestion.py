@@ -140,6 +140,8 @@ class IngestionWorker:
         # доказательств.
         self.lanes_enabled = bool(getattr(self.settings, "independent_lanes", False))
         self.evidence = None
+        # Состав пар сохраняется для раннего старта следующего запуска.
+        self.roster_dirty = False
 
     def set_execution_obligations(self, boundaries):
         """Main-thread snapshot of unfinished financial work, never a DB read here."""
@@ -147,6 +149,24 @@ class IngestionWorker:
                     for key, (stamp, inclusive) in boundaries.items() if stamp is not None}
         with self._execution_lock:
             self._execution_obligations = snapshot
+
+    def persist_roster(self):
+        """Текущие пары владельца — сохранённый состав для раннего старта."""
+        self.roster_dirty = False
+        entries = []
+        for pair in self._cache.live_pairs():
+            instrument = pair["instrument"]
+            entries.append({
+                "instrument_uid": pair["uid"], "interval": pair["timeframe"], "ticker": instrument.ticker,
+                "instrument_type": instrument.instrument_type, "short_name": getattr(instrument, "short_name", None),
+                "origin": "obligation" if self.execution_boundary(pair["key"][0]) is not None else "selected",
+                "requirements": {"min_bars": int(pair["min_bars"] or 1)},
+            })
+        try:
+            self._store.save_roster(source=self._source, entries=entries)
+        except Exception as exc:
+            self.roster_dirty = True
+            log.warning("Состав пар не сохранён: %s", exc)
 
     def execution_boundary(self, instrument_key):
         """Граница исполнения незавершённой сделки инструмента: (момент, включительно) или None."""
@@ -208,6 +228,8 @@ class IngestionWorker:
             if self._service_need(now):
                 return True
             if self.lanes_enabled:
+                if self.roster_dirty:
+                    self.persist_roster()
                 # Живая полоса: восстановление, сверку и календарь ведут свои полосы.
                 return (self._service_handoff(now) or self._service_fresh(now)
                         or bool(self._service_conflicts(now)))
@@ -265,6 +287,7 @@ class IngestionWorker:
                 if uid is None:
                     self._need_retry_at[key] = now + self._backoff(self._need_attempts[key])
                     continue
+            known = (uid, timeframe) in self._cache._live_members
             try:
                 self._cache.register_live_pair(instrument, uid, timeframe, min_bars)
             except ValueError as exc:
@@ -276,6 +299,8 @@ class IngestionWorker:
                 log.warning("Live-пара %s удержана: %s", key, exc)
                 continue
             self._need_attempts.setdefault(key, 0)
+            if not known:
+                self.roster_dirty = True
             pair = self._pair(uid, timeframe)
             if pair["closed"] >= min_bars and pair["history"] == "done":
                 self._cache.finish_live_need(key, min_bars)
