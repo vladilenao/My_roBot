@@ -1132,7 +1132,7 @@ def _instrument_names(instruments) -> dict[str, str]:
     return names
 
 
-def _load_contracts_metadata(instruments, client_provider=None):
+def _load_contracts_metadata(instruments, client_provider=None, request_budget=None):
     """Кэш метаданных контрактов из источника данных прогона.
 
     Акции и фьючерсы грузятся по-разному: у фьючерса есть шаг, стоимость шага,
@@ -1166,7 +1166,9 @@ def _load_contracts_metadata(instruments, client_provider=None):
 
     contracts: dict[str, object] = {}
     loaders = {"future": load_futures_contracts, "share": load_share_contracts}
-    with context as client:
+    with context as raw_client:
+        # Через общий арбитр: каталоги — сервис инструментов, их квота мала.
+        client = raw_client if request_budget is None else request_budget.wrap_client(raw_client, lane="interactive")
         for instrument_type, tickers in by_type.items():
             loader = loaders.get(instrument_type)
             if loader is None:
