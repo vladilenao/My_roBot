@@ -336,3 +336,114 @@ def test_schedule_is_requested_from_now_and_past_dates_are_not_requested(tmp_pat
         pass
     assert requests and all(pd.Timestamp(item["from_"]).tz_convert(None) >= now for item in requests)
     assert rec.session_calendar("uid", now).is_open(now)
+
+
+def _broker_day(day, intervals):
+    """Форма TradingDay из ответа брокера (проба 8.5, 13.10.2026)."""
+    utc = lambda value: pd.Timestamp(f"{day} {value}", tz="UTC").to_pydatetime()
+    return SimpleNamespace(date=pd.Timestamp(day, tz="UTC").to_pydatetime(), is_trading_day=True,
+        intervals=[SimpleNamespace(type=kind, interval=SimpleNamespace(start_ts=utc(a), end_ts=utc(b)))
+                   for kind, a, b in intervals])
+
+
+def test_broker_schedule_auctions_and_clearing_are_breaks_and_exchange_case_is_ignored():
+    shares = _broker_day("2026-10-13", [
+        ("opening_auction_morning", "03:50:00", "03:59:59"), ("opening_auction", "03:50:00", "03:59:59"),
+        ("regular_trading_session_morning", "04:00:00", "05:59:59"), ("regular_trading_session", "04:00:00", "05:59:59"),
+        ("regular_trading_session_main", "06:00:00", "15:54:59"), ("regular_trading_session", "06:00:00", "15:54:59"),
+        ("closing_auction_main", "15:55:00", "15:59:30"), ("closing_auction", "15:55:00", "15:59:30"),
+        ("regular_trading_session_evening", "16:00:01", "20:49:59"), ("regular_trading_session", "16:00:01", "20:49:59")])
+    response = SimpleNamespace(exchanges=[SimpleNamespace(exchange="MOEX_MRNG_EVNG_E_WKND_DLR", days=[shares])])
+    cal = _calendar_from_response(response, "moex_mrng_evng_e_wknd_dlr")
+    assert cal is not None and len(cal.intervals) == 3  # дубли схлопнуты
+    at = lambda value: pd.Timestamp(f"2026-10-13 {value}")
+    assert not cal.is_open(at("03:55"))  # аукцион открытия
+    assert cal.is_open(at("05:59")) and cal.is_open(at("06:00")) and cal.is_open(at("15:54"))
+    assert not cal.is_open(at("15:57"))  # аукцион закрытия
+    assert cal.is_open(at("16:00")) and cal.is_open(at("20:49")) and not cal.is_open(at("20:50"))
+    futures = _broker_day("2026-10-13", [
+        ("regular_trading_session_evening", "16:00:00", "20:50:00"), ("clearing", "20:50:01", "21:30:00"),
+        ("weekend_session_new_kind", "21:30:00", "22:00:00")])
+    cal = _calendar_from_response(SimpleNamespace(exchanges=[SimpleNamespace(exchange="FORTS_FUTURES_WEEKEND", days=[futures])]),
+                                  "forts_futures_weekend")
+    assert not cal.is_open(at("21:00"))  # вечерний клиринг — перерыв
+    assert cal.is_open(at("21:45"))  # неизвестный тип — консервативно торги
+
+
+def _no_trade_setup(tmp_path, now, stored, exchange, trades):
+    """Неликвидная пара: свеча есть только в минуте со сделкой (проба 8.5, NGZ6)."""
+    # Робот запущен до пустых минут: граница запуска (вариант «б») их не скрывает.
+    target, clock = pd.Timestamp(now), [pd.Timestamp(stored[-1]) + pd.Timedelta(seconds=70)]
+    timeline = MultiTimeframeScheduler(["1m"], clock=lambda: clock[0].to_pydatetime())
+    budget = RequestBudget(lambda: clock[0], 0)
+    store = MarketDataStore(tmp_path / "market.sqlite3")
+    rec = MarketDataReconciler(store, source="tbank_exchange", request_budget=budget)
+    rec.service_calendar = lambda _: False
+    rec._ranges["uid"] = [SessionCalendar("MOEX", ((pd.Timestamp("2026-10-12 07:00"), pd.Timestamp("2026-10-12 20:00")),),
+        pd.Timestamp("2026-10-12"), pd.Timestamp("2026-10-13"), clock[0])]
+    def loader(**kwargs):
+        frame = candles(*exchange)
+        frame = frame[frame["datetime"] >= kwargs["start_date"]]
+        if kwargs.get("end_date") is not None:
+            frame = frame[frame["datetime"] < kwargs["end_date"]]
+        return frame, "uid"
+    requests = []
+    def get_last_trades(*, instrument_id, from_, to):
+        requests.append((pd.Timestamp(from_).tz_convert(None), pd.Timestamp(to).tz_convert(None)))
+        stamps = [pd.Timestamp(item) for item in trades]
+        return SimpleNamespace(trades=[SimpleNamespace(time=stamp.tz_localize("UTC").to_pydatetime())
+                                       for stamp in stamps if requests[-1][0] <= stamp < requests[-1][1]])
+    client = SimpleNamespace(market_data=SimpleNamespace(get_last_trades=get_last_trades))
+    class Provider:
+        @contextmanager
+        def client_context(self, token):
+            yield client
+    cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
+                            market_reconciler=rec, client_provider=Provider())
+    item = Instrument("NGZ6", "NGZ6", "future", "NGZ6", "uid")
+    _registered(cache, store, item, "1m", stored)
+    worker = IngestionWorker(cache)
+    worker.run_until_idle()
+    clock[0] = target
+    return cache, store, worker, clock, requests
+
+
+def _states(store, start, end):
+    return {stamp: store.coverage_state(source="tbank_exchange", instrument_uid="uid", interval="1m", open_time=stamp)
+            for stamp in pd.date_range(start, end, freq="1min")}
+
+
+def test_minutes_without_trades_are_confirmed_and_traded_minute_without_candle_stays_gap(tmp_path):
+    cache, store, worker, clock, requests = _no_trade_setup(tmp_path, "2026-10-12 12:10:05",
+        stored=["2026-10-12 12:00"], exchange=["2026-10-12 12:00", "2026-10-12 12:06"],
+        trades=["2026-10-12 12:04:20", "2026-10-12 12:06:01"])  # в 12:04 сделка есть, свечи нет
+    for _ in range(5):
+        worker.step()
+    states = _states(store, "2026-10-12 12:01", "2026-10-12 12:09")
+    assert requests and all(end <= pd.Timestamp("2026-10-12 12:10") for _, end in requests)
+    assert [stamp.minute for stamp, state in states.items() if state == "confirmed_no_trade"] == [1, 2, 3, 5, 7, 8]
+    assert states[pd.Timestamp("2026-10-12 12:09")] is None  # срок публикации ещё не истёк
+    assert states[pd.Timestamp("2026-10-12 12:04")] not in {"confirmed_no_trade", "received"}
+    assert states[pd.Timestamp("2026-10-12 12:06")] == "received"
+    resolved = store.cursors(source="tbank_exchange", instrument_uid="uid", interval="1m")["resolved_through"]
+    assert pd.Timestamp(resolved).tz_convert(None) == pd.Timestamp("2026-10-12 12:03")  # префикс до настоящей дыры
+
+
+def test_no_trade_evidence_covers_only_last_hour_and_rejects_truncated_answer(tmp_path):
+    cache, store, worker, clock, requests = _no_trade_setup(tmp_path, "2026-10-12 12:10:05",
+        stored=["2026-10-12 10:00"], exchange=["2026-10-12 10:00"], trades=[])
+    for _ in range(5):
+        worker.step()
+    states = _states(store, "2026-10-12 10:01", "2026-10-12 12:09")
+    assert all(start >= pd.Timestamp("2026-10-12 11:15") for start, _ in requests)
+    assert not any(state == "confirmed_no_trade" for stamp, state in states.items() if stamp < pd.Timestamp("2026-10-12 11:15"))
+    assert {state for stamp, state in states.items()
+            if pd.Timestamp("2026-10-12 11:16") <= stamp <= pd.Timestamp("2026-10-12 12:08")} == {"confirmed_no_trade"}
+
+    busy = [f"2026-10-12 12:05:{second:02d}.{part:03d}" for second in range(50) for part in range(20)]
+    _, store, worker, _, requests = _no_trade_setup(tmp_path / "busy", "2026-10-12 12:10:05",
+        stored=["2026-10-12 12:00"], exchange=["2026-10-12 12:00"], trades=busy)
+    for _ in range(5):
+        worker.step()
+    assert requests
+    assert "confirmed_no_trade" not in _states(store, "2026-10-12 12:01", "2026-10-12 12:09").values()

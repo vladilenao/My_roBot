@@ -292,12 +292,31 @@ class MarketDataReconciler:
             self._recheck_after[key] = stamps[-1] + pd.Timedelta(microseconds=1) if len(stamps) == 1000 else cal.coverage_end
 
 
+# Непрерывные торги, в которых формируются свечи. Аукционы и клиринг — перерыв;
+# неизвестный тип считается торговым: ложная задержка лучше скрытого сбоя.
+_BREAK_INTERVAL_MARKERS = ("auction", "clearing")
+
+
+def _trading_interval(kind: str) -> bool:
+    kind = (kind or "").lower()
+    return not any(marker in kind for marker in _BREAK_INTERVAL_MARKERS)
+
+
+def _minute_window(start, end):
+    """Брокер даёт концы вида 05:59:59 и начала вида 16:00:01: выравниваем по минутам."""
+    lower = to_naive(start).floor("min")
+    upper = (to_naive(end) + pd.Timedelta(microseconds=1)).ceil("min")
+    return lower, upper
+
+
 def _calendar_from_response(response: object, exchange: str, observed_at=None) -> SessionCalendar | None:
     schedules = getattr(response, "exchanges", ())
-    schedule = next((item for item in schedules if getattr(item, "exchange", "") == exchange), None)
+    # Код площадки в ответе приходит в верхнем регистре, в карточке — в нижнем.
+    schedule = next((item for item in schedules
+                     if str(getattr(item, "exchange", "")).lower() == str(exchange).lower()), None)
     if schedule is None:
         return None
-    result: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    result: set[tuple[pd.Timestamp, pd.Timestamp]] = set()
     dates = []
     for day in getattr(schedule, "days", ()):
         day_date = getattr(day, "date", None)
@@ -305,20 +324,27 @@ def _calendar_from_response(response: object, exchange: str, observed_at=None) -
             dates.append(to_naive(day_date).normalize())
         if not getattr(day, "is_trading_day", False):
             continue
-        for item in getattr(day, "intervals", ()):
+        intervals = getattr(day, "intervals", ())
+        for item in intervals:
             window = getattr(item, "interval", None)
             start, end = getattr(window, "start_ts", None), getattr(window, "end_ts", None)
-            if start is not None and end is not None:
-                result.append((to_naive(start), to_naive(end)))
-        if not getattr(day, "intervals", ()):
+            if start is not None and end is not None and _trading_interval(getattr(item, "type", "")):
+                result.add(_minute_window(start, end))
+        if not intervals:
             start, end = getattr(day, "start_time", None), getattr(day, "end_time", None)
             if start is not None and end is not None:
-                result.append((to_naive(start), to_naive(end)))
+                lower, upper = _minute_window(start, end)
+                clearing = (getattr(day, "clearing_start_time", None), getattr(day, "clearing_end_time", None))
+                if all(value is not None and getattr(value, "year", 1970) > 1970 for value in clearing):
+                    pause_start, pause_end = _minute_window(*clearing)
+                    result.update(window for window in ((lower, pause_start), (pause_end, upper)) if window[0] < window[1])
+                else:
+                    result.add((lower, upper))
     if not dates and result:
         dates = sorted({stamp.normalize() for a, b in result for stamp in (a, b - pd.Timedelta(microseconds=1))})
     if not dates:
         return None
-    return SessionCalendar(exchange, tuple(result), min(dates), max(dates) + pd.Timedelta(days=1),
+    return SessionCalendar(exchange, tuple(sorted(result)), min(dates), max(dates) + pd.Timedelta(days=1),
                            to_naive(observed_at) if observed_at is not None else None,
                            covered_dates=tuple(dates))
 
