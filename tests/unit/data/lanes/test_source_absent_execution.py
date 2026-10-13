@@ -150,3 +150,14 @@ def test_late_candle_without_skipped_minute_is_ignored(tmp_path):
         manager = _opened(storage)
         assert manager.record_late_candle("NGV6", ABSENT, (100.0, 105.0, 99.0, 100.0), observed_at=NOW) == 0
         assert _events(storage, "MARKET_DATA_LATE_CANDLE") == []
+
+
+def test_trade_journaled_under_ticker_alias_is_marked(tmp_path):
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = _opened(storage)
+        assert manager.record_source_absent(["uid-ng", "NGV6"], [(ABSENT, EVIDENCE)], observed_at=NOW) == 1
+        assert manager.record_late_candle(["uid-ng", "NGV6"], ABSENT, (100.0, 105.0, 99.0, 100.0),
+                                          observed_at=NOW) == 1
+        (_, payload_json), = _events(storage, "MARKET_DATA_LATE_CANDLE")
+    payload = json.loads(payload_json)
+    assert payload["touched_target"] is True and payload["touched_stop"] is False

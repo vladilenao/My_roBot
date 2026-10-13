@@ -217,3 +217,26 @@ def test_completeness_window_covers_chart_and_obligation(tmp_path):
     assert env.completeness.window_lower(pair_1m, env.clock[0]) == pd.Timestamp("2026-10-12 15:01")
     roster_window = env.store.roster(source=SOURCE)
     assert roster_window == []  # окно пишется в состав только для сохранённых пар
+
+
+def test_saved_recovery_book_is_adopted_once_and_removed(tmp_path):
+    from src.data.ingestion import RecoveryRange
+
+    day = minutes("2026-10-12 12:00", "2026-10-12 12:30")
+    market = Market({"1m": day})
+    env = setup(tmp_path, started="2026-10-12 12:00:30", now="2026-10-12 14:00:05",
+                stored={"1m": [str(stamp) for stamp in day if not "12:05" <= stamp.strftime("%H:%M") <= "12:09"]},
+                market=market)
+    far = pd.Timestamp("2026-10-20")
+    book = RecoveryRange(pd.Timestamp("2026-10-12 12:05"), pd.Timestamp("2026-10-12 12:09"), far, far,
+                         pd.Timestamp("2026-10-12 12:05"), attempts=5, state="parked")
+    env.store.save_live_state(book.as_json(), kind="recovery", source=SOURCE, instrument_uid="uid", interval="1m")
+    env.store.save_live_state(book.as_json(), kind="recovery", source="other", instrument_uid="uid", interval="1m")
+
+    run(env.completeness)
+
+    # Парковка книги не задерживает догрузку: дыра — обычная дыра окна.
+    assert all(state(env, stamp) == "received" for stamp in minutes("2026-10-12 12:05", "2026-10-12 12:09"))
+    assert env.store.live_state(kind="recovery", source=SOURCE, instrument_uid="uid", interval="1m") == {}
+    assert env.store.live_state(kind="recovery", source="other", instrument_uid="uid", interval="1m") != {}
+    assert env.completeness.adopt_recovery_books() == []

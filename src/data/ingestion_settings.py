@@ -116,17 +116,24 @@ class MarketDataSettings:
         return {"quotes": dict(self.quote_lane_shares), "instruments": dict(self.instrument_lane_shares)}
 
     def deprecated_overrides(self) -> tuple[str, ...]:
-        """Изменённые параметры прежнего раунда, которые полосы не используют."""
+        """Заданные в конфиге или изменённые параметры прежнего раунда, которые полосы не используют."""
         if not self.independent_lanes:
             return ()
         defaults = MarketDataSettings.__dataclass_fields__
-        return tuple(name for name in DEPRECATED_WITH_LANES if getattr(self, name) != defaults[name].default)
+        given = getattr(self, "_given", frozenset())
+        return tuple(name for name in DEPRECATED_WITH_LANES
+                     if name in given or getattr(self, name) != defaults[name].default)
 
     @classmethod
     def from_flat(cls, flat: Mapping[str, Any]) -> "MarketDataSettings":
         """Эффективные значения из плоских ключей ``market_data_<имя>``."""
         values = {name: flat[f"market_data_{name}"] for name in setting_names() if f"market_data_{name}" in flat}
-        return cls(**values)
+        settings = cls(**values)
+        # Ключи, заданные в файлах конфигурации (а не профилем по умолчанию), —
+        # для предупреждения об устаревших параметрах.
+        given = flat.get("market_data_explicit_keys") or ()
+        object.__setattr__(settings, "_given", frozenset(key.removeprefix("market_data_") for key in given))
+        return settings
 
     def as_dict(self) -> dict[str, Any]:
         """Эффективный профиль для диагностики; секретов здесь нет."""

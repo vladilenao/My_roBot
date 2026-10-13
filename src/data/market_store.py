@@ -312,6 +312,27 @@ class MarketDataStore:
         with self._lock, self._connect() as conn:
             self._write_live(conn, self._live_key(kind, source, instrument_uid, interval, open_time), value)
 
+    def take_live_states(self, *, kind, source) -> list[tuple[str, str, dict]]:
+        """Забирает и удаляет одной транзакцией все состояния вида: (uid, ТФ, значение)."""
+        prefix = "live:" + kind + ":"
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute("SELECT key, value FROM metadata WHERE substr(key,1,?)=?",
+                                    (len(prefix), prefix)).fetchall()
+                taken = []
+                for key, value in rows:
+                    identity = json.loads(key[len(prefix):])
+                    if identity[0] != source:
+                        continue
+                    taken.append((identity[1], identity[2], json.loads(value)))
+                    conn.execute("DELETE FROM metadata WHERE key=?", (key,))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return taken
+
     def accept_observation(self, observation, *, source=SOURCE_TBANK, reconcile_sequence=None):
         """Единое атомарное принятие нормализованного stream/RPC наблюдения.
 

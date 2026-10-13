@@ -1040,6 +1040,12 @@ def _build_runtime(
 
     runtime_ref: list = []
 
+    def journal_ids(key):
+        """Ключ инструмента и его псевдонимы, под которыми сделки лежат в журнале."""
+        aliases = (getattr(runtime_ref[0], "execution_aliases", None) or {}) if runtime_ref else {}
+        canonical = aliases.get(key, key)
+        return [canonical, *(alias for alias, target in aliases.items() if target == canonical and alias != canonical)]
+
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
         intent_since[0] = as_aware(trade_manager._clock.now())
@@ -1053,8 +1059,7 @@ def _build_runtime(
             # журнале сделки, исполнение задним числом не переигрывается.
             drain_late = getattr(data_cache, "drain_late_source_absent", None)
             for uid, minute, ohlc in (drain_late() if callable(drain_late) else ()):
-                aliases = getattr(runtime_ref[0], "execution_aliases", {}) if runtime_ref else {}
-                trade_manager.record_late_candle(aliases.get(uid, uid), minute, ohlc,
+                trade_manager.record_late_candle(journal_ids(uid), minute, ohlc,
                                                  observed_at=trade_manager._clock.now())
             batches = {}
             initial_boundaries = None
@@ -1096,7 +1101,8 @@ def _build_runtime(
                     absent = skipped(instrument, last, fresh) if callable(skipped) and not fresh.empty else []
                     if absent:
                         # Пометка пропуска — до продвижения границы исполнения.
-                        trade_manager.record_source_absent(ticker, absent, observed_at=trade_manager._clock.now())
+                        trade_manager.record_source_absent(journal_ids(ticker), absent,
+                                                           observed_at=trade_manager._clock.now())
                     for row in fresh.itertuples(index=False):
                         stamp = to_aware_utc(row.datetime).to_pydatetime()
                         values = (float(row.open), float(row.low), float(row.high), float(row.close))

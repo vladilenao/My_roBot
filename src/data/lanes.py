@@ -21,7 +21,7 @@ from datetime import timedelta
 import pandas as pd
 
 from src.data.coverage_states import RESOLVED_INTERVAL_STATES
-from src.data.ingestion import CHUNK_SPAN, _naive
+from src.data.ingestion import CHUNK_SPAN, RecoveryRange, _naive
 from src.data.request_budget import RequestDeferred
 from src.logging_setup import get_logger
 
@@ -154,6 +154,7 @@ class CompletenessLane:
         self._cursors: dict[int, int] = {}
         self.windows: dict[tuple[str, str], pd.Timestamp] = {}
         self.last_holes: dict[tuple[str, str], int] = {}
+        self._books_adopted = False
 
     # ── состав и окно ──
     def set_active(self, pairs):
@@ -280,9 +281,30 @@ class CompletenessLane:
             end = opened
         return start, end
 
+    def adopt_recovery_books(self):
+        """Однократный перенос книг ``RecoveryRange`` прежней очереди (задача 5.5).
+
+        Раунды и парковка книг полосам не нужны: незакрытые минуты книги
+        внутри окна полноты — обычные дыры окна, старше окна — не нужны
+        потребителям. Книги удаляются одной транзакцией, повторно не читаются.
+        """
+        self._books_adopted = True
+        books = [(uid, timeframe, RecoveryRange.from_json(value))
+                 for uid, timeframe, value in self._store.take_live_states(kind="recovery", source=self._source)]
+        books = [(uid, timeframe, book) for uid, timeframe, book in books if book is not None]
+        for uid, timeframe, book in books:
+            self._cache.set_live_gap(uid, timeframe, None)
+            log.info("Книга восстановления %s %s %s–%s (%s) передана полосе полноты",
+                     uid, timeframe, _text(book.lower), _text(book.upper), book.state)
+        if books:
+            self.wake()
+        return books
+
     # ── шаг ──
     def step(self, now=None):
         now = _naive(now or self._timeline.now())
+        if not self._books_adopted:
+            self.adopt_recovery_books()
         pairs = [pair for pair in self._cache.live_pairs()
                  if self._active is None or (pair["uid"], pair["timeframe"]) in self._active]
         by_level: dict[int, list] = {}

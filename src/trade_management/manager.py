@@ -178,6 +178,10 @@ def pd_timestamp_iso(value) -> str:
     return stamp.isoformat()
 
 
+def _instrument_ids(value) -> tuple[str, ...]:
+    return (value,) if isinstance(value, str) else tuple(dict.fromkeys(value))
+
+
 class TradeManager:
     """Coordinates workflow intent without duplicating factual broker state.
 
@@ -1839,13 +1843,15 @@ class TradeManager:
 
     _OPEN_PHASES_SQL = "phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')"
 
-    def record_source_absent(self, instrument_id, minutes, *, observed_at):
+    def record_source_absent(self, instrument_ids, minutes, *, observed_at):
         """Исполнение проходит минуты «у источника нет»: явная пометка в журнале сделки.
 
         Пишется до продвижения границы исполнения, идемпотентно по минуте и
         сделке. Вместе с минутой сохраняются действовавшие стоп и цели — по ним
         позже оценивается поздно пришедшая свеча (решение владельца 13.10.2026).
+        ``instrument_ids`` — ключ инструмента или все его псевдонимы журнала.
         """
+        ids = _instrument_ids(instrument_ids)
         rows = [(pd_timestamp_iso(minute), evidence) for minute, evidence in minutes]
         if not rows:
             return 0
@@ -1853,7 +1859,7 @@ class TradeManager:
         with self._storage.transaction() as connection:
             trades = connection.execute(
                 "SELECT t.trade_id,t.side,p.confirmed_stop FROM trades t LEFT JOIN protection p ON p.trade_id=t.trade_id "
-                f"WHERE t.instrument_id=? AND t.{self._OPEN_PHASES_SQL}", (instrument_id,)).fetchall()
+                f"WHERE t.instrument_id IN ({','.join('?' * len(ids))}) AND t.{self._OPEN_PHASES_SQL}", ids).fetchall()
             for trade_id, side, stop in trades:
                 targets = [row[0] for row in connection.execute(
                     "SELECT price FROM targets WHERE trade_id=? ORDER BY target_index", (trade_id,))]
@@ -1865,23 +1871,24 @@ class TradeManager:
                          json.dumps(payload, sort_keys=True), pd_timestamp_iso(observed_at)))
                     written += cursor.rowcount
         if written:
-            log.warning("Исполнение %s прошло минут без свечи у источника: %d", instrument_id, len(rows))
+            log.warning("Исполнение %s прошло минут без свечи у источника: %d", ids[0], len(rows))
         return written
 
-    def record_late_candle(self, instrument_id, minute, ohlc, *, observed_at):
+    def record_late_candle(self, instrument_ids, minute, ohlc, *, observed_at):
         """Свеча минуты, пройденной исполнением как «у источника нет»: факты не меняются.
 
         В журнал пишется позднее поступление и признак возможного касания
         стопа или цели, действовавших в момент пропуска.
         """
+        ids = _instrument_ids(instrument_ids)
         stamp = pd_timestamp_iso(minute)
         open_price, high, low, close = (Decimal(str(value)) for value in ohlc)
         written = 0
         with self._storage.transaction() as connection:
             skipped = connection.execute(
                 "SELECT e.trade_id,e.payload_json FROM events e JOIN trades t ON t.trade_id=e.trade_id "
-                "WHERE e.event_type='MARKET_DATA_SOURCE_ABSENT' AND t.instrument_id=? AND e.event_id LIKE ?",
-                (instrument_id, f"source-absent:%:{stamp}")).fetchall()
+                f"WHERE e.event_type='MARKET_DATA_SOURCE_ABSENT' AND t.instrument_id IN ({','.join('?' * len(ids))}) "
+                "AND e.event_id LIKE ?", (*ids, f"source-absent:%:{stamp}")).fetchall()
             for trade_id, payload_json in skipped:
                 payload = json.loads(payload_json)
                 stop = None if payload.get("stop") is None else Decimal(payload["stop"])
@@ -1898,7 +1905,7 @@ class TradeManager:
                 written += cursor.rowcount
                 if cursor.rowcount and (touched_stop or touched_target):
                     log.warning("Поздняя свеча %s %s могла задеть %s сделки %s; исполнение не переигрывается",
-                                instrument_id, stamp, "стоп" if touched_stop else "цель", trade_id)
+                                ids[0], stamp, "стоп" if touched_stop else "цель", trade_id)
         return written
 
     def observe_bars(self, prices, bar_times, *, timeframe="1m", gap_before=False):
