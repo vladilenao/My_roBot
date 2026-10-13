@@ -21,9 +21,11 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.data.ingestion_settings import SettingError, setting_names, validate_combination, validate_setting
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
+from src.instruments.futures import FAMILIES
 
 CONFIG_FILENAME = "robot.toml"
 BUNDLED_FILENAME = "default.toml"
@@ -41,10 +43,18 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "timeout_secs": "tick_timeout_secs",
         "catch_up_bars": "tick_catch_up_bars",
     },
+    "market_data": {
+        "database_file": "market_data_database_file",
+        "export_enabled": "market_data_export_enabled",
+        "export_host": "market_data_export_host",
+        "export_port": "market_data_export_port",
+        **{name: f"market_data_{name}" for name in setting_names()},
+    },
     "instruments": {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
     },
+    "historical": {"rollover": "historical_rollover"},
     "notifier": {
         "channels": "notifier_channels",
         "channel": "notifier",
@@ -89,6 +99,10 @@ _EXPECTED_TYPES: dict[str, type] = {
     "tick_poll_secs": int,
     "tick_timeout_secs": int,
     "tick_catch_up_bars": int,
+    "market_data_database_file": str,
+    "market_data_export_enabled": bool,
+    "market_data_export_host": str,
+    "market_data_export_port": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -118,7 +132,10 @@ _EXPECTED_TYPES: dict[str, type] = {
     "directions": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
+    "historical_rollover": dict,
 }
+
+_INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 _NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
@@ -149,6 +166,7 @@ _RISK_DEFAULTS = {
     "min_risk_cost_ratio": 2.0,
     "min_net_payoff": 1.5,
     "max_slippage_r": 0.25,
+    "max_entry_deviation_r": 0.25,
 }
 _RISK_LIMIT_KEYS = set(_RISK_DEFAULTS) | {"max_qty", "slippage_tolerance"}
 _ALLOWED_DIRECTIONS = frozenset({"long", "short"})
@@ -366,7 +384,7 @@ def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
     if unknown:
         raise ConfigError(f"{path}: [trading.risk_limits] незнакомые ключи {sorted(unknown)}")
     value = {**_RISK_DEFAULTS, **value}
-    for key in ("portfolio_pct", "commission", "slippage", "slippage_tolerance", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r"):
+    for key in ("portfolio_pct", "commission", "slippage", "slippage_tolerance", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r", "max_entry_deviation_r"):
         if key in value:
             _finite_number(value[key], f"[trading.risk_limits] {key}", path, non_negative=True)
     if value["portfolio_pct"] > 100:
@@ -488,6 +506,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
     """Проверка типов и допустимых значений ключей конфигурации."""
     cleaned: dict[str, Any] = {}
     for key, value in flat.items():
+        if key in _INGESTION_KEYS:
+            try:
+                cleaned[key] = validate_setting(key.removeprefix("market_data_"), value)
+            except SettingError as exc:
+                raise ConfigError(f"{path}: [market_data] {exc}") from None
+            continue
         expected = _EXPECTED_TYPES[key]
         if not isinstance(value, expected):
             raise ConfigError(
@@ -520,6 +544,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             continue
         if key == "directions":
             cleaned[key] = _validate_directions(value, path)
+            continue
+        if key == "historical_rollover":
+            cleaned[key] = _validate_rollover(value, path)
             continue
         if key == "initial_deposit":
             if isinstance(value, bool):
@@ -561,6 +588,32 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
     return cleaned
+
+
+def _validate_rollover(value: dict, path: Path) -> dict:
+    where = "historical.rollover"
+    if set(value) - {"policy", "families"}:
+        raise ConfigError(f"{path}: [{where}] незнакомые ключи {sorted(set(value)-{'policy', 'families'})}")
+    if value.get("policy", "calendar") != "calendar":
+        raise ConfigError(f"{path}: [{where}] policy поддерживает только calendar")
+    families = value.get("families", {})
+    if not isinstance(families, dict):
+        raise ConfigError(f"{path}: [{where}] families должна быть таблицей")
+    normalized = {}
+    for key, settings in families.items():
+        canonical = key.upper()
+        prefix = f"{path}: [{where}.families.{key}]"
+        if canonical not in FAMILIES or canonical in normalized:
+            raise ConfigError(f"{prefix} неизвестное или повторяющееся семейство")
+        if not isinstance(settings, dict) or set(settings)-{"lead_days"}:
+            raise ConfigError(f"{prefix} допустим только ключ lead_days")
+        days = settings.get("lead_days")
+        if days is not None and (type(days) is not int or days < 0):
+            raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
+        if "lead_days" in settings and days is None:
+            raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
+        normalized[canonical] = dict(settings)
+    return {"policy": "calendar", "families": normalized}
 
 
 _CLEARING_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -732,7 +785,15 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
 
 def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
     """Validate constraints that span TOML sections and configuration files."""
+    try:
+        validate_combination({key.removeprefix("market_data_"): value for key, value in config.items() if key in _INGESTION_KEYS})
+    except SettingError as exc:
+        raise ConfigError(f"{path}: [market_data] {exc}") from None
     assignment_ids: set[str] = set()
+    floor = config.get("contract_expiry_block_days", 2)
+    for family, settings in config.get("historical_rollover", {}).get("families", {}).items():
+        if settings.get("lead_days", floor) < floor:
+            raise ConfigError(f"{path}: [historical.rollover.families.{family}] lead_days не может быть меньше contract_expiry_block_days ({floor})")
     assignments: list[dict[str, Any]] = []
     for source in ("share_strategies", "future_strategies"):
         for table in config.get(source, {}).values():

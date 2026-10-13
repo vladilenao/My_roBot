@@ -22,6 +22,7 @@ from src.api.client import ClientProvider
 from src.config import HISTORICAL_API_URL
 from src.data.timeutil import to_aware_utc, to_naive
 from src.logging_setup import get_logger
+from src.instruments.futures import FuturesCard
 
 log = get_logger(__name__)
 
@@ -39,6 +40,7 @@ _INTERVALS = {
 
 # Потолок свечей в одной странице: максимум эмулятора — меньше страниц на 1m.
 _CANDLES_PAGE_LIMIT = 200_000
+_SYNC_TIMEOUT = 300.0
 
 class EmulatorError(RuntimeError):
     """Ошибка локального эмулятора исторических данных."""
@@ -148,9 +150,13 @@ class HistoricalClient:
     свечей и поиск инструмента работают без изменений.
     """
 
-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self, base_url: str | None = None, *, timeout: float = 60.0,
+        snapshot_generation: int | None = None,
+    ) -> None:
         self._base_url = (base_url or HISTORICAL_API_URL).rstrip("/")
         self._timeout = timeout
+        self._snapshot_generation = snapshot_generation
         self.instruments = HistoricalInstruments(self)
         self._closed = False
 
@@ -172,6 +178,76 @@ class HistoricalClient:
     def ping(self) -> dict:
         """Проверка живости источника: ``GET /health``."""
         return self._get("/health")
+
+    def futures_catalog(self) -> tuple[FuturesCard, ...]:
+        """Полный legacy-каталог: страница ровно limit не доказывает конец."""
+        rows = []
+        offset = 0
+        while True:
+            page = self._get("/api/v1/instruments", {
+                "instrument_type": "future", "limit": 5000, "offset": offset,
+            })
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise EmulatorError("INVALID_RESPONSE", "Некорректный каталог фьючерсов")
+            rows.extend(page)
+            if len(page) < 5000:
+                break
+            offset += len(page)
+        return tuple(FuturesCard.from_row(row) for row in rows)
+
+    def sync_market_data(self) -> dict:
+        """Проверить импорт My Robot перед историческим прогоном."""
+        url = f"{self._base_url}/api/v1/market-import/sync"
+        try:
+            post = request.Request(url, data=b"", method="POST")
+            with request.urlopen(post, timeout=self._timeout) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            raise self._error(exc) from exc
+        except urlerror.URLError as exc:
+            raise EmulatorError("SOURCE_UNAVAILABLE", f"Эмулятор недоступен: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise EmulatorError(
+                "SOURCE_TIMEOUT", f"Эмулятор не ответил за {self._timeout:g}s"
+            ) from exc
+        except OSError as exc:
+            raise EmulatorError("SOURCE_UNAVAILABLE", f"Сбой связи с эмулятором: {exc}") from exc
+        except ValueError as exc:
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректный JSON") from exc
+        if not isinstance(result, dict):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор не вернул объект JSON")
+        return result
+
+    def coverage(self, *, instrument_id: str, timeframe: str, from_=None, to=None) -> dict:
+        """Границы и число свечей пары «инструмент × интервал» без выгрузки свечей.
+
+        Один счётный запрос ``GET /api/v1/coverage``: эмулятор отвечает, сколько
+        свечей реально сохранено в диапазоне и где начинается и заканчивается
+        история. Заменяет сплошное чтение диапазона на стороне робота.
+        """
+        params = {"instrument_id": instrument_id, "interval": timeframe}
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
+        if from_ is not None:
+            params["from"] = _bounds(from_)
+        if to is not None:
+            params["to"] = _bounds(to)
+        return self._get("/api/v1/coverage", params)
+
+    def trading_schedules(self, *, instrument_id: str, from_, to) -> dict:
+        """Расписание инструмента на том же snapshot_generation, что и свечи."""
+        params = {"instrument_id": instrument_id, "from": _bounds(from_), "to": _bounds(to)}
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
+        payload = self._get("/api/v1/trading-schedules", params)
+        if not isinstance(payload, dict):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректное расписание")
+        if self._snapshot_generation is not None and (
+            type(payload.get("snapshot_generation")) is not int
+            or payload["snapshot_generation"] != self._snapshot_generation
+        ):
+            raise EmulatorError("SNAPSHOT_MISMATCH", "Эмулятор вернул расписание другого снимка")
+        return payload
 
     def get_all_candles(
         self,
@@ -195,6 +271,8 @@ class HistoricalClient:
             "interval": self._interval(interval),
             "limit": _CANDLES_PAGE_LIMIT,
         }
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
         if from_ is not None:
             params["from"] = _bounds(from_)
         if to is not None:
@@ -252,6 +330,9 @@ class HistoricalClient:
             low=_quotation(row.get("low")),
             close=_quotation(row.get("close")),
             volume=int(row.get("volume") or 0),
+            # Эмулятор хранит только завершённые свечи (импорт отвергает
+            # незавершённые), а загрузчик не считает отсутствие флага закрытием.
+            is_complete=True,
         )
 
     def _catalog(self, instrument_type: str, schema) -> tuple:
@@ -293,6 +374,10 @@ class HistoricalClient:
             # константами: пустое значение означает «источник не отдал», а не
             # «нулевое обеспечение».
             fields["expiration_date"] = _expiration(row.get("expiration_date"))
+            fields["first_trade_date"] = _expiration(row.get("first_trade_date"))
+            fields["last_trade_date"] = _expiration(row.get("last_trade_date"))
+            fields["basic_asset"] = row.get("basic_asset") or ""
+            fields["basic_asset_size"] = _quotation(row.get("basic_asset_size"))
             fields["min_price_increment_amount"] = _quotation(
                 row.get("min_price_increment_amount", row.get("min_price_increment"))
             )
@@ -322,8 +407,13 @@ class HistoricalClient:
 
     def _error(self, exc: HTTPError) -> EmulatorError:
         try:
-            detail = json.loads(exc.read().decode("utf-8")).get("error", {})
+            body = json.loads(exc.read().decode("utf-8"))
+            detail = body.get("error") or body.get("detail") or {}
         except Exception:  # noqa: BLE001 — тело ошибки может быть любым
+            detail = {}
+        if isinstance(detail, str):
+            return EmulatorError("MARKET_IMPORT_FAILED", detail, exc.code)
+        if not isinstance(detail, dict):
             detail = {}
         return EmulatorError(
             detail.get("code", "INTERNAL_ERROR"),
@@ -335,13 +425,55 @@ class HistoricalClient:
 class EmulatorClientProvider(ClientProvider):
     """Провайдер исторического режима: локальный эмулятор без токена T-API."""
 
-    def __init__(self, base_url: str | None = None, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self, base_url: str | None = None, *, timeout: float = 60.0,
+        sync_timeout: float = _SYNC_TIMEOUT,
+    ) -> None:
         self._base_url = base_url or HISTORICAL_API_URL
         self._timeout = timeout
+        self._sync_timeout = sync_timeout
+        self._snapshot_generation: int | None = None
 
     @property
     def base_url(self) -> str:
         return self._base_url
 
+    @property
+    def snapshot_generation(self) -> int | None:
+        return self._snapshot_generation
+
     def client_context(self, token=None) -> HistoricalClient:
-        return HistoricalClient(self._base_url, timeout=self._timeout)
+        return HistoricalClient(
+            self._base_url, timeout=self._timeout,
+            snapshot_generation=self._snapshot_generation,
+        )
+
+    def calendar_source(self, store, *, token=None, request_budget=None, horizon_days=7, refresh_seconds=3600):
+        from src.market_calendar.service import EmulatorScheduleSource
+
+        return EmulatorScheduleSource(store, self, horizon_days=horizon_days)
+
+    def prepare_snapshot(self) -> dict:
+        """Один раз догнать журнал и закрепить свечной снимок за провайдером."""
+        self._snapshot_generation = None
+        with HistoricalClient(self._base_url, timeout=self._sync_timeout) as client:
+            result = client.sync_market_data()
+        producer = result.get("producer_id")
+        target = result.get("target_change_id")
+        after = result.get("after_id")
+        synchronized = result.get("synchronized")
+        if (
+            not isinstance(producer, str) or not producer
+            or type(target) is not int or target < 0
+            or type(after) is not int or after < 0
+            or type(synchronized) is not bool
+        ):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректный статус импорта")
+        if synchronized:
+            generation = result.get("snapshot_generation")
+            if type(generation) is not int or generation < 0 or after < target:
+                raise EmulatorError(
+                    "INVALID_RESPONSE", "Эмулятор не подтвердил границу или номер снимка"
+                )
+            self._snapshot_generation = generation
+        return result

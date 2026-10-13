@@ -6,7 +6,7 @@ import sqlite3
 from decimal import Decimal
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -308,6 +308,26 @@ CREATE INDEX trade_observations_by_time ON trade_market_observations(trade_id, o
 # Историческая схема нужна для миграционных фикстур, не для runtime-открытия.
 SCHEMA_V9_SQL = SCHEMA_SQL
 SCHEMA_SQL += MIGRATE_V9_TO_V10_SQL
+SCHEMA_V10_SQL = SCHEMA_SQL
+
+MIGRATE_V10_TO_V11_SQL = """
+CREATE TABLE rollover_states (
+    family TEXT PRIMARY KEY,
+    catalog_digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE rollover_transitions (
+    transition_id TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE rollover_commands (
+    transition_id TEXT NOT NULL REFERENCES rollover_transitions(transition_id),
+    command_id TEXT NOT NULL REFERENCES outbox(command_id),
+    PRIMARY KEY (transition_id, command_id)
+);
+"""
+SCHEMA_SQL += MIGRATE_V10_TO_V11_SQL
 
 
 def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | None = None) -> None:
@@ -337,6 +357,7 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
                 3: MIGRATE_V3_TO_V4_SQL, 4: MIGRATE_V4_TO_V5_SQL,
                 5: MIGRATE_V5_TO_V6_SQL, 6: MIGRATE_V6_TO_V7_SQL,
                 9: MIGRATE_V9_TO_V10_SQL,
+                10: MIGRATE_V10_TO_V11_SQL,
             }
             while version < SCHEMA_VERSION:
                 if version == 7:

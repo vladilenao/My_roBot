@@ -410,6 +410,10 @@ class TestTradingBot:
         assert len(rejections) == 1
         assert rejections[0].get("reason") == "Размер позиции ниже минимального"
         assert len(_decisions(channel)) == 1
+        # Решение идёт непосредственно перед своим отказом и связано с ним ключом.
+        kinds = [e.type for e in channel.events if e.type in {EventType.DECISION, EventType.REJECTED}]
+        assert kinds == [EventType.DECISION, EventType.REJECTED]
+        assert rejections[0].get("event_id") == _decisions(channel)[0].get("event_id") != ""
 
     def test_signal_management_exit_bypasses_entry_filter_in_cycle(self):
         signal_filter = MagicMock()
@@ -457,6 +461,18 @@ class TestTradingBot:
         assert events[0] == "protect:1m"
         assert trade_manager.manage.call_count == 2
         assert trade_manager.manage.call_args_list[0].kwargs["timeframe"] == "1m"
+
+    @pytest.mark.parametrize("ready_tfs", [set(), {"1h"}])
+    def test_available_protection_bars_do_not_wait_for_global_1m_readiness(self, ready_tfs):
+        bot = _make_bot(
+            timeline=FakeTimeline(), cache=FakeCache(),
+            bus=RecordingChannel().bus, strategy=_make_strategy(),
+        )
+        bot._post_tick = MagicMock()
+
+        bot._tick(ready_tfs)
+
+        bot._post_tick.assert_called_once_with({"1m"})
 
     def test_deleted_assignment_keeps_1m_management_subscription(self):
         trade_manager = MagicMock()
@@ -724,7 +740,7 @@ class TestTradingBot:
 
         bot.run()
 
-        notified = [m for m in channel.messages if "Сбой" in m]
+        notified = [m for m in channel.messages if "СБОЙ" in m]
         assert len(notified) == 1
         assert "boom" not in notified[0]
         assert "обновление свечей таймфрейма 1h" in notified[0]
@@ -803,9 +819,9 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "такта работы" in m or "тактов работы" in m]
         assert len(heartbeats) == 2
-        assert "тиков работы — 4" in heartbeats[-1]
+        assert "4 такта работы" in heartbeats[-1]
 
     def test_heartbeat_not_on_every_tick_when_interval_large(self):
         channel = RecordingChannel()
@@ -822,7 +838,7 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "такта работы" in m or "тактов работы" in m]
         assert heartbeats == []
 
     def test_heartbeat_includes_error_count_and_resets(self):
@@ -857,11 +873,11 @@ class TestTradingBot:
 
         bot.run()
 
-        heartbeats = [m for m in channel.messages if "Сердцебиение" in m]
+        heartbeats = [m for m in channel.messages if "такт работы" in m or "такта работы" in m]
         # ошибка не роняет тик: tick 1 выполнился со счётчиком ошибок, tick 2 — сброс
         assert len(heartbeats) == 2
-        assert "ошибок за период — 1" in heartbeats[0]
-        assert "ошибок за период — 0" in heartbeats[-1]
+        assert "1 ошибка" in heartbeats[0]
+        assert "0 ошибок" in heartbeats[-1]
 
     def test_tick_held_until_fresh_bar_published(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
@@ -1056,7 +1072,7 @@ class TestTradingBot:
         cache.flag = False
         bot._tick(set())  # пустой тик: ни у одного ТФ свеча не закрылась
         assert len(_decisions(channel)) == 0
-        assert not any("Сердцебиение" in m for m in channel.messages)
+        assert not any("такт работы" in m or "такта работы" in m or "тактов работы" in m for m in channel.messages)
 
         cache.flag = True
         bot._tick({"1h"})

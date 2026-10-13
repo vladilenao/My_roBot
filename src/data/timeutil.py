@@ -28,3 +28,12 @@ def to_aware_utc(dt) -> pd.Timestamp:
     else:
         ts = ts.tz_convert("UTC")
     return ts
+
+
+def to_utc_naive(dt) -> pd.Timestamp:
+    """Входной факт сначала конвертируется в UTC, потом лишается зоны.
+
+    Отличается от legacy to_naive, который сохраняется для внутренних уже
+    нормализованных UTC значений и исторических интерфейсов.
+    """
+    return to_aware_utc(dt).tz_localize(None)

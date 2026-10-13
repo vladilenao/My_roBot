@@ -21,6 +21,8 @@ FINANCIAL_PAYLOAD_FIELDS = (
 )
 
 _REQUIRED: dict[EventType, tuple[str, ...]] = {
+    EventType.STARTUP_ANALYSIS: ("published_at", "results", "available_bars", "required_bars", "coverage_complete", "reason"),
+    EventType.MARKET_DATA_STATUS: ("session", "data_state", "observed_at", "reason"),
     EventType.DECISION: ("outcome", "side"),
     EventType.SIGNAL: ("side", "quantity", "entry", "stop"),
     EventType.REJECTED: ("reason",),
@@ -31,14 +33,19 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
 }
 
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
-    EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id"),
+    EventType.STARTUP_ANALYSIS: (),
+    EventType.MARKET_DATA_STATUS: ("phase", "break_kind", "last_due", "next_event", "schedule",
+                                  "received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
+                                 "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete",
+                                 "ingestion"),
+    EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id", "analysis_mode"),
     EventType.SIGNAL: (
-        "targets", "expected_r", "strategy", "filter_profile", "trade_id",
+        "targets", "expected_r", "strategy", "filter_profile", "trade_id", "event_id",
         "risk_amount", "reward_amount", "costs_amount", "payoff_ratio",
         "fixed_reward_amount", "fixed_quantity", "net_reward_amount", "algorithm_version",
         *DIAGNOSTIC_PAYLOAD_FIELDS,
     ),
-    EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile", "algorithm_version",
+    EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile", "event_id", "algorithm_version",
                          "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold",
                          *DIAGNOSTIC_PAYLOAD_FIELDS),
     EventType.HEARTBEAT: (),
@@ -106,6 +113,7 @@ OPTIONAL_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
 }
 for _event_type in (EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT, EventType.TARGET_HIT, EventType.TRADE_CLOSED):
     OPTIONAL_PAYLOAD_FIELDS[_event_type] += FINANCIAL_PAYLOAD_FIELDS
+OPTIONAL_PAYLOAD_FIELDS[EventType.TARGET_HIT] += ("target_number",)
 OPTIONAL_PAYLOAD_FIELDS[EventType.POSITION_ADDED] += ("requested_quantity", "selected_quantity", "limiting_constraint")
 for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT,
                    EventType.TARGET_HIT, EventType.TRADE_CLOSED, EventType.STOP_MOVED,
@@ -114,6 +122,9 @@ for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION
 
 
 _JSON_TYPES: dict[str, str] = {
+    "available_bars": "number",
+    "required_bars": "number",
+    "coverage_complete": "boolean",
     "quantity": "number",
     "positions": "number",
     "tick_count": "number",
@@ -125,7 +136,12 @@ _JSON_TYPES: dict[str, str] = {
     "selected_quantity": "number",
     "fixed_quantity": "number",
     "quantity_remaining": "number",
+    "target_number": "number",
     "fees_known": "boolean",
+    "ingestion": "object",
+    "last_due": "object",
+    "next_event": "object",
+    "schedule": "object",
 }
 
 
@@ -137,6 +153,13 @@ def _property(name: str) -> dict[str, Any]:
     """
     if name == "visual":
         return {"$ref": SCHEMA_ID}
+    if name == "results":
+        return {"type": "array", "items": {
+            "type": "object", "required": ["assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason"],
+            "properties": {field: {"type": "string"} for field in
+                           ("assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason")},
+            "additionalProperties": False,
+        }}
     json_type = _JSON_TYPES.get(name, "string")
     if json_type == "array":
         return {"type": "array", "items": {"type": "string"}}

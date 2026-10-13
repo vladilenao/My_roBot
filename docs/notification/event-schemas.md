@@ -28,7 +28,7 @@
 }
 ```
 
-- `type` — один из 21 типов каталога: 19 пользовательских уведомлений и две служебные границы тика ([events.md](events.md)).
+- `type` — один из 23 типов каталога: 21 пользовательское уведомление и две служебные границы тика ([events.md](events.md)).
 - `instrument` — короткое имя контракта; пустая строка, если событие не про контракт.
 - `bar_time` — время закрытия бара в ISO8601 или `null`.
 - `timeframe` — таймфрейм сигнала или пустая строка.
@@ -59,6 +59,76 @@
 64 элементами с явными агрегатами ранних исполнений, не потерей общего результата.
 
 ## События анализа
+
+### `startup_analysis`
+
+Информационный обзор последней доступной сессии. `bar_time` — закрытие свечи,
+`published_at` — отдельное время публикации UTC. Результаты содержат все привязки,
+включая HOLD и причины неполного расчёта. Событие не является торговым допуском.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload startup_analysis",
+  "type": "object",
+  "required": ["published_at", "results", "available_bars", "required_bars", "coverage_complete", "reason"],
+  "properties": {
+    "published_at": {"type": "string"},
+    "results": {"type": "array", "items": {
+      "type": "object",
+      "required": ["assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason"],
+      "properties": {
+        "assignment_id": {"type": "string"}, "strategy": {"type": "string"},
+        "filter_profile": {"type": "string"}, "outcome": {"type": "string"},
+        "indicators": {"type": "string"}, "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    }},
+    "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
+    "coverage_complete": {"type": "boolean"}, "reason": {"type": "string"}
+  },
+  "additionalProperties": false
+}
+```
+
+### `market_data_status`
+
+Состояние сессии и данных независимо от торгового тика. Все временные поля — UTC
+ISO8601, границы баров означают закрытие. Неизвестная граница отсутствует, не равна
+времени опроса. `session`: open/waiting_session/unknown; `data_state`:
+warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
+
+Необязательный `ingestion` — технический срез владельца live-входа:
+`transport` (polling/stream), `epoch` (поколение stream или null), `fallback`
+(stream настроен, но пара обслуживается polling), `data_hold`
+(BOOTSTRAPPING/RECONCILING/READY/GAP_HOLD/CONFLICT_HOLD/INTEGRITY_HOLD),
+границы `received_through`/`resolved_through`/`processed_through` (UTC ISO8601
+открытия бара), `gap` (lower/upper/state active|parked/attempts/next_retry_at/reason
+или null), `incident` (integrity-инцидент или null), `history_error`, `cutover`
+(момент запуска, от которого проверяется непрерывность пары без обязательств)
+и `pre_cutover_gaps` (пробелы прогрева до запуска без доказательства расписания).
+Удержание не означает потерю данных или отсутствие сделок.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload market_data_status",
+  "type": "object",
+  "required": ["session", "data_state", "observed_at", "reason"],
+  "properties": {
+    "session": {"type": "string"}, "phase": {"type": "string"}, "break_kind": {"type": "string"},
+    "last_due": {"type": "object"}, "next_event": {"type": "object"}, "schedule": {"type": "object"},
+    "data_state": {"type": "string"},
+    "observed_at": {"type": "string"}, "reason": {"type": "string"},
+    "received_bar": {"type": "string"}, "analyzed_bar": {"type": "string"},
+    "analysis_mode": {"type": "string"}, "expected_bar": {"type": "string"},
+    "publication_deadline": {"type": "string"}, "next_open": {"type": "string"},
+    "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
+    "coverage_complete": {"type": "boolean"}, "ingestion": {"type": "object"}
+  },
+  "additionalProperties": false
+}
+```
 
 Публикует бот по итогам тика: решение каждой стратегии, рекомендация, прошедшая допуск,
 и отказ на допуске.
@@ -100,6 +170,9 @@
     },
     "event_id": {
       "type": "string"
+    },
+    "analysis_mode": {
+      "type": "string"
     }
   },
   "additionalProperties": false
@@ -119,6 +192,7 @@
 `quantity`/`selected_quantity` — допущенный объём, `requested_quantity` — явный запрос при наличии,
 `limiting_constraint` — риск, ГО, предел количества, запрос или профиль. Денежная диагностика
 показывает общий бюджет после допуска с резервом этого входа, не факт исполнения.
+`event_id` связывает план с решением стратегии для единого консольного блока.
 Консоль и Telegram.
 
 ```json
@@ -154,6 +228,18 @@
     "expected_r": {
       "type": "string"
     },
+    "strategy": {
+      "type": "string"
+    },
+    "filter_profile": {
+      "type": "string"
+    },
+    "trade_id": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
     "risk_amount": {
       "type": "string"
     },
@@ -166,32 +252,57 @@
     "payoff_ratio": {
       "type": "string"
     },
-    "strategy": {
+    "fixed_reward_amount": {
       "type": "string"
     },
-    "filter_profile": {
+    "fixed_quantity": {
+      "type": "number"
+    },
+    "net_reward_amount": {
       "type": "string"
     },
-    "trade_id": {
+    "algorithm_version": {
       "type": "string"
     },
-    "fixed_reward_amount": {"type": "string"},
-    "fixed_quantity": {"type": "number"},
-    "net_reward_amount": {"type": "string"},
-    "algorithm_version": {"type": "string"},
-    "budget_base": {"type": "string"},
-    "portfolio_pct": {"type": "string"},
-    "risk_budget": {"type": "string"},
-    "open_risk": {"type": "string"},
-    "pending_risk": {"type": "string"},
-    "free_risk": {"type": "string"},
-    "risk_excess": {"type": "string"},
-    "risk_state": {"type": "string"},
-    "unknown_reason": {"type": "string"},
-    "requested_quantity": {"type": "number"},
-    "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"},
-    "visual": {"$ref": "visual-snapshot.json"}
+    "budget_base": {
+      "type": "string"
+    },
+    "portfolio_pct": {
+      "type": "string"
+    },
+    "risk_budget": {
+      "type": "string"
+    },
+    "open_risk": {
+      "type": "string"
+    },
+    "pending_risk": {
+      "type": "string"
+    },
+    "free_risk": {
+      "type": "string"
+    },
+    "risk_excess": {
+      "type": "string"
+    },
+    "risk_state": {
+      "type": "string"
+    },
+    "unknown_reason": {
+      "type": "string"
+    },
+    "requested_quantity": {
+      "type": "number"
+    },
+    "selected_quantity": {
+      "type": "number"
+    },
+    "limiting_constraint": {
+      "type": "string"
+    },
+    "visual": {
+      "$ref": "visual-snapshot.json"
+    }
   },
   "additionalProperties": false
 }
@@ -201,6 +312,7 @@
 
 Сделка не допущена к исполнению. `reason` — причина из риск-менеджера, `code` — машинный
 код, если риск-менеджер его вернул.
+`event_id` связывает недопуск с исходным сигналом в консольном блоке.
 Экономический отказ содержит R/C/S, payoff при известности, выбранный объём,
 версию и применённый порог. `risk_state=unknown` и `unknown_reason` явно обозначают
 неполные данные портфеля; неизвестный свободный бюджет не отправляется как ноль.
@@ -232,24 +344,63 @@
     "filter_profile": {
       "type": "string"
     },
-    "algorithm_version": {"type": "string"},
-    "risk_amount": {"type": "string"},
-    "costs_amount": {"type": "string"},
-    "slippage_amount": {"type": "string"},
-    "payoff_ratio": {"type": "string"},
-    "threshold": {"type": "string"},
-    "budget_base": {"type": "string"},
-    "portfolio_pct": {"type": "string"},
-    "risk_budget": {"type": "string"},
-    "open_risk": {"type": "string"},
-    "pending_risk": {"type": "string"},
-    "free_risk": {"type": "string"},
-    "risk_excess": {"type": "string"},
-    "risk_state": {"type": "string"},
-    "unknown_reason": {"type": "string"},
-    "requested_quantity": {"type": "number"},
-    "selected_quantity": {"type": "number"},
-    "limiting_constraint": {"type": "string"}
+    "event_id": {
+      "type": "string"
+    },
+    "algorithm_version": {
+      "type": "string"
+    },
+    "risk_amount": {
+      "type": "string"
+    },
+    "costs_amount": {
+      "type": "string"
+    },
+    "slippage_amount": {
+      "type": "string"
+    },
+    "payoff_ratio": {
+      "type": "string"
+    },
+    "threshold": {
+      "type": "string"
+    },
+    "budget_base": {
+      "type": "string"
+    },
+    "portfolio_pct": {
+      "type": "string"
+    },
+    "risk_budget": {
+      "type": "string"
+    },
+    "open_risk": {
+      "type": "string"
+    },
+    "pending_risk": {
+      "type": "string"
+    },
+    "free_risk": {
+      "type": "string"
+    },
+    "risk_excess": {
+      "type": "string"
+    },
+    "risk_state": {
+      "type": "string"
+    },
+    "unknown_reason": {
+      "type": "string"
+    },
+    "requested_quantity": {
+      "type": "number"
+    },
+    "selected_quantity": {
+      "type": "number"
+    },
+    "limiting_constraint": {
+      "type": "string"
+    }
   },
   "additionalProperties": false
 }
@@ -641,7 +792,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `target_hit`
 
-Закрыта часть позиции по цели.
+Закрыта часть позиции по цели. `target_number` — подтверждённый порядковый
+номер цели из плана, а `quantity` — исполненный объём; одно не выводится из другого.
 
 ```json
 {
@@ -691,14 +843,33 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "occurred_at": {
       "type": "string"
     },
-    "gross_pnl": {"type": "string"},
-    "net_pnl": {"type": "string"},
-    "fees_total": {"type": "string"},
-    "fees_known": {"type": "boolean"},
-    "fee_source": {"type": "string"},
-    "pnl_units": {"type": "string"},
-    "quantity_remaining": {"type": "number"},
-    "visual": {"$ref": "visual-snapshot.json"}
+    "gross_pnl": {
+      "type": "string"
+    },
+    "net_pnl": {
+      "type": "string"
+    },
+    "fees_total": {
+      "type": "string"
+    },
+    "fees_known": {
+      "type": "boolean"
+    },
+    "fee_source": {
+      "type": "string"
+    },
+    "pnl_units": {
+      "type": "string"
+    },
+    "quantity_remaining": {
+      "type": "number"
+    },
+    "target_number": {
+      "type": "number"
+    },
+    "visual": {
+      "$ref": "visual-snapshot.json"
+    }
   },
   "additionalProperties": false
 }

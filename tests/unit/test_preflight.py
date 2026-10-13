@@ -164,8 +164,8 @@ class TestSuccessfulPreflight:
 
         _run(load_candles=load)
 
-        # границы диапазона плюс скан разрывов по всему диапазону
-        assert calls == [HEAD_WINDOW, TAIL_WINDOW, SCAN_WINDOW]
+        # Только обязательные окна прогрева и правой границы.
+        assert calls == [HEAD_WINDOW, TAIL_WINDOW]
 
     def test_passes_source_and_clock_to_loader(self):
         captured = {}
@@ -352,14 +352,16 @@ class TestHigherTimeframeTail:
 
 
 class TestStartShift:
-    """Начало в нерабочей точке календара переносится на первую доступную свечу."""
+    """Начало в нерабочей точке переносится на ближайший бар драйверного потока."""
 
     END = datetime(2024, 1, 10, 0, 0)
+    SHIFTED = datetime(2024, 1, 3, 4, 0)
     AHEAD = _window("2024-01-01 00:00", "2024-01-08 00:00")
-    SHIFTED_HEAD = _window("2024-01-03 04:00", "2024-01-03 04:03")
+    SHIFTED_HEAD = _window("2024-01-03 03:58", "2024-01-03 04:01")
     SHIFTED_TAIL = _window("2024-01-09 23:58", "2024-01-10 00:00")
-    SHIFTED_HEAD_BARS = _bars("2024-01-03 04:00:00", "2024-01-03 04:01:00", "2024-01-03 04:02:00")
+    SHIFTED_HEAD_BARS = _bars("2024-01-03 03:59:00", "2024-01-03 04:00:00")
     SHIFTED_TAIL_BARS = _bars("2024-01-09 23:58:00", "2024-01-09 23:59:00")
+    SHIFTED_SCAN = (pd.Timestamp("2024-01-03 04:00"), pd.Timestamp(END))
 
     def _source(self, *, ahead=None, shifted_head=None, scan=None) -> _candles:
         return _candles(
@@ -371,11 +373,7 @@ class TestStartShift:
                 ),
                 self.SHIFTED_TAIL: self.SHIFTED_TAIL_BARS,
             },
-            scan_windows=(
-                SCAN_WINDOW,
-                (pd.Timestamp(START), pd.Timestamp(self.END)),
-                (pd.Timestamp("2024-01-03 04:02"), pd.Timestamp(self.END)),
-            ),
+            scan_windows=(self.SHIFTED_SCAN,),
             scan=scan,
         )
 
@@ -385,8 +383,8 @@ class TestStartShift:
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert report.start == datetime(2024, 1, 3, 4, 2)
-        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:02" in report.notes[0]
+        assert report.start == self.SHIFTED
+        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:00" in report.notes[0]
 
     def test_shift_note_printed_with_passed_check(self):
         source = self._source(ahead=_bars("2024-01-03 04:00:00"))
@@ -396,18 +394,14 @@ class TestStartShift:
         assert "Проверка пройдена: пар 1." in message
         assert "начало диапазона сдвинуто" in message
 
-    def test_shift_and_gap_warning_coexist(self):
-        scan = _frame("2024-01-03 04:02", "2024-01-03 04:10").drop(index=3)
-        source = self._source(
-            ahead=_bars("2024-01-03 04:00:00"),
-            scan=scan,
-        )
+    def test_shift_does_not_scan_internal_range(self):
+        source = self._source(ahead=_bars("2024-01-03 04:00:00"))
 
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:02" in report.notes[0]
-        assert "разрывов данных: 1" in report.notes[-1]
+        assert "сдвинуто с 2024-01-01 00:00 на 2024-01-03 04:00" in report.notes[0]
+        assert not any("разрыв" in note for note in report.notes)
 
     def test_remaining_problem_reported_after_shift(self):
         source = self._source(ahead=_bars("2024-01-03 04:00:00"), shifted_head=pd.DataFrame())
@@ -415,9 +409,21 @@ class TestStartShift:
         report = _run(start=START, end=self.END, load_candles=source)
 
         assert report.ok is False
-        assert report.start == datetime(2024, 1, 3, 4, 2)
+        assert report.start == self.SHIFTED
         assert "сдвинуто" in report.notes[0]
-        assert "2024-01-03 04:02" in report.problems[0]
+        assert "2024-01-03 04:00" in report.problems[0]
+
+    def test_shift_does_not_repeat_when_warmup_insufficient(self):
+        source = self._source(
+            ahead=_bars("2024-01-03 04:00:00"),
+            shifted_head=_bars("2024-01-03 04:00:00"),
+        )
+
+        report = _run(start=START, end=self.END, load_candles=source)
+
+        assert report.ok is False
+        assert report.start == self.SHIFTED
+        assert any("прогрев" in problem for problem in report.problems)
 
     def test_data_beyond_lookahead_stays_an_error(self):
         report = _run(start=START, end=self.END, load_candles=self._source())
@@ -427,32 +433,33 @@ class TestStartShift:
         assert "свечи не покрывают начало диапазона 2024-01-01 00:00" in report.problems[0]
         assert "ближайшая свеча" not in report.problems[0]
 
-    def test_shift_aligned_to_coarsest_timeframe(self):
+    def test_shift_follows_driver_not_coarser_timeframe(self):
         pairs = (Pair("SBER", "share", "1m"), Pair("SBER", "share", "1h"))
         source = _candles(
             {
                 HEAD_WINDOW: pd.DataFrame(),
+                self.AHEAD: _bars("2024-01-03 04:07:00"),
+                _window("2024-01-03 04:05", "2024-01-03 04:08"): _bars(
+                    "2024-01-03 04:06:00", "2024-01-03 04:07:00"
+                ),
                 _window("2023-12-31 22:00", "2024-01-01 01:00"): _hourly(
                     "2023-12-31 22:00:00", "2024-01-01 00:00:00"
                 ),
-                self.AHEAD: _bars("2024-01-03 04:07:00"),
-                _window("2024-01-03 03:00", "2024-01-03 06:00"): _hourly(
+                _window("2024-01-03 02:07", "2024-01-03 05:07"): _hourly(
                     "2024-01-03 03:00:00", "2024-01-03 04:00:00", "2024-01-03 05:00:00"
-                ),
-                _window("2024-01-03 04:58", "2024-01-03 05:01"): _bars(
-                    "2024-01-03 04:58:00", "2024-01-03 04:59:00", "2024-01-03 05:00:00"
                 ),
                 self.SHIFTED_TAIL: self.SHIFTED_TAIL_BARS,
                 _window("2024-01-09 22:00", "2024-01-10 00:00"): _hourly(
                     "2024-01-09 22:00:00", "2024-01-09 23:00:00"
                 ),
-            }
+            },
+            scan_windows=((pd.Timestamp("2024-01-03 04:07"), pd.Timestamp(self.END)),),
         )
 
         report = _run(pairs=pairs, start=START, end=self.END, load_candles=source)
 
         assert report.ok is True
-        assert report.start == datetime(2024, 1, 3, 5, 0)
+        assert report.start == datetime(2024, 1, 3, 4, 7)
 
     def test_unreachable_source_is_not_hidden_by_shift(self):
         source = self._source(ahead=_bars("2024-01-03 04:00:00"))
@@ -476,80 +483,53 @@ class TestStartShift:
         assert "сдвинуто" not in report.message()
 
 
-class TestContinuityScan:
-    """Разрывы внутри диапазона — предупреждение, а не запрет на прогон."""
-
-    LONG_END = START + timedelta(minutes=200_010)
+class TestCoverageProbe:
+    """При наличии coverage полнота диапазона оценивается без выгрузки свечей."""
 
     @staticmethod
-    def _source(scan=None, *, head=None, tail=None, seen=None,
-                scan_windows=(SCAN_WINDOW,), start=START, end=END):
-        period = timedelta(minutes=1)
-        return _candles(
-            {
-                (pd.Timestamp(start) - period * WARMUP, pd.Timestamp(start) + period): (
-                    _head() if head is None else head
-                ),
-                (pd.Timestamp(end) - 2 * period, pd.Timestamp(end)): (
-                    _tail() if tail is None else tail
-                ),
-            },
-            scan_windows=scan_windows,
-            scan=scan,
-            seen=seen,
-        )
+    def _probe(*, count=1440, first="2024-01-01 00:00:00", last="2024-01-01 23:59:00", error=None):
+        calls = []
 
-    def _minutes_with_hole(self, hole_minutes: int) -> pd.DataFrame:
-        stamps = pd.date_range("2024-01-01 00:00", "2024-01-01 00:30", freq="1min")
-        stamps = stamps.delete(range(10, 10 + hole_minutes))
-        return _bars(*[s.strftime("%Y-%m-%d %H:%M:%S") for s in stamps])
+        def coverage(*, instrument_id, timeframe, start_date, end_date):
+            calls.append((instrument_id, timeframe, start_date, end_date))
+            if error is not None:
+                raise RuntimeError(error)
+            return {"count": count, "from": first, "to": last}
 
-    def test_gap_counted_in_warning(self):
-        source = self._source(scan=self._minutes_with_hole(5))
+        return coverage, calls
 
-        report = _run(load_candles=source)
-
-        assert report.ok is True
-        assert report.problems == ()
-        note = report.notes[-1]
-        assert "таймфрейм 1m" in note
-        assert "разрывов данных: 1" in note
-        assert "пропущено баров 5" in note
-        assert "самый длинный 5 м" in note
-        assert "прогон перейдёт их по часам" in note
-
-    def test_several_gaps_are_summed(self):
-        scan = _bars(
-            *[s.strftime("%Y-%m-%d %H:%M:%S")
-              for s in pd.date_range("2024-01-01 00:00", "2024-01-01 00:20", freq="1min").delete([5, 6])]
-        )
-        source = self._source(scan=scan)
-
-        report = _run(load_candles=source)
-
-        assert "разрывов данных: 1" in report.notes[-1]
-        assert "пропущено баров 2" in report.notes[-1]
-
-    def test_longest_gap_reported_in_hours(self):
-        stamps = list(pd.date_range("2024-01-01 00:00", "2024-01-01 00:20", freq="1min"))
-        hole = [s for s in pd.date_range("2024-01-01 00:06", "2024-01-01 00:08", freq="1min")]
-        stamps = [s for s in stamps if s not in hole]
-        scan = _bars(*[s.strftime("%Y-%m-%d %H:%M:%S") for s in stamps])
-        source = self._source(scan=scan)
-
-        report = _run(load_candles=source)
-
-        assert "самый длинный 3 м" in report.notes[-1]
-
-    def test_clean_range_says_no_gaps(self):
-        report = _run(load_candles=self._source())
-
-        assert report.ok is True
-        assert "разрывов данных не найдено" in report.notes[-1]
-
-    def test_only_smallest_timeframe_is_scanned(self):
-        """Разрывы старших ТФ выводятся из мелких: сканируется только ведущий."""
+    def test_reports_count_without_scanning(self):
         seen = []
+        source = _candles({HEAD_WINDOW: _head(), TAIL_WINDOW: _tail()}, seen=seen)
+        coverage, calls = self._probe(count=1440)
+
+        report = _run(load_candles=source, coverage=coverage)
+
+        assert report.ok is True
+        note = report.notes[-1]
+        assert "покрытие диапазона" in note
+        assert "свечей 1440" in note
+        assert "разрыв" not in note
+        assert calls and all(tf == "1m" for _, tf, _, _ in calls)
+        assert not any((pd.Timestamp(s), pd.Timestamp(e)) == SCAN_WINDOW for _, s, e in seen)
+
+    def test_reports_absent_data(self):
+        coverage, _ = self._probe(count=0, first=None, last=None)
+
+        report = _run(load_candles=_full_source(), coverage=coverage)
+
+        assert report.ok is True
+        assert "свечей нет" in report.notes[-1]
+
+    def test_failure_is_a_warning_not_a_problem(self):
+        coverage, _ = self._probe(error="источник молчит")
+
+        report = _run(load_candles=_full_source(), coverage=coverage)
+
+        assert report.ok is True
+        assert "не проверено: SBER 1m (источник молчит)" in report.notes[-1]
+
+    def test_probed_only_for_smallest_timeframe(self):
         hour = timedelta(hours=1)
         source = _candles(
             {
@@ -559,73 +539,12 @@ class TestContinuityScan:
                 ),
                 (pd.Timestamp(END) - 2 * timedelta(minutes=1), pd.Timestamp(END)): _tail(),
                 (pd.Timestamp(END) - 2 * hour, pd.Timestamp(END)): _hourly("2024-01-01 23:00:00"),
-            },
-            seen=seen,
+            }
         )
+        coverage, calls = self._probe(count=10)
         pairs = (Pair("SBER", "share", "1m"), Pair("SBER", "share", "1h"))
 
-        report = _run(pairs=pairs, load_candles=source)
+        report = _run(pairs=pairs, load_candles=source, coverage=coverage)
 
         assert report.ok is True
-        scans = [
-            tf for tf, start, end in seen
-            if (pd.Timestamp(start), pd.Timestamp(end)) == SCAN_WINDOW
-        ]
-        assert scans == ["1m"]
-
-    def test_partial_scan_names_checked_window(self):
-        long_tail = _frame("2024-05-18 21:28", "2024-05-18 21:29")
-        source = self._source(
-            end=self.LONG_END,
-            tail=long_tail,
-            scan_windows=((pd.Timestamp(START), pd.Timestamp(self.LONG_END)),),
-        )
-
-        report = _run(end=self.LONG_END, load_candles=source)
-
-        assert report.ok is True
-        note = report.notes[-1]
-        assert "хвост не проверялся" in note
-        assert "2024-01-01 00:00" in note
-        assert "разрывов данных не найдено" in note
-
-    def test_scan_failure_is_a_warning_not_a_problem(self):
-        def load(**kw):
-            if (pd.Timestamp(kw["start_date"]), pd.Timestamp(kw["end_date"])) == SCAN_WINDOW:
-                raise RuntimeError("источник молчит")
-            return _full_source()(**kw)
-
-        report = _run(load_candles=load)
-
-        assert report.ok is True
-        assert "не проверено: SBER 1m (источник молчит)" in report.notes[-1]
-
-    def test_range_without_enough_bars_is_reported_as_unchecked(self):
-        source = self._source(scan=_bars("2024-01-01 00:00:00"))
-
-        report = _run(load_candles=source)
-
-        assert report.ok is True
-        assert "не проверено: SBER 1m (в диапазоне меньше двух свечей)" in report.notes[-1]
-
-    def test_pair_scan_failure_is_listed_in_note(self):
-        pairs = (Pair("SBER", "share", "1m"), Pair("GAZP", "share", "1m"))
-        scan = self._minutes_with_hole(0)
-
-        def load(ticker, **kw):
-            if ticker == "GAZP" and (pd.Timestamp(kw["start_date"]), pd.Timestamp(kw["end_date"])) == SCAN_WINDOW:
-                raise RuntimeError("нет данных")
-            return self._source(scan=scan)(ticker, **kw)
-
-        report = _run(pairs=pairs, load_candles=load)
-
-        assert report.ok is True
-        assert "не проверено: GAZP 1m" in report.notes[-1]
-
-    def test_no_scan_when_run_is_impossible(self):
-        source = _candles({HEAD_WINDOW: pd.DataFrame(), TAIL_WINDOW: _tail()})
-
-        report = _run(load_candles=source)
-
-        assert report.ok is False
-        assert not any("разрыв" in note for note in report.notes)
+        assert [tf for _, tf, _, _ in calls] == ["1m"]

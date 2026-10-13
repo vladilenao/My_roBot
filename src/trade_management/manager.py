@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Sequence
 from uuid import uuid4
+from contextlib import contextmanager
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
 from src.logging_setup import get_logger
@@ -23,6 +24,7 @@ from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
     action_from_payload, action_payload,
 )
+from src.instruments.model import instrument_key
 from src.trade_management.errors import (
     InvalidStopBoundaryError,
     ReservationRejected,
@@ -36,7 +38,7 @@ from src.trade_management.audit import (
     TraceOutcome,
     calculation_trace,
 )
-from src.trade_management.economics import plan_economics
+from src.trade_management.economics import plan_economics, entry_price_deviation
 from src.trade_management.models import (
     PlanEconomics, PortfolioBudgetPolicy, SignalAdmission, TradePhase, TradePlan, rebase_on_average, rejection_message, rejection_reason,
 )
@@ -70,6 +72,25 @@ DEFAULT_SLIPPAGE_TOLERANCE = Decimal("0.005")
 BUDGET_REJECTION_CODES = frozenset(
     {"risk-budget", "margin-committed-by-pending-orders", "margin-budget"}
 )
+
+
+@dataclass(frozen=True)
+class DispatchDataEvidence:
+    """Read-only допуск данных; None актуальности не означает разрешение.
+
+    Инспектор и его guard предоставляет composition. Здесь нет зависимости
+    от gRPC, автоматического TTL или самостоятельного чтения market API.
+    """
+
+    execution_ready: bool
+    work_ready: bool
+    intent_current: bool | None = None
+
+    def __post_init__(self):
+        if type(self.execution_ready) is not bool or type(self.work_ready) is not bool:
+            raise ValueError("Data evidence требует явные boolean признаки готовности")
+        if self.intent_current is not None and type(self.intent_current) is not bool:
+            raise ValueError("Актуальность должна быть boolean либо unknown")
 
 
 @dataclass(frozen=True)
@@ -179,6 +200,8 @@ class TradeManager:
         min_risk_cost_ratio: Decimal | float | str = Decimal("2"),
         min_net_payoff: Decimal | float | str = Decimal("1.5"),
         max_slippage_r: Decimal | float | str = Decimal("0.25"),
+        max_entry_deviation_r: Decimal | float | str = Decimal("0.25"),
+        live_market_provider=None,
         clock: Clock | Callable[[], datetime] | None = None,
     ) -> None:
         self._storage = storage
@@ -217,7 +240,77 @@ class TradeManager:
         self._min_risk_cost_ratio = Decimal(str(min_risk_cost_ratio))
         self._min_net_payoff = Decimal(str(min_net_payoff))
         self._max_slippage_r = Decimal(str(max_slippage_r))
+        self._max_entry_deviation_r = Decimal(str(max_entry_deviation_r))
+        self._live_market_provider = live_market_provider
         self._equity_unknown = False
+        self.contract_lifecycle = None
+
+    def initialize_account(self):
+        """Начальный капитал прогона существует и при отсутствии сделок."""
+        with self._storage.transaction() as connection:
+            self._ensure_account(connection, as_aware(self._clock.now()).isoformat())
+
+    def contract_has_obligations(self, ticker):
+        return bool(self._storage.connection.execute(
+            "SELECT 1 FROM trades t JOIN positions p USING(trade_id) WHERE t.instrument_id=? "
+            "AND (p.quantity>0 OR EXISTS(SELECT 1 FROM orders o WHERE o.trade_id=t.trade_id "
+            "AND o.status IN ('PENDING','ACK','PARTIAL') AND o.action_type IN ('OPEN','ADD','CLOSE','REDUCE','CANCEL')))",
+            (ticker,)).fetchone())
+
+    def consume_queued_broker_events(self):
+        drain = getattr(self._broker, "drain_addressed_events", None)
+        if callable(drain):
+            for event in drain():
+                self.consume(event)
+
+    def drain_contract(self, ticker, *, market_close=None):
+        """Отменить увеличения и закрыть остаток; не создавать второе ожидание."""
+        now = as_aware(self._clock.now())
+        rows = self._storage.connection.execute(
+            "SELECT o.command_id,o.trade_id FROM orders o JOIN trades t USING(trade_id) "
+            "JOIN outbox b ON b.command_id=o.command_id WHERE t.instrument_id=? "
+            "AND o.action_type IN ('OPEN','ADD') AND o.status='PENDING' AND b.status='PENDING'", (ticker,)).fetchall()
+        for command_id, trade_id in rows:
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:rollover-local-cancel", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL,
+                filled_quantity=0, price=None, fee=Decimal(0), timestamp=now, reason="contract-rollover"))
+        submitted = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker:
+                continue
+            pending = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type IN ('OPEN','ADD') AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            cancelling = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type='CANCEL' AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            if pending and not cancelling:
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision, reason="contract-rollover")
+                if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
+                    submitted.append(action)
+        # Подтверждения CANCEL могут изменить ревизию: закрытия строятся после них.
+        if submitted:
+            self.dispatch(now)
+            self.consume_queued_broker_events()
+        # CancelEntry подтверждает отмену всех увеличений сделки, включая
+        # неопределённую доставку после сбоя ACK. Поздние fills всё равно
+        # применяются reducer-ом и снова удерживают переходный барьер.
+        unresolved = self._storage.connection.execute(
+            "SELECT o.command_id,o.trade_id FROM orders o JOIN trades t USING(trade_id) "
+            "WHERE t.instrument_id=? AND o.action_type IN ('OPEN','ADD') AND o.status='PENDING' "
+            "AND EXISTS(SELECT 1 FROM orders c WHERE c.trade_id=o.trade_id AND c.action_type='CANCEL' AND c.status='CANCEL')",
+            (ticker,)).fetchall()
+        for command_id, trade_id in unresolved:
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:rollover-confirmed-cancel", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL,
+                filled_quantity=0, price=None, fee=Decimal(0), timestamp=now, reason="contract-rollover"))
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if plan.instrument_id != ticker or state.quantity <= 0:
+                continue
+            closing = self._storage.connection.execute("SELECT 1 FROM orders WHERE trade_id=? AND action_type='CLOSE' AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone()
+            if not closing:
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision, reason="contract-rollover")
+                if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
+                    submitted.append(action)
+        return tuple(submitted)
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -230,7 +323,39 @@ class TradeManager:
         if callable(resume):
             for trade in recovered:
                 resume(trade)
+        # A gap-entry guard first queues CloseTrade at revision N and then marks
+        # its still-live trade REJECTED at N+1. It is the sole terminal snapshot
+        # whose broker state must be restored for that durable close to survive
+        # restart; it remains absent from the ordinary active recovery result.
+        resume_guard = getattr(self._broker, "resume_gap_entry_guard_close", None)
+        if callable(register) and callable(resume) and callable(resume_guard):
+            for trade in self._storage.load_trades(include_terminal=True):
+                if trade.state.phase is not TradePhase.REJECTED or trade.state.quantity <= 0:
+                    continue
+                for action in self._pending_proven_gap_guard_closes(trade):
+                    register(trade.plan)
+                    resume(trade)
+                    resume_guard(trade, action)
         return recovered
+
+    def _pending_proven_gap_guard_closes(self, trade: RecoveredTrade) -> tuple[CloseTrade, ...]:
+        rows = self._storage.connection.execute(
+            "SELECT b.payload_json FROM outbox b JOIN orders o ON o.command_id=b.command_id "
+            "WHERE b.trade_id=? AND b.status='PENDING' AND o.action_type='CLOSE' AND o.status='PENDING'",
+            (trade.plan.trade_id,),
+        ).fetchall()
+        actions = []
+        for (payload,) in rows:
+            try:
+                action = _action_from_payload(json.loads(payload))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            if self._proven_gap_guard_close(
+                self._storage.connection, action, trade.state.phase,
+                trade.state.state_revision, trade.state.quantity,
+            ):
+                actions.append(action)
+        return tuple(actions)
 
     def submit_plan(
         self,
@@ -374,6 +499,10 @@ class TradeManager:
         is left half-written.
         """
         self._assert_stop_within_market(action, market_close)
+        if isinstance(action, AddToTrade) and self.contract_lifecycle is not None:
+            row = self._storage.connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            if row and not self.contract_lifecycle.can_increase(row[0], self._clock.now()):
+                return False
         if isinstance(action, (CloseTrade, ReduceTrade)) and action.reference_price is None and market_close is not None:
             action = replace(action, reference_price=Decimal(str(market_close)))
         now = as_aware(self._clock.now()).isoformat()
@@ -553,6 +682,8 @@ class TradeManager:
 
     def dispatch(self, now: datetime, *, limit: int = 100) -> tuple[ExecutionEvent, ...]:
         """Deliver persisted outbox commands and immediately consume their outcomes."""
+        if self._storage.outbox_guard_configured:
+            return self._dispatch_guarded(now, limit=limit)
         events: list[ExecutionEvent] = []
         for command in self._storage.claim_outbox(limit):
             action = _action_from_payload(command.payload)
@@ -561,6 +692,160 @@ class TradeManager:
             self.consume(event)
             events.append(event)
         return tuple(events)
+
+    def configure_dispatch_eligibility(self, evidence_for, guard_factory) -> None:
+        """Один обязательный порт; прямой dispatch и прямой claim не обходят его."""
+        if self._storage.outbox_guard_configured:
+            raise ValueError("Обязательный outbox guard уже установлен")
+        if not callable(evidence_for) or not callable(guard_factory):
+            raise ValueError("Dispatch eligibility требует инспектор и data guard")
+        self._dispatch_evidence_for = evidence_for
+        self._dispatch_now = None
+        self.dispatch_block_reasons = {}
+        self._dispatch_reconciliations = set()
+
+        @contextmanager
+        def guarded():
+            with guard_factory():
+                yield self._dispatch_eligible
+        self._storage.configure_outbox_guard(guarded)
+
+    def _dispatch_guarded(self, now, *, limit):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be positive")
+        # Как старый batch, не отправлять новые команды, созданные consume
+        # в этом же вызове (например, slippage guard после входа).
+        boundary = self._storage.outbox_dispatch_boundary()
+        events = []
+        self._dispatch_now = as_aware(now)
+        try:
+            for _ in range(limit):
+                with self._storage.outbox_delivery_guard():
+                    commands = self._storage.claim_outbox(1, through_rowid=boundary)
+                    if not commands:
+                        break
+                    command = commands[0]
+                    if command.command_id in self._dispatch_reconciliations:
+                        event = None  # Подтверждённая доставка: не новый broker.submit.
+                    else:
+                        event = self._broker.submit(_action_from_payload(command.payload), now)
+                # Guard только до локальной доставки. Observer/Telegram и
+                # reducer не держат market lock и не фильтруются по hold.
+                self._storage.mark_outbox_sent(command.command_id, sent_at=now)
+                if event is not None:
+                    self.consume(event)
+                    events.append(event)
+        finally:
+            self._dispatch_now = None
+        return tuple(events)
+
+    def _dispatch_eligible(self, connection, command):
+        def deny(reason):
+            self.dispatch_block_reasons[command.command_id] = reason
+            return False
+
+        self._dispatch_reconciliations.discard(command.command_id)
+        try:
+            action = _action_from_payload(command.payload)
+        except (TypeError, ValueError, KeyError):
+            return deny("invalid-command")
+        if action.command_id != command.command_id or action.trade_id != command.trade_id:
+            return deny("command-identity-mismatch")
+        record = connection.execute(
+            "SELECT t.instrument_id,t.phase,t.state_revision,t.plan_json,p.quantity,o.status "
+            "FROM trades t JOIN positions p USING(trade_id) JOIN orders o USING(trade_id) "
+            "WHERE t.trade_id=? AND o.command_id=?", (action.trade_id, action.command_id),
+        ).fetchone()
+        if record is None:
+            return deny("unknown-trade-or-order")
+        instrument, phase, revision, plan_json, quantity, status = record
+        if connection.execute("SELECT 1 FROM events WHERE command_id=? AND trade_id=? LIMIT 1",
+                              (action.command_id, action.trade_id)).fetchone():
+            self._dispatch_reconciliations.add(action.command_id)
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if status != "PENDING":
+            return deny("order-state-unconfirmed")
+        protected = self._confirmed_guard_close(connection, action, phase, revision, quantity)
+        if action.state_revision != revision and not protected:
+            return deny("stale-state-revision")
+        if isinstance(action, OpenTrade):
+            phase_valid = phase == TradePhase.ENTRY_PENDING and quantity == 0
+        elif protected:
+            phase_valid = True  # Existing guard ставит REJECTED после enqueue.
+        else:
+            try:
+                self._validate_phase(action, TradePhase(phase))
+                phase_valid = True
+            except ValueError:
+                phase_valid = False
+        if not phase_valid:
+            return deny("stale-trade-phase")
+        if isinstance(action, (CloseTrade, ReduceTrade, MoveStop)) and quantity <= 0:
+            return deny("trade-not-open")
+        if isinstance(action, ReduceTrade) and action.quantity > quantity:
+            return deny("quantity-exceeds-trade-remainder")
+        evidence = self._dispatch_evidence_for(instrument, action, command)
+        if not isinstance(evidence, DispatchDataEvidence):
+            return deny("data-evidence-unconfirmed")
+        if protected:
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if not evidence.execution_ready:
+            return deny("execution-prefix-unconfirmed")
+        now = self._dispatch_now or as_aware(self._clock.now())
+        if isinstance(action, CancelEntry) and action.reason == "entry-timeout":
+            ack = connection.execute("SELECT updated_at FROM orders WHERE trade_id=? AND action_type='OPEN' "
+                                     "AND status='ACK' ORDER BY updated_at DESC LIMIT 1", (action.trade_id,)).fetchone()
+            if ack is None:
+                return deny("entry-ack-unconfirmed")
+            timeframe = json.loads(plan_json).get("timeframe", "")
+            if now - as_aware(datetime.fromisoformat(ack[0])) <= timedelta(seconds=_entry_ttl_seconds(timeframe)):
+                return deny("entry-timeout-not-due")
+            self.dispatch_block_reasons.pop(action.command_id, None)
+            return True
+        if not evidence.work_ready:
+            return deny("work-input-unconfirmed")
+        if evidence.intent_current is not True:
+            return deny("freshness-unconfirmed" if evidence.intent_current is None else "stale-intent")
+        self.dispatch_block_reasons.pop(action.command_id, None)
+        return True
+
+    def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
+        """Proof существующего guard, не whitelist по строке reason."""
+        if not self._proven_gap_guard_close(connection, action, phase, revision, quantity):
+            return False
+        # Поддерживаемый runtime — свечной JournalBroker. Другой executor с
+        # неизвестными немедленными эффектами не объявляется безопасным.
+        from src.broker.journal_broker import JournalBroker
+        if not isinstance(self._broker, JournalBroker):
+            return False
+        state = self._broker.trade_state(action.trade_id)
+        if state is None:
+            return False
+        if state.revision == action.state_revision:
+            return True
+        return state.revision == action.state_revision + 1 and self._broker.has_recovery_guard_close(action)
+
+    @staticmethod
+    def _proven_gap_guard_close(connection, action, phase, revision, quantity):
+        if not isinstance(action, CloseTrade) or action.reason != GAP_ENTRY_REASON or quantity <= 0:
+            return False
+        if phase != TradePhase.REJECTED or revision != action.state_revision + 1:
+            return False
+        prefix = f"{action.trade_id}:{GAP_ENTRY_REASON}:"
+        if not action.command_id.startswith(prefix):
+            return False
+        original = action.command_id[len(prefix):]
+        filled = connection.execute("SELECT 1 FROM fills f JOIN orders o USING(order_id) "
+            "WHERE f.trade_id=? AND o.command_id=? AND o.action_type IN ('OPEN','ADD') AND f.quantity>0 LIMIT 1",
+            (action.trade_id, original)).fetchone()
+        traced = connection.execute("SELECT 1 FROM calculations WHERE trade_id=? "
+            "AND algorithm='execution.slippage_guard' AND reason=? AND outcome='REJECTED' LIMIT 1",
+            (action.trade_id, GAP_ENTRY_REASON)).fetchone()
+        if not filled or not traced:
+            return False
+        return True
 
     def consume(self, event: ExecutionEvent | FeeAdjustment) -> bool:
         """Reduce one broker event, then schedule post-fill risk/protection checks."""
@@ -601,11 +886,11 @@ class TradeManager:
 
     def configure_visual_context(self, instruments):
         """Runtime metadata, independent of the notification channel."""
-        self._visual_instruments.update({i.ticker: i for i in instruments})
+        self._visual_instruments.update({instrument_key(i): i for i in instruments})
 
     def remember_market(self, instrument, timeframe, frame, as_of):
-        self._visual_instruments[instrument.ticker] = instrument
-        self._visual_markets[instrument.ticker, timeframe] = market_snapshot(frame, timeframe, as_of)
+        self._visual_instruments[instrument_key(instrument)] = instrument
+        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of)
 
     def _notify_execution(self, event):
         if self._execution_observer is None:
@@ -632,7 +917,13 @@ class TradeManager:
             connection.execute("BEGIN")
             try:
                 plan_row = connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
-                timeframe = json.loads(plan_row[0]).get("timeframe", "")
+                saved_plan = json.loads(plan_row[0])
+                timeframe = saved_plan.get("timeframe", "")
+                if action.startswith("TARGET:"):
+                    target_id = action.partition(":")[2]
+                    details["target_number"] = next(
+                        (index for index, target in enumerate(saved_plan.get("targets", ()), 1)
+                         if target.get("target_id") == target_id), None)
                 market = self._visual_markets.get((instrument, timeframe))
                 if market is not None:
                     grid = CandleScheduler(timeframe)
@@ -666,8 +957,10 @@ class TradeManager:
         if decision.signal_type is SignalType.HOLD:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
+        if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
+            return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
-        meta = contract(instrument.ticker) if callable(contract) else None
+        meta = contract(instrument_key(instrument)) if callable(contract) else None
         if meta is None:
             log.debug("actions_for_signal %s: нет метаданных контракта", instrument.ticker)
             return SignalAdmission(
@@ -729,17 +1022,20 @@ class TradeManager:
     ) -> tuple[TradeAction, ...]:
         """Protect each live trade of the instrument from the provided frame."""
         now = now or as_aware(self._clock.now())
+        if self.contract_lifecycle is not None and self.contract_lifecycle.retiring(instrument_key(instrument), now):
+            return self.drain_contract(instrument_key(instrument))
         contract = getattr(self._broker, "contract_for", None)
-        meta = contract(instrument.ticker) if callable(contract) else None
+        meta = contract(instrument_key(instrument)) if callable(contract) else None
         if meta is None:
             return ()
-        if _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
-            return self._close_expiring(instrument.ticker)
+        automatic_contract = self.contract_lifecycle is not None and self.contract_lifecycle.contains(instrument_key(instrument))
+        if not automatic_contract and _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
+            return self._close_expiring(instrument_key(instrument))
         results: list[TradeAction] = []
-        results.extend(self._cancel_stale_entries(instrument.ticker, now))
+        results.extend(self._cancel_stale_entries(instrument_key(instrument), now))
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
-            if plan.instrument_id != instrument.ticker or state.phase not in _MANAGEABLE or state.quantity <= 0:
+            if plan.instrument_id != instrument_key(instrument) or state.phase not in _MANAGEABLE or state.quantity <= 0:
                 continue
             profile_cls = PROFILE_CLASSES.get(plan.profile.name)
             if profile_cls is None:
@@ -919,7 +1215,7 @@ class TradeManager:
                 if callable(apply_with_trace):
                     filtered, filter_trace = apply_with_trace(
                         decision, context, profile_name=assignment.filter_profile,
-                        instrument=instrument.ticker, timeframe=timeframe
+                        instrument=instrument_key(instrument), timeframe=timeframe
                     )
                     if filter_trace is not None:
                         self._traces.record(filter_trace)
@@ -958,6 +1254,15 @@ class TradeManager:
         return tuple(submitted)
 
     def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
+        live_market = None
+        if self._live_market_provider is not None:
+            live_market = self._live_market_provider(instrument)
+            if not live_market.get("valid"):
+                return SignalAdmission(rejections=(rejection_reason("current-price-unavailable",
+                    message=live_market.get("reason", "Текущая цена недоступна")),))
+            if self.contract_has_obligations(instrument_key(instrument)) and not live_market.get("execution_ready"):
+                return SignalAdmission(rejections=(rejection_reason("execution-coverage-blocked",
+                    message="Исполнительный курсор остановлен перед неразрешённым базовым интервалом"),))
         instrument_type = getattr(instrument, "instrument_type", None)
         allowed = self._direction_limits.get(instrument_type) if instrument_type is not None else None
         if allowed is not None:
@@ -995,15 +1300,18 @@ class TradeManager:
                 "min_risk_cost_ratio": self._min_risk_cost_ratio,
                 "min_net_payoff": self._min_net_payoff,
                 "max_slippage_r": self._max_slippage_r,
+                **({"max_entry_deviation_r": self._max_entry_deviation_r} if live_market is not None else {}),
             },
         )
         trade_id = decision.event_id or f"{assignment.id}:{timeframe}:{decision.signal_type.value}"
+        if live_market is not None:
+            market["live_market"] = dict(live_market)
         profile = profile_cls()
         plan, plan_trace = profile.plan_with_trace(
             PlanningContext(
                 trade_id=trade_id,
                 assignment_id=assignment.id,
-                instrument_id=instrument.ticker,
+                instrument_id=instrument_key(instrument),
                 signal=decision,
                 profile=snapshot,
                 market=market,
@@ -1019,6 +1327,23 @@ class TradeManager:
                 rejections=(rejection_reason(code),),
             )
         plan = replace(plan, timeframe=timeframe or "")
+        if live_market is not None:
+            deviation = entry_price_deviation(plan.side, live_market["current_price"],
+                plan.reference_entry, plan.stop_price)
+            reason = "entry-price-deviation" if deviation is None or deviation > self._max_entry_deviation_r else "current-entry-price-allowed"
+            self._traces.record(calculation_trace("portfolio.current-entry-price",
+                inputs={"market": MeasuredValue(dict(live_market), "market-snapshot"),
+                        "entry": MeasuredValue(plan.reference_entry, "price"),
+                        "stop": MeasuredValue(plan.stop_price, "price"),
+                        "max_entry_deviation_r": MeasuredValue(self._max_entry_deviation_r, "ratio")},
+                result=MeasuredValue(deviation, "ratio"), reason=reason,
+                outcome=TraceOutcome.REJECTED if reason == "entry-price-deviation" else TraceOutcome.ACCEPTED,
+                formula="max(0,direction*(current-entry))/abs(entry-stop)",
+                links=TraceLinks(assignment_id=assignment.id, signal_id=plan.signal_id)))
+            if reason == "entry-price-deviation":
+                return SignalAdmission(rejections=(rejection_reason(reason,
+                    message=f"Цена {live_market['current_price']} ухудшает плановый вход {plan.reference_entry}: "
+                            f"отклонение {deviation if deviation is not None else 'неизвестно'}R, предел {self._max_entry_deviation_r}R"),))
         if self._storage.connection.execute(
             "SELECT 1 FROM processed_signals WHERE assignment_id=? AND signal_id=?",
             (plan.assignment_id, plan.signal_id),
@@ -1528,7 +1853,7 @@ class TradeManager:
         elif isinstance(action, AddToTrade):
             allowed = phase in {TradePhase.OPEN, TradePhase.BUILDING}
         elif isinstance(action, CancelEntry):
-            allowed = phase is TradePhase.ENTRY_PENDING
+            allowed = phase is TradePhase.ENTRY_PENDING or (action.reason == "contract-rollover" and phase in _MANAGEABLE)
         else:
             allowed = phase in _MANAGEABLE
         if not allowed:

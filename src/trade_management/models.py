@@ -214,7 +214,7 @@ class TradePlan:
             raise ValueError("unsupported trade algorithm_version")
         object.__setattr__(self, "entry_order_type", EntryOrderType(self.entry_order_type))
         admission = dict(self.admission_snapshot)
-        for key in ("portfolio_pct", "min_trade_risk_pct", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r", "go_per_contract"):
+        for key in ("portfolio_pct", "min_trade_risk_pct", "min_risk_cost_ratio", "min_net_payoff", "max_slippage_r", "max_entry_deviation_r", "go_per_contract"):
             if key in admission:
                 admission[key] = Decimal(str(admission[key]))
                 _nonnegative_decimal(admission[key], key)

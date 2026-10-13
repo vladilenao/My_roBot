@@ -201,7 +201,9 @@ class JournalBroker(BrokerPort):
         self._addressed_trades: dict[str, AddressedTrade] = {}
         self._scheduled_actions: list[ScheduledAction] = []
         self._processing_due: list[ScheduledAction] = []
+        self._recovery_guard_closes: set[str] = set()
         self._processed_addressed_bars: set[tuple[str, datetime]] = set()
+        self.increase_allowed = None
         # Addressed SQLite runtime starts with no CSV-derived state. Legacy CSV
         # callers retain their explicit replay path below.
         if journal is not None:
@@ -281,6 +283,33 @@ class JournalBroker(BrokerPort):
                 self._scheduled_actions.append(ScheduledAction(pending.action, pending.submitted_at))
                 self._command_events[pending.action.command_id] = self._command_outcome(pending.action, pending.submitted_at, ExecutionStatus.ACK, "next-bar")
 
+    def resume_gap_entry_guard_close(self, recovered: object, action: CloseTrade) -> bool:
+        """Allow only the persisted pre-REJECTED guard-close after restart.
+
+        The trade snapshot has revision N+1 because the slippage guard marked
+        it REJECTED after queuing its close at N. TradeManager has already
+        proven the durable fill/trace/order origin before this narrow marker is
+        installed; arbitrary stale closes cannot create it.
+        """
+        plan = getattr(recovered, "plan", None)
+        state = getattr(recovered, "state", None)
+        trade = None if plan is None else self._addressed_trades.get(plan.trade_id)
+        if (
+            plan is None or state is None or trade is None
+            or action.trade_id != plan.trade_id
+            or action.state_revision + 1 != state.state_revision
+            or action.reason != "gap-entry"
+            or not action.command_id.startswith(f"{plan.trade_id}:gap-entry:")
+            or state.quantity <= 0
+            or trade.revision != state.state_revision
+        ):
+            return False
+        self._recovery_guard_closes.add(action.command_id)
+        return True
+
+    def has_recovery_guard_close(self, action: TradeAction) -> bool:
+        return isinstance(action, CloseTrade) and action.command_id in self._recovery_guard_closes
+
     def _resume_pending_increases(self, trade: AddressedTrade, recovered: object) -> None:
         scheduled = {s.action.command_id for s in self._scheduled_actions}
         for pending in getattr(recovered, "pending_increases", ()):
@@ -311,7 +340,7 @@ class JournalBroker(BrokerPort):
         trade = self._addressed_trades.get(action.trade_id)
         if trade is None:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "unknown-trade")
-        elif action.state_revision != trade.revision:
+        elif action.state_revision != trade.revision and not self.has_recovery_guard_close(action):
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
         elif isinstance(action, (OpenTrade, AddToTrade)) and trade.plan.algorithm_version == "economics-v2" and action.order_type is not EntryOrderType.LIMIT:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "limit-entry-required")
@@ -449,8 +478,12 @@ class JournalBroker(BrokerPort):
 
     @staticmethod
     def _command_outcome(action: TradeAction, now: datetime, status: ExecutionStatus, reason: str) -> ExecutionEvent:
+        execution_id = f"{action.command_id}:{status.value}"
+        if status is ExecutionStatus.CANCEL:
+            r = (reason or "cancel").replace(":", "-")
+            execution_id = f"cancel:{action.trade_id}:{r}:{action.command_id}"
         return ExecutionEvent(
-            execution_id=f"{action.command_id}:{status.value}", order_id=action.command_id,
+            execution_id=execution_id, order_id=action.command_id,
             command_id=action.command_id, trade_id=action.trade_id, status=status,
             filled_quantity=0, price=None, fee=Decimal("0"), timestamp=now, reason=reason,
             fee_source=FeeSource.UNKNOWN,
@@ -621,14 +654,14 @@ class JournalBroker(BrokerPort):
             stop_price=signal.stop_price,
             take_profit=signal.take_profit,
             reason="",
-            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена (id={order_id})",
+            message=f"Заявка {signal.side} {signal.qty} {display} по {signal.entry_price} размещена",
             ts_order=now,
         )
 
     def cancel_order(self, order_id: int, reason: str) -> OrderResult:
         order = self._orders.get(order_id)
         if order is None or order.status != OrderStatus.NEW:
-            return self._noop_result(f"Заявка {order_id} не найдена или не активна")
+            return self._noop_result("Заявка не найдена или не активна")
         order.status = OrderStatus.CANCELLED
         self._write_terminal(order, reason, now := self._clock.now().replace(microsecond=0))
         self._orders.pop(order_id, None)
@@ -637,6 +670,7 @@ class JournalBroker(BrokerPort):
             EventType.TRADE_CANCELLED,
             now,
             trade_id=order.position_id,
+            instrument=self._display(order.ticker),
             order_id=order_id,
             reason=reason,
         )
@@ -650,7 +684,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason=reason,
-            message=f"Заявка {order_id} отменена ({reason})",
+            message=f"Заявка {self._display(order.ticker)} отменена ({reason})",
             ts_order=now,
         )
 
@@ -669,6 +703,11 @@ class JournalBroker(BrokerPort):
         closes = {ticker: values[3] for ticker, values in ohlc.items()}
 
         self._track_addressed_bars(now, ohlc, bar_times=bar_times)
+
+        # The addressed runtime has no legacy CSV journal or legacy orders.
+        # Its positions and financial results are owned by TradeManager/SQLite.
+        if self.journal is None:
+            return results
 
         cancel_pids = self.manager.track_bar(closes, dict(self._contracts))
         for pid in cancel_pids:
@@ -743,6 +782,14 @@ class JournalBroker(BrokerPort):
                 pending.append(scheduled)
         self._scheduled_actions = pending
         self._processing_due = due
+
+        if self.increase_allowed is not None:
+            for scheduled in due:
+                action = scheduled.action
+                trade = self._addressed_trades[action.trade_id]
+                if isinstance(action, (OpenTrade, AddToTrade)) and not self.increase_allowed(
+                        trade.plan.instrument_id, moments[trade.plan.instrument_id]):
+                    self._cancel_increases(trade, moments[trade.plan.instrument_id], "contract-rollover")
 
         # A confirmed stop amendment is active at this bar's open, before its range.
         for scheduled in due:
@@ -856,11 +903,14 @@ class JournalBroker(BrokerPort):
         accepted_limit = isinstance(action, (OpenTrade, AddToTrade)) and action.order_type is EntryOrderType.LIMIT
         accepted_v2 = (trade.plan.algorithm_version == "economics-v2" and self._command_events.get(action.command_id)
                        and self._command_events[action.command_id].status is ExecutionStatus.ACK)
-        if not isinstance(action, MoveStop) and not accepted_limit and not accepted_v2 and action.state_revision != trade.revision:
+        recovery_guard = self.has_recovery_guard_close(action)
+        if not isinstance(action, MoveStop) and not accepted_limit and not accepted_v2 and not recovery_guard and action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
             self._addressed_events.append(event)
             return event
         event = self._execute_action(trade, action, now, fill_price, bar=bar)
+        if recovery_guard:
+            self._recovery_guard_closes.discard(action.command_id)
         if accepted_limit or trade.plan.algorithm_version == "economics-v2":
             self._command_events[action.command_id] = event
         self._addressed_events.append(event)
@@ -910,6 +960,8 @@ class JournalBroker(BrokerPort):
                     instrument=self._display(trade.plan.instrument_id),
                     quantity=filled,
                     price=target.price,
+                    target_number=next((index for index, planned in enumerate(trade.plan.targets, 1)
+                                        if planned.target_id == target.target_id), None),
                 )
                 if position.qty == 0:
                     self.manager.positions.pop(trade.plan.trade_id, None)
@@ -1157,6 +1209,7 @@ class JournalBroker(BrokerPort):
             EventType.TRADE_CANCELLED,
             now,
             trade_id=order.position_id,
+            instrument=self._display(order.ticker),
             order_id=order_id,
             reason="ttl",
         )
@@ -1170,7 +1223,7 @@ class JournalBroker(BrokerPort):
             stop_price=order.stop_price,
             take_profit=order.take_profit,
             reason="ttl",
-            message=f"Заявка {order_id} истекла по TTL",
+            message=f"Заявка {self._display(order.ticker)} истекла по TTL",
             ts_order=now,
         )
 

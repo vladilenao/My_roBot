@@ -64,6 +64,116 @@ def _http_error(status, body):
     return HTTPError("http://emulator:8100/x", status, "err", {}, io.BytesIO(payload))
 
 
+def _sync_result(**overrides):
+    result = {
+        "producer_id": "robot-db-1",
+        "target_change_id": 12,
+        "after_id": 12,
+        "synchronized": True,
+        "snapshot_generation": 42,
+    }
+    result.update(overrides)
+    return result
+
+
+class TestMarketDataSnapshot:
+    def test_preflight_post_uses_separate_timeout_and_all_candle_pages_use_snapshot(self):
+        pages = _PagedHttp(_rows(5), page_size=2)
+        calls = []
+
+        def respond(url, timeout=None):
+            calls.append((url, timeout))
+            if hasattr(url, "get_method"):
+                assert url.get_method() == "POST"
+                assert url.full_url.endswith("/api/v1/market-import/sync")
+                return _Response(_sync_result())
+            return pages(url, timeout=timeout)
+
+        with patch("src.api.emulator_client.request.urlopen", respond):
+            provider = EmulatorClientProvider("http://emulator:8100", timeout=4, sync_timeout=30)
+            assert provider.prepare_snapshot()["snapshot_generation"] == 42
+            list(provider.client_context().get_all_candles(
+                from_=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
+                instrument_id="uid-1",
+            ))
+
+        assert calls[0][1] == 30
+        assert all(timeout == 4 for _, timeout in calls[1:])
+        assert len(pages.requests) == 3
+        assert all(page["snapshot_generation"] == "42" for page in pages.requests)
+
+    def test_unconfirmed_response_clears_previous_snapshot(self):
+        responses = iter([_sync_result(), _sync_result(synchronized=False)])
+        calls = []
+
+        def respond(url, timeout=None):
+            if hasattr(url, "get_method"):
+                return _Response(next(responses))
+            calls.append(url)
+            return _Response({"candles": []})
+
+        with patch("src.api.emulator_client.request.urlopen", respond):
+            provider = EmulatorClientProvider("http://emulator:8100")
+            provider.prepare_snapshot()
+            assert provider.prepare_snapshot()["synchronized"] is False
+            list(provider.client_context().get_all_candles(
+                from_=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
+                instrument_id="uid-1",
+            ))
+
+        assert "snapshot_generation" not in calls[0]
+
+    def test_trading_schedules_use_snapshot_and_reject_missing_or_foreign_generation(self):
+        client = HistoricalClient("http://emulator:8100", snapshot_generation=42)
+        with patch.object(client, "_get", return_value={"snapshot_generation": 42, "days": []}) as get:
+            assert client.trading_schedules(
+                instrument_id="uid-1", from_=datetime(2026, 10, 1), to=datetime(2026, 10, 2)
+            )["days"] == []
+        assert get.call_args.args[0] == "/api/v1/trading-schedules"
+        assert get.call_args.args[1]["snapshot_generation"] == 42
+
+        for payload in ({"days": []}, {"snapshot_generation": 43, "days": []}):
+            with patch.object(client, "_get", return_value=payload):
+                with pytest.raises(EmulatorError, match="SNAPSHOT_MISMATCH"):
+                    client.trading_schedules(
+                        instrument_id="uid-1", from_=datetime(2026, 10, 1), to=datetime(2026, 10, 2)
+                    )
+
+    @pytest.mark.parametrize("response", [
+        _sync_result(synchronized=True, snapshot_generation=True),
+        _sync_result(synchronized=True, snapshot_generation=-1),
+        _sync_result(synchronized=True, after_id=11),
+        _sync_result(synchronized="true"),
+        _sync_result(target_change_id="12"),
+    ])
+    def test_malformed_sync_response_is_rejected(self, response):
+        with patch("src.api.emulator_client.request.urlopen", return_value=_Response(response)):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.code == "INVALID_RESPONSE"
+
+    def test_sync_error_detail_is_readable(self):
+        with patch(
+            "src.api.emulator_client.request.urlopen",
+            side_effect=_http_error(503, {"detail": "My Robot недоступен"}),
+        ):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.status == 503
+        assert "My Robot недоступен" in str(raised.value)
+
+    def test_sync_connection_reset_is_reported_as_unavailable(self):
+        with patch(
+            "src.api.emulator_client.request.urlopen",
+            side_effect=ConnectionResetError("соединение разорвано"),
+        ):
+            with pytest.raises(EmulatorError) as raised:
+                EmulatorClientProvider("http://emulator:8100").prepare_snapshot()
+        assert raised.value.code == "SOURCE_UNAVAILABLE"
+
+
 class TestQuotationConversion:
     def test_integer_price(self):
         assert _quotation(100.0) == schemas.Quotation(units=100, nano=0)
@@ -107,6 +217,16 @@ class TestCandlesConversion:
         assert candle.high.units > candle.open.units
         assert candle.low.units < candle.open.units
 
+    def test_emulator_candle_is_explicitly_complete(self):
+        # Загрузчик не считает отсутствие флага закрытием; архив эмулятора
+        # содержит только завершённые свечи и сообщает это явно.
+        candle, = self._candles(
+            [{"datetime": "2024-01-01 00:00:00", "open": 1.0, "high": 1.0,
+              "low": 1.0, "close": 1.0, "volume": 1}]
+        )
+
+        assert candle.is_complete is True
+
     def test_time_is_tz_aware_utc(self):
         candle, = self._candles(
             [{"datetime": "2024-01-01 00:00:00", "open": 1.0, "high": 1.0,
@@ -146,6 +266,39 @@ class TestCandlesConversion:
                     instrument_id="uid-1",
                 )
             )
+
+
+class TestCoverageQuery:
+    def test_query_carries_bounds_interval_and_snapshot(self):
+        http = _Http({"/coverage": {
+            "instrument_id": "uid-1", "interval": "5m",
+            "from": "2024-01-02 09:35:00", "to": "2024-12-31 18:50:00",
+            "count": 208431, "slots": 210817,
+        }})
+        with patch("src.api.emulator_client.request.urlopen", http):
+            with HistoricalClient("http://emulator:8100", snapshot_generation=42) as client:
+                data = client.coverage(
+                    instrument_id="uid-1", timeframe="5m",
+                    from_=datetime(2024, 1, 1, 3, 4), to=datetime(2024, 1, 2, 0, 0),
+                )
+
+        assert data["count"] == 208431
+        url = http.urls()[0]
+        assert "/api/v1/coverage" in url
+        assert "instrument_id=uid-1" in url
+        assert "interval=5m" in url
+        assert "from=2024-01-01+03%3A04%3A00" in url
+        assert "to=2024-01-02+00%3A00%3A00" in url
+        assert "snapshot_generation=42" in url
+
+    def test_omits_bounds_and_snapshot_when_absent(self):
+        http = _Http({"/coverage": {"count": 0}})
+        with patch("src.api.emulator_client.request.urlopen", http):
+            data = _client().coverage(instrument_id="uid-1", timeframe="1m")
+
+        assert data["count"] == 0
+        url = http.urls()[0]
+        assert "from=" not in url and "to=" not in url and "snapshot_generation" not in url
 
 
 class _PagedHttp:

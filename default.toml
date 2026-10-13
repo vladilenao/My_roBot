@@ -12,9 +12,28 @@ data_dir = "data"
 poll_secs = 1
 timeout_secs = 300
 
+# Локальная база живых завершённых свечей. Экспорт выключен, пока не задан
+# MARKET_DATA_EXPORT_TOKEN в окружении и export_enabled = true.
+[market_data]
+database_file = "market-data.sqlite3"
+export_enabled = false
+export_host = "127.0.0.1"
+export_port = 8101
+# Транспорт live-свечей: "polling" или "stream" (подписка с резервным опросом).
+# Параметры приёма и восстановления — docs/market-data/live-ingestion.md; их
+# значения по умолчанию — инженерный профиль, а не гарантия брокера.
+# Stream выбран после read-only пробы брокера (8.5); откат — "polling".
+live_transport = "stream"
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"
+
+# Автоматическая историческая цепочка. Без lead_days семейство наследует
+# trading.contract_expiry_block_days; индивидуальный срок может быть только больше.
+[historical.rollover]
+policy = "calendar"
+# Пример: [historical.rollover.families.BR] lead_days = 3
 
 [notifier]
 # Каналы доставки уведомлений в порядке подписки: "console" | "telegram".
@@ -27,7 +46,7 @@ channels = ["console","telegram"]
 events = [
     "clearing_done", "decision", "error", "heartbeat", "order_accepted", "order_rejected",
     "position_added", "protection_armed", "rate_limited", "rejected", "reservation_changed",
-    "risk_limit_hit", "signal", "stop_hit", "stop_moved", "target_hit", "trade_cancelled",
+    "risk_limit_hit", "signal", "startup_analysis", "market_data_status", "stop_hit", "stop_moved", "target_hit", "trade_cancelled",
     "trade_closed", "trade_opened"
 ]
 
@@ -173,8 +192,8 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
-    { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
+    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10 },
+    { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "basic_levels", priority = 10 },
 ]
 
 [strategies.future.BR]
@@ -291,6 +310,7 @@ future = ["long", "short"]     # фьючерсы: и лонг, и шорт
 share  = ["long"]              # акции: только лонг
 
 [trading.risk_limits]
+max_entry_deviation_r = 0.25 # неблагоприятное движение от входа / расстояние вход–стоп
 portfolio_pct = 2.0     # единый риск всех открытых остатков и pending-входов, % от min(balance, equity)
 # Старые trade_pct, instrument_pct и groups нужно удалить из robot.toml:
 # отдельные процентные квоты заменены единым portfolio_pct, молчаливой миграции нет.

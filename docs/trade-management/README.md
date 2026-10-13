@@ -9,8 +9,8 @@
 - [Четыре профиля управления сделкой](profiles.md) — уровни, цели, стопы, доборы
   и выходы с графиками (`levels_rr`, `atr_trend`, `ma_cloud`, `pattern_targets`).
 - [Хранилище сделок, CSV-экспорт и аудит](storage-and-audit.md) — SQLite как
-  источник истины, автоматические `journal.csv`/`positions.csv`, `trade_audit.log`
-  и поведение при блокировке файлов на Windows/macOS.
+  источник истины, автоматические `trade_event.csv`/`trade_summary.csv`,
+  `trade_decision_trace.log` и поведение при блокировке файлов на Windows/macOS.
 
 Уведомления пользователю: [События шины уведомлений](../notification/events.md) —
 каталог событий, видимость по каналам и точки публикации;

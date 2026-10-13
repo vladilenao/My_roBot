@@ -7,8 +7,10 @@ from src.market_context import (
 from src import __version__
 from datetime import datetime, timedelta
 from decimal import Decimal
+from dataclasses import replace
 from pathlib import Path
 from shutil import rmtree
+import json
 import sys
 
 from src.decision import SignalFilter
@@ -18,6 +20,12 @@ from src.config import (
     CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
+    MARKET_DATA_DATABASE_FILE,
+    MARKET_DATA_EXPORT_ENABLED,
+    MARKET_DATA_EXPORT_HOST,
+    MARKET_DATA_EXPORT_PORT,
+    MARKET_DATA_SETTINGS,
+    MARKET_DATA_EXPORT_TOKEN,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -49,29 +57,45 @@ from src.config import (
     runtime_dir,
     run_dir_name,
     HIST_DIR,
+    HISTORICAL_ROLLOVER,
+    TIMEFRAMES,
 )
-from src.api.emulator_client import EmulatorClientProvider
+from src.api.client import default_client_provider
+from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
-from src.history.preflight import active_pairs, run_preflight, smallest_period
+from src.history.preflight import active_pairs, run_preflight, run_chain_preflight, smallest_period
+from src.history.selection import HistorySelection
+from src.history.warmup import obligation_requirements, warmup_requirements
+from src.history.contract_lifecycle import ConstantContractLifecycle, RolloverLifecycle
 from src.history.report import (
+    CalendarScheduleMetadata,
+    MarketDataSync,
     REPORT_TXT,
     RunMetrics,
     collect_result,
+    collect_rollover,
     completion_line,
     crash_line,
     write_report,
 )
-from src.scheduler.clock import HistoricalClock
+from src.scheduler.clock import HistoricalClock, as_aware
 from src.data.cache import MarketDataCache
 from src.data.htf_provider import HtfFrameProvider
 from src.data.loader import load_candles
+from src.data.market_store import MarketDataStore
+from src.data.export_api import MarketDataExportServer
+from src.data.reconciliation import MarketDataReconciler
+from src.data.poller import LiveMarketDataPoller
+from src.data.ingestion import IngestionWorker
+from src.data.stream_ingestion import StreamSupervisor
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
 from src.events.bus import EventBus
 from src.events.event import Event
 from src.events.types import EventType
 from src.instruments import Instrument, normalize_instrument
+from src.instruments.model import instrument_key
 from src.instruments.selector import select_instruments
 from src.logging_setup import get_logger, setup_logging
 from src.notifier import build_channels, close_channels
@@ -234,18 +258,54 @@ def _run_history(start, end, pause):
     выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
     второй раз. Повтор ровно один — границы для нового начала проверены.
     """
+    provider = EmulatorClientProvider()
+    try:
+        sync = provider.prepare_snapshot()
+    except EmulatorError as exc:
+        market_data_sync = MarketDataSync(reason=exc.message)
+        print(f"Импорт My Robot перед прогоном не подтверждён: {exc.message}")
+    else:
+        if sync["synchronized"]:
+            market_data_sync = MarketDataSync(
+                status="synchronized",
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                snapshot_generation=sync["snapshot_generation"],
+            )
+            print(
+                "Импорт My Robot подтверждён: "
+                f"снимок {sync['snapshot_generation']}, "
+                f"курсор {sync['after_id']}/{sync['target_change_id']}."
+            )
+        else:
+            source = sync.get("source")
+            state = source.get("state") if isinstance(source, dict) else None
+            reason = (
+                f"эмулятор сообщил состояние {state}"
+                if state in {"incomplete", "blocked", "error"}
+                else "эмулятор не подтвердил полноту журнала"
+            )
+            market_data_sync = MarketDataSync(
+                producer_id=sync["producer_id"],
+                target_change_id=sync["target_change_id"],
+                after_id=sync["after_id"],
+                reason=reason,
+            )
+            print(f"Импорт My Robot перед прогоном не подтверждён: {reason}")
     instruments = None
     for _ in range(2):
         clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
         state_dir = state_dir_for(start, end)
         code, shifted, instruments = _launch(
             state_dir=state_dir,
-            client_provider=EmulatorClientProvider(),
+            client_provider=provider,
             clock=clock,
             session=build_run_session(MODE_HISTORY, clock),
             channel_names=[],
             history=True,
             instruments=instruments,
+            market_data_sync=market_data_sync,
         )
         if shifted is None:
             return code
@@ -293,6 +353,50 @@ def _source_ping(client_provider):
     return ping
 
 
+def _source_coverage(client_provider):
+    """Счётная проверка покрытия на источнике: у эмулятора есть ``/coverage``."""
+    client_context = getattr(client_provider, "client_context", None)
+    if client_context is None:
+        return None
+
+    def coverage(*, instrument_id, timeframe, start_date, end_date):
+        with client_context() as client:
+            probe = getattr(client, "coverage", None)
+            if probe is None:
+                raise EmulatorError("UNSUPPORTED", "источник не умеет проверять покрытие")
+            return probe(instrument_id=instrument_id, timeframe=timeframe,
+                         from_=start_date, to=end_date)
+
+    return coverage
+
+
+def _historical_calendar_expectation(market_calendar):
+    """Загружает календарь снимка только во время предпроверки границы."""
+    from src.market_calendar.rules import candle_rule
+
+    def expectation(pair, now):
+        if not pair.instrument_id:
+            return None
+        timeout = MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf.get(
+            pair.timeframe, MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        )
+        result = market_calendar.expectation(
+            pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+            timedelta(seconds=timeout),
+        )
+        if result.phase.value == "unknown":
+            # В отличие от live-тиков preflight допускает один запрос к
+            # эмулятору, чтобы проверить границу того же snapshot.
+            market_calendar.service(to_naive(now).to_pydatetime())
+            result = market_calendar.expectation(
+                pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+                timedelta(seconds=timeout),
+            )
+        return result
+
+    return expectation
+
+
 def _launch(
     *,
     state_dir,
@@ -302,6 +406,7 @@ def _launch(
     channel_names,
     history: bool = False,
     instruments=None,
+    market_data_sync: MarketDataSync | None = None,
 ) -> tuple[int, datetime | None, list]:
     """Единая сборка прогона: различаются только источник, часы и каталог.
 
@@ -329,28 +434,68 @@ def _launch(
             validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
             client_provider=client_provider,
             market_now=None if clock is None else clock.now(),
+            historical=history,
         ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-        instruments = [normalize_instrument(item) for item in instruments]
+        if not isinstance(instruments, HistorySelection):
+            instruments = [normalize_instrument(item) for item in instruments]
+
+    selection = instruments if isinstance(instruments, HistorySelection) else None
+    if selection is not None:
+        try:
+            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS)
+        except ValueError as exc:
+            print(f"Прогон невозможен — контрактная цепочка: {exc}")
+            return 2, None, selection
+        selection.save(state_dir)
+        session.contract_selection = selection
+        instruments = selection.instruments
+
+    provider = client_provider if history or client_provider is not None else default_client_provider()
+    market_calendar = None
+    if history:
+        from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
+
+        snapshot_store = SnapshotScheduleStore()
+        market_calendar = MarketCalendar(
+            snapshot_store,
+            EmulatorScheduleSource(snapshot_store, provider),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
+        calendar_expectation = _historical_calendar_expectation(market_calendar)
+    else:
+        calendar_expectation = None
 
     if history:
-        report = run_preflight(
-            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-            start=session.start,
-            end=session.end,
-            warmup_bars=_warmup_bars(),
-            load_candles=load_candles,
-            client_provider=client_provider,
-            clock=clock,
-            ping=_source_ping(client_provider),
-        )
+        if selection is not None and selection.families:
+            report = run_chain_preflight(selection,
+                requirements=_family_warmup, start=session.start, end=session.end,
+                load_candles=load_candles, client_provider=client_provider, clock=clock,
+                ping=_source_ping(client_provider),
+                coverage=_source_coverage(client_provider),
+                fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+                fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
+        else:
+            report = run_preflight(
+                active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+                start=session.start,
+                end=session.end,
+                warmup_bars=_warmup_bars(),
+                load_candles=load_candles,
+                client_provider=client_provider,
+                clock=clock,
+                ping=_source_ping(client_provider),
+                coverage=_source_coverage(client_provider),
+                calendar_expectation=calendar_expectation,
+            )
         if not report.ok:
             print(report.message())
-            return 2, None, instruments
+            return 2, None, selection or instruments
         if report.start != session.start:
             print(report.message())
-            return 3, report.start, instruments
+            return 3, report.start, selection or instruments
         if report.notes:
             print(report.message())
+        session.set_boundary_checks(report.boundaries)
 
     channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
@@ -361,6 +506,32 @@ def _launch(
         catch_up_bars=CATCH_UP_BARS,
         clock=clock,
     )
+    market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
+    from src.data.request_budget import RequestBudget
+    request_budget = None if history else RequestBudget(
+        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute,
+        per_minute_by_service={"instruments": 200})
+    if market_store is not None:
+        from src.market_calendar.service import MarketCalendar
+
+        market_calendar = MarketCalendar(
+            market_store,
+            provider.calendar_source(
+                market_store, token=TINKOFF_TOKEN, request_budget=request_budget,
+                horizon_days=MARKET_DATA_SETTINGS.schedule_horizon_days,
+                refresh_seconds=MARKET_DATA_SETTINGS.schedule_refresh_interval_secs,
+            ),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
+    market_reconciler = None if market_store is None else MarketDataReconciler(
+        market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
+        client_provider=provider,
+        request_budget=request_budget,
+        market_calendar=market_calendar,
+        calendar_evidence=MARKET_DATA_SETTINGS.calendar_evidence,
+        candle_publication_timeout_secs=MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        candle_publication_timeout_by_tf=MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf,
+    )
     data_cache = MarketDataCache(
         loader=load_candles,
         timeline=timeline,
@@ -369,8 +540,15 @@ def _launch(
         data_backfill_window_seconds=None if clock is not None else DATA_BACKFILL_WINDOW_SECONDS,
         freshness_tolerance_bars=CATCH_UP_BARS,
         clock=clock,
-        client_provider=client_provider,
+        client_provider=provider,
+        market_store=market_store,
+        market_reconciler=market_reconciler,
+        market_calendar=market_calendar,
+        request_budget=request_budget,
+        recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
     )
+    if history:
+        data_cache.set_boundary_checks(report.boundaries)
 
     htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
     PROFILES["triple_screen"] = TripleScreenFilter(
@@ -378,28 +556,139 @@ def _launch(
     )
 
     storage = None
+    export_server = None
+    market_poller = None
     try:
+        if not history and MARKET_DATA_EXPORT_ENABLED:
+            export_server = MarketDataExportServer(
+                market_store, MARKET_DATA_EXPORT_TOKEN or "",
+                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
+            )
+            export_server.start()
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
-            client_provider=client_provider,
+            client_provider=provider,
         )
         storage = runtime.storage
-        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session)
+        live_waiter = None
+        if not history:
+            market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider)
+            live_waiter = market_poller.wait_startup
+        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
     finally:
+        if market_poller is not None:
+            market_poller.close()
+        if export_server is not None:
+            export_server.close()
         if history:
-            _finish_history(storage, session, data_cache, timeline, state_dir)
+            _finish_history(
+                storage, session, data_cache, timeline, state_dir, market_data_sync
+            )
         close_channels(channels)
-    return 0, None, instruments
+    return 0, None, selection or instruments
 
 
-def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
+def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
+    """Сеть live-данных принадлежит фоновым полосам; бот только читает кэш.
+
+    Main thread передаёт owner неизменяемые потребности сохранённых
+    обязательств и execution boundary до старта полос: reader не читает
+    финансовую SQLite из другого потока.
+    """
+    settings = MARKET_DATA_SETTINGS
+    log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
+    worker = IngestionWorker(data_cache, settings=settings)
+    # Roster уважает роли lifecycle: инструменты исполнения (в том числе
+    # DRAINING с обязательствами) и рынка, без автоматического rollover.
+    lifecycle = getattr(runtime, "contract_lifecycle", None)
+    roster = list(instruments)
+    for source in ("execution_instruments", "market_instruments"):
+        extra = getattr(lifecycle, source, None)
+        for instrument in (extra() if callable(extra) else ()):
+            if instrument_key(instrument) not in {instrument_key(item) for item in roster}:
+                roster.append(instrument)
+    instruments = roster
+    storage = runtime.storage
+    if storage is not None:
+        trades = storage.load_trades()
+        runtime.execution_aliases = {alias: instrument_key(instrument)
+                                     for instrument in instruments
+                                     for alias in (instrument_key(instrument), instrument.ticker)}
+        boundaries = _canonical_execution_boundaries(
+            storage.execution_bar_boundaries(), runtime.execution_aliases)
+        worker.set_execution_obligations(boundaries)
+        for instrument in instruments:
+            key = instrument_key(instrument)
+            for timeframe, count in obligation_requirements(
+                    [t for t in trades if runtime.execution_aliases.get(t.plan.instrument_id) == key]).items():
+                data_cache.request_live_history(instrument, timeframe, count)
+            if key in boundaries:
+                data_cache.note_execution_lower(instrument, boundaries[key][0])
+        runtime.ingestion_worker = worker
+    stream = None
+    if settings.live_transport == "stream":
+        provider = client_provider or default_client_provider()
+        factory = getattr(provider, "stream_session", None)
+        if factory is None:
+            log.warning("Live-stream недоступен у провайдера %s — используется polling", type(provider).__name__)
+        else:
+            stream = StreamSupervisor(data_cache, worker, lambda: factory(
+                TINKOFF_TOKEN, control_queue_max_messages=settings.stream_control_queue_max_messages),
+                settings=settings)
+    poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
+    poller.start()
+    return poller
+
+
+def _canonical_execution_boundaries(boundaries, aliases):
+    """Map legacy ticker obligations to the UID used by live market pairs."""
+    result = {}
+    for identity, boundary in boundaries.items():
+        key = aliases.get(identity, identity)
+        previous = result.get(key)
+        if previous is None or boundary[0] < previous[0]:
+            result[key] = boundary
+        elif boundary[0] == previous[0]:
+            result[key] = (boundary[0], boundary[1] or previous[1])
+    return result
+
+
+def _family_warmup(family):
+    return warmup_requirements(family, FUTURE_STRATEGIES, _strategy_map(),
+                              TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
+
+
+def _calendar_schedule(data_cache) -> CalendarScheduleMetadata | None:
+    """Расписание, которым пользовался прогон; None — календаря у прогона нет."""
+    calendar = getattr(data_cache, "market_calendar", None)
+    usage = getattr(calendar, "usage", None)
+    if not callable(usage):
+        return None
+    try:
+        return CalendarScheduleMetadata(**usage())
+    except Exception as exc:  # отчёт не должен падать из-за диагностики
+        log.warning("Сводка расписания для отчёта не собрана: %s", exc)
+        return None
+
+
+def _finish_history(
+    storage, session, data_cache, timeline, state_dir,
+    market_data_sync: MarketDataSync | None = None,
+) -> None:
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
+    original_reason = session.stop_reason()
+    lifecycle = getattr(session, "contract_lifecycle", None)
+    if isinstance(lifecycle, RolloverLifecycle):
+        lifecycle.finish(timeline.now())
+        if any(state["phase"] == "DRAINING" for state in lifecycle.states.values()):
+            session.mark_contract_failure("старые обязательства не завершены к концу прогона")
     reason = session.stop_reason()
-    crashed = not reason
+    crashed = not original_reason
     longest_gap = getattr(data_cache, "longest_gap", None)
     exhaustion = getattr(session, "exhaustion", None)
+    last_processed = getattr(data_cache, "last_processed_bar", None)
     metrics = RunMetrics(
         start=session.start,
         end=session.end,
@@ -414,6 +703,12 @@ def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
         horizon_start=None if exhaustion is None else exhaustion.horizon_start,
         horizon_end=None if exhaustion is None else exhaustion.horizon_end,
         horizon_limited=bool(getattr(exhaustion, "horizon_limited", False)),
+        market_data_sync=market_data_sync or MarketDataSync(),
+        boundary_checks=tuple(getattr(session, "boundary_checks", ())),
+        last_processed_bar=last_processed if isinstance(last_processed, datetime) else None,
+        terminal_gap=bool(getattr(session, "terminal_gap", None)),
+        rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
+        calendar_schedule=_calendar_schedule(data_cache),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -422,7 +717,14 @@ def _finish_history(storage, session, data_cache, timeline, state_dir) -> None:
 
 
 
-def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> None:
+def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None) -> None:
+    def post_tick(ready_tfs):
+        worker = getattr(runtime, "ingestion_worker", None)
+        if worker is not None and runtime.storage is not None:
+            worker.set_execution_obligations(_canonical_execution_boundaries(
+                runtime.storage.execution_bar_boundaries(), runtime.execution_aliases))
+        return runtime.post_tick(ready_tfs)
+
     TradingBot(
         instruments=instruments,
         bus=bus,
@@ -434,25 +736,37 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None) -> N
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
+        market_data_settings=MARKET_DATA_SETTINGS,
+        live_data_waiter=live_waiter,
         context_cache=MarketContextCache(
             data_cache=data_cache,
             trend_analyzer=TrendAnalyzer(),
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        post_tick=runtime.post_tick,
+        post_tick=post_tick if runtime.post_tick is not None else None,
         trade_manager=runtime.trade_manager,
+        contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
     ).run()
 
 
+class _UnsafeExecutionState(RuntimeError):
+    """The in-memory simulator must be rebuilt from durable state."""
+
+    fatal_execution = True
+
+
 class _Runtime:
-    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None) -> None:
+    def __init__(self, post_tick=None, trade_manager=None, action_executor=None, storage=None, contract_lifecycle=None) -> None:
         self.post_tick = post_tick
         self.trade_manager = trade_manager
         self.action_executor = action_executor
         self.storage = storage
+        self.contract_lifecycle = contract_lifecycle
+        self.ingestion_worker = None
+        self.execution_aliases = {}
 
 
 def _build_runtime(
@@ -468,7 +782,8 @@ def _build_runtime(
     instruments = [
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
     ]
-    if not trading_enabled():
+    historical = isinstance(clock, HistoricalClock)
+    if not trading_enabled() and not historical:
         log.info("Торговый режим выключен — NotifyOnly.")
         return _Runtime()
 
@@ -494,11 +809,14 @@ def _build_runtime(
             contract_names=_instrument_names(instruments),
         )
     except Exception as exc:
+        if historical:
+            raise RuntimeError(f"Не удалось создать исторический симулятор/журнал: {exc}") from exc
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime()
 
     risk_limits = _risk_limits()
     names = _instrument_names(instruments)
+    costs = {"commission": 1.5, "slippage": 1.0} if historical else {}
 
     def publish_execution(execution, details):
         action = details["action_type"].split(":", 1)[0]
@@ -522,7 +840,7 @@ def _build_runtime(
              execution_id=execution.execution_id, status=str(execution.status),
              visual=details.get("visual"),
              timeframe=details["visual"].data["timeframe"] if details.get("visual") else "",
-             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining",
+             **{key: details[key] for key in ("gross_pnl", "net_pnl", "fees_total", "fees_known", "pnl_units", "quantity_remaining", "target_number",
                                             "requested_quantity", "selected_quantity", "limiting_constraint")
                 if key in details and str(execution.status) in {"fill", "partial"}}))
 
@@ -535,35 +853,101 @@ def _build_runtime(
         profiles_config=TRADE_MANAGEMENT_PROFILES,
         risk_limits=risk_limits,
         max_qty=RISK_LIMITS.get("max_qty"),
-        commission=RISK_LIMITS.get("commission"),
-        slippage=RISK_LIMITS.get("slippage"),
+        commission=RISK_LIMITS.get("commission", costs.get("commission")),
+        slippage=RISK_LIMITS.get("slippage", costs.get("slippage")),
         slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
         min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
         portfolio_pct=RISK_LIMITS.get("portfolio_pct", 2),
         min_risk_cost_ratio=RISK_LIMITS.get("min_risk_cost_ratio", 2),
         min_net_payoff=RISK_LIMITS.get("min_net_payoff", 1.5),
         max_slippage_r=RISK_LIMITS.get("max_slippage_r", 0.25),
+        max_entry_deviation_r=RISK_LIMITS.get("max_entry_deviation_r", 0.25),
+        live_market_provider=None if historical else data_cache.entry_market if getattr(data_cache, "live_session_enabled", False) is True else None,
         contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
         direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
         clock=clock,
     )
+    if historical:
+        trade_manager.initialize_account()
     trade_manager.restore()
+    # Live: общий outbox доставляется только по read-only рыночным фактам
+    # owner (design 9a). Начало торгового шага отличает текущее намерение
+    # от удержанного раньше, актуальность которого не доказана.
+    intent_since = [None]
+    if not historical and getattr(data_cache, "live_session_enabled", False) is True:
+        trade_manager.configure_dispatch_eligibility(
+            _dispatch_evidence(data_cache, instruments, storage, intent_since), lambda: data_cache._lock)
     trade_manager.configure_visual_context(instruments)
     action_executor = _OutboxExecutor(trade_manager)
-    contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
+    selection = getattr(session, "contract_selection", None)
+    if isinstance(selection, HistorySelection) and selection.families:
+        from src.portfolio.models import ContractMeta
+        contracts = _load_contracts_metadata(selection.fixed, client_provider=client_provider)
+        for chain in selection.chains:
+            for segment in chain:
+                card = segment.card
+                contracts[card.uid] = ContractMeta(card.uid, float(card.price_step), float(card.step_cost),
+                    float(card.go_buy), float(card.go_sell), currency=(card.currency or "RUB").upper(), expiration_date=card.expiration_date)
+    else:
+        contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
     storage.set_names(_instrument_names(instruments))
     broker.set_names(_instrument_names(instruments))
-    print_contract_metadata(contracts)
+    print_contract_metadata(contracts, _instrument_names(instruments))
+    lifecycle = ConstantContractLifecycle(instruments)
+    if isinstance(selection, HistorySelection) and selection.families:
+        lifecycle = RolloverLifecycle(selection, storage, trade_manager, data_cache, _family_warmup, session.end,
+            work_timeframes=lambda instrument: {pair.timeframe for pair in active_pairs([instrument], SHARE_STRATEGIES, FUTURE_STRATEGIES)})
+        trade_manager.contract_lifecycle = lifecycle
+        broker.increase_allowed = lifecycle.execution_increase_allowed
+        lifecycle.configure_cache()
+        session.contract_lifecycle = lifecycle
+
+    # Cursors advance only after executions and observations of a minute have
+    # committed. On restart SQLite provides the safe boundary of live state.
+    execution_cursors = storage.execution_bar_boundaries()
+    execution_closes = {}
+    pending_bar = None
+    # Live owner: каждая исполняемая минута закрепляется до симуляции, а после
+    # рестарта рыночный marker догоняет уже durable финансовую границу.
+    pin_input = getattr(data_cache, "pin_execution_input", None)
+    pinned_execution = getattr(data_cache, "live_session_enabled", False) is True and callable(pin_input)
+    resumed_markers = set()
+
+    def commit_bar(stamp, prices, addressed, broker_events):
+        instrument_bar_times = {ticker: stamp for ticker in prices}
+        for event in addressed:
+            trade_manager.consume(event)
+        addressed_ids = {event.trade_id for event in addressed}
+        for event in broker_events:
+            if event.trade_id not in addressed_ids:
+                bus.publish(_broker_event(event))
+        trade_manager.observe_bars(prices, instrument_bar_times)
+        execution_closes.update({ticker: values[3] for ticker, values in prices.items()})
+        trade_manager.mark_to_market(execution_closes)
+        # Только после всех durable операций минуты курсоры обеих БД могут
+        # продвинуться. При исключении pending_bar будет повторён.
+        for ticker in prices:
+            execution_cursors[ticker] = (stamp, False)
+            instrument = next((item for item in instruments if instrument_key(item) == ticker), None)
+            mark_processed = getattr(data_cache, "mark_processed", None)
+            if instrument is not None and callable(mark_processed):
+                mark_processed(instrument, "1m", stamp)
 
     def on_bar(ready_tfs: set[str]) -> None:
+        nonlocal pending_bar
+        intent_since[0] = as_aware(trade_manager._clock.now())
         try:
-            prices = {}
-            bar_times = []
-            instrument_bar_times = {}
-            for instrument in instruments:
+            # The simulator has already advanced if a durable write failed.
+            # Retry those same events before asking it to execute another bar.
+            if pending_bar is not None:
+                commit_bar(*pending_bar)
+                pending_bar = None
+            batches = {}
+            initial_boundaries = None
+            for instrument in lifecycle.execution_instruments():
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
                 except Exception as exc:
@@ -574,49 +958,101 @@ def _build_runtime(
                     continue
                 if frame.empty:
                     continue
-                bar_time = frame["datetime"].iloc[-1]
-                if hasattr(bar_time, "to_pydatetime"):
-                    bar_time = bar_time.to_pydatetime()
                 try:
-                    bar_times.append(bar_time)
-                    prices[instrument.ticker] = (
-                        float(frame["open"].iloc[-1]),
-                        float(frame["low"].iloc[-1]),
-                        float(frame["high"].iloc[-1]),
-                        float(frame["close"].iloc[-1]),
-                    )
-                    instrument_bar_times[instrument.ticker] = bar_time
+                    ticker = instrument_key(instrument)
+                    stamps = frame["datetime"].map(to_aware_utc)
+                    boundary = execution_cursors.get(ticker)
+                    if boundary is None:
+                        if initial_boundaries is None:
+                            initial_boundaries = storage.execution_bar_boundaries()
+                        boundary = initial_boundaries.get(ticker, (stamps.max(), True))
+                    last, inclusive = boundary
+                    if pinned_execution and ticker not in resumed_markers:
+                        resumed_markers.add(ticker)
+                        if not inclusive:
+                            data_cache.resume_execution_marker(instrument, last)
+                    fresh = frame.loc[stamps >= last if inclusive else stamps > last]
+                    fresh = fresh.sort_values("datetime").drop_duplicates("datetime", keep="last")
+                    contiguous = getattr(data_cache, "contiguous_after", None)
+                    if callable(contiguous):
+                        protected = contiguous(instrument, "1m", fresh, last)
+                        # Старые адаптеры и тестовые double не обязаны знать
+                        # новый контракт покрытия; в таком случае оставляем
+                        # исходный DataFrame.
+                        if isinstance(protected, type(fresh)):
+                            fresh = protected
+                    for row in fresh.itertuples(index=False):
+                        stamp = to_aware_utc(row.datetime).to_pydatetime()
+                        values = (float(row.open), float(row.low), float(row.high), float(row.close))
+                        if pinned_execution:
+                            try:
+                                _, pinned = pin_input(instrument, row.datetime)
+                            except ValueError as exc:
+                                # Конфликт/integrity-hold: не выдумываем OHLC и
+                                # не перескакиваем минуту; healthy UID идут дальше.
+                                log.warning("Исполнение %s удержано перед %s: %s",
+                                            _instrument_ticker(instrument), stamp, exc)
+                                break
+                            values = tuple(float(pinned[key]) for key in ("open", "low", "high", "close"))
+                        batches.setdefault(stamp, {})[ticker] = values
                 except Exception as exc:
                     log.warning(
-                        "Сбой обработки бара %s по %s: %s",
-                        bar_time, _instrument_ticker(instrument), exc,
+                        "Сбой подготовки минутных баров по %s: %s",
+                        _instrument_ticker(instrument), exc,
                     )
                     continue
-            if prices:
-                broker.track_bar(max(bar_times), prices, contracts, bar_times=instrument_bar_times)
-            addressed = list(broker.drain_addressed_events())
-            for event in addressed:
+            for stamp, prices in sorted(batches.items()):
+                instrument_bar_times = {ticker: stamp for ticker in prices}
                 try:
-                    trade_manager.consume(event)
+                    broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
+                    addressed = list(broker.drain_addressed_events())
+                    broker_events = list(broker.drain_events())
                 except Exception as exc:
-                    log.warning(
-                        "Сбой применения бара исполнением (%s): %s", event.execution_id, exc
-                    )
-            addressed_ids = {event.trade_id for event in addressed}
-            for event in broker.drain_events():
-                if event.trade_id not in addressed_ids:
-                    bus.publish(_broker_event(event))
-            trade_manager.observe_bars(prices, instrument_bar_times)
-            trade_manager.mark_to_market({ticker: values[3] for ticker, values in prices.items()})
+                    # track_bar may have mutated the in-memory simulator. It is
+                    # unsafe to retry another bar until SQLite rehydrates it.
+                    raise _UnsafeExecutionState("Сбой симуляции до фиксации минуты") from exc
+                pending_bar = (stamp, prices, addressed, broker_events)
+                commit_bar(*pending_bar)
+                pending_bar = None
+            return True
+        except _UnsafeExecutionState:
+            log.exception("Исполнение остановлено до восстановления из SQLite")
+            raise
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
+            return False
 
     return _Runtime(
         post_tick=on_bar,
         trade_manager=trade_manager,
         action_executor=action_executor,
         storage=storage,
+        contract_lifecycle=lifecycle,
     )
+
+
+def _dispatch_evidence(data_cache, instruments, storage, intent_since):
+    """Готовность входа для допуска доставки; без сети и без stream-reader.
+
+    Вызывается в финансовом потоке под guard кэша: срез качества не меняется
+    между проверкой и локальной доставкой.
+    """
+    from src.trade_management.manager import DispatchDataEvidence
+    by_key = {instrument_key(item): item for item in instruments}
+
+    def inspect(instrument_id, action, command):
+        instrument = by_key.get(instrument_id)
+        if instrument is None:
+            return None
+        execution = data_cache.pair_status(instrument, "1m")["state"] == "READY"
+        row = storage.connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (command.trade_id,)).fetchone()
+        timeframe = json.loads(row[0]).get("timeframe", "") if row else ""
+        work = bool(timeframe) and data_cache.pair_status(instrument, timeframe)["state"] == "READY"
+        since = intent_since[0]
+        current = True if since is not None and as_aware(command.created_at) >= since else None
+        return DispatchDataEvidence(execution, work, current)
+
+    return inspect
 
 
 class _OutboxExecutor:
@@ -676,7 +1112,7 @@ def _instrument_ticker(instrument) -> str | None:
 
 
 def _instrument_names(instruments) -> dict[str, str]:
-    """Карта тикер -> короткое имя (NG-10.26) из селектора/нормализации инструментов.
+    """Карта адрес контракта (UID/legacy ticker) → короткое имя.
 
     В карту попадают только настоящие короткие имена: тикер и полный label
     пользователю не показываются, для неизвестного контракта остаётся
@@ -684,7 +1120,7 @@ def _instrument_names(instruments) -> dict[str, str]:
     """
     names: dict[str, str] = {}
     for instrument in instruments:
-        ticker = _instrument_ticker(instrument)
+        ticker = _instrument_ticker(instrument) if isinstance(instrument, (tuple, list)) else instrument_key(instrument)
         if not ticker:
             continue
         if isinstance(instrument, (tuple, list)):
@@ -751,6 +1187,9 @@ def _load_contracts_metadata(instruments, client_provider=None):
     if missing:
         log.warning("Нет метаданных контрактов для: %s — входы отклонятся.", missing)
     log.info("Метаданные контрактов загружены: %s", sorted(contracts))
+    for instrument in instruments:
+        if isinstance(instrument, Instrument) and instrument.uid and instrument.ticker in contracts:
+            contracts[instrument_key(instrument)] = replace(contracts.pop(instrument.ticker), ticker=instrument_key(instrument))
     return contracts
 
 
@@ -769,11 +1208,11 @@ def _instrument_type(instrument) -> str:
     return str(getattr(instrument, "instrument_type", "") or "")
 
 
-def print_contract_metadata(contracts) -> None:
+def print_contract_metadata(contracts, names=None) -> None:
     for ticker, meta in sorted(contracts.items()):
         log.info(
             "Контракт %s: шаг %.6f, стоимость шага %.4f, ГО(купли) %.2f, ГО(продажи) %.2f",
-            ticker, meta.price_step, meta.step_cost, meta.go_buy, meta.go_sell,
+            (names or {}).get(ticker) or "контракт не указан", meta.price_step, meta.step_cost, meta.go_buy, meta.go_sell,
         )
 
 

@@ -6,6 +6,7 @@ from src.market_context.models import MarketContext
 from src.market_context.sr_levels import SRLevelsCalculator
 from src.market_context.trend import TrendAnalyzer
 from src.logging_setup import get_logger
+from src.instruments.model import instrument_key
 
 log = get_logger(__name__)
 
@@ -48,6 +49,10 @@ class MarketContextCache:
     def invalidate(self, instrument, timeframe: str) -> None:
         self._cache.pop(self._key(instrument, timeframe), None)
 
+    def context_for_frame(self, instrument, timeframe, frame):
+        """Чистый контекст конкретного as-of кадра, включая поздние исправления."""
+        return self._compute_context(frame, instrument)
+
     def _compute_context(self, df: pd.DataFrame, instrument) -> MarketContext:
         trend = self._trend_analyzer.analyze(df)
         current_price = float(df["close"].iloc[-1])
@@ -67,6 +72,8 @@ class MarketContextCache:
 
     @staticmethod
     def _key(instrument, timeframe: str) -> tuple:
+        if isinstance(getattr(instrument, "uid", None), str) and instrument.uid:
+            return (instrument_key(instrument), timeframe)
         base = getattr(instrument, "base_code", None) or getattr(instrument, "ticker", None) or str(instrument)
         return (base, timeframe)
 

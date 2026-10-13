@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from t_tech.invest import CandleInterval
 import pandas as pd
 
+from src.data.ingestion_settings import MarketDataSettings
 from src.config_loader import (
     ConfigError,
     app_dir,
@@ -20,6 +21,7 @@ load_dotenv()  # загружает переменные из .env
 
 # Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
+MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 CLOUDFLARE_URL = os.getenv("CLOUDFLARE_URL")
@@ -62,6 +64,15 @@ _DEFAULTS = {
     # Ограничение частоты API-дозагрузок свечей и окно bounded backfill
     "data_refresh_min_interval": 5,
     "data_backfill_window_seconds": 3600,
+    # Локальный журнал живых свечей и необязательный API для Historical Broker
+    # API Emulator. Токен намеренно только в окружении, не в robot.toml.
+    "market_data_database_file": "market-data.sqlite3",
+    "market_data_export_enabled": False,
+    "market_data_export_host": "127.0.0.1",
+    "market_data_export_port": 8101,
+    # Live-ingestion: предварительный инженерный профиль design 11c. Значения
+    # не являются SLA брокера и не наследуются от [tick] timeout_secs.
+    **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
     # Привязки инструментов к активным стратегиям (имена из реестра src.strategies)
     "share_strategies": {
         "SBER": {
@@ -91,9 +102,11 @@ _DEFAULTS = {
     # Горизонт блокировки входов и принудительного закрытия фьючерсов:
     # календарные сутки до момента экспирации контракта.
     "contract_expiry_block_days": 2,
+    "historical_rollover": {"policy": "calendar", "families": {}},
 }
 
 _CONFIG = load_config(_DEFAULTS)
+HISTORICAL_ROLLOVER = _CONFIG["historical_rollover"]
 
 TIMEFRAME = _CONFIG["timeframe"]
 if TIMEFRAME not in TIMEFRAMES:
@@ -119,6 +132,13 @@ CATCH_UP_BARS = _CONFIG["tick_catch_up_bars"]
 # и окно инкрементальной дозагрузки (bounded backfill).
 DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
 DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
+MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
+MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
+MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
+MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
+# Эффективные параметры live-ingestion: транспорт, сроки публикации/recovery,
+# лимиты stream и бюджет запросов. Исторический режим их не использует.
+MARKET_DATA_SETTINGS = MarketDataSettings.from_flat(_CONFIG)
 
 # Каналы уведомлений в порядке конфигурации: "console" | "telegram"
 NOTIFIER_CHANNELS: tuple[str, ...] = tuple(_CONFIG["notifier_channels"])

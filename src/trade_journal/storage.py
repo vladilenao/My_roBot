@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from decimal import Decimal
 from typing import Callable, Iterator, Mapping
+from threading import local
 
 from src.trade_journal.schema import initialize_schema
 from src.scheduler.clock import Clock, as_aware, as_clock
@@ -161,6 +162,8 @@ class Storage:
         if audit_path is not None and Path(database).resolve() == Path(audit_path).resolve():
             raise ValueError("database path must not match audit export path")
         self.connection = connect(database, initial_deposit=initial_deposit)
+        self._outbox_guard_factory = None
+        self._outbox_guard_local = local()
         self._clock = as_clock(clock)
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
@@ -398,7 +401,44 @@ class Storage:
             self._enqueue(connection, command_id, trade_id, payload, processed_at)
         return True
 
-    def claim_outbox(self, limit: int = 1) -> tuple[OutboxCommand, ...]:
+    @property
+    def outbox_guard_configured(self) -> bool:
+        return self._outbox_guard_factory is not None
+
+    def configure_outbox_guard(self, factory) -> None:
+        """Composition устанавливает один обязательный guard, не per-call bypass."""
+        if not callable(factory):
+            raise ValueError("outbox guard factory должна быть callable")
+        if self._outbox_guard_factory is not None:
+            raise ValueError("Обязательный outbox guard уже установлен")
+        self._outbox_guard_factory = factory
+
+    @contextmanager
+    def outbox_delivery_guard(self):
+        """Data lock до financial transaction; nested claim использует тот же срез."""
+        active = getattr(self._outbox_guard_local, "active", False)
+        if active:
+            yield self._outbox_guard_local.predicate
+            return
+        if self._outbox_guard_factory is None:
+            yield None
+            return
+        with self._outbox_guard_factory() as predicate:
+            if not callable(predicate):
+                raise ValueError("outbox guard должен предоставить eligibility predicate")
+            self._outbox_guard_local.active = True
+            self._outbox_guard_local.predicate = predicate
+            try:
+                yield predicate
+            finally:
+                self._outbox_guard_local.active = False
+                self._outbox_guard_local.predicate = None
+
+    def outbox_dispatch_boundary(self) -> int:
+        """Срез существовавших intents: consume не расширяет текущий batch."""
+        return self.connection.execute("SELECT COALESCE(MAX(rowid),0) FROM outbox").fetchone()[0]
+
+    def claim_outbox(self, limit: int = 1, *, through_rowid: int | None = None) -> tuple[OutboxCommand, ...]:
         """Claim pending intents for delivery without making a network guarantee.
 
         A process crash after this commit can redeliver the same ``command_id`` on
@@ -406,29 +446,30 @@ class Storage:
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
-        with self.transaction() as connection:
-            rows = connection.execute(
-                "SELECT command_id, trade_id, payload_json, created_at FROM outbox "
-                "WHERE status = 'PENDING' ORDER BY created_at, command_id LIMIT ?",
-                (limit,),
-            ).fetchall()
-            command_ids = [row[0] for row in rows]
-            if command_ids:
-                placeholders = ", ".join("?" for _ in command_ids)
-                connection.execute(
-                    f"UPDATE outbox SET status = 'CLAIMED' WHERE command_id IN ({placeholders}) "
-                    "AND status = 'PENDING'",
-                    command_ids,
+        with self.outbox_delivery_guard() as eligible:
+            with self.transaction() as connection:
+                cursor = connection.execute(
+                    "SELECT command_id, trade_id, payload_json, created_at FROM outbox "
+                    "WHERE status = 'PENDING' AND (? IS NULL OR rowid<=?) ORDER BY created_at, command_id",
+                    (through_rowid, through_rowid),
                 )
-            return tuple(
-                OutboxCommand(
-                    command_id=row[0],
-                    trade_id=row[1],
-                    payload=json.loads(row[2]),
-                    created_at=datetime.fromisoformat(row[3]),
-                )
-                for row in rows
-            )
+                commands = []
+                for row in cursor:
+                    command = OutboxCommand(row[0], row[1], json.loads(row[2]), datetime.fromisoformat(row[3]))
+                    # Проверка и переход статуса в одной BEGIN IMMEDIATE.
+                    # Удержанные головы очереди не расходуют limit здоровых UID.
+                    if eligible is None or eligible(connection, command):
+                        commands.append(command)
+                    if len(commands) >= limit:
+                        break
+                command_ids = [command.command_id for command in commands]
+                if command_ids:
+                    placeholders = ", ".join("?" for _ in command_ids)
+                    connection.execute(
+                        f"UPDATE outbox SET status = 'CLAIMED' WHERE command_id IN ({placeholders}) "
+                        "AND status = 'PENDING'", command_ids,
+                    )
+                return tuple(commands)
 
     def mark_outbox_sent(self, command_id: str, *, sent_at: datetime | None = None) -> bool:
         """Record a successful submission of a claimed command, not its execution."""
@@ -478,6 +519,47 @@ class Storage:
             self._load_trade(dict(zip(columns, row, strict=True)))
             for row in cursor.fetchall()
         )
+
+    def execution_bar_boundaries(self) -> dict[str, tuple[datetime, bool]]:
+        """Safe replay starts for instruments with durable pending/open trades.
+
+        An observed minute is complete and excluded. A last execution minute
+        without an observation is included, but older bars cannot be applied
+        to the already restored position/stop. Pending commands alone do not
+        advance that boundary: earlier protection must still run first.
+        """
+        boundaries = {}
+        instruments = self.connection.execute(
+            "SELECT DISTINCT instrument_id FROM trades "
+            "WHERE phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')"
+        ).fetchall()
+        for (instrument,) in instruments:
+            candidates = []
+            for (stamp,) in self.connection.execute(
+                "SELECT bar_id FROM trade_market_observations "
+                "WHERE instrument_id=? AND timeframe='1m'", (instrument,),
+            ):
+                candidates.append((as_aware(datetime.fromisoformat(stamp)), False))
+            for stamp, kind, payload in self.connection.execute(
+                "SELECT e.occurred_at,e.event_type,e.payload_json FROM events e "
+                "JOIN trades t USING(trade_id) WHERE t.instrument_id=?", (instrument,),
+            ):
+                if kind in ('FILL', 'PARTIAL') or json.loads(payload).get('confirmed_stop'):
+                    candidates.append((as_aware(datetime.fromisoformat(stamp)), True))
+            if candidates:
+                latest = max(stamp for stamp, _ in candidates)
+                boundaries[instrument] = (latest, all(include for stamp, include in candidates if stamp == latest))
+                continue
+            # No position has executed yet. Start at submission, not at the
+            # warm-up history that happened before the order existed.
+            stamps = [as_aware(datetime.fromisoformat(stamp)) for (stamp,) in self.connection.execute(
+                "SELECT b.created_at FROM outbox b JOIN trades t USING(trade_id) "
+                "WHERE t.instrument_id=? AND t.phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')",
+                (instrument,),
+            )]
+            if stamps:
+                boundaries[instrument] = (min(stamps), True)
+        return boundaries
 
     def load_trade(self, trade_id: str, *, include_terminal: bool = False) -> RecoveredTrade | None:
         """Load one trade without re-registering it anywhere.

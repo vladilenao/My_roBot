@@ -9,7 +9,9 @@ from uuid import uuid4
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
 from src.config import BAR_TIME_TZ_OFFSET_HOURS
+from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
+from src.instruments.model import instrument_key
 from src.events.event import Event
 from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
@@ -18,6 +20,7 @@ from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
+from src.history.contract_lifecycle import ConstantContractLifecycle, ContractLifecycleError
 
 log = get_logger(__name__)
 
@@ -53,7 +56,7 @@ class _EntryCandidate:
         return (
             -self.assignment.priority,
             self.assignment.id,
-            self.instrument.ticker,
+            instrument_key(self.instrument),
             self.decision.event_id or "",
         )
 
@@ -87,6 +90,9 @@ class TradingBot:
         action_executor=None,
         protection_timeframe: str = "1m",
         run=None,
+        contract_lifecycle=None,
+        market_data_settings=None,
+        live_data_waiter=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -99,6 +105,11 @@ class TradingBot:
         self._heartbeat_every = heartbeat_every_ticks or 0
         self._tick_poll_secs = tick_poll_secs
         self._tick_timeout_secs = tick_timeout_secs
+        # Live-ожидание публикации и повтор статуса настраиваются отдельно от
+        # legacy-таймаута такта (design 7a).
+        self._market_data_settings = market_data_settings or MarketDataSettings()
+        # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
+        self._await_live_data = live_data_waiter
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
@@ -110,6 +121,7 @@ class TradingBot:
             i if isinstance(i, Instrument) else normalize_instrument(i)
             for i in instruments
         ]
+        self._contract_lifecycle = contract_lifecycle or ConstantContractLifecycle(self._instruments)
         self._tick_count = 0
         self._errors_in_period = 0
         self._heartbeat_countdown = self._heartbeat_every
@@ -122,6 +134,8 @@ class TradingBot:
 
     # ── ПУНКТ 2: бесконечный цикл «тик = закрытая свеча активного ТФ» ──
     def _loop(self) -> None:
+        if getattr(self._data_cache, "live_session_enabled", False) is True:
+            return self._loop_live()
         first = True
         while not self._run.should_stop():
             try:
@@ -138,7 +152,12 @@ class TradingBot:
             except KeyboardInterrupt:
                 log.info("Бот остановлен.")
                 return
+            except ContractLifecycleError as exc:
+                self._run.mark_contract_failure(str(exc))
+                return
             except Exception as exc:
+                if getattr(exc, "fatal_execution", False):
+                    raise
                 self._report_error(exc, "обработка тика")
                 if _is_rate_limited(exc):
                     reset = rate_limit_reset_secs(exc) or DEFAULT_BASE_DELAY
@@ -149,6 +168,27 @@ class TradingBot:
                     time.sleep(self._timeline.fallback_secs())
         log.info("Прогон завершён: %s", self._run.stop_reason())
 
+    def _loop_live(self):
+        from src.bot.live_analysis import LiveAnalysis
+        live = LiveAnalysis(self)
+        try:
+            live.bootstrap()
+            changed = getattr(self._data_cache, "wait_for_data_change", None)
+            while not self._run.should_stop():
+                # Поколение снимается до шага: данные, пришедшие во время
+                # обработки, разбудят следующий шаг без ожидания опроса.
+                generation = getattr(self._data_cache, "data_generation", None)
+                try:
+                    live.step()
+                except Exception as exc:
+                    if getattr(exc, "fatal_execution", False):
+                        raise
+                    self._report_error(exc, "обработка live-пар")
+                waiter = (lambda timeout: changed(generation, timeout)) if callable(changed) and generation is not None else None
+                self._timeline.wait_live_poll(self._tick_poll_secs, data_waiter=waiter, wake_at=live.next_wakeup())
+        except KeyboardInterrupt:
+            log.info("Бот остановлен.")
+
     # ── ПУНКТ 2.0: первый тик при запуске без ожидания границы ──
     def _bootstrap(self) -> set[str]:
         """Первичное наполнение кадров и ограниченное ожидание свежего закрытого бара.
@@ -158,7 +198,8 @@ class TradingBot:
         опубликован (запуск на границе), ждёт его появления с тем же таймаутом,
         что и штатный тик. Возвращает ТФ с готовой свежей свечой.
         """
-        for instrument in self._instruments:
+        bootstrap_instruments = self._contract_lifecycle.market_instruments() if self._contract_lifecycle.automatic else self._instruments
+        for instrument in bootstrap_instruments:
             for tf in self._assigned_timeframes(instrument):
                 self._data_cache.frame_for(instrument, tf)
         return self._timeline.wait_until_bar_published(
@@ -175,6 +216,9 @@ class TradingBot:
         completed = False
         self._bus.publish(Event.tick_started(tick_id=tick_id))
         try:
+            if self._contract_lifecycle.automatic:
+                self._contract_lifecycle.before_tick(self._timeline.now())
+                self._instruments = list(self._contract_lifecycle.market_instruments())
             for instrument in self._instruments:
                 for tf in self._assigned_timeframes(instrument):
                     try:
@@ -187,6 +231,23 @@ class TradingBot:
                 except Exception as exc:
                     self._report_error(exc, f"обновление свечей таймфрейма {tf}")
             self._data_cache.close_tick()
+            if self._run.is_virtual and callable(getattr(self._data_cache, "final_drivers_processed", None)):
+                self._run.update_data_status(source_failed=self._data_cache.history_source_failed,
+                                             drivers_complete=self._data_cache.final_drivers_processed())
+            calendar = getattr(self._data_cache, "take_calendar_event", None)
+            event = calendar() if self._contract_lifecycle.automatic and callable(calendar) else None
+            if event is not None:
+                self._run.clock.jump_to(event)
+                self._timeline.reanchor()
+                if getattr(self._run, "boundary_checks", ()):
+                    self._contract_lifecycle.before_tick(event)
+                    self._contract_lifecycle.after_execution(event)
+                return
+            terminal = getattr(self._data_cache, "take_terminal_gap", None)
+            completion = terminal() if self._run.is_virtual and callable(terminal) else None
+            if completion is not None and self._run.complete_terminal_gap(completion):
+                self._timeline.reanchor()
+                return
             if getattr(self._data_cache, "data_exhausted", False):
                 self._run.mark_data_exhausted(
                     getattr(self._data_cache, "data_exhaustion", None)
@@ -199,12 +260,23 @@ class TradingBot:
                 self._run.mark_data_gap(gap)
                 self._timeline.reanchor()
                 return
+            # Protection is simulated from closed base bars before any strategy
+            # may calculate a new entry. One lagging pair must not block the
+            # available minutes of other instruments behind the global TF gate.
+            if self._post_tick is not None:
+                execution_complete = self._post_tick({self._protection_timeframe}) is not False
+            else:
+                execution_complete = True
+            if self._contract_lifecycle.automatic:
+                self._contract_lifecycle.after_execution(self._timeline.now())
+                self._instruments = list(self._contract_lifecycle.market_instruments())
+            note_processed = getattr(self._data_cache, "note_driver_processed", None)
+            if self._run.is_virtual and execution_complete and callable(note_processed):
+                note_processed()
+                self._run.update_data_status(source_failed=self._data_cache.history_source_failed,
+                                             drivers_complete=self._data_cache.final_drivers_processed())
             if not ready_tfs:
                 return
-            # Protection is simulated from closed base bars before any strategy
-            # may calculate a new entry from a slower timeframe.
-            if self._protection_timeframe in ready_tfs and self._post_tick is not None:
-                self._post_tick({self._protection_timeframe})
             entry_candidates: list[_EntryCandidate] = []
             for instrument in self._instruments:
                 try:
@@ -215,6 +287,11 @@ class TradingBot:
                     self._report_error(exc, f"анализ {instrument.label}")
             for candidate in sorted(entry_candidates, key=_EntryCandidate.sort_key):
                 try:
+                    # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО
+                    # идут в консоли одним блоком с СИГНАЛ.
+                    self._emit(candidate.instrument, candidate.assignment.strategy, candidate.decision,
+                               filter_profile=candidate.assignment.filter_profile,
+                               filtered_out=False, timeframe=candidate.timeframe)
                     self._admit_candidate(candidate)
                 except _OperationError as err:
                     self._report_error(err.cause, err.operation)
@@ -298,6 +375,9 @@ class TradingBot:
                     continue
                 ta = strategy.compute(frame)
                 decision = strategy.decide(ta, timeframe=tf)
+                if self._contract_lifecycle.automatic and not self._contract_lifecycle.signal_allowed(
+                        instrument, frame["datetime"].iloc[-1], decision.bar_time, self._timeline.now()):
+                    continue
                 log.debug(
                     "%s %s | %s → %s %s",
                     self._display_name(instrument), tf, name,
@@ -307,7 +387,7 @@ class TradingBot:
                 bar_time = self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1])
                 msk_time = bar_time + timedelta(hours=BAR_TIME_TZ_OFFSET_HOURS)
                 event_id = (
-                    f"{assignment.id}:{instrument.ticker}:{tf}:"
+                    f"{assignment.id}:{instrument_key(instrument)}:{tf}:"
                     f"{msk_time.isoformat()}:{decision.signal_type.value}"
                 )
                 decision = replace(
@@ -323,16 +403,13 @@ class TradingBot:
                             assignment, decision, instrument, frame, context, tf,
                         )
                         if entry_candidates is None:
+                            self._emit(instrument, name, decision,
+                                filter_profile=assignment.filter_profile,
+                                filtered_out=False, timeframe=tf)
                             self._admit_candidate(candidate)
                         else:
                             entry_candidates.append(candidate)
                         summaries.append(f"{name}={decision.signal_type.name}")
-                        self._emit(
-                            instrument, name, decision,
-                            filter_profile=assignment.filter_profile,
-                            filtered_out=False,
-                            timeframe=tf,
-                        )
                         continue
                 filtered_out = False
                 if context is not None:
@@ -515,6 +592,7 @@ class TradingBot:
         filter_profile: str = "",
         filtered_out: bool = False,
         timeframe: str = "",
+        analysis_mode: str = "",
     ) -> None:
         """Publish the strategy outcome; the channel decides how it reads."""
         if filtered_out:
@@ -533,6 +611,7 @@ class TradingBot:
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
                 event_id=decision.event_id or "",
+                analysis_mode=analysis_mode,
             )
         )
 
@@ -550,7 +629,7 @@ class TradingBot:
         """Publish the admitted plan: it is queued, not yet executed."""
         economics = plan.economics
         contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
-        meta = contract_for(instrument.ticker) if callable(contract_for) else None
+        meta = contract_for(instrument_key(instrument)) if callable(contract_for) else None
         visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
         self._bus.publish(
             Event.signal(
@@ -573,6 +652,7 @@ class TradingBot:
                 strategy=plan.profile.name,
                 timeframe=timeframe or plan.timeframe,
                 trade_id=plan.trade_id,
+                event_id=plan.signal_id,
                 bar_time=as_of,
                 visual=visual,
             )
@@ -602,12 +682,17 @@ class TradingBot:
                 filter_profile=filter_profile,
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
+                event_id=decision.event_id or "",
             )
         )
 
     # ── диспетчеризация привязок по типу инструмента ──
     def _strategies_for(self, instrument: Instrument) -> list[Assignment]:
         if instrument.instrument_type == "future":
+            if isinstance(instrument.family, str):
+                from src.instruments.futures import FAMILIES
+                return self._future_strategies.get(instrument.family,
+                    self._future_strategies.get(FAMILIES[instrument.family][0], []))
             return self._future_strategies.get(instrument.ticker[:2].upper(), [])
         return self._share_strategies.get(instrument.ticker, [])
 
