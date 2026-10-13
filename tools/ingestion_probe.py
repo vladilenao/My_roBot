@@ -259,6 +259,30 @@ def probe_schedule(client, instrument):
     return result
 
 
+# ── доказательство отсутствия сделок ──
+def probe_no_trade_evidence(client, instrument, *, minutes=55):
+    """Минуты со свечой против минут со сделками GetLastTrades за последний час."""
+    from src.api.client import LIVE_CANDLE_SOURCE, NATIVE_CANDLE_INTERVALS
+
+    end = utc_now().replace(second=0, microsecond=0)
+    start = end - timedelta(minutes=minutes)
+    candles = client.market_data.get_candles(instrument_id=instrument["uid"], from_=start, to=end,
+        interval=NATIVE_CANDLE_INTERVALS["1m"].rpc, candle_source_type=LIVE_CANDLE_SOURCE).candles
+    with_candle = {c.time.replace(tzinfo=timezone.utc) for c in candles if c.is_complete}
+    trades = client.market_data.get_last_trades(instrument_id=instrument["uid"], from_=start, to=end).trades
+    with_trades = {t.time.replace(second=0, microsecond=0, tzinfo=timezone.utc) for t in trades}
+    window = [start + timedelta(minutes=index) for index in range(minutes)]
+    candle_only = [iso(m) for m in window if m in with_candle and m not in with_trades]
+    trades_only = [iso(m) for m in window if m in with_trades and m not in with_candle]
+    return {"minutes": minutes, "trades": len(trades),
+            "first_trade": iso(min((t.time for t in trades), default=None)),
+            "with_candle": sum(1 for m in window if m in with_candle),
+            "with_trades": sum(1 for m in window if m in with_trades),
+            "neither": sum(1 for m in window if m not in with_candle and m not in with_trades),
+            "candle_without_trades": candle_only, "trades_without_candle": trades_only,
+            "agrees": not candle_only and not trades_only}
+
+
 # ── холодный старт ──
 def probe_cold_start(instrument, *, days):
     from src.data.loader import load_candles
@@ -277,12 +301,18 @@ def probe_cold_start(instrument, *, days):
             "seconds": round(time.monotonic() - started, 2), "max_rss_mb_before": before, "max_rss_mb_after": rss_mb()}
 
 
-def run_probe(client, session_factory, tickers, *, listen_seconds, check_after, live_minutes, cold_days):
+def run_probe(client, session_factory, tickers, *, listen_seconds, check_after, live_minutes, cold_days,
+              no_trade_only=False):
     report = {"started_at": iso(utc_now()), "tickers": list(tickers),
-              "mode": "live" if live_minutes else "closed-market-safe"}
+              "mode": "no-trade-evidence" if no_trade_only else "live" if live_minutes else "closed-market-safe"}
     section(report, "instruments", lambda: {"items": resolve(client, tickers)})
     instruments = report["instruments"].get("items", [])
     if not instruments:
+        return report
+    for item in instruments:
+        section(report, f"no_trade:{item['ticker']}", probe_no_trade_evidence, client, item)
+    if no_trade_only:
+        report["finished_at"] = iso(utc_now())
         return report
     listen = max(listen_seconds, live_minutes * 60)
     section(report, "stream", probe_stream, session_factory, instruments, listen_seconds=listen, check_after=check_after)
@@ -306,6 +336,10 @@ def summary(report):
         lines.append(f"Подписки: подтверждено {good}/{stream['pairs']}, без ACK: {len(stream['missing_acks'])}, "
                      f"ping: {len(stream['ping_offsets_s'])}, свечей: {len(stream['candles'])}")
     for name, value in report.items():
+        if name.startswith("no_trade:") and value.get("ok"):
+            lines.append(f"{name}: свеча {value['with_candle']}, сделки {value['with_trades']}, ни того ни другого "
+                         f"{value['neither']} из {value['minutes']} минут; совпадает: {'да' if value['agrees'] else 'нет'}")
+    for name, value in report.items():
         if isinstance(value, dict) and value.get("ok") is False:
             lines.append(f"Ошибка раздела {name}: {value['error']}")
     return "\n".join(lines)
@@ -318,6 +352,8 @@ def main(argv=None):
     parser.add_argument("--listen-seconds", type=int, default=30, help="сколько слушать поток без --live-minutes")
     parser.add_argument("--live-minutes", type=int, default=0, help="слушать поток N минут (в торговую сессию)")
     parser.add_argument("--cold-days", type=int, default=30, help="глубина холодного старта 1m, дней")
+    parser.add_argument("--no-trade-only", action="store_true",
+                        help="только проверка минут без сделок по GetLastTrades (секунды, в торговую сессию)")
     parser.add_argument("--out", type=Path, default=PROJECT_ROOT / "data" / "probe")
     args = parser.parse_args(argv)
 
@@ -331,7 +367,7 @@ def main(argv=None):
     with provider.client_context() as client:
         report = run_probe(client, provider.stream_session, args.tickers, listen_seconds=args.listen_seconds,
                            check_after=min(10, args.listen_seconds // 2), live_minutes=args.live_minutes,
-                           cold_days=args.cold_days)
+                           cold_days=args.cold_days, no_trade_only=args.no_trade_only)
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"ingestion-probe-{datetime.now():%Y%m%d-%H%M%S}.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
