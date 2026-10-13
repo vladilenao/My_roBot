@@ -240,3 +240,34 @@ def test_saved_recovery_book_is_adopted_once_and_removed(tmp_path):
     assert env.store.live_state(kind="recovery", source=SOURCE, instrument_uid="uid", interval="1m") == {}
     assert env.store.live_state(kind="recovery", source="other", instrument_uid="uid", interval="1m") != {}
     assert env.completeness.adopt_recovery_books() == []
+
+
+def test_lane_diagnostics_are_machine_readable_in_pair_status(tmp_path):
+    present = [stamp for stamp in minutes("2026-10-12 10:00", "2026-10-12 10:30") if stamp != pd.Timestamp("2026-10-12 10:20")]
+    market = Market({"1m": present})
+    env = setup(tmp_path, started="2026-10-12 09:59:30", now="2026-10-12 12:00:05",
+                stored={"1m": ["2026-10-12 09:59"]}, market=market)
+    run(env.completeness)
+    env.completeness.holes(env.cache.live_pair("uid", "1m"), pd.Timestamp(env.clock[0]))
+    lanes = env.cache.pair_status(env.item, "1m")["lanes"]
+    completeness = lanes["completeness"]
+    assert completeness["holes_due"] == 0 and completeness["source_absent"] == 0
+    assert completeness["next_check_at"] == "2026-10-12T13:00:05Z"     # первая повторная проверка 10:20
+    assert completeness["window_lower"] <= "2026-10-12T10:00:00Z"
+
+    for delay in (timedelta(hours=1), timedelta(hours=24)):
+        env.clock[0] += delay + timedelta(seconds=1)
+        env.completeness.wake()
+        run(env.completeness)
+    env.completeness.holes(env.cache.live_pair("uid", "1m"), pd.Timestamp(env.clock[0]))
+    assert env.cache.pair_status(env.item, "1m")["lanes"]["completeness"]["source_absent"] >= 1
+
+
+def test_evidence_lane_reports_pending_recent_minute(tmp_path):
+    market = Market({"1m": ["2026-10-12 12:00", "2026-10-12 12:06"]}, trades=["2026-10-12 12:04:20"])
+    env = setup(tmp_path, started="2026-10-12 12:00:30", now="2026-10-12 12:10:05",
+                stored={"1m": ["2026-10-12 12:00"]}, market=market)
+    run(env.evidence)
+    evidence = env.cache.pair_status(env.item, "1m")["lanes"]["evidence"]
+    assert evidence["missing"] == "2026-10-12T12:04:00Z" and evidence["attempts"] >= 1
+    assert evidence["next_check_at"] is not None

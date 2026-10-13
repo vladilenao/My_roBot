@@ -132,9 +132,11 @@ class LiveMarketDataPoller:
             return last
         budget = getattr(self._cache, "_request_budget", None)
         snapshot = budget.snapshot() if budget is not None and hasattr(budget, "snapshot") else {}
-        completeness = next((lane for lane in self._lanes if lane.name == "completeness"), None)
-        holes = sum(getattr(completeness, "last_holes", {}).values()) if completeness is not None else 0
-        log.info("Полосы данных: запросы за минуту %s; дыр окна к проверке %d", snapshot, holes)
+        lanes = {getattr(lane, "name", ""): lane for lane in self._lanes}
+        holes = sum(getattr(lanes.get("completeness"), "last_holes", {}).values())
+        waiting = len(getattr(lanes.get("evidence"), "_next", {}))
+        log.info("Полосы данных: запросы за минуту %s; дыр окна к проверке %d; пар ждут доказательства %d",
+                 snapshot, holes, waiting)
         return now
 
     def _run_worker(self) -> None:

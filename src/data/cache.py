@@ -792,6 +792,13 @@ class MarketDataCache:
             member["gap"] = gap
             self._refresh_member_state(uid, timeframe, member)
 
+    def set_lane_status(self, uid, timeframe, lane, status) -> None:
+        """Сводка фоновой полосы по паре для машиночитаемой диагностики."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is not None:
+                member.setdefault("lanes", {})[lane] = status
+
     def pair_status(self, instrument, timeframe):
         """Read-only факты готовности пары для анализа, допуска и диагностики."""
         with self._lock:
@@ -810,7 +817,8 @@ class MarketDataCache:
                     "processed_through": cursors.get("processed_through"),
                     "incident": held.get("incident"),
                     "cutover": None if self.live_floor(uid, timeframe) is None else self._live_cutover.isoformat(),
-                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0)}
+                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0),
+                    "lanes": {lane: dict(value) for lane, value in (member.get("lanes") or {}).items()}}
 
     def input_ready_at(self, instrument, timeframe, open_time):
         """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""

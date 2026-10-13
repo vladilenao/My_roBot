@@ -118,6 +118,8 @@ class EvidenceLane:
         if remaining is None:
             self._losses.pop((uid, timeframe), None)
             self._next.pop((uid, timeframe), None)
+            self._cache.set_lane_status(uid, timeframe, self.name, {"missing": None, "attempts": 0,
+                                                                     "next_check_at": None, "checked_at": _text(now)})
             return
         self._schedule(pair, remaining, now)
 
@@ -128,6 +130,9 @@ class EvidenceLane:
         self._attempts[key] = attempt + 1
         delay = self._retry[min(attempt, len(self._retry) - 1)]
         self._next[pair["uid"], pair["timeframe"]] = now + delay
+        self._cache.set_lane_status(pair["uid"], pair["timeframe"], self.name, {
+            "missing": _text(missing), "attempts": attempt + 1, "next_check_at": _text(now + delay),
+            "checked_at": _text(now)})
         # Старые счётчики интервалов, ушедших из окна, не копятся.
         horizon = now - self._window
         for stale in [item for item in self._attempts if item[2] < horizon]:
@@ -268,6 +273,11 @@ class CompletenessLane:
                 continue
             due.append(opened)
         self.last_holes[uid, timeframe] = len(due)
+        absent = sum(1 for state, _ in snapshot["states"].values() if state == "source_absent")
+        self._cache.set_lane_status(uid, timeframe, self.name, {
+            "window_lower": _text(lower), "window_upper": _text(upper), "holes_due": len(due),
+            "first_hole": _text(due[0]) if due else None, "source_absent": absent,
+            "next_check_at": None if later is None else _text(later), "checked_at": _text(now)})
         return due, later
 
     def _first_run(self, pair, due):
