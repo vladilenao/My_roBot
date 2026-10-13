@@ -156,6 +156,8 @@ class TradingBot:
                 self._run.mark_contract_failure(str(exc))
                 return
             except Exception as exc:
+                if getattr(exc, "fatal_execution", False):
+                    raise
                 self._report_error(exc, "обработка тика")
                 if _is_rate_limited(exc):
                     reset = rate_limit_reset_secs(exc) or DEFAULT_BASE_DELAY
@@ -179,6 +181,8 @@ class TradingBot:
                 try:
                     live.step()
                 except Exception as exc:
+                    if getattr(exc, "fatal_execution", False):
+                        raise
                     self._report_error(exc, "обработка live-пар")
                 waiter = (lambda timeout: changed(generation, timeout)) if callable(changed) and generation is not None else None
                 self._timeline.wait_live_poll(self._tick_poll_secs, data_waiter=waiter, wake_at=live.next_wakeup())

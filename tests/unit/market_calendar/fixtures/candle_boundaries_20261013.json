@@ -1,0 +1,180 @@
+{
+  "SBER": {
+    "uid": "e6123145-9665-43e0-8413-cd61b8aa9b13",
+    "timeframes": {
+      "4h": [
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T04:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T08:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T12:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T16:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T20:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-13T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-13T04:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1d": [
+        {
+          "open_utc": "2026-10-06T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-07T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-08T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-09T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-10T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-11T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-13T00:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1w": [
+        {
+          "open_utc": "2026-10-05T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1M": [
+        {
+          "open_utc": "2026-10-01T00:00:00+00:00",
+          "is_complete": false
+        }
+      ]
+    }
+  },
+  "NGZ6": {
+    "uid": "a73b487a-131c-4fca-9518-9cb715ca7b54",
+    "timeframes": {
+      "4h": [
+        {
+          "open_utc": "2026-10-11T12:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T04:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T08:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T12:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T16:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T20:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-13T04:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1d": [
+        {
+          "open_utc": "2026-10-06T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-07T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-08T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-09T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-10T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-11T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-13T00:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1w": [
+        {
+          "open_utc": "2026-10-05T00:00:00+00:00",
+          "is_complete": true
+        },
+        {
+          "open_utc": "2026-10-12T00:00:00+00:00",
+          "is_complete": false
+        }
+      ],
+      "1M": [
+        {
+          "open_utc": "2026-10-01T00:00:00+00:00",
+          "is_complete": false
+        }
+      ]
+    }
+  }
+}

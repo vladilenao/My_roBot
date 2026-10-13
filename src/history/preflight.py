@@ -92,11 +92,13 @@ class BoundaryCheck:
     first_after: datetime | None = None
     right_window: tuple[datetime, datetime] | None = None
     gap_seconds: float = 0
+    schedule_versions: tuple[tuple[str, str], ...] = ()
+    trading_gap: bool = False
     error: str | None = None
 
     @property
     def ok(self):
-        return self.status in {"covered", "confirmed_gap"}
+        return self.status in {"covered", "confirmed_gap", "planned_pause"}
 
     @property
     def identity(self):
@@ -111,8 +113,15 @@ class BoundaryCheck:
         if self.status == "covered":
             return f"{prefix}: граница покрыта фактическим баром {self.last_before}"
         if self.status == "confirmed_gap":
-            return (f"{prefix}: перерыв на границе подтверждён соседними барами "
+            # Расписание ожидало торговые свечи: это наблюдаемый разрыв в
+            # торговое время, а не плановый перерыв; правило L/R его принимает.
+            kind = "разрыв в торговое время" if self.trading_gap else "перерыв на границе"
+            return (f"{prefix}: {kind} подтверждён соседними барами "
                     f"{self.last_before} и {self.first_after}, разрыв {_span(timedelta(seconds=self.gap_seconds))}")
+        if self.status == "planned_pause":
+            versions = ", ".join(f"{day}:{version}" for day, version in self.schedule_versions)
+            suffix = f" (версии {versions})" if versions else ""
+            return f"{prefix}: плановый перерыв подтверждён расписанием после {self.last_before}{suffix}"
         return f"{prefix}: конец диапазона не покрыт — {self.error}"
 
     def payload(self):
@@ -146,7 +155,7 @@ def _boundary_frame(frame, lower, upper, pair):
 
 
 def check_right_boundary(pair, *, start, boundary, load_candles, client_provider=None, clock=None,
-                         deadline=None, role="end", initial_tail=None):
+                          deadline=None, role="end", initial_tail=None, calendar_expectation=None):
     start, boundary = to_naive(start).to_pydatetime(), to_naive(boundary).to_pydatetime()
     lower = max(start, boundary-LOOKAHEAD)
     upper = min(boundary+LOOKAHEAD, to_naive(deadline).to_pydatetime()) if deadline is not None else boundary+LOOKAHEAD
@@ -181,6 +190,15 @@ def check_right_boundary(pair, *, start, boundary, load_candles, client_provider
         if last >= expected:
             return replace(result, status="covered", last_before=last)
         result = replace(result, last_before=last, right_window=(boundary, upper))
+        if calendar_expectation is not None:
+            expectation = calendar_expectation(pair, boundary)
+            due = None if expectation is None else expectation.last_due
+            schedule = getattr(expectation, "schedule", None)
+            versions = () if schedule is None else tuple((day.isoformat(), version) for day, version in schedule.days)
+            if due is not None and last >= due.open and expectation.phase.value in {"break", "closed"}:
+                return replace(result, status="planned_pause", right_window=None, schedule_versions=versions)
+            if due is not None and due.open > last and expectation.phase.value != "unknown":
+                result = replace(result, trading_gap=True, schedule_versions=versions)
         if not pair.instrument_id:
             return replace(result, error="не разрешена устойчивая идентичность пары")
         if upper <= boundary:
@@ -279,6 +297,7 @@ def run_preflight(
     clock=None,
     ping=None,
     coverage=None,
+    calendar_expectation=None,
 ) -> PreflightReport:
     """Проверяет источник, разрешение инструментов и покрытие диапазона.
 
@@ -289,6 +308,9 @@ def run_preflight(
     необязательная проверка живости источника. ``coverage`` — необязательный
     необязательный счётный запрос покрытия к источнику. Его отсутствие не влияет
     на обязательные проверки.
+
+    ``calendar_expectation`` при наличии возвращает календарное ожидание пары
+    на границе. Подтверждённый перерыв допускает хвост без бара-продолжения.
 
     Начало в нерабочей точке календаря — один повтор проверки: если предложенный
     сдвиг даёт покрытый прогрев, он возвращается в ``start``, а ``notes`` объясняет
@@ -318,6 +340,7 @@ def run_preflight(
         client_provider=client_provider,
         clock=clock,
         ping_problem=ping_problem,
+        calendar_expectation=calendar_expectation,
     )
     shift_to = report.shift_to
     # Недоступный источник сдвигом не лечится: второй проход по нему ничего
@@ -332,6 +355,7 @@ def run_preflight(
             client_provider=client_provider,
             clock=clock,
             ping_problem=None,
+            calendar_expectation=calendar_expectation,
         )
         note = (
             f"начало диапазона сдвинуто с {start_dt:%Y-%m-%d %H:%M} на {shift_to:%Y-%m-%d %H:%M}: "
@@ -452,6 +476,7 @@ def _check_all(
     client_provider,
     clock,
     ping_problem: str | None = None,
+    calendar_expectation=None,
 ) -> PreflightReport:
     """Один проход по всем парам: границы диапазона и отметка о недоступном источнике."""
     problems: list[str] = []
@@ -474,6 +499,7 @@ def _check_all(
             clock=clock,
             boundary_results=boundaries,
             is_driver=_period(pair.timeframe) == driver_period,
+            calendar_expectation=calendar_expectation,
         )
         detail.append(line)
         problems.extend(pair_problems)
@@ -517,6 +543,7 @@ def _check_pair(
     clock,
     boundary_results=None,
     is_driver: bool = True,
+    calendar_expectation=None,
 ) -> tuple[str, list[str], datetime | None]:
     """Проверяет одну пару и возвращает строку отчёта, проблемы и возможный сдвиг.
 
@@ -587,7 +614,8 @@ def _check_pair(
         if pair.instrument_id is not None and tail_uid != pair.instrument_id:
             raise ValueError("источник вернул другую идентичность инструмента")
         check = check_right_boundary(pair, start=start_dt, boundary=end_dt, load_candles=load_candles,
-            client_provider=client_provider, clock=clock, initial_tail=(tail, tail_from))
+            client_provider=client_provider, clock=clock, initial_tail=(tail, tail_from),
+            calendar_expectation=calendar_expectation)
     except Exception as exc:
         check = BoundaryCheck(pair, *source_identity(client_provider), "end", end_dt, expected_last,
                               (tail_from, end_dt), error=f"ошибка обязательного чтения: {exc}")
@@ -644,7 +672,7 @@ def _nearest_before(pair: Pair, moment: datetime, load_candles, client_provider,
 
 def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         client_provider=None, clock=None, ping=None,
-                        fixed_pairs=(), fixed_warmup=1, coverage=None):
+                        fixed_pairs=(), fixed_warmup=1, coverage=None, calendar_expectation=None):
     """Проверить назначенные участки, не требуя годы истории каждого выпуска."""
     problems, notes, detail = [], [], []
     boundaries = []
@@ -652,8 +680,9 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
     shifted = to_naive(start).to_pydatetime()
     if fixed_pairs:
         fixed = run_preflight(fixed_pairs, start=start, end=end, warmup_bars=fixed_warmup,
-                              load_candles=load_candles, client_provider=client_provider,
-                              clock=clock, ping=ping, coverage=coverage)
+                               load_candles=load_candles, client_provider=client_provider,
+                               clock=clock, ping=ping, coverage=coverage,
+                               calendar_expectation=calendar_expectation)
         problems.extend(fixed.problems)
         notes.extend(fixed.notes)
         detail.extend(fixed.detail)
@@ -713,7 +742,8 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                     check = check_right_boundary(Pair(card.ticker, "future", tf, card.uid, card.short_name),
                         start=segment.start, boundary=segment.end, load_candles=load_candles,
                         client_provider=client_provider, clock=clock, deadline=segment.deadline,
-                        role="end" if segment.end == end else "cutoff")
+                        role="end" if segment.end == end else "cutoff",
+                        calendar_expectation=calendar_expectation)
                     boundaries.append(check)
                     if not check.ok:
                         raise LookupError(f"конец участка не покрыт: {check.message()}")

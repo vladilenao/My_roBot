@@ -236,6 +236,57 @@ class TestHistoryMetadataWithoutToken:
 
 
 class TestRuntimeComposition:
+    def test_prepared_minute_retries_same_packet_after_commit_failure(self):
+        event = SimpleNamespace(trade_id="trade-1", event_id="event-1")
+        broker = MagicMock()
+        broker.drain_addressed_events.return_value = [event]
+        broker.drain_events.return_value = []
+        manager = MagicMock()
+        manager.consume.side_effect = [RuntimeError("temporary storage error"), None]
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = _frame_with_candle()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+            "src.trade_management.manager.TradeManager", return_value=manager
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"):
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+
+        assert runtime.post_tick({"1m"}) is False
+        assert runtime.post_tick({"1m"}) is True
+        broker.track_bar.assert_called_once()
+        assert manager.consume.call_count == 2
+        assert manager.consume.call_args_list[0].args[0] is event
+        assert manager.consume.call_args_list[1].args[0] is event
+        cache.mark_processed.assert_called_once()
+
+    def test_simulator_exception_does_not_continue_from_mutated_memory(self):
+        broker = MagicMock()
+        broker.track_bar.side_effect = RuntimeError("partial in-memory state")
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = _frame_with_candle()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+            "src.trade_management.manager.TradeManager", return_value=MagicMock()
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"):
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+
+        with pytest.raises(run._UnsafeExecutionState):
+            runtime.post_tick(("1m",))
+        cache.mark_processed.assert_not_called()
+        broker.drain_addressed_events.assert_not_called()
+
     def test_notify_only_never_initializes_storage_or_broker(self):
         with patch("run.trading_enabled", return_value=False), patch(
             "src.trade_journal.storage.Storage"
@@ -356,6 +407,37 @@ class TestRuntimeComposition:
         broker.track_bar.assert_called_once()
 
 
+    def test_closed_market_tick_without_bars_completes_and_keeps_clearing_behaviour(self):
+        # Задача 5.4 календаря: в перерыв/после закрытия свежих 1m нет, но
+        # post_tick отрабатывает. Адресный брокер не ведёт CSV-клиринг
+        # (journal=None, снят в a317d9c) — календарь это не меняет.
+        broker = MagicMock()
+        broker.drain_addressed_events.return_value = []
+        broker.drain_events.return_value = [MagicMock()]
+        broker.run_clearing_if_due.return_value = True
+        manager = MagicMock()
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = pd.DataFrame()
+        bus = MagicMock()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch(
+            "src.broker.create_addressable_journal_broker", return_value=broker
+        ), patch(
+            "src.trade_management.manager.TradeManager", return_value=manager
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"), patch("run._broker_event", side_effect=lambda event: event):
+            runtime = run._build_runtime([SELECTOR_NG], cache, bus, run.runtime_dir())
+            assert runtime.post_tick(("1m",)) is True
+
+        broker.track_bar.assert_not_called()
+        broker.run_clearing_if_due.assert_not_called()
+
+
 class TestInstrumentNames:
     def test_share_named_by_ticker(self):
         names = run._instrument_names(
@@ -450,6 +532,22 @@ class TestHistoryStartShift:
         selector.assert_not_called()
         channels.assert_not_called()
         assert (code, shifted, instruments) == (2, None, ready)
+
+
+def test_historical_preflight_calendar_loads_once_before_returning_expectation():
+    from src.history.preflight import Pair
+
+    unknown = SimpleNamespace(phase=SimpleNamespace(value="unknown"))
+    known = SimpleNamespace(phase=SimpleNamespace(value="closed"))
+    calendar = MagicMock()
+    calendar.expectation.side_effect = [unknown, known]
+
+    result = run._historical_calendar_expectation(calendar)(
+        Pair("NG", "future", "1m", "uid-1", "NG-1.25"), datetime(2026, 10, 13, 12)
+    )
+
+    assert result is known
+    calendar.service.assert_called_once_with(datetime(2026, 10, 13, 12))
 
 
 class TestRunHistoryRetry:
@@ -629,3 +727,30 @@ class TestFinishHistoryReportsCheckedHorizon:
         assert payload["checked_horizon"]["limited"] is False
         assert "проверен весь остаток диапазона" in payload["stop_reason"]
         assert "ограничен семью сутками" not in text
+
+
+def test_execution_boundaries_translate_legacy_ticker_to_live_uid():
+    boundary = datetime(2026, 10, 8, 11, 20)
+    aliases = {"EDZ6": "uid-ed", "uid-ed": "uid-ed"}
+
+    assert run._canonical_execution_boundaries(
+        {"EDZ6": (boundary, True)}, aliases) == {"uid-ed": (boundary, True)}
+
+
+def test_live_loop_does_not_swallow_unsafe_execution_state():
+    from src.bot.trading_bot import TradingBot
+
+    bot = SimpleNamespace(
+        _run=SimpleNamespace(should_stop=lambda: False),
+        _data_cache=SimpleNamespace(data_generation=0),
+        _timeline=MagicMock(),
+        _report_error=MagicMock(),
+        _tick_poll_secs=1,
+    )
+    live = MagicMock()
+    live.step.side_effect = run._UnsafeExecutionState("unsafe")
+
+    with patch("src.bot.live_analysis.LiveAnalysis", return_value=live), pytest.raises(run._UnsafeExecutionState):
+        TradingBot._loop_live(bot)
+
+    bot._report_error.assert_not_called()

@@ -81,7 +81,7 @@ def test_friday_overview_is_immediate_dated_and_read_only():
     assert all(event.get("results")[0]["outcome"] == "BUY" for event in reviews)
     assert reviews[0].bar_time.date() == datetime(2026, 10, 9).date()
     assert "09.10.2026" in render(reviews[0], 3)
-    assert "Информационный" in render(reviews[0], 3)
+    assert "только обзор" in render(reviews[0], 3)
     assert "Стартовый обзор" in telegram_render(reviews[0], tz_offset_hours=3)
     manager.actions_for_signal.assert_not_called()
     manager.manage.assert_not_called()
@@ -170,7 +170,7 @@ def test_closed_session_and_delayed_last_bar_are_separate():
     assert any(e.type is EventType.MARKET_DATA_STATUS and e.get("data_state") == "delayed" for e in events)
 
 
-def test_informational_events_are_rendered_by_console_without_hold_aggregation():
+def test_informational_events_show_only_useful_overviews_in_console():
     live, _, _, events, _ = setup()
     live.bootstrap()
     stream = io.StringIO()
@@ -180,7 +180,9 @@ def test_informational_events_are_rendered_by_console_without_hold_aggregation()
     text = stream.getvalue()
     assert "СТАРТОВЫЙ ОБЗОР" in text
     assert "09.10.2026" in text
-    assert "Полученная свеча" in text
+    assert "Полученная свеча" not in text
+    assert "Источник данных" not in text
+    assert "ДАННЫЕ АКТУАЛЬНЫ" not in text
 
 
 def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path):
@@ -206,6 +208,40 @@ def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path
     assert len(calls) == len(set(calls))
     status = cache.pair_status(instrument, "1h")
     assert status["history"] == "done" and "3/100" in status["history_error"]
+
+
+def test_live_warmup_uses_calendar_last_due_as_upper_bound():
+    live, cache, _, _, _ = setup()
+    due = datetime(2026, 10, 9, 20)
+    cache.calendar_expectation = lambda *args, **kwargs: SimpleNamespace(last_due=SimpleNamespace(close=due))
+    calls, original = [], cache.prepare_live_history
+
+    def prepare(*args, **kwargs):
+        calls.append(kwargs.get("max_close"))
+        return original(*args, **kwargs)
+
+    cache.prepare_live_history = prepare
+    live.register_needs()
+
+    assert calls and set(calls) == {due}
+
+
+def test_entry_market_uses_calendar_phase_and_publication_deadline():
+    now = datetime(2026, 10, 12, 10, 4)
+    timeline = MultiTimeframeScheduler(["1m"], clock=lambda: now)
+    item = Instrument("SBER", "SBER", "share", "SBER", "uid")
+    cache = MarketDataCache(lambda **kwargs: (frame("2026-10-12 10:00", "1m", 1), "uid"), timeline)
+    cache.calendar_expectation = lambda *args, **kwargs: SimpleNamespace(
+        phase=SimpleNamespace(value="break"), last_due=None,
+    )
+    assert cache.entry_market(item) == {"valid": False, "reason": "Торговая сессия на перерыве"}
+
+    cache.calendar_expectation = lambda *args, **kwargs: SimpleNamespace(
+        phase=SimpleNamespace(value="trading"),
+        last_due=SimpleNamespace(close=datetime(2026, 10, 12, 10, 2),
+                                 publication_deadline=datetime(2026, 10, 12, 10, 3)),
+    )
+    assert cache.entry_market(item) == {"valid": False, "reason": "Не получена ожидаемая базовая свеча"}
 
 
 def test_overview_cache_ignores_hole_before_required_tail_but_not_inside():

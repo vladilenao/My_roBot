@@ -59,6 +59,22 @@ def test_checkpoint_is_monotonic_and_bound_to_producer(tmp_path):
         store.acknowledge("historical-emulator", "another-db", 1)
 
 
+def test_schedule_feed_and_checkpoint_are_independent_from_candle_cursor(tmp_path):
+    store = _store(tmp_path)
+    store.record_candles(source="tbank_exchange", instrument_uid="uid-1", interval="1m", candles=_frame())
+    assert store.record_schedule_binding(source="tbank", instrument_uid="uid-1", exchange="MOEX")
+
+    page = store.schedule_changes_after(store.producer_id, 0)
+    acknowledged = store.acknowledge_schedule("historical-emulator", store.producer_id, page["next_after_id"])
+
+    # Привязка без UID бесполезна эмулятору; код режима нормализован.
+    assert page["changes"] == [{"change_id": 1, "kind": "schedule_binding", "source": "tbank",
+                                "exchange": "moex", "instrument_uid": "uid-1",
+                                "observed_at": page["changes"][0]["observed_at"]}]
+    assert acknowledged["acknowledged_through"] == 1
+    assert store.changes_after(store.producer_id, 0)["next_after_id"] == 1
+
+
 def test_coverage_status_is_an_exported_change(tmp_path):
     store = _store(tmp_path)
     changed = store.set_interval_state(
@@ -134,5 +150,27 @@ def test_export_api_pages_changes_and_rejects_wrong_token(tmp_path):
         with pytest.raises(error.HTTPError) as exc:
             _http(base, "/api/v1/market-data/source", "wrong")
         assert exc.value.code == 401
+    finally:
+        server.close()
+
+
+def test_export_api_pages_schedule_feed_and_uses_separate_checkpoint(tmp_path):
+    store = _store(tmp_path)
+    store.record_schedule_binding(source="tbank", instrument_uid="uid-1", exchange="MOEX")
+    server = MarketDataExportServer(store, "secret", port=0)
+    try:
+        server.start()
+    except PermissionError:
+        pytest.skip("Песочница не разрешает открыть loopback-сокет")
+    try:
+        host, port = server.address
+        base = f"http://{host}:{port}"
+        _, source = _http(base, "/api/v1/market-data/source", "secret")
+        _, page = _http(base, f"/api/v1/market-data/trading-schedules?producer_id={source['producer_id']}&after_id=0", "secret")
+        _, checkpoint = _http(base, "/api/v1/market-data/consumers/historical-emulator/trading-schedules-checkpoint",
+                              "secret", {"producer_id": source["producer_id"], "change_id": page["next_after_id"]})
+
+        assert page["changes"][0]["kind"] == "schedule_binding"
+        assert checkpoint["acknowledged_through"] == 1
     finally:
         server.close()

@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from math import isfinite
 from typing import Any, Mapping
 
 LIVE_TRANSPORTS = ("polling", "stream")
+NATIVE_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M")
 
 # имя ключа → (вид, минимум, максимум, включительный минимум)
 _LIMITS: dict[str, tuple[str, float | None, float | None, bool]] = {
@@ -38,6 +39,9 @@ _LIMITS: dict[str, tuple[str, float | None, float | None, bool]] = {
     "recent_reconciliation_bars": ("int", 1, None, True),
     "subscription_check_interval_secs": ("number", 0, None, False),
     "status_repeat_interval_secs": ("number", 0, None, False),
+    "schedule_refresh_interval_secs": ("number", 0, None, False),
+    "schedule_max_age_secs": ("number", 0, None, False),
+    "schedule_horizon_days": ("int", 0, None, True),
 }
 
 
@@ -67,6 +71,11 @@ class MarketDataSettings:
     recent_reconciliation_bars: int = 2
     subscription_check_interval_secs: float = 300
     status_repeat_interval_secs: float = 60
+    schedule_refresh_interval_secs: float = 3600
+    schedule_max_age_secs: float = 129600
+    schedule_horizon_days: int = 7
+    calendar_evidence: bool = True
+    candle_publication_timeout_by_tf: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         for name in setting_names():
@@ -101,6 +110,19 @@ def validate_setting(name: str, value: Any) -> Any:
         if not isinstance(value, bool):
             raise SettingError("stream_fallback_polling должен быть логическим значением")
         return value
+    if name == "calendar_evidence":
+        if not isinstance(value, bool):
+            raise SettingError("calendar_evidence должен быть логическим значением")
+        return value
+    if name == "candle_publication_timeout_by_tf":
+        if not isinstance(value, dict):
+            raise SettingError("candle_publication_timeout_by_tf должен быть отображением")
+        for timeframe, timeout in value.items():
+            if timeframe not in NATIVE_TIMEFRAMES:
+                raise SettingError(f"candle_publication_timeout_by_tf: неизвестный ТФ {timeframe!r}")
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+                raise SettingError(f"candle_publication_timeout_by_tf[{timeframe!r}] должен быть конечным числом > 0")
+        return value
     kind, lower, upper, inclusive = _LIMITS[name]
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
         raise SettingError(f"{name} должен быть конечным числом")
@@ -122,3 +144,10 @@ def validate_combination(values: Mapping[str, Any]) -> None:
     health = values.get("stream_health_timeout_seconds")
     if ping is not None and health is not None and health * 1000 <= ping:
         raise SettingError("stream_health_timeout_seconds должен превышать интервал ping")
+
+
+def candle_publication_timeout(settings: MarketDataSettings, timeframe: str) -> float:
+    """Эффективный срок публикации конкретного нативного таймфрейма."""
+    if timeframe not in NATIVE_TIMEFRAMES:
+        raise ValueError(f"Неподдерживаемый ТФ {timeframe!r}")
+    return settings.candle_publication_timeout_by_tf.get(timeframe, settings.candle_publication_timeout_secs)

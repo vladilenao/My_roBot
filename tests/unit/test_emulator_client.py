@@ -125,6 +125,22 @@ class TestMarketDataSnapshot:
 
         assert "snapshot_generation" not in calls[0]
 
+    def test_trading_schedules_use_snapshot_and_reject_missing_or_foreign_generation(self):
+        client = HistoricalClient("http://emulator:8100", snapshot_generation=42)
+        with patch.object(client, "_get", return_value={"snapshot_generation": 42, "days": []}) as get:
+            assert client.trading_schedules(
+                instrument_id="uid-1", from_=datetime(2026, 10, 1), to=datetime(2026, 10, 2)
+            )["days"] == []
+        assert get.call_args.args[0] == "/api/v1/trading-schedules"
+        assert get.call_args.args[1]["snapshot_generation"] == 42
+
+        for payload in ({"days": []}, {"snapshot_generation": 43, "days": []}):
+            with patch.object(client, "_get", return_value=payload):
+                with pytest.raises(EmulatorError, match="SNAPSHOT_MISMATCH"):
+                    client.trading_schedules(
+                        instrument_id="uid-1", from_=datetime(2026, 10, 1), to=datetime(2026, 10, 2)
+                    )
+
     @pytest.mark.parametrize("response", [
         _sync_result(synchronized=True, snapshot_generation=True),
         _sync_result(synchronized=True, snapshot_generation=-1),

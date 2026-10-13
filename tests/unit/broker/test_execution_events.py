@@ -94,6 +94,19 @@ def _bar(broker: JournalBroker, now: datetime, open_: float, low: float, high: f
     broker.track_bar(now, {"NG": (open_, low, high, close)}, {})
 
 
+def test_addressed_bar_does_not_enter_legacy_journal_path(monkeypatch):
+    from src.broker import create_addressable_journal_broker
+
+    broker = create_addressable_journal_broker(100_000, ["14:05"])
+    assert broker.journal is None
+
+    def legacy_bar(*_args, **_kwargs):
+        raise AssertionError("legacy PositionManager must not process addressed bars")
+
+    monkeypatch.setattr(broker.manager, "track_bar", legacy_bar)
+    assert broker.track_bar(NOW, {"NG": (100, 99, 101, 100)}, {}) == []
+
+
 def test_journal_broker_executes_exact_trade_and_command_and_preserves_reason(tmp_path):
     broker = JournalBroker(
         TradeJournal.created_on_init(tmp_path / "journal.csv"),

@@ -4,7 +4,7 @@ from html import escape
 from datetime import datetime, timedelta, timezone
 
 from src.events.types import EventType
-from src.notifier.templates.events import ingestion_summary
+from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.events.visual import utc
 
 PHASES = {"PLANNED": "План создан", "ENTRY_PENDING": "В работе, ждёт подтверждения",
@@ -183,6 +183,18 @@ def render(event, *, root=False, tz_offset_hours=0):
                      "Ожидаемый интервал: " + dated(event.get("expected_bar"))]
             if event.get("next_open"):
                 lines.append("Следующее открытие: " + dated(event.get("next_open")))
+            phase = {"trading": "Торги", "break": "Перерыв", "closed": "Рынок закрыт", "unknown": "Расписание неизвестно"}.get(event.get("phase"))
+            if phase:
+                lines.append("Фаза рынка: " + phase)
+            break_kind = {"clearing": "Клиринг", "auction": "Аукцион", "intersession": "Межсессионный перерыв"}.get(event.get("break_kind"))
+            if break_kind:
+                lines.append("Причина перерыва: " + break_kind)
+            next_event = event.get("next_event") or {}
+            if next_event.get("at"):
+                lines.append("Следующее событие: " + escape(next_event_label(next_event.get("kind"))) + " · " + dated(next_event["at"]))
+            schedule_line = schedule_summary(event.get("schedule"))
+            if schedule_line:
+                lines.append("Расписание: " + escape(schedule_line))
             summary = ingestion_summary(event.get("ingestion"))
             if summary:
                 lines.append(escape(summary))

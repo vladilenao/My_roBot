@@ -1,0 +1,1116 @@
+{
+  "moex_mrng_evng_e_wknd_dlr": {
+    "tickers": [
+      {
+        "ticker": "SBER",
+        "uid": "e6123145-9665-43e0-8413-cd61b8aa9b13"
+      },
+      {
+        "ticker": "GAZP",
+        "uid": "962e2a95-02a9-4171-abd7-aa198dbe643a"
+      }
+    ],
+    "days": {
+      "2026-10-13": {
+        "trading_date_from_date": "2026-10-13",
+        "date_iso_utc": "2026-10-13T00:00:00+00:00",
+        "version": "a94efb025053a6c17e99480b8b2c83c3b0c53f437d8d59831fb27f8f79bb34ea",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-13T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-13T04:00:00+00:00",
+          "end_time": "2026-10-13T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-13T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-13T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-13T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-13T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-13T03:50:00+00:00",
+            "end": "2026-10-13T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-13T03:50:00+00:00",
+            "end": "2026-10-13T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-13T04:00:00+00:00",
+            "end": "2026-10-13T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T04:00:00+00:00",
+            "end": "2026-10-13T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-13T06:00:00+00:00",
+            "end": "2026-10-13T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T06:00:00+00:00",
+            "end": "2026-10-13T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-13T15:55:00+00:00",
+            "end": "2026-10-13T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-13T15:55:00+00:00",
+            "end": "2026-10-13T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-13T16:00:01+00:00",
+            "end": "2026-10-13T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T16:00:01+00:00",
+            "end": "2026-10-13T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-14": {
+        "trading_date_from_date": "2026-10-14",
+        "date_iso_utc": "2026-10-14T00:00:00+00:00",
+        "version": "2a08764dad76cc7eab6e2b73e536c42df64073eb10244ce4ccd23e52fdcfa734",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-14T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-14T04:00:00+00:00",
+          "end_time": "2026-10-14T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-14T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-14T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-14T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-14T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-14T03:50:00+00:00",
+            "end": "2026-10-14T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-14T03:50:00+00:00",
+            "end": "2026-10-14T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-14T04:00:00+00:00",
+            "end": "2026-10-14T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T04:00:00+00:00",
+            "end": "2026-10-14T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-14T06:00:00+00:00",
+            "end": "2026-10-14T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T06:00:00+00:00",
+            "end": "2026-10-14T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-14T15:55:00+00:00",
+            "end": "2026-10-14T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-14T15:55:00+00:00",
+            "end": "2026-10-14T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-14T16:00:01+00:00",
+            "end": "2026-10-14T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T16:00:01+00:00",
+            "end": "2026-10-14T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-15": {
+        "trading_date_from_date": "2026-10-15",
+        "date_iso_utc": "2026-10-15T00:00:00+00:00",
+        "version": "22874f44c096ed0d67a19fb9c963dcae4f8320f3f8c1b2c20bb2a57cf5115902",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-15T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-15T04:00:00+00:00",
+          "end_time": "2026-10-15T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-15T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-15T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-15T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-15T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-15T03:50:00+00:00",
+            "end": "2026-10-15T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-15T03:50:00+00:00",
+            "end": "2026-10-15T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-15T04:00:00+00:00",
+            "end": "2026-10-15T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T04:00:00+00:00",
+            "end": "2026-10-15T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-15T06:00:00+00:00",
+            "end": "2026-10-15T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T06:00:00+00:00",
+            "end": "2026-10-15T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-15T15:55:00+00:00",
+            "end": "2026-10-15T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-15T15:55:00+00:00",
+            "end": "2026-10-15T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-15T16:00:01+00:00",
+            "end": "2026-10-15T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T16:00:01+00:00",
+            "end": "2026-10-15T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-16": {
+        "trading_date_from_date": "2026-10-16",
+        "date_iso_utc": "2026-10-16T00:00:00+00:00",
+        "version": "0ceede7411fdd0bff37a23e8d6f3e7e374999881cac9e112d29cd096b55d8357",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-16T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-16T04:00:00+00:00",
+          "end_time": "2026-10-16T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-16T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-16T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-16T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-16T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-16T03:50:00+00:00",
+            "end": "2026-10-16T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-16T03:50:00+00:00",
+            "end": "2026-10-16T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-16T04:00:00+00:00",
+            "end": "2026-10-16T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T04:00:00+00:00",
+            "end": "2026-10-16T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-16T06:00:00+00:00",
+            "end": "2026-10-16T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T06:00:00+00:00",
+            "end": "2026-10-16T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-16T15:55:00+00:00",
+            "end": "2026-10-16T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-16T15:55:00+00:00",
+            "end": "2026-10-16T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-16T16:00:01+00:00",
+            "end": "2026-10-16T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T16:00:01+00:00",
+            "end": "2026-10-16T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-17": {
+        "trading_date_from_date": "2026-10-17",
+        "date_iso_utc": "2026-10-17T00:00:00+00:00",
+        "version": "9100ff575c107a00554a31275340b6f0cb3611e901c8bc7a35c5c7d0b4c0b4fa",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-17T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-16T23:00:00+00:00",
+          "end_time": "2026-10-17T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-17T06:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-17T06:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "dealer_holiday_trading_session_morning",
+            "start": "2026-10-16T23:00:00+00:00",
+            "end": "2026-10-17T06:40:00+00:00"
+          },
+          {
+            "type": "dealer_regular_trading_session",
+            "start": "2026-10-16T23:00:00+00:00",
+            "end": "2026-10-17T06:40:00+00:00"
+          },
+          {
+            "type": "holiday_opening_auction_morning",
+            "start": "2026-10-17T06:50:00+00:00",
+            "end": "2026-10-17T06:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-17T06:50:00+00:00",
+            "end": "2026-10-17T06:59:59+00:00"
+          },
+          {
+            "type": "holiday_trading_session_morning",
+            "start": "2026-10-17T07:00:00+00:00",
+            "end": "2026-10-17T16:00:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-17T07:00:00+00:00",
+            "end": "2026-10-17T16:00:00+00:00"
+          },
+          {
+            "type": "dealer_holiday_trading_session_evening",
+            "start": "2026-10-17T16:00:01+00:00",
+            "end": "2026-10-17T20:49:59+00:00"
+          },
+          {
+            "type": "dealer_regular_trading_session",
+            "start": "2026-10-17T16:00:01+00:00",
+            "end": "2026-10-17T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-18": {
+        "trading_date_from_date": "2026-10-18",
+        "date_iso_utc": "2026-10-18T00:00:00+00:00",
+        "version": "fdda48f84cefb9b17889104b32bd028767b23f8a0d5fb73919e1118d31ad38b9",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-18T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-17T23:00:00+00:00",
+          "end_time": "2026-10-18T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-18T06:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-18T06:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "dealer_holiday_trading_session_morning",
+            "start": "2026-10-17T23:00:00+00:00",
+            "end": "2026-10-18T06:40:00+00:00"
+          },
+          {
+            "type": "dealer_regular_trading_session",
+            "start": "2026-10-17T23:00:00+00:00",
+            "end": "2026-10-18T06:40:00+00:00"
+          },
+          {
+            "type": "holiday_opening_auction_morning",
+            "start": "2026-10-18T06:50:00+00:00",
+            "end": "2026-10-18T06:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-18T06:50:00+00:00",
+            "end": "2026-10-18T06:59:59+00:00"
+          },
+          {
+            "type": "holiday_trading_session_morning",
+            "start": "2026-10-18T07:00:00+00:00",
+            "end": "2026-10-18T16:00:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-18T07:00:00+00:00",
+            "end": "2026-10-18T16:00:00+00:00"
+          },
+          {
+            "type": "dealer_holiday_trading_session_evening",
+            "start": "2026-10-18T16:00:01+00:00",
+            "end": "2026-10-18T20:49:59+00:00"
+          },
+          {
+            "type": "dealer_regular_trading_session",
+            "start": "2026-10-18T16:00:01+00:00",
+            "end": "2026-10-18T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-19": {
+        "trading_date_from_date": "2026-10-19",
+        "date_iso_utc": "2026-10-19T00:00:00+00:00",
+        "version": "f559a8e31a916aac532aedff1aeac4607b4c572a0a3ad26cb2f4f5114dbfc2be",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-19T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-19T04:00:00+00:00",
+          "end_time": "2026-10-19T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-19T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-19T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-19T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-19T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-19T03:50:00+00:00",
+            "end": "2026-10-19T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-19T03:50:00+00:00",
+            "end": "2026-10-19T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-19T04:00:00+00:00",
+            "end": "2026-10-19T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T04:00:00+00:00",
+            "end": "2026-10-19T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-19T06:00:00+00:00",
+            "end": "2026-10-19T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T06:00:00+00:00",
+            "end": "2026-10-19T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-19T15:55:00+00:00",
+            "end": "2026-10-19T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-19T15:55:00+00:00",
+            "end": "2026-10-19T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-19T16:00:01+00:00",
+            "end": "2026-10-19T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T16:00:01+00:00",
+            "end": "2026-10-19T20:49:59+00:00"
+          }
+        ]
+      },
+      "2026-10-20": {
+        "trading_date_from_date": "2026-10-20",
+        "date_iso_utc": "2026-10-20T00:00:00+00:00",
+        "version": "a4e28246713e64cb45dd1a6c2a72d8aaf9d851485edc261f934b8f582846a8fe",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-20T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-20T04:00:00+00:00",
+          "end_time": "2026-10-20T20:49:59+00:00",
+          "opening_auction_start_time": "2026-10-20T03:50:00+00:00",
+          "closing_auction_end_time": "2026-10-20T15:59:30+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "2026-10-20T15:55:00+00:00",
+          "opening_auction_end_time": "2026-10-20T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-20T03:50:00+00:00",
+            "end": "2026-10-20T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-20T03:50:00+00:00",
+            "end": "2026-10-20T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-20T04:00:00+00:00",
+            "end": "2026-10-20T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T04:00:00+00:00",
+            "end": "2026-10-20T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-20T06:00:00+00:00",
+            "end": "2026-10-20T15:54:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T06:00:00+00:00",
+            "end": "2026-10-20T15:54:59+00:00"
+          },
+          {
+            "type": "closing_auction_main",
+            "start": "2026-10-20T15:55:00+00:00",
+            "end": "2026-10-20T15:59:30+00:00"
+          },
+          {
+            "type": "closing_auction",
+            "start": "2026-10-20T15:55:00+00:00",
+            "end": "2026-10-20T15:59:30+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-20T16:00:01+00:00",
+            "end": "2026-10-20T20:49:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T16:00:01+00:00",
+            "end": "2026-10-20T20:49:59+00:00"
+          }
+        ]
+      }
+    }
+  },
+  "forts_futures_weekend": {
+    "tickers": [
+      {
+        "ticker": "NGZ6",
+        "uid": "a73b487a-131c-4fca-9518-9cb715ca7b54"
+      }
+    ],
+    "days": {
+      "2026-10-13": {
+        "trading_date_from_date": "2026-10-13",
+        "date_iso_utc": "2026-10-13T00:00:00+00:00",
+        "version": "3f38cd0f59d01f886244a88a0c6629007bf8cd2038e6167c2dcb707b1c2789e5",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-13T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-13T04:00:00+00:00",
+          "end_time": "2026-10-13T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-13T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-13T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-13T03:50:00+00:00",
+            "end": "2026-10-13T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-13T03:50:00+00:00",
+            "end": "2026-10-13T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-13T04:00:00+00:00",
+            "end": "2026-10-13T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T04:00:00+00:00",
+            "end": "2026-10-13T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-13T06:00:00+00:00",
+            "end": "2026-10-13T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T06:00:00+00:00",
+            "end": "2026-10-13T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-13T16:00:00+00:00",
+            "end": "2026-10-13T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-13T16:00:00+00:00",
+            "end": "2026-10-13T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-13T20:50:01+00:00",
+            "end": "2026-10-13T21:30:00+00:00"
+          }
+        ]
+      },
+      "2026-10-14": {
+        "trading_date_from_date": "2026-10-14",
+        "date_iso_utc": "2026-10-14T00:00:00+00:00",
+        "version": "81f7243c463b43070d5cdf0c2af9881a3dac0830aef2c3eca99ee51dd492bdbc",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-14T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-14T04:00:00+00:00",
+          "end_time": "2026-10-14T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-14T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-14T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-14T03:50:00+00:00",
+            "end": "2026-10-14T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-14T03:50:00+00:00",
+            "end": "2026-10-14T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-14T04:00:00+00:00",
+            "end": "2026-10-14T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T04:00:00+00:00",
+            "end": "2026-10-14T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-14T06:00:00+00:00",
+            "end": "2026-10-14T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T06:00:00+00:00",
+            "end": "2026-10-14T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-14T16:00:00+00:00",
+            "end": "2026-10-14T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-14T16:00:00+00:00",
+            "end": "2026-10-14T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-14T20:50:01+00:00",
+            "end": "2026-10-14T21:30:00+00:00"
+          }
+        ]
+      },
+      "2026-10-15": {
+        "trading_date_from_date": "2026-10-15",
+        "date_iso_utc": "2026-10-15T00:00:00+00:00",
+        "version": "a3c76989605c23c845fdfadee039ccf520613a16533e1f7b4c7e391a1ca270e0",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-15T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-15T04:00:00+00:00",
+          "end_time": "2026-10-15T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-15T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-15T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-15T03:50:00+00:00",
+            "end": "2026-10-15T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-15T03:50:00+00:00",
+            "end": "2026-10-15T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-15T04:00:00+00:00",
+            "end": "2026-10-15T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T04:00:00+00:00",
+            "end": "2026-10-15T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-15T06:00:00+00:00",
+            "end": "2026-10-15T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T06:00:00+00:00",
+            "end": "2026-10-15T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-15T16:00:00+00:00",
+            "end": "2026-10-15T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-15T16:00:00+00:00",
+            "end": "2026-10-15T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-15T20:50:01+00:00",
+            "end": "2026-10-15T21:30:00+00:00"
+          }
+        ]
+      },
+      "2026-10-16": {
+        "trading_date_from_date": "2026-10-16",
+        "date_iso_utc": "2026-10-16T00:00:00+00:00",
+        "version": "e7aa414f4ade918696867bab9af2ebf0bf4aa310610cca8a088b776627c8a3f7",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-16T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-16T04:00:00+00:00",
+          "end_time": "2026-10-16T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-16T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-16T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-16T03:50:00+00:00",
+            "end": "2026-10-16T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-16T03:50:00+00:00",
+            "end": "2026-10-16T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-16T04:00:00+00:00",
+            "end": "2026-10-16T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T04:00:00+00:00",
+            "end": "2026-10-16T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-16T06:00:00+00:00",
+            "end": "2026-10-16T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T06:00:00+00:00",
+            "end": "2026-10-16T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-16T16:00:00+00:00",
+            "end": "2026-10-16T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-16T16:00:00+00:00",
+            "end": "2026-10-16T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-16T20:50:01+00:00",
+            "end": "2026-10-16T21:30:00+00:00"
+          }
+        ]
+      },
+      "2026-10-17": {
+        "trading_date_from_date": "2026-10-17",
+        "date_iso_utc": "2026-10-17T00:00:00+00:00",
+        "version": "e069982c05d65d6ed488ba9b814ced5d546e328c1849024c3434a61b2281a650",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-17T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-17T07:00:00+00:00",
+          "end_time": "2026-10-17T16:00:00+00:00",
+          "opening_auction_start_time": "2026-10-17T06:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-17T06:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "holiday_opening_auction_morning",
+            "start": "2026-10-17T06:50:00+00:00",
+            "end": "2026-10-17T06:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-17T06:50:00+00:00",
+            "end": "2026-10-17T06:59:59+00:00"
+          },
+          {
+            "type": "holiday_trading_session_morning",
+            "start": "2026-10-17T07:00:00+00:00",
+            "end": "2026-10-17T16:00:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-17T07:00:00+00:00",
+            "end": "2026-10-17T16:00:00+00:00"
+          }
+        ]
+      },
+      "2026-10-18": {
+        "trading_date_from_date": "2026-10-18",
+        "date_iso_utc": "2026-10-18T00:00:00+00:00",
+        "version": "cdaf5919dd1b33d8907f713f87256de60ac161690777db3dcb5d012b4fb425c6",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-18T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-18T07:00:00+00:00",
+          "end_time": "2026-10-18T16:00:00+00:00",
+          "opening_auction_start_time": "2026-10-18T06:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-18T06:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "holiday_opening_auction_morning",
+            "start": "2026-10-18T06:50:00+00:00",
+            "end": "2026-10-18T06:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-18T06:50:00+00:00",
+            "end": "2026-10-18T06:59:59+00:00"
+          },
+          {
+            "type": "holiday_trading_session_morning",
+            "start": "2026-10-18T07:00:00+00:00",
+            "end": "2026-10-18T16:00:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-18T07:00:00+00:00",
+            "end": "2026-10-18T16:00:00+00:00"
+          }
+        ]
+      },
+      "2026-10-19": {
+        "trading_date_from_date": "2026-10-19",
+        "date_iso_utc": "2026-10-19T00:00:00+00:00",
+        "version": "110b838f0eb888c8667e448efdbe4c82ec1b379826752cd5dc75d994637aa943",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-19T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-19T04:00:00+00:00",
+          "end_time": "2026-10-19T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-19T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-19T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-19T03:50:00+00:00",
+            "end": "2026-10-19T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-19T03:50:00+00:00",
+            "end": "2026-10-19T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-19T04:00:00+00:00",
+            "end": "2026-10-19T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T04:00:00+00:00",
+            "end": "2026-10-19T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-19T06:00:00+00:00",
+            "end": "2026-10-19T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T06:00:00+00:00",
+            "end": "2026-10-19T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-19T16:00:00+00:00",
+            "end": "2026-10-19T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-19T16:00:00+00:00",
+            "end": "2026-10-19T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-19T20:50:01+00:00",
+            "end": "2026-10-19T21:30:00+00:00"
+          }
+        ]
+      },
+      "2026-10-20": {
+        "trading_date_from_date": "2026-10-20",
+        "date_iso_utc": "2026-10-20T00:00:00+00:00",
+        "version": "a4524cc013afe2a39ff98a756a2a82a6f4946fb2d90794bfee588506255a2705",
+        "is_trading_day": true,
+        "named_fields": {
+          "date": "2026-10-20T00:00:00+00:00",
+          "is_trading_day": true,
+          "start_time": "2026-10-20T04:00:00+00:00",
+          "end_time": "2026-10-20T20:50:00+00:00",
+          "opening_auction_start_time": "2026-10-20T03:50:00+00:00",
+          "closing_auction_end_time": "1970-01-01T00:00:00+00:00",
+          "evening_opening_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_start_time": "1970-01-01T00:00:00+00:00",
+          "evening_end_time": "1970-01-01T00:00:00+00:00",
+          "clearing_start_time": "1970-01-01T00:00:00+00:00",
+          "clearing_end_time": "1970-01-01T00:00:00+00:00",
+          "premarket_start_time": "1970-01-01T00:00:00+00:00",
+          "premarket_end_time": "1970-01-01T00:00:00+00:00",
+          "closing_auction_start_time": "1970-01-01T00:00:00+00:00",
+          "opening_auction_end_time": "2026-10-20T03:59:59+00:00"
+        },
+        "intervals": [
+          {
+            "type": "opening_auction_morning",
+            "start": "2026-10-20T03:50:00+00:00",
+            "end": "2026-10-20T03:59:59+00:00"
+          },
+          {
+            "type": "opening_auction",
+            "start": "2026-10-20T03:50:00+00:00",
+            "end": "2026-10-20T03:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_morning",
+            "start": "2026-10-20T04:00:00+00:00",
+            "end": "2026-10-20T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T04:00:00+00:00",
+            "end": "2026-10-20T05:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_main",
+            "start": "2026-10-20T06:00:00+00:00",
+            "end": "2026-10-20T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T06:00:00+00:00",
+            "end": "2026-10-20T15:59:59+00:00"
+          },
+          {
+            "type": "regular_trading_session_evening",
+            "start": "2026-10-20T16:00:00+00:00",
+            "end": "2026-10-20T20:50:00+00:00"
+          },
+          {
+            "type": "regular_trading_session",
+            "start": "2026-10-20T16:00:00+00:00",
+            "end": "2026-10-20T20:50:00+00:00"
+          },
+          {
+            "type": "clearing",
+            "start": "2026-10-20T20:50:01+00:00",
+            "end": "2026-10-20T21:30:00+00:00"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -2,7 +2,7 @@
 
 import io
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
@@ -52,6 +52,47 @@ class TestChannelPort:
 
 
 class TestConsoleChannel:
+    def test_shared_api_limit_is_one_line_per_episode(self) -> None:
+        clock = [datetime(2026, 10, 13, 11, 30, tzinfo=timezone.utc)]
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: clock[0], tz_offset_hours=3)
+
+        def status(instrument: str, state: str) -> Event:
+            return Event.market_data_status(instrument, timeframe="15m", session="open",
+                data_state=state, observed_at=clock[0].replace(tzinfo=None),
+                reason="Ожидание сброса общего лимита API" if state == "rate_limited" else "")
+
+        for instrument in ("SBER", "PHOR", "VTBR"):
+            channel.handle(status(instrument, "rate_limited"))
+        assert stream.getvalue() == "14:30  СИСТЕМА    ЛИМИТ API · ждём сброса\n\n"
+
+        clock[0] += timedelta(minutes=2)
+        channel.handle(status("SBER", "current"))
+        assert stream.getvalue().count("ЛИМИТ API") == 1
+        channel.handle(status("SBER", "rate_limited"))
+        assert stream.getvalue().count("ЛИМИТ API") == 2
+
+    def test_repeated_pair_warning_is_throttled_but_recovery_resets_it(self) -> None:
+        clock = [datetime(2026, 10, 13, 11, 30, tzinfo=timezone.utc)]
+        stream = io.StringIO()
+        channel = ConsoleChannel(stream=stream, now=lambda: clock[0])
+
+        def status(state: str) -> Event:
+            return Event.market_data_status("SBER", timeframe="15m", session="open",
+                data_state=state, observed_at=clock[0].replace(tzinfo=None),
+                reason="Нет свечи" if state == "delayed" else "")
+
+        channel.handle(status("delayed"))
+        clock[0] += timedelta(minutes=1)
+        channel.handle(status("delayed"))
+        assert stream.getvalue().count("ЗАДЕРЖКА ДАННЫХ") == 1
+        clock[0] += timedelta(minutes=15)
+        channel.handle(status("delayed"))
+        assert stream.getvalue().count("ЗАДЕРЖКА ДАННЫХ") == 2
+        channel.handle(status("current"))
+        channel.handle(status("delayed"))
+        assert stream.getvalue().count("ЗАДЕРЖКА ДАННЫХ") == 3
+
     def test_color_capability_respects_terminal_and_environment(self, monkeypatch) -> None:
         class Terminal(io.StringIO):
             def isatty(self) -> bool:

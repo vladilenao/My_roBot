@@ -24,6 +24,48 @@ def broker(kind: EventType, **payload) -> Event:
     return Event.broker_event(kind, trade_id="internal-id", instrument="PHOR", **payload)
 
 
+def test_live_status_keeps_diagnostics_out_of_console() -> None:
+    observed = datetime(2026, 10, 13, 11, 30, 12)
+    diagnostics = dict(
+        session="open", observed_at=observed,
+        received_bar=datetime(2026, 10, 13, 11, 30),
+        analyzed_bar=datetime(2026, 10, 13, 11, 30),
+        phase="trading", next_event={"kind": "publication_deadline", "at": observed},
+        schedule={"source": "tbank", "digest": "bb4515efb582"},
+        ingestion={"transport": "stream", "epoch": 1, "data_hold": "READY", "pre_cutover_gaps": 4},
+    )
+    current = Event.market_data_status("PHOR", timeframe="1h", data_state="current", **diagnostics)
+    limited = Event.market_data_status("SBER", timeframe="15m", data_state="rate_limited",
+        reason="Ожидание сброса общего лимита API", **diagnostics)
+
+    assert shown(current) is None
+    plain = shown(limited)
+    assert plain == "14:30  СИСТЕМА    ЛИМИТ API · ждём сброса"
+    colored = shown(limited, color=True)
+    assert "\x1b[33mЛИМИТ API\x1b[0m" in colored
+    assert re.sub(r"\x1b\[[0-9;]*m", "", colored) == plain
+
+
+def test_live_warning_is_short_and_keeps_pair_context() -> None:
+    status = Event.market_data_status("VTBR", timeframe="15m", session="open",
+        data_state="delayed", observed_at=datetime(2026, 10, 13, 13, 15),
+        expected_bar=datetime(2026, 10, 13, 13, 0),
+        received_bar=datetime(2026, 10, 13, 12, 45),
+        analyzed_bar=datetime(2026, 10, 13, 12, 45))
+
+    assert shown(status, tz_offset_hours=3) == "16:15  VTBR       ЗАДЕРЖКА ДАННЫХ · 15m · свеча 16:00"
+
+
+def test_clean_startup_hold_does_not_fill_console() -> None:
+    overview = Event.startup_analysis("SBER", timeframe="15m",
+        published_at=datetime(2026, 10, 13, 11, 30),
+        bar_time=datetime(2026, 10, 13, 11, 15),
+        results=[{"outcome": "HOLD", "reason": ""}],
+        available_bars=100, required_bars=100, coverage_complete=True)
+
+    assert shown(overview) is None
+
+
 def test_buy_sell_filter_and_rejection_are_complete_blocks() -> None:
     buy = Event.decision("SBER", outcome="signal_buy", side="BUY", price="100.123456",
                          strategy="macd_rsi_stoch", filter_profile="raw", timeframe="15m",

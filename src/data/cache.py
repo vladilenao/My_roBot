@@ -128,7 +128,7 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, market_calendar=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
@@ -140,6 +140,7 @@ class MarketDataCache:
         self._market_store = market_store
         self._market_source = market_source
         self._market_reconciler = market_reconciler
+        self._market_calendar = market_calendar
         self._data_refresh_min_interval = data_refresh_min_interval  # мин. пауза между API-дозагрузками
         self._data_backfill_window_seconds = data_backfill_window_seconds  # окно инкр. дозагрузки (bounded backfill)
         self._freshness_tolerance_bars = freshness_tolerance_bars  # терпимость готовности ТФ (в барах), 0 = жёсткий AND
@@ -460,6 +461,12 @@ class MarketDataCache:
                 pair, stamp = (item.uid, item.timeframe), _naive(item.open_time)
                 if result["state"] == "accepted" and result["changed"]:
                     changed.setdefault(pair, []).append(item)
+                    if result.get("previous_coverage") == "scheduled_closed":
+                        self._market_store.save_live_state(
+                            {"outside_schedule": True, "open_time": stamp.isoformat()},
+                            kind="calendar", source=self._market_source,
+                            instrument_uid=item.uid, interval=item.timeframe, open_time=stamp,
+                        )
                 if result["state"] == "conflict":
                     self._live_conflicts.add((*pair, stamp))
                 elif result["state"] == "accepted" and sequence is not None:
@@ -803,9 +810,17 @@ class MarketDataCache:
     def expected_live_open(self, key, now):
         """Открытие последнего ожидаемого закрытого бара пары по календарю."""
         grid = self._timeline.grid(key[2])
-        expected = _naive(grid.previous_candle_start(now))
         reconciler = self._market_reconciler
         uid = self._uids.get(key)
+        expectation = None if not uid or reconciler is None else reconciler.calendar_expectation(
+            instrument_uid=uid, interval=key[2], now=now)
+        if expectation is not None and expectation.phase.value != "unknown":
+            due = expectation.last_due
+            return None if due is None else _naive(due.open)
+
+        # UNKNOWN сохраняет прежнюю сеточную семантику и частоту опроса.
+        expected = _naive(grid.previous_candle_start(now))
+
         cal = reconciler.session_calendar(uid, now) if uid and reconciler else None
         if cal is None or not cal.covers(now):
             return expected
@@ -1154,6 +1169,34 @@ class MarketDataCache:
         uid = self._uids.get(self._key(instrument, "1m")) or getattr(instrument, "uid", None)
         return self._market_reconciler.session_calendar(uid, self._timeline.now()) if uid and self._market_reconciler else None
 
+    @property
+    def market_calendar(self):
+        """Календарь прогона или live-owner'а (для отчёта и диагностики)."""
+        calendar = self._market_calendar
+        if calendar is None and self._market_reconciler is not None:
+            calendar = getattr(self._market_reconciler, "market_calendar", None)
+        return calendar
+
+    def instrument_uid(self, instrument, timeframe="1m"):
+        """UID пары из live-регистрации, иначе из карточки инструмента."""
+        return self._uids.get(self._key(instrument, timeframe)) or getattr(instrument, "uid", None)
+
+    def calendar_expectation(self, instrument, timeframe, now=None):
+        uid = self.instrument_uid(instrument, timeframe)
+        if not uid or self._market_reconciler is None:
+            return None
+        return self._market_reconciler.calendar_expectation(
+            instrument_uid=uid, interval=timeframe, now=now or self._timeline.now()
+        )
+
+    def expected_calendar_bars(self, instrument, timeframe, lower, upper):
+        uid = self.instrument_uid(instrument, timeframe)
+        if not uid or self._market_reconciler is None:
+            return ()
+        return self._market_reconciler.expected_bars(
+            instrument_uid=uid, interval=timeframe, lower=lower, upper=upper
+        )
+
     def analysis_cursor(self, instrument, timeframe, assignment_id):
         uid = self._uids.get(self._key(instrument, timeframe))
         if not uid or self._market_store is None:
@@ -1174,6 +1217,18 @@ class MarketDataCache:
             return {"valid": False, "reason": "Нет завершённых базовых данных для текущей цены"}
         stamp = _naive(frame["datetime"].iloc[-1])
         now = _naive(self._timeline.now())
+        expectation = self.calendar_expectation(instrument, "1m", now)
+        if expectation is not None:
+            phase = expectation.phase.value
+            if phase == "break":
+                return {"valid": False, "reason": "Торговая сессия на перерыве"}
+            if phase == "closed":
+                return {"valid": False, "reason": "Торговая сессия закрыта"}
+            due = expectation.last_due
+            if phase == "trading" and due is not None:
+                actual_close = _naive(self._timeline.grid("1m").bar_close(stamp))
+                if actual_close < due.close and now >= due.publication_deadline:
+                    return {"valid": False, "reason": "Не получена ожидаемая базовая свеча"}
         if now - (stamp + pd.Timedelta(minutes=1)) > pd.Timedelta(seconds=max(60, self._freshness_tolerance_bars * 60 + 60)):
             return {"valid": False, "reason": "Базовая оценка текущей цены устарела"}
         if not self.coverage_for(instrument, "1m", frame.tail(3)):
@@ -1248,19 +1303,44 @@ class MarketDataCache:
         grid = self._timeline.grid(timeframe)
         now = _naive(now or self._timeline.now())
         expected = _naive(grid.previous_candle_start(now))
+
+        def due_open(key):
+            """История следует закреплённому расписанию; UNKNOWN остаётся на сетке."""
+            if not self._history:
+                return expected
+            uid = self._uids.get(key)
+            if not uid:
+                return expected
+            if self._market_reconciler is not None:
+                expectation = self._market_reconciler.calendar_expectation(
+                    instrument_uid=uid, interval=timeframe, now=now,
+                )
+            elif self._market_calendar is not None:
+                from src.market_calendar.rules import candle_rule
+                from datetime import timedelta
+                self._market_calendar.service(now)
+                expectation = self._market_calendar.expectation(uid, candle_rule(timeframe), now, timedelta(seconds=65))
+            else:
+                return expected
+            if expectation is None or getattr(getattr(expectation, "phase", None), "value", None) == "unknown":
+                return expected
+            return None if expectation.last_due is None else _naive(expectation.last_due.open)
         if self._freshness_tolerance_bars <= 0:
             frames = [
-                frame
+                (key, frame)
                 for key, frame in self._frames.items()
                 if key[2] == timeframe and self._active_key(key)
             ]
             if not frames:
                 return True
-            for frame in frames:
+            for key, frame in frames:
+                pair_expected = due_open(key)
+                if pair_expected is None:
+                    continue
                 if frame is None or frame.empty:
                     continue
                 closed = self._closed_only(frame, timeframe)
-                if closed.empty or _naive(closed["datetime"].max()) < expected:
+                if closed.empty or _naive(closed["datetime"].max()) < pair_expected:
                     return False
             return True
 
@@ -1274,6 +1354,10 @@ class MarketDataCache:
             if key[2] != timeframe or not self._active_key(key):
                 continue
             have_frames = True
+            pair_expected = due_open(key)
+            if pair_expected is None:
+                continue
+            threshold = pair_expected - tol
             if frame is None or frame.empty:
                 continue
             closed = self._closed_only(frame, timeframe)
@@ -1287,7 +1371,7 @@ class MarketDataCache:
                 )
                 continue
             active += 1
-            if last < expected:
+            if last < pair_expected:
                 lagging = True
         if not have_frames:
             return True

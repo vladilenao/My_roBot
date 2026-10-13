@@ -72,6 +72,62 @@ def test_nominal_tail_is_fast_and_diagnostic_boundary_bar_is_excluded():
     assert result.first_after is None and len(source.calls) == 1
 
 
+@pytest.mark.parametrize("phase", ["break", "closed"])
+def test_calendar_confirmed_pause_does_not_require_right_neighbor(phase):
+    source = Source(["2025-01-24 20:49"])
+    result = check_right_boundary(Pair("NG", "future", "1m", "ng-1", "NG-1.25"),
+        start=moment("2025-01-20 00:00"), boundary=moment("2025-01-27 00:00"), load_candles=source,
+        calendar_expectation=lambda pair, now: SimpleNamespace(
+            phase=SimpleNamespace(value=phase), last_due=SimpleNamespace(open=moment("2025-01-24 20:49")),
+        ))
+
+    assert result.status == "planned_pause" and result.ok
+    assert len(source.calls) == 1
+
+
+@pytest.mark.parametrize("phase,due", [
+    ("trading", "2025-01-24 20:49"),
+    ("unknown", "2025-01-24 20:49"),
+    ("closed", "2025-01-24 20:50"),
+])
+def test_calendar_pause_requires_closed_or_break_and_covered_last_due(phase, due):
+    result, source = check(["2025-01-24 20:49", "2025-01-27 07:00"], calendar_expectation=lambda pair, now:
+        SimpleNamespace(phase=SimpleNamespace(value=phase), last_due=SimpleNamespace(open=moment(due))))
+
+    assert result.status == "confirmed_gap"
+    assert len(source.calls) == 2
+
+
+def test_trading_time_gap_is_accepted_by_neighbours_but_named_honestly():
+    # Расписание ждало торговые свечи после 20:49: правило L/R разрыв принимает,
+    # но сообщение не выдаёт его за плановый перерыв.
+    result, _ = check(["2025-01-24 20:49", "2025-01-27 07:00"], calendar_expectation=lambda pair, now:
+        SimpleNamespace(phase=SimpleNamespace(value="trading"), last_due=SimpleNamespace(open=moment("2025-01-26 23:58")),
+                        schedule=None))
+
+    assert result.status == "confirmed_gap" and result.ok and result.trading_gap
+    assert "разрыв в торговое время подтверждён соседними барами" in result.message()
+
+
+def test_run_preflight_propagates_calendar_expectation_to_right_boundary():
+    source = Source(["2025-01-20 00:00", "2025-01-20 00:01", "2025-01-20 00:02", "2025-01-24 20:49"])
+    calls = []
+
+    def expectation(pair, now):
+        calls.append((pair, now))
+        return SimpleNamespace(
+            phase=SimpleNamespace(value="closed"), last_due=SimpleNamespace(open=moment("2025-01-24 20:49")),
+        )
+
+    report = run_preflight([Pair("NG", "future", "1m", short_name="NG-1.25")],
+        start=moment("2025-01-20 00:02"), end=moment("2025-01-27 00:00"), warmup_bars=2,
+        load_candles=source, calendar_expectation=expectation)
+
+    assert report.ok and report.boundaries[0].status == "planned_pause"
+    assert calls == [(Pair("NG", "future", "1m", "ng-1", "NG-1.25"), moment("2025-01-27 00:00"))]
+    assert len(source.calls) == 3
+
+
 def test_normalizes_timezone_order_and_duplicates():
     result, _ = check(["2025-01-27T10:00:00+03:00", "2025-01-24T23:49:00+03:00", "2025-01-24T20:49:00Z"])
     assert result.last_before == moment("2025-01-24 20:49")

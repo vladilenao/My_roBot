@@ -69,6 +69,7 @@ from src.history.selection import HistorySelection
 from src.history.warmup import obligation_requirements, warmup_requirements
 from src.history.contract_lifecycle import ConstantContractLifecycle, RolloverLifecycle
 from src.history.report import (
+    CalendarScheduleMetadata,
     MarketDataSync,
     REPORT_TXT,
     RunMetrics,
@@ -369,6 +370,33 @@ def _source_coverage(client_provider):
     return coverage
 
 
+def _historical_calendar_expectation(market_calendar):
+    """Загружает календарь снимка только во время предпроверки границы."""
+    from src.market_calendar.rules import candle_rule
+
+    def expectation(pair, now):
+        if not pair.instrument_id:
+            return None
+        timeout = MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf.get(
+            pair.timeframe, MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        )
+        result = market_calendar.expectation(
+            pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+            timedelta(seconds=timeout),
+        )
+        if result.phase.value == "unknown":
+            # В отличие от live-тиков preflight допускает один запрос к
+            # эмулятору, чтобы проверить границу того же snapshot.
+            market_calendar.service(to_naive(now).to_pydatetime())
+            result = market_calendar.expectation(
+                pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+                timedelta(seconds=timeout),
+            )
+        return result
+
+    return expectation
+
+
 def _launch(
     *,
     state_dir,
@@ -422,6 +450,21 @@ def _launch(
         session.contract_selection = selection
         instruments = selection.instruments
 
+    provider = client_provider if history or client_provider is not None else default_client_provider()
+    market_calendar = None
+    if history:
+        from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
+
+        snapshot_store = SnapshotScheduleStore()
+        market_calendar = MarketCalendar(
+            snapshot_store,
+            EmulatorScheduleSource(snapshot_store, provider),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
+        calendar_expectation = _historical_calendar_expectation(market_calendar)
+    else:
+        calendar_expectation = None
+
     if history:
         if selection is not None and selection.families:
             report = run_chain_preflight(selection,
@@ -430,7 +473,7 @@ def _launch(
                 ping=_source_ping(client_provider),
                 coverage=_source_coverage(client_provider),
                 fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-                fixed_warmup=_warmup_bars())
+                fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
         else:
             report = run_preflight(
                 active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
@@ -442,6 +485,7 @@ def _launch(
                 clock=clock,
                 ping=_source_ping(client_provider),
                 coverage=_source_coverage(client_provider),
+                calendar_expectation=calendar_expectation,
             )
         if not report.ok:
             print(report.message())
@@ -465,11 +509,28 @@ def _launch(
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
     from src.data.request_budget import RequestBudget
     request_budget = None if history else RequestBudget(
-        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute)
+        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute,
+        per_minute_by_service={"instruments": 200})
+    if market_store is not None:
+        from src.market_calendar.service import MarketCalendar
+
+        market_calendar = MarketCalendar(
+            market_store,
+            provider.calendar_source(
+                market_store, token=TINKOFF_TOKEN, request_budget=request_budget,
+                horizon_days=MARKET_DATA_SETTINGS.schedule_horizon_days,
+                refresh_seconds=MARKET_DATA_SETTINGS.schedule_refresh_interval_secs,
+            ),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
     market_reconciler = None if market_store is None else MarketDataReconciler(
         market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
-        client_provider=client_provider,
+        client_provider=provider,
         request_budget=request_budget,
+        market_calendar=market_calendar,
+        calendar_evidence=MARKET_DATA_SETTINGS.calendar_evidence,
+        candle_publication_timeout_secs=MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        candle_publication_timeout_by_tf=MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
@@ -479,9 +540,10 @@ def _launch(
         data_backfill_window_seconds=None if clock is not None else DATA_BACKFILL_WINDOW_SECONDS,
         freshness_tolerance_bars=CATCH_UP_BARS,
         clock=clock,
-        client_provider=client_provider,
+        client_provider=provider,
         market_store=market_store,
         market_reconciler=market_reconciler,
+        market_calendar=market_calendar,
         request_budget=request_budget,
         recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
     )
@@ -505,12 +567,12 @@ def _launch(
             export_server.start()
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
-            client_provider=client_provider,
+            client_provider=provider,
         )
         storage = runtime.storage
         live_waiter = None
         if not history:
-            market_poller = _start_live_ingestion(data_cache, runtime, instruments, client_provider)
+            market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider)
             live_waiter = market_poller.wait_startup
         _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
     finally:
@@ -549,13 +611,20 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     storage = runtime.storage
     if storage is not None:
         trades = storage.load_trades()
-        boundaries = storage.execution_bar_boundaries()
+        runtime.execution_aliases = {alias: instrument_key(instrument)
+                                     for instrument in instruments
+                                     for alias in (instrument_key(instrument), instrument.ticker)}
+        boundaries = _canonical_execution_boundaries(
+            storage.execution_bar_boundaries(), runtime.execution_aliases)
+        worker.set_execution_obligations(boundaries)
         for instrument in instruments:
             key = instrument_key(instrument)
-            for timeframe, count in obligation_requirements([t for t in trades if t.plan.instrument_id == key]).items():
+            for timeframe, count in obligation_requirements(
+                    [t for t in trades if runtime.execution_aliases.get(t.plan.instrument_id) == key]).items():
                 data_cache.request_live_history(instrument, timeframe, count)
             if key in boundaries:
                 data_cache.note_execution_lower(instrument, boundaries[key][0])
+        runtime.ingestion_worker = worker
     stream = None
     if settings.live_transport == "stream":
         provider = client_provider or default_client_provider()
@@ -571,9 +640,35 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     return poller
 
 
+def _canonical_execution_boundaries(boundaries, aliases):
+    """Map legacy ticker obligations to the UID used by live market pairs."""
+    result = {}
+    for identity, boundary in boundaries.items():
+        key = aliases.get(identity, identity)
+        previous = result.get(key)
+        if previous is None or boundary[0] < previous[0]:
+            result[key] = boundary
+        elif boundary[0] == previous[0]:
+            result[key] = (boundary[0], boundary[1] or previous[1])
+    return result
+
+
 def _family_warmup(family):
     return warmup_requirements(family, FUTURE_STRATEGIES, _strategy_map(),
                               TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
+
+
+def _calendar_schedule(data_cache) -> CalendarScheduleMetadata | None:
+    """Расписание, которым пользовался прогон; None — календаря у прогона нет."""
+    calendar = getattr(data_cache, "market_calendar", None)
+    usage = getattr(calendar, "usage", None)
+    if not callable(usage):
+        return None
+    try:
+        return CalendarScheduleMetadata(**usage())
+    except Exception as exc:  # отчёт не должен падать из-за диагностики
+        log.warning("Сводка расписания для отчёта не собрана: %s", exc)
+        return None
 
 
 def _finish_history(
@@ -613,6 +708,7 @@ def _finish_history(
         last_processed_bar=last_processed if isinstance(last_processed, datetime) else None,
         terminal_gap=bool(getattr(session, "terminal_gap", None)),
         rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
+        calendar_schedule=_calendar_schedule(data_cache),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -622,6 +718,13 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None) -> None:
+    def post_tick(ready_tfs):
+        worker = getattr(runtime, "ingestion_worker", None)
+        if worker is not None and runtime.storage is not None:
+            worker.set_execution_obligations(_canonical_execution_boundaries(
+                runtime.storage.execution_bar_boundaries(), runtime.execution_aliases))
+        return runtime.post_tick(ready_tfs)
+
     TradingBot(
         instruments=instruments,
         bus=bus,
@@ -641,12 +744,18 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        post_tick=runtime.post_tick,
+        post_tick=post_tick if runtime.post_tick is not None else None,
         trade_manager=runtime.trade_manager,
         contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
     ).run()
+
+
+class _UnsafeExecutionState(RuntimeError):
+    """The in-memory simulator must be rebuilt from durable state."""
+
+    fatal_execution = True
 
 
 class _Runtime:
@@ -656,6 +765,8 @@ class _Runtime:
         self.action_executor = action_executor
         self.storage = storage
         self.contract_lifecycle = contract_lifecycle
+        self.ingestion_worker = None
+        self.execution_aliases = {}
 
 
 def _build_runtime(
@@ -892,11 +1003,21 @@ def _build_runtime(
                     continue
             for stamp, prices in sorted(batches.items()):
                 instrument_bar_times = {ticker: stamp for ticker in prices}
-                broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
-                pending_bar = (stamp, prices, list(broker.drain_addressed_events()), list(broker.drain_events()))
+                try:
+                    broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
+                    addressed = list(broker.drain_addressed_events())
+                    broker_events = list(broker.drain_events())
+                except Exception as exc:
+                    # track_bar may have mutated the in-memory simulator. It is
+                    # unsafe to retry another bar until SQLite rehydrates it.
+                    raise _UnsafeExecutionState("Сбой симуляции до фиксации минуты") from exc
+                pending_bar = (stamp, prices, addressed, broker_events)
                 commit_bar(*pending_bar)
                 pending_bar = None
             return True
+        except _UnsafeExecutionState:
+            log.exception("Исполнение остановлено до восстановления из SQLite")
+            raise
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
             return False

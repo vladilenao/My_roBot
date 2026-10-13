@@ -83,6 +83,8 @@ class ConsoleChannel(Channel):
         self._hold_count = 0
         self._hold_instruments: dict[str, None] = {}
         self._printed_in_tick = False
+        self._api_limit_active = False
+        self._last_live_notice: dict[tuple[str, str], tuple[str, str, datetime]] = {}
 
     def handle(self, event: Event) -> None:
         if self._disabled:
@@ -95,6 +97,20 @@ class ConsoleChannel(Channel):
             return
         if event.type not in self.notification_types:
             return
+        if event.type is EventType.MARKET_DATA_STATUS:
+            state = event.get("data_state")
+            if state == "rate_limited" and self._api_limit_active:
+                return
+            if state != "rate_limited":
+                self._api_limit_active = False
+            key = (event.instrument, event.timeframe)
+            if state in {"current", "waiting_bar"} and not event.get("reason"):
+                self._last_live_notice.pop(key, None)
+            elif state != "rate_limited":
+                previous = self._last_live_notice.get(key)
+                now = self._now()
+                if previous and previous[:2] == (state, event.get("reason") or "") and now - previous[2] < timedelta(minutes=15):
+                    return
         if self._is_clean_hold(event):
             self._remember_hold(event)
             return
@@ -107,6 +123,11 @@ class ConsoleChannel(Channel):
         if text is None:
             return
         printed = self._write(text, separate_after=event.type is not EventType.HEARTBEAT)
+        if printed and event.type is EventType.MARKET_DATA_STATUS and event.get("data_state") == "rate_limited":
+            self._api_limit_active = True
+        if printed and event.type is EventType.MARKET_DATA_STATUS and event.get("data_state") != "rate_limited":
+            self._last_live_notice[(event.instrument, event.timeframe)] = (
+                event.get("data_state"), event.get("reason") or "", self._now())
         if printed and self._active_tick_id is not None:
             self._printed_in_tick = True
 

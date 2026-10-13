@@ -103,18 +103,32 @@ class _Handler(BaseHTTPRequestHandler):
             except CursorExpired:
                 self._error(HTTPStatus.GONE, "CURSOR_EXPIRED", "Часть журнала изменений недоступна; выполните сверку.")
             return
+        if parsed.path == "/api/v1/market-data/trading-schedules":
+            query = parse_qs(parsed.query)
+            producer_id = _one(query, "producer_id")
+            after_id = _integer(query, "after_id")
+            limit = _integer(query, "limit", default=500, minimum=1)
+            if producer_id is None or after_id is None or limit is None:
+                self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "producer_id и after_id обязательны; limit — целое число.")
+                return
+            try:
+                self._json(HTTPStatus.OK, self.export_server.store.schedule_changes_after(producer_id, after_id, limit))
+            except ProducerMismatch:
+                self._error(HTTPStatus.CONFLICT, "PRODUCER_MISMATCH", "Запрошенный producer_id не совпадает с текущим.")
+            return
         self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
 
     def do_PUT(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        schedule_match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/trading-schedules-checkpoint", parsed.path)
         match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/checkpoint", parsed.path)
         if not self._authorised():
             self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Токен отсутствует или неверен.")
             return
-        if not match:
+        if not match and not schedule_match:
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
-        consumer_id = match.group(1)
+        consumer_id = (schedule_match or match).group(1)
         if not _CONSUMER_ID.fullmatch(consumer_id):
             self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Некорректный consumer_id.")
             return
@@ -124,7 +138,8 @@ class _Handler(BaseHTTPRequestHandler):
             producer_id, change_id = body["producer_id"], body["change_id"]
             if not isinstance(producer_id, str) or isinstance(change_id, bool) or not isinstance(change_id, int):
                 raise ValueError
-            self._json(HTTPStatus.OK, self.export_server.store.acknowledge(consumer_id, producer_id, change_id))
+            method = self.export_server.store.acknowledge_schedule if schedule_match else self.export_server.store.acknowledge
+            self._json(HTTPStatus.OK, method(consumer_id, producer_id, change_id))
         except ProducerMismatch:
             self._error(HTTPStatus.CONFLICT, "PRODUCER_MISMATCH", "Запрошенный producer_id не совпадает с текущим.")
         except (ValueError, KeyError, json.JSONDecodeError):

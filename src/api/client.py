@@ -65,6 +65,9 @@ class ClientProvider:
     def client_context(self, token=None):
         raise NotImplementedError
 
+    def calendar_source(self, store, *, token=None, request_budget=None, horizon_days=7, refresh_seconds=3600):
+        raise NotImplementedError
+
 
 class TinkoffClientProvider(ClientProvider):
     """Боевой режим: аутентифицированный клиент T-Банка Invest API."""
@@ -77,6 +80,14 @@ class TinkoffClientProvider(ClientProvider):
         from src.api.market_data_stream import MarketDataStreamSession
         return MarketDataStreamSession(
             self.client_context(token), control_queue_max_messages=control_queue_max_messages,
+        )
+
+    def calendar_source(self, store, *, token=None, request_budget=None, horizon_days=7, refresh_seconds=3600):
+        from src.market_calendar.service import BrokerScheduleSource
+
+        return BrokerScheduleSource(
+            store, self, token=token, request_budget=request_budget,
+            horizon_days=horizon_days, refresh_seconds=refresh_seconds,
         )
 
 

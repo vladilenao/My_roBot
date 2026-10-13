@@ -172,6 +172,58 @@ paths:
           $ref: '#/components/responses/ProducerMismatch'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/trading-schedules:
+    get:
+      tags: [MarketDataExport]
+      summary: Следующая страница изменений расписаний
+      operationId: getTradingScheduleChanges
+      parameters:
+        - name: producer_id
+          in: query
+          required: true
+          schema: {type: string, format: uuid}
+        - name: after_id
+          in: query
+          required: true
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
+      responses:
+        '200':
+          description: Изменения расписаний с независимым schedule_change_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleChangePage'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/ProducerMismatch'}
+  /api/v1/market-data/consumers/{consumer_id}/trading-schedules-checkpoint:
+    put:
+      tags: [MarketDataExport]
+      summary: Подтвердить страницу отдельной ленты расписаний
+      operationId: putTradingScheduleCheckpoint
+      parameters:
+        - name: consumer_id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckpointRequest'}
+      responses:
+        '200':
+          description: Последний подтверждённый schedule_change_id.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckpointResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/ProducerMismatch'}
 components:
   securitySchemes:
     ExportToken:
@@ -259,6 +311,61 @@ components:
             oneOf:
               - $ref: '#/components/schemas/CandleChange'
               - $ref: '#/components/schemas/IntervalStatusChange'
+    ScheduleChangePage:
+      type: object
+      additionalProperties: false
+      required: [producer_id, next_after_id, has_more, changes]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        next_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Последний change_id страницы (schedule_change_id) либо исходный after_id при пустом ответе.
+        has_more:
+          type: boolean
+        changes:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/ScheduleDayChange'
+              - $ref: '#/components/schemas/ScheduleBindingChange'
+    ScheduleDayChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, source, exchange, observed_at, day]
+      properties:
+        change_id: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [schedule_day]}
+        source: {type: string, example: tbank}
+        exchange:
+          type: string
+          description: Код режима торгов в нижнем регистре.
+          example: moex_mrng_evng_e_wknd_dlr
+        observed_at: {type: string, format: date-time}
+        day:
+          type: object
+          additionalProperties: false
+          required: [trading_date, version, raw_json, is_trading_day, last_confirmed_at]
+          properties:
+            trading_date: {type: string, format: date, description: Торговая дата по МСК.}
+            version: {type: string, description: sha256 канонического JSON исходного TradingDay.}
+            raw_json: {type: string, description: Канонический JSON исходного TradingDay (UTC ISO).}
+            is_trading_day: {type: boolean}
+            last_confirmed_at: {type: string, format: date-time}
+    ScheduleBindingChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, source, exchange, instrument_uid, observed_at]
+      properties:
+        change_id: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [schedule_binding]}
+        source: {type: string, example: tbank}
+        exchange: {type: string, description: Код режима торгов в нижнем регистре.}
+        instrument_uid: {type: string}
+        observed_at: {type: string, format: date-time}
     CandleChange:
       type: object
       additionalProperties: false

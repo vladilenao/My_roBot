@@ -101,12 +101,22 @@ def normalize_rpc_candle(row, *, uid, timeframe, received_at, actual_source=None
         actual_source=actual_source)
 
 
+def _text(value) -> str:
+    """Вид события и источник расписания — строки (Literal), не Enum."""
+    return str(getattr(value, "value", value))
+
+
 @dataclass(frozen=True)
 class LivePairState:
     source: str
     instrument_uid: str
     timeframe: str
     session: str = "unknown"
+    phase: str = "unknown"
+    break_kind: str | None = None
+    last_due: object | None = None
+    next_event: object | None = None
+    schedule: object | None = None
     data_state: str = "warming_up"
     received_bar: datetime | None = None
     analyzed_bar: datetime | None = None
@@ -121,8 +131,9 @@ class LivePairState:
     ingestion: dict | None = None
 
     def observe(self, *, now: datetime, session: str, expected_bar: datetime | None,
-                timeout_secs: float, received_bar: datetime | None = None,
-                next_open: datetime | None = None, resolved_bar: datetime | None = None) -> "LivePairState":
+                 timeout_secs: float, received_bar: datetime | None = None,
+                 next_open: datetime | None = None, resolved_bar: datetime | None = None,
+                 publication_deadline: datetime | None = None) -> "LivePairState":
         """Дедлайн привязан к первому неразрешённому закрытию, а не к опросу.
 
         Все времена — UTC; expected_bar/received_bar означают закрытие свечи.
@@ -137,7 +148,7 @@ class LivePairState:
             expected, deadline = None, None
         if expected is None and expected_bar is not None and (progress is None or progress < expected_bar):
             expected = expected_bar
-            deadline = expected + timedelta(seconds=timeout_secs)
+            deadline = publication_deadline or expected + timedelta(seconds=timeout_secs)
         state = "current" if received is not None else "warming_up"
         if expected is not None:
             state = "delayed" if deadline is not None and now >= deadline else "waiting_bar"
@@ -150,7 +161,23 @@ class LivePairState:
         return replace(self, analyzed_bar=bar_time, analysis_mode=mode)
 
     def payload(self, observed_at: datetime) -> dict:
-        return {"session": self.session, "data_state": self.data_state,
+        due = None if self.last_due is None else {
+            "open": self.last_due.open, "close": self.last_due.close,
+            "publication_deadline": self.last_due.publication_deadline,
+            "rule_confirmed": self.last_due.rule_confirmed,
+        }
+        event = None if self.next_event is None else {
+            "kind": _text(self.next_event.kind), "at": self.next_event.at,
+        }
+        schedule = None if self.schedule is None else {
+            "source": _text(self.schedule.source), "exchange": self.schedule.exchange,
+            "days": [(day.isoformat(), version) for day, version in self.schedule.days],
+            "digest": self.schedule.digest, "observed_at": self.schedule.observed_at,
+            "snapshot_generation": self.schedule.snapshot_generation, "stale": self.schedule.stale,
+        }
+        return {"session": self.session, "phase": self.phase, "break_kind": self.break_kind,
+                "last_due": due, "next_event": event, "schedule": schedule,
+                "data_state": self.data_state,
                 "observed_at": observed_at, "reason": self.reason,
                 "received_bar": self.received_bar, "analyzed_bar": self.analyzed_bar,
                 "analysis_mode": self.analysis_mode, "expected_bar": self.expected_bar,

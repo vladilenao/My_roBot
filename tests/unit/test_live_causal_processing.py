@@ -113,6 +113,26 @@ def test_out_of_order_minutes_wait_for_missing_and_run_in_time_order_once(tmp_pa
     assert executed(broker) == [0, 1, 2]
 
 
+def test_restart_keeps_open_execution_behind_unproven_minute_until_candle_arrives(tmp_path):
+    cache, store, _ = live_cache(tmp_path)
+    cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100), ("2026-10-12 12:02", 102)), received_at=NOW)
+    store.set_interval_state(source="tbank_exchange", instrument_uid=UID, interval="1m",
+                             open_time="2026-10-12 12:01", state="unresolved", evidence="schedule_unavailable")
+    for minute in range(100):
+        store.set_interval_state(source="tbank_exchange", instrument_uid=UID, interval="1m",
+            open_time=pd.Timestamp("2026-09-14 04:00") + pd.Timedelta(minutes=minute),
+            state="unresolved", evidence="schedule_unavailable")
+
+    restarted, _, _ = live_cache(tmp_path)
+    runtime, broker = runtime_for(restarted, tmp_path)
+    runtime.post_tick({"1m"})
+    assert executed(broker) == [0]
+
+    restarted.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:01", 101)), received_at=NOW)
+    runtime.post_tick({"1m"})
+    assert executed(broker) == [0, 1, 2]
+
+
 def test_first_late_arrival_is_not_a_correction(tmp_path):
     cache, store, _ = live_cache(tmp_path)
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100), ("2026-10-12 12:02", 102)), received_at=NOW)
@@ -233,7 +253,8 @@ def test_market_data_status_carries_ingestion_diagnostics_and_hold_reason(tmp_pa
     assert ingestion["transport"] == "polling" and ingestion["data_hold"] == "GAP_HOLD"
     assert ingestion["gap"]["state"] == "parked" and ingestion.get("processed_through") is None
     assert "не восстановлен" in status.get("reason")
-    assert "Источник данных: опрос · удержание: пропуск" in render(status, 3)
+    assert "не восстановлен" in render(status, 3)
+    assert "Источник данных" not in render(status, 3)
     assert "удержание: пропуск" in telegram_render(status, tz_offset_hours=3)
     assert "token" not in str(status.to_dict()).lower()
 
