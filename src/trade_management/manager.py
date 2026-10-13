@@ -1864,12 +1864,26 @@ class TradeManager:
                 targets = [row[0] for row in connection.execute(
                     "SELECT price FROM targets WHERE trade_id=? ORDER BY target_index", (trade_id,))]
                 for minute, evidence in rows:
-                    payload = {"minute": minute, "evidence": evidence, "side": side, "stop": stop, "targets": targets}
+                    payload = {"minute": minute, "evidence": evidence, "side": side, "stop": stop, "targets": targets,
+                               "reason": "source-absent-minute"}
+                    event_id = f"source-absent:{trade_id}:{minute}"
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
-                        (f"source-absent:{trade_id}:{minute}", trade_id, "MARKET_DATA_SOURCE_ABSENT",
-                         json.dumps(payload, sort_keys=True), pd_timestamp_iso(observed_at)))
+                        (event_id, trade_id, "MARKET_DATA_SOURCE_ABSENT",
+                         json.dumps(payload, sort_keys=True), as_aware(observed_at).isoformat()))
                     written += cursor.rowcount
+                    if cursor.rowcount:
+                        self._traces.record_in_transaction(connection, calculation_trace(
+                            "execution.source_absent_minute",
+                            inputs={"minute": MeasuredValue(minute, "utc_minute"),
+                                    "evidence": MeasuredValue(evidence, "coverage_evidence"),
+                                    "side": MeasuredValue(side, "side"),
+                                    "stop": MeasuredValue(stop, "price"),
+                                    "targets": MeasuredValue(targets, "price")},
+                            result=MeasuredValue("skipped", "execution"),
+                            reason="source-absent-minute",
+                            formula="минута без свечи у источника после всех проверок: без стопа, тейка и переоценки",
+                            links=TraceLinks(trade_id=trade_id, event_id=event_id)))
         if written:
             log.warning("Исполнение %s прошло минут без свечи у источника: %d", ids[0], len(rows))
         return written
@@ -1896,13 +1910,27 @@ class TradeManager:
                 buy = payload.get("side") == "BUY"
                 touched_stop = stop is not None and (low <= stop if buy else high >= stop)
                 touched_target = any((high >= target if buy else low <= target) for target in targets)
+                reason = ("late-candle-touched-stop" if touched_stop
+                          else "late-candle-touched-target" if touched_target else "late-candle")
+                event_id = f"late-candle:{trade_id}:{stamp}"
                 cursor = connection.execute(
                     "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
-                    (f"late-candle:{trade_id}:{stamp}", trade_id, "MARKET_DATA_LATE_CANDLE",
+                    (event_id, trade_id, "MARKET_DATA_LATE_CANDLE",
                      json.dumps({"minute": stamp, "open": str(open_price), "high": str(high), "low": str(low),
-                                 "close": str(close), "touched_stop": touched_stop, "touched_target": touched_target},
-                                sort_keys=True), pd_timestamp_iso(observed_at)))
+                                 "close": str(close), "touched_stop": touched_stop, "touched_target": touched_target,
+                                 "reason": reason}, sort_keys=True), as_aware(observed_at).isoformat()))
                 written += cursor.rowcount
+                if cursor.rowcount:
+                    self._traces.record_in_transaction(connection, calculation_trace(
+                        "execution.late_candle",
+                        inputs={"minute": MeasuredValue(stamp, "utc_minute"),
+                                "high": MeasuredValue(high, "price"), "low": MeasuredValue(low, "price"),
+                                "side": MeasuredValue(payload.get("side"), "side"),
+                                "stop": MeasuredValue(stop, "price"), "targets": MeasuredValue(targets, "price")},
+                        result=MeasuredValue({"touched_stop": touched_stop, "touched_target": touched_target}, "flag"),
+                        reason=reason,
+                        formula="BUY: low <= стоп, high >= цель; SELL: high >= стоп, low <= цель; факты не меняются",
+                        links=TraceLinks(trade_id=trade_id, event_id=event_id)))
                 if cursor.rowcount and (touched_stop or touched_target):
                     log.warning("Поздняя свеча %s %s могла задеть %s сделки %s; исполнение не переигрывается",
                                 ids[0], stamp, "стоп" if touched_stop else "цель", trade_id)

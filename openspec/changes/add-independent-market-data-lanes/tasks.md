@@ -50,7 +50,7 @@
   - классификация: `confirmed_no_trade`, ожидание с повтором, неубедительный ответ.
 
   Тест тихой минуты NG: префикс 1m продвигается, 15-минутное решение не удерживается.
-- [x] 4.3 Повторы GetCandles по `evidence_retry_secs` для интервалов со сделками без свечи. Передача полосе полноты на выходе из окна с учётом выполненных проверок.
+- [x] 4.3 Повторы GetCandles по `evidence_retry_secs` для интервалов со сделками без свечи. Передача полосе полноты на выходе из окна; короткие повторы в расписание полноты не засчитываются (уточнение спеки при реализации).
 - [x] 4.4 Перенести сверку последних баров (`recent_reconciliation_*`) в полосу доказательств без изменения её смысла.
 - [x] 4.5 Тесты:
   - короткий обрыв потока восстанавливается одним GetCandles;
@@ -97,7 +97,7 @@
 
 - [x] 8.1 Ключи `[market_data]`: `independent_lanes`, `unary_requests_per_minute` (котировки), `instrument_requests_per_minute`, `quote_lane_shares`, `instrument_lane_shares`, `evidence_window_secs`, `evidence_retry_secs`, `completeness_recheck_secs`, `completeness_rescan_interval_secs`, `lane_status_log_interval_secs`. Валидация и эффективный профиль в журнале; предупреждение об устаревших параметрах раунда. Старые конфиги принимаются. Устаревшим считается ключ, заданный в файле конфигурации (загрузчик передаёт `market_data_explicit_keys`), или изменённое значение.
 - [x] 8.2 Машиночитаемая диагностика в `market_data_status.ingestion`: окно полноты, дыры-кандидаты, `source_absent`, недавние пропуски, следующая проверка. Сводка полос в журнал по периоду. Консоль и Telegram не менять. Сделано: `ingestion.lanes.completeness` (`window_lower`, `window_upper`, `holes_due`, `first_hole`, `source_absent`, `next_check_at`) и `ingestion.lanes.evidence` (`missing`, `attempts`, `next_check_at`); сводка в журнал раз в `lane_status_log_interval_secs`.
-- [ ] 8.3 Документация `docs/market-data/live-ingestion.md`: полосы и диаграмма, арбитр, окно полноты, итоговые состояния, ранний старт, откат. `docs/trade-management/storage-and-audit.md`: пометка пропущенной минуты и поздней свечи.
+- [x] 8.3 Документация `docs/market-data/live-ingestion.md`: полосы и диаграмма, арбитр, окно полноты, итоговые состояния, ранний старт, откат. `docs/trade-management/storage-and-audit.md`: пометка пропущенной минуты и поздней свечи.
 
 ## 9. Приёмка
 

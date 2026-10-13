@@ -161,3 +161,25 @@ def test_trade_journaled_under_ticker_alias_is_marked(tmp_path):
         (_, payload_json), = _events(storage, "MARKET_DATA_LATE_CANDLE")
     payload = json.loads(payload_json)
     assert payload["touched_target"] is True and payload["touched_stop"] is False
+
+
+def test_skip_and_late_candle_are_audited_and_labelled(tmp_path):
+    from src.trade_journal.export import REASON_LABELS, CsvExporter
+
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager = _opened(storage)
+        manager.record_source_absent("NGV6", [(ABSENT, EVIDENCE)], observed_at=NOW)
+        manager.record_source_absent("NGV6", [(ABSENT, EVIDENCE)], observed_at=NOW)
+        manager.record_late_candle("NGV6", ABSENT, (100.0, 101.0, 95.0, 100.0), observed_at=NOW)
+        traces = storage.connection.execute(
+            "SELECT algorithm, reason, event_id FROM calculations WHERE algorithm LIKE 'execution.%' "
+            "AND (algorithm LIKE '%source_absent%' OR algorithm LIKE '%late_candle%') ORDER BY algorithm").fetchall()
+        occurred = storage.connection.execute(
+            "SELECT occurred_at FROM events WHERE event_type='MARKET_DATA_SOURCE_ABSENT'").fetchone()[0]
+    assert traces == [("execution.late_candle", "late-candle-touched-stop", "late-candle:trade-1:2026-10-13T11:20:00"),
+                      ("execution.source_absent_minute", "source-absent-minute",
+                       "source-absent:trade-1:2026-10-13T11:20:00")]
+    assert occurred == NOW.isoformat()
+    assert CsvExporter._describe_event("MARKET_DATA_SOURCE_ABSENT", "") == "Минута пропущена: свечи нет у источника"
+    assert CsvExporter._describe_event("MARKET_DATA_LATE_CANDLE", "") == "Поздняя свеча пропущенной минуты"
+    assert "стоп" in REASON_LABELS["late-candle-touched-stop"]
