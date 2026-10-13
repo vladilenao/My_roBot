@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import timedelta
+from threading import Lock
 
 import pandas as pd
 from t_tech.invest.schemas import TradeSourceType
@@ -130,6 +131,16 @@ class IngestionWorker:
         self._stream_pairs = set()
         self._held_pairs = set()
         self._handoffs = {}
+        self._execution_lock = Lock()
+        self._execution_obligations = {}
+        self._execution_cursor = 0
+
+    def set_execution_obligations(self, boundaries):
+        """Main-thread snapshot of unfinished financial work, never a DB read here."""
+        snapshot = {key: (_naive(stamp), bool(inclusive))
+                    for key, (stamp, inclusive) in boundaries.items() if stamp is not None}
+        with self._execution_lock:
+            self._execution_obligations = snapshot
 
     # ── вход supervisor ──
     def set_stream_pairs(self, pairs, *, held=()):
@@ -373,13 +384,82 @@ class IngestionWorker:
 
     # ── auxiliary: recovery, сверка, конфликты, календарь по очереди ──
     def _service_auxiliary(self, now):
-        kinds = (self._service_recovery, self._service_old_gap, self._service_recent,
+        kinds = (self._service_recovery, self._service_execution_gap, self._service_old_gap, self._service_recent,
                  self._service_conflicts, self._service_calendar)
         for offset in range(len(kinds)):
             index = (self._aux_turn + offset) % len(kinds)
             if kinds[index](now):
                 self._aux_turn = index + 1
                 return True
+        return False
+
+    def _service_execution_gap(self, now):
+        """Recover the first minute required by an unfinished financial trade."""
+        with self._execution_lock:
+            obligations = dict(self._execution_obligations)
+        pairs = [pair for pair in self._cache.live_pairs()
+                 if pair["history"] == "done" and pair["timeframe"] == "1m"
+                 and pair["key"][0] in obligations]
+        if not pairs:
+            return False
+        for offset in range(len(pairs)):
+            pair = pairs[(self._execution_cursor + offset) % len(pairs)]
+            boundary, inclusive = obligations[pair["key"][0]]
+            grid = self._timeline.grid("1m")
+            lower = boundary if inclusive else _naive(grid.bar_close(boundary))
+            floor = self._cache.live_floor(pair["uid"], "1m")
+            if floor is not None:
+                lower = max(lower, _naive(floor))
+            horizon = self._horizon(pair["key"], now)
+            if horizon is None or lower > horizon:
+                continue
+            gap, _ = self._first_missing(pair, now, lower=lower, horizon=horizon)
+            if gap is None:
+                continue
+            state = self._store.coverage_state(source=self._source, instrument_uid=pair["uid"],
+                                               interval="1m", open_time=gap)
+            if state is None:
+                self._store.set_interval_state(
+                    source=self._source, instrument_uid=pair["uid"], interval="1m",
+                    open_time=gap, state="unresolved", evidence="execution_coverage_missing",
+                    observed_at=now)
+            if self._store.first_recovery_candidate(
+                    source=self._source, instrument_uid=pair["uid"], interval="1m",
+                    lower=gap, upper=gap, now=now) is None:
+                continue
+            self._execution_cursor = (self._execution_cursor + offset + 1) % len(pairs)
+            period = grid.bar_close(gap) - gap
+            attempted = True
+            try:
+                self._cache._load(pair["instrument"], "1m", start_date=gap,
+                                  end_date=gap + period, wait_for_budget=False)
+                after = self._store.coverage_state(source=self._source, instrument_uid=pair["uid"],
+                                                   interval="1m", open_time=gap)
+                if after not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    if self._reconciler is not None:
+                        self._reconciler.record_empty_recovery(
+                            instrument_uid=pair["uid"], interval="1m", open_time=gap)
+                    else:
+                        self._store.set_interval_state(source=self._source, instrument_uid=pair["uid"],
+                            interval="1m", open_time=gap, state="unresolved", evidence="empty_recovery_response",
+                            observed_at=now)
+            except RequestDeferred:
+                attempted = False
+                raise
+            except Exception as exc:
+                self.errors[pair["uid"], "1m"] = str(exc)
+                self._store.set_interval_state(
+                    source=self._source, instrument_uid=pair["uid"], interval="1m",
+                    open_time=gap, state="unresolved", evidence="recovery_request_failed",
+                    observed_at=now)
+                log.warning("Восстановление минуты исполнения %s %s: %s", pair["key"], gap, exc)
+            finally:
+                if attempted:
+                    self._store.record_recovery_attempt(
+                        source=self._source, instrument_uid=pair["uid"], interval="1m",
+                        open_time=gap, now=now,
+                        next_attempt=now + timedelta(seconds=self.settings.recovery_recheck_interval_secs))
+            return True
         return False
 
     def _service_old_gap(self, now):

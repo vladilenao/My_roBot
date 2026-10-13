@@ -570,16 +570,21 @@ class MarketDataStore:
             ).fetchone()
         return None if row is None else str(row["state"])
 
-    def first_recovery_candidate(self, *, source: str, instrument_uid: str, interval: str, now=None) -> pd.Timestamp | None:
+    def first_recovery_candidate(self, *, source: str, instrument_uid: str, interval: str,
+                                 now=None, lower=None, upper=None) -> pd.Timestamp | None:
         """Самая старая дыра, которую нужно запросить отдельным backfill-ом."""
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """SELECT c.open_time_utc FROM interval_coverage c
                 LEFT JOIN recovery_attempts r USING(source,instrument_uid,interval,open_time_utc)
                 WHERE c.source=? AND c.instrument_uid=? AND c.interval=? AND c.state IN ('pending','unresolved')
+                AND (? IS NULL OR c.open_time_utc>=?) AND (? IS NULL OR c.open_time_utc<=?)
                 AND (? IS NULL OR r.next_attempt_at IS NULL OR r.next_attempt_at<=?)
                 ORDER BY c.open_time_utc LIMIT 1""",
-                (source, instrument_uid, interval, None if now is None else _utc_text(now),
+                (source, instrument_uid, interval,
+                 None if lower is None else _utc_text(lower), None if lower is None else _utc_text(lower),
+                 None if upper is None else _utc_text(upper), None if upper is None else _utc_text(upper),
+                 None if now is None else _utc_text(now),
                  None if now is None else _utc_text(now)),
             ).fetchone()
         return None if row is None else pd.Timestamp(row["open_time_utc"]).tz_localize(None)

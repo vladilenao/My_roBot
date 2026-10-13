@@ -549,13 +549,20 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     storage = runtime.storage
     if storage is not None:
         trades = storage.load_trades()
-        boundaries = storage.execution_bar_boundaries()
+        runtime.execution_aliases = {alias: instrument_key(instrument)
+                                     for instrument in instruments
+                                     for alias in (instrument_key(instrument), instrument.ticker)}
+        boundaries = _canonical_execution_boundaries(
+            storage.execution_bar_boundaries(), runtime.execution_aliases)
+        worker.set_execution_obligations(boundaries)
         for instrument in instruments:
             key = instrument_key(instrument)
-            for timeframe, count in obligation_requirements([t for t in trades if t.plan.instrument_id == key]).items():
+            for timeframe, count in obligation_requirements(
+                    [t for t in trades if runtime.execution_aliases.get(t.plan.instrument_id) == key]).items():
                 data_cache.request_live_history(instrument, timeframe, count)
             if key in boundaries:
                 data_cache.note_execution_lower(instrument, boundaries[key][0])
+        runtime.ingestion_worker = worker
     stream = None
     if settings.live_transport == "stream":
         provider = client_provider or default_client_provider()
@@ -569,6 +576,19 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
     poller.start()
     return poller
+
+
+def _canonical_execution_boundaries(boundaries, aliases):
+    """Map legacy ticker obligations to the UID used by live market pairs."""
+    result = {}
+    for identity, boundary in boundaries.items():
+        key = aliases.get(identity, identity)
+        previous = result.get(key)
+        if previous is None or boundary[0] < previous[0]:
+            result[key] = boundary
+        elif boundary[0] == previous[0]:
+            result[key] = (boundary[0], boundary[1] or previous[1])
+    return result
 
 
 def _family_warmup(family):
@@ -622,6 +642,13 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None) -> None:
+    def post_tick(ready_tfs):
+        worker = getattr(runtime, "ingestion_worker", None)
+        if worker is not None and runtime.storage is not None:
+            worker.set_execution_obligations(_canonical_execution_boundaries(
+                runtime.storage.execution_bar_boundaries(), runtime.execution_aliases))
+        return runtime.post_tick(ready_tfs)
+
     TradingBot(
         instruments=instruments,
         bus=bus,
@@ -641,12 +668,18 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        post_tick=runtime.post_tick,
+        post_tick=post_tick if runtime.post_tick is not None else None,
         trade_manager=runtime.trade_manager,
         contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
     ).run()
+
+
+class _UnsafeExecutionState(RuntimeError):
+    """The in-memory simulator must be rebuilt from durable state."""
+
+    fatal_execution = True
 
 
 class _Runtime:
@@ -656,6 +689,8 @@ class _Runtime:
         self.action_executor = action_executor
         self.storage = storage
         self.contract_lifecycle = contract_lifecycle
+        self.ingestion_worker = None
+        self.execution_aliases = {}
 
 
 def _build_runtime(
@@ -892,11 +927,21 @@ def _build_runtime(
                     continue
             for stamp, prices in sorted(batches.items()):
                 instrument_bar_times = {ticker: stamp for ticker in prices}
-                broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
-                pending_bar = (stamp, prices, list(broker.drain_addressed_events()), list(broker.drain_events()))
+                try:
+                    broker.track_bar(stamp, prices, contracts, bar_times=instrument_bar_times)
+                    addressed = list(broker.drain_addressed_events())
+                    broker_events = list(broker.drain_events())
+                except Exception as exc:
+                    # track_bar may have mutated the in-memory simulator. It is
+                    # unsafe to retry another bar until SQLite rehydrates it.
+                    raise _UnsafeExecutionState("Сбой симуляции до фиксации минуты") from exc
+                pending_bar = (stamp, prices, addressed, broker_events)
                 commit_bar(*pending_bar)
                 pending_bar = None
             return True
+        except _UnsafeExecutionState:
+            log.exception("Исполнение остановлено до восстановления из SQLite")
+            raise
         except Exception as exc:
             log.warning("Сбой обработки бара исполнением: %s", exc)
             return False

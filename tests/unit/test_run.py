@@ -236,6 +236,57 @@ class TestHistoryMetadataWithoutToken:
 
 
 class TestRuntimeComposition:
+    def test_prepared_minute_retries_same_packet_after_commit_failure(self):
+        event = SimpleNamespace(trade_id="trade-1", event_id="event-1")
+        broker = MagicMock()
+        broker.drain_addressed_events.return_value = [event]
+        broker.drain_events.return_value = []
+        manager = MagicMock()
+        manager.consume.side_effect = [RuntimeError("temporary storage error"), None]
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = _frame_with_candle()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+            "src.trade_management.manager.TradeManager", return_value=manager
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"):
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+
+        assert runtime.post_tick({"1m"}) is False
+        assert runtime.post_tick({"1m"}) is True
+        broker.track_bar.assert_called_once()
+        assert manager.consume.call_count == 2
+        assert manager.consume.call_args_list[0].args[0] is event
+        assert manager.consume.call_args_list[1].args[0] is event
+        cache.mark_processed.assert_called_once()
+
+    def test_simulator_exception_does_not_continue_from_mutated_memory(self):
+        broker = MagicMock()
+        broker.track_bar.side_effect = RuntimeError("partial in-memory state")
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = _frame_with_candle()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+            "src.trade_management.manager.TradeManager", return_value=MagicMock()
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"):
+            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+
+        with pytest.raises(run._UnsafeExecutionState):
+            runtime.post_tick(("1m",))
+        cache.mark_processed.assert_not_called()
+        broker.drain_addressed_events.assert_not_called()
+
     def test_notify_only_never_initializes_storage_or_broker(self):
         with patch("run.trading_enabled", return_value=False), patch(
             "src.trade_journal.storage.Storage"
@@ -629,3 +680,30 @@ class TestFinishHistoryReportsCheckedHorizon:
         assert payload["checked_horizon"]["limited"] is False
         assert "проверен весь остаток диапазона" in payload["stop_reason"]
         assert "ограничен семью сутками" not in text
+
+
+def test_execution_boundaries_translate_legacy_ticker_to_live_uid():
+    boundary = datetime(2026, 10, 8, 11, 20)
+    aliases = {"EDZ6": "uid-ed", "uid-ed": "uid-ed"}
+
+    assert run._canonical_execution_boundaries(
+        {"EDZ6": (boundary, True)}, aliases) == {"uid-ed": (boundary, True)}
+
+
+def test_live_loop_does_not_swallow_unsafe_execution_state():
+    from src.bot.trading_bot import TradingBot
+
+    bot = SimpleNamespace(
+        _run=SimpleNamespace(should_stop=lambda: False),
+        _data_cache=SimpleNamespace(data_generation=0),
+        _timeline=MagicMock(),
+        _report_error=MagicMock(),
+        _tick_poll_secs=1,
+    )
+    live = MagicMock()
+    live.step.side_effect = run._UnsafeExecutionState("unsafe")
+
+    with patch("src.bot.live_analysis.LiveAnalysis", return_value=live), pytest.raises(run._UnsafeExecutionState):
+        TradingBot._loop_live(bot)
+
+    bot._report_error.assert_not_called()

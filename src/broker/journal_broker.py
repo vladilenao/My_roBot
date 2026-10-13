@@ -704,6 +704,11 @@ class JournalBroker(BrokerPort):
 
         self._track_addressed_bars(now, ohlc, bar_times=bar_times)
 
+        # The addressed runtime has no legacy CSV journal or legacy orders.
+        # Its positions and financial results are owned by TradeManager/SQLite.
+        if self.journal is None:
+            return results
+
         cancel_pids = self.manager.track_bar(closes, dict(self._contracts))
         for pid in cancel_pids:
             order = next((o for o in self._orders.values() if o.position_id == pid and o.status == OrderStatus.NEW), None)
