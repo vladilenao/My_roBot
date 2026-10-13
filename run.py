@@ -1038,6 +1038,8 @@ def _build_runtime(
             if instrument is not None and callable(mark_processed):
                 mark_processed(instrument, "1m", stamp)
 
+    runtime_ref: list = []
+
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
         intent_since[0] = as_aware(trade_manager._clock.now())
@@ -1047,6 +1049,13 @@ def _build_runtime(
             if pending_bar is not None:
                 commit_bar(*pending_bar)
                 pending_bar = None
+            # Свечи минут, пройденных как «у источника нет»: только отметка в
+            # журнале сделки, исполнение задним числом не переигрывается.
+            drain_late = getattr(data_cache, "drain_late_source_absent", None)
+            for uid, minute, ohlc in (drain_late() if callable(drain_late) else ()):
+                aliases = getattr(runtime_ref[0], "execution_aliases", {}) if runtime_ref else {}
+                trade_manager.record_late_candle(aliases.get(uid, uid), minute, ohlc,
+                                                 observed_at=trade_manager._clock.now())
             batches = {}
             initial_boundaries = None
             for instrument in lifecycle.execution_instruments():
@@ -1083,6 +1092,11 @@ def _build_runtime(
                         # исходный DataFrame.
                         if isinstance(protected, type(fresh)):
                             fresh = protected
+                    skipped = getattr(data_cache, "source_absent_between", None)
+                    absent = skipped(instrument, last, fresh) if callable(skipped) and not fresh.empty else []
+                    if absent:
+                        # Пометка пропуска — до продвижения границы исполнения.
+                        trade_manager.record_source_absent(ticker, absent, observed_at=trade_manager._clock.now())
                     for row in fresh.itertuples(index=False):
                         stamp = to_aware_utc(row.datetime).to_pydatetime()
                         values = (float(row.open), float(row.low), float(row.high), float(row.close))
@@ -1124,13 +1138,15 @@ def _build_runtime(
             log.warning("Сбой обработки бара исполнением: %s", exc)
             return False
 
-    return _Runtime(
+    runtime = _Runtime(
         post_tick=on_bar,
         trade_manager=trade_manager,
         action_executor=action_executor,
         storage=storage,
         contract_lifecycle=lifecycle,
     )
+    runtime_ref.append(runtime)
+    return runtime
 
 
 def _dispatch_evidence(data_cache, instruments, storage, intent_since):

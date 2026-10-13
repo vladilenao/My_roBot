@@ -196,6 +196,9 @@ class MarketDataCache:
         self._pre_cutover_gaps = {}
         self._live_members = {}
         self._live_evidence = {}
+        # Свечи минут, которые исполнение могло пройти как «у источника нет»:
+        # главный поток пишет по ним отметку в журнал сделки.
+        self._late_after_source_absent = deque()
         self._live_generation = 0
         self._data_changed = threading.Condition(self._lock)
         self._pending_live_history = {}
@@ -485,6 +488,10 @@ class MarketDataCache:
                 pair, stamp = (item.uid, item.timeframe), _naive(item.open_time)
                 if result["state"] == "accepted" and result["changed"]:
                     changed.setdefault(pair, []).append(item)
+                    if result.get("previous_coverage") == "source_absent" and item.timeframe == "1m":
+                        row = item.as_row()
+                        self._late_after_source_absent.append((item.uid, stamp, tuple(
+                            float(row[name]) for name in ("open", "high", "low", "close"))))
                     if result.get("previous_coverage") == "scheduled_closed":
                         self._market_store.save_live_state(
                             {"outside_schedule": True, "open_time": stamp.isoformat()},
@@ -1009,6 +1016,29 @@ class MarketDataCache:
             allowed.append(index)
             previous = stamp
         return frame.loc[allowed].copy()
+
+    def source_absent_between(self, instrument, last_bar, frame) -> list:
+        """Минуты «у источника нет» между границей исполнения и последним рядом кадра."""
+        if frame is None or frame.empty or last_bar is None or self._market_store is None:
+            return []
+        uid = self._uids.get(self._key(instrument, "1m"))
+        if not uid:
+            return []
+        lower = _naive(last_bar) + pd.Timedelta(minutes=1)
+        upper = _naive(frame["datetime"].max())
+        if upper < lower:
+            return []
+        snapshot = self._market_store.window_snapshot(source=self._market_source, instrument_uid=uid,
+                                                      interval="1m", lower=lower, upper=upper)
+        return sorted((stamp, evidence) for stamp, (state, evidence) in snapshot["states"].items()
+                      if state == "source_absent" and stamp not in snapshot["received"])
+
+    def drain_late_source_absent(self) -> list:
+        """Поздние свечи минут «у источника нет»: (uid, минута, (open, high, low, close))."""
+        items = []
+        while self._late_after_source_absent:
+            items.append(self._late_after_source_absent.popleft())
+        return items
 
     @_synchronized
     def mark_processed(self, instrument, timeframe: str, stamp) -> None:
