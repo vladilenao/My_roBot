@@ -303,10 +303,13 @@ def _trading_interval(kind: str) -> bool:
 
 
 def _minute_window(start, end):
-    """Брокер даёт концы вида 05:59:59 и начала вида 16:00:01: выравниваем по минутам."""
-    lower = to_naive(start).floor("min")
-    upper = (to_naive(end) + pd.Timedelta(microseconds=1)).ceil("min")
-    return lower, upper
+    """Минуты, пересекающие окно брокера [start, end).
+
+    Концы вида 05:59:59 и начала вида 16:00:01 захватывают свою минуту; конец
+    ровно на минуте (20:50:00 FORTS, дальше клиринг) её не включает — так же
+    окно трактует календарь торгов.
+    """
+    return to_naive(start).floor("min"), to_naive(end).ceil("min")
 
 
 def _calendar_from_response(response: object, exchange: str, observed_at=None) -> SessionCalendar | None:

@@ -5,6 +5,7 @@ import threading
 
 import pandas as pd
 import pytest
+from t_tech.invest.schemas import TradeSourceType
 
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
@@ -366,6 +367,7 @@ def test_broker_schedule_auctions_and_clearing_are_breaks_and_exchange_case_is_i
         ("weekend_session_new_kind", "21:30:00", "22:00:00")])
     cal = _calendar_from_response(SimpleNamespace(exchanges=[SimpleNamespace(exchange="FORTS_FUTURES_WEEKEND", days=[futures])]),
                                   "forts_futures_weekend")
+    assert cal.is_open(at("20:49")) and not cal.is_open(at("20:50"))  # конец ровно на минуте её не включает
     assert not cal.is_open(at("21:00"))  # вечерний клиринг — перерыв
     assert cal.is_open(at("21:45"))  # неизвестный тип — консервативно торги
 
@@ -388,7 +390,8 @@ def _no_trade_setup(tmp_path, now, stored, exchange, trades):
             frame = frame[frame["datetime"] < kwargs["end_date"]]
         return frame, "uid"
     requests = []
-    def get_last_trades(*, instrument_id, from_, to):
+    def get_last_trades(*, instrument_id, from_, to, trade_source):
+        assert trade_source == TradeSourceType.TRADE_SOURCE_ALL  # дилерские сделки тоже
         requests.append((pd.Timestamp(from_).tz_convert(None), pd.Timestamp(to).tz_convert(None)))
         stamps = [pd.Timestamp(item) for item in trades]
         return SimpleNamespace(trades=[SimpleNamespace(time=stamp.tz_localize("UTC").to_pydatetime())

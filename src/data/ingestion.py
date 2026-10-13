@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import pandas as pd
+from t_tech.invest.schemas import TradeSourceType
 
 from src.data.ingestion_settings import MarketDataSettings
 from src.data.request_budget import RequestDeferred
@@ -693,8 +694,11 @@ class IngestionWorker:
                 rpc = getattr(client.market_data, "get_last_trades", None)
                 if rpc is None:  # эмулятор и исторический прогон: доказательства нет
                     return False
+                # Профиль свечей UNSPECIFIED включает дилерские свечи выходного дня,
+                # поэтому и сделки берутся из всех источников.
                 response = self._budget.call(rpc, instrument_id=uid,
                     from_=to_aware_utc(lower).to_pydatetime(), to=to_aware_utc(end).to_pydatetime(),
+                    trade_source=TradeSourceType.TRADE_SOURCE_ALL,
                     key=("last_trades", uid, timeframe, lower), wait=False)
         except RequestDeferred:
             return False
