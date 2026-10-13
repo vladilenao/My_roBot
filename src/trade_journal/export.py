@@ -138,6 +138,10 @@ REASON_LABELS = {
     "late-increase-fill-after-cancel": "компенсация позднего добора",
     "clearing": "клиринг",
     "ttl": "истёк срок заявки",
+    "source-absent-minute": "без стопа, тейка и переоценки",
+    "late-candle": "исполнение не переигрывается",
+    "late-candle-touched-stop": "свеча могла задеть стоп; исполнение не переигрывается",
+    "late-candle-touched-target": "свеча могла задеть цель; исполнение не переигрывается",
     "close-not-confirmed": "закрытие не подтверждено",
     "filter-rejected": "сигнал отфильтрован",
     "no-contract-meta": "нет метаданных контракта",
@@ -684,6 +688,10 @@ JOIN trades ON trades.trade_id = positions.trade_id
         et = (event_type or "").upper()
         if et == "FEE_ADJUSTMENT":
             return "Комиссия уточнена брокером"
+        if et == "MARKET_DATA_SOURCE_ABSENT":
+            return "Минута пропущена: свечи нет у источника"
+        if et == "MARKET_DATA_LATE_CANDLE":
+            return "Поздняя свеча пропущенной минуты"
         status = _STATUS_LABELS.get(et, event_type or "")
         action, _, target = (action_type or "").partition(":")
         if action == "TARGET" and target:

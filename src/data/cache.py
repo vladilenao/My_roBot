@@ -14,6 +14,8 @@ from src.data.timeutil import to_naive
 from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
+from src.data.request_budget import RequestDeferred
 from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)
@@ -194,6 +196,9 @@ class MarketDataCache:
         self._pre_cutover_gaps = {}
         self._live_members = {}
         self._live_evidence = {}
+        # Свечи минут, которые исполнение могло пройти как «у источника нет»:
+        # главный поток пишет по ним отметку в журнал сделки.
+        self._late_after_source_absent = deque()
         self._live_generation = 0
         self._data_changed = threading.Condition(self._lock)
         self._pending_live_history = {}
@@ -373,6 +378,9 @@ class MarketDataCache:
                 "history": "pending", "warmup_days": 0, "history_error": "", "state": "BOOTSTRAPPING",
             })
             member["keys"].add(key)
+            # Пара сохранённого состава, затем выбранная пользователем: дальше
+            # обслуживается выбранным инструментом (семейство, полное имя).
+            member["instrument"] = instrument
             lower = self._pending_execution_lower.pop(instrument_key(instrument), None)
             if lower is not None and timeframe == "1m":
                 previous = member["execution_lower"]
@@ -393,6 +401,26 @@ class MarketDataCache:
             self._refresh_member_state(uid, timeframe, member)
             self._live_generation += 1
             self._data_changed.notify_all()
+
+    def unregister_live_pair(self, uid, timeframe):
+        """Снимает пару, не выбранную в этом запуске и без обязательств.
+
+        Данные в рыночной базе остаются; снимается только обслуживание:
+        свежий опрос, подписка и полосы её больше не видят.
+        """
+        with self._lock:
+            member = self._live_members.pop((uid, timeframe), None)
+            if member is None:
+                return False
+            for key in member["keys"]:
+                self._uids.pop(key, None)
+                self._instruments.pop(key, None)
+                self._frames.pop(key, None)
+                self._last_loaded.pop(key, None)
+            self._live_evidence.pop((uid, timeframe), None)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+            return True
 
     def set_live_execution_lower(self, uid, timeframe, open_time):
         """Main-thread boundary сохранённых обязательств, не high-water receipt."""
@@ -460,6 +488,10 @@ class MarketDataCache:
                 pair, stamp = (item.uid, item.timeframe), _naive(item.open_time)
                 if result["state"] == "accepted" and result["changed"]:
                     changed.setdefault(pair, []).append(item)
+                    if result.get("previous_coverage") == "source_absent" and item.timeframe == "1m":
+                        row = item.as_row()
+                        self._late_after_source_absent.append((item.uid, stamp, tuple(
+                            float(row[name]) for name in ("open", "high", "low", "close"))))
                     if result.get("previous_coverage") == "scheduled_closed":
                         self._market_store.save_live_state(
                             {"outside_schedule": True, "open_time": stamp.isoformat()},
@@ -572,7 +604,7 @@ class MarketDataCache:
                                                       interval=timeframe, open_time=probe)
         else:
             state = reconciler.interval_state(instrument_uid=uid, interval=timeframe, open_time=probe, now=now)
-        if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+        if state not in RESOLVED_INTERVAL_STATES:
             return None
         following = _naive(grid.bar_close(probe))
         if state == "scheduled_closed" and reconciler is not None:
@@ -760,6 +792,13 @@ class MarketDataCache:
             member["gap"] = gap
             self._refresh_member_state(uid, timeframe, member)
 
+    def set_lane_status(self, uid, timeframe, lane, status) -> None:
+        """Сводка фоновой полосы по паре для машиночитаемой диагностики."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is not None:
+                member.setdefault("lanes", {})[lane] = status
+
     def pair_status(self, instrument, timeframe):
         """Read-only факты готовности пары для анализа, допуска и диагностики."""
         with self._lock:
@@ -778,7 +817,8 @@ class MarketDataCache:
                     "processed_through": cursors.get("processed_through"),
                     "incident": held.get("incident"),
                     "cutover": None if self.live_floor(uid, timeframe) is None else self._live_cutover.isoformat(),
-                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0)}
+                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0),
+                    "lanes": {lane: dict(value) for lane, value in (member.get("lanes") or {}).items()}}
 
     def input_ready_at(self, instrument, timeframe, open_time):
         """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""
@@ -977,13 +1017,36 @@ class MarketDataCache:
                     open_time=probe, now=self._timeline.now(),
                 ) if self._market_reconciler is not None else self._market_store.coverage_state(
                     source=self._market_source, instrument_uid=instrument_id, interval=timeframe, open_time=probe))
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     self._report_coverage_block(key, probe, state)
                     return frame.loc[allowed].copy()
                 probe += pd.Timedelta(minutes=1)
             allowed.append(index)
             previous = stamp
         return frame.loc[allowed].copy()
+
+    def source_absent_between(self, instrument, last_bar, frame) -> list:
+        """Минуты «у источника нет» между границей исполнения и последним рядом кадра."""
+        if frame is None or frame.empty or last_bar is None or self._market_store is None:
+            return []
+        uid = self._uids.get(self._key(instrument, "1m"))
+        if not uid:
+            return []
+        lower = _naive(last_bar) + pd.Timedelta(minutes=1)
+        upper = _naive(frame["datetime"].max())
+        if upper < lower:
+            return []
+        snapshot = self._market_store.window_snapshot(source=self._market_source, instrument_uid=uid,
+                                                      interval="1m", lower=lower, upper=upper)
+        return sorted((stamp, evidence) for stamp, (state, evidence) in snapshot["states"].items()
+                      if state == "source_absent" and stamp not in snapshot["received"])
+
+    def drain_late_source_absent(self) -> list:
+        """Поздние свечи минут «у источника нет»: (uid, минута, (open, high, low, close))."""
+        items = []
+        while self._late_after_source_absent:
+            items.append(self._late_after_source_absent.popleft())
+        return items
 
     @_synchronized
     def mark_processed(self, instrument, timeframe: str, stamp) -> None:
@@ -1152,7 +1215,7 @@ class MarketDataCache:
             while probe < _naive(right):
                 state = self._market_reconciler.interval_state(instrument_uid=uid,
                     interval=timeframe, open_time=probe, now=self._timeline.now())
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     if floor is None or probe >= floor:
                         return False
                     # До запуска: доказательства нет и получить его нельзя —
@@ -1669,7 +1732,7 @@ class MarketDataCache:
                         instrument_uid=instrument_id, interval=timeframe,
                         open_time=probe, now=self._timeline.now(),
                     )
-                    if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    if state not in RESOLVED_INTERVAL_STATES:
                         self._report_coverage_block(key, probe, state)
                         return ordered.loc[allowed].copy()
                     probe += period

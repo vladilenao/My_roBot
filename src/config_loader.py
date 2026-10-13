@@ -136,6 +136,7 @@ _EXPECTED_TYPES: dict[str, type] = {
 }
 
 _INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
+EXPLICIT_INGESTION_KEYS = "market_data_explicit_keys"
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 _NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
@@ -885,9 +886,15 @@ def load_config(
     ``config_file``/``bundled_file`` явно; иначе пути резолвятся автоматически.
     """
     result: dict[str, Any] = dict(defaults or {})
+    explicit: set[str] = set()
     for path in _candidate_files(config_file, bundled_file):
         if not path.is_file():
             continue
-        result.update(_parse(path, result))
+        parsed = _parse(path, result)
+        explicit.update(key for key in parsed if key in _INGESTION_KEYS)
+        result.update(parsed)
     _validate_combined_config(result, Path(config_file or CONFIG_FILENAME))
+    # Ключи [market_data], заданные в файлах, — для предупреждения об устаревших.
+    if explicit:
+        result[EXPLICIT_INGESTION_KEYS] = frozenset(explicit)
     return result

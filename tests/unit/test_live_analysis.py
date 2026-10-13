@@ -11,6 +11,7 @@ from src.bot import TradingBot
 from src.bot.live_analysis import LiveAnalysis
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
+from src.data.ingestion_settings import MarketDataSettings
 from src.data.request_budget import RequestBudget
 from src.data.reconciliation import SessionCalendar
 from src.data.reconciliation import MarketDataReconciler
@@ -23,6 +24,9 @@ from src.notifier.templates import render
 from src.notifier.telegram_templates import render as telegram_render
 from src.scheduler.timing import MultiTimeframeScheduler
 from src.strategies.contracts import Assignment, Decision, SignalType
+
+# Прежняя общая очередь — откат при independent_lanes = false.
+LEGACY_QUEUE = MarketDataSettings(independent_lanes=False)
 
 
 def frame(end, tf="1h", count=100):
@@ -49,7 +53,7 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
     store = MarketDataStore(Path(tempfile.mkdtemp()) / "market.sqlite3")
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=cutover)
-    worker = IngestionWorker(cache)
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     events = []
     class Channel:
         supported_types = ALL_EVENT_TYPES
@@ -219,7 +223,7 @@ def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path
     instrument = Instrument("SBER", "SBER", "share", "SBER", "uid")
     assert cache.prepare_live_history(instrument, "1h", 100).empty  # торговое чтение без сети
     assert calls == []
-    IngestionWorker(cache).run_until_idle()
+    IngestionWorker(cache, settings=LEGACY_QUEUE).run_until_idle()
     result = cache.prepare_live_history(instrument, "1h", 100)
     assert len(result) == 3
     # Начальные 30 дней и одно расширение: 60 дней не дали более ранних свечей,
@@ -315,7 +319,7 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
         return source[keep].reset_index(drop=True), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
                            market_reconciler=rec, recovery_retry_seconds=65)
-    worker = IngestionWorker(cache)
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     store.set_interval_state(source="tbank_exchange", instrument_uid="uid", interval="1m",
         open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
     events, operations = [], []

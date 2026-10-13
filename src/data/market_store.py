@@ -22,10 +22,10 @@ from src.scheduler.timing import tf_period_minutes
 from src.market_calendar.serialization import canonical_day_json, day_version
 from src.market_calendar.intervals import normalize_exchange, trading_date
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SOURCE_TBANK = "tbank_exchange"
-INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "pending", "unresolved"})
-RESOLVED_INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade"})
+from src.data.coverage_states import EXPORTED_STATE, INTERVAL_STATES, RESOLVED_INTERVAL_STATES  # noqa: E402,F401
+ROSTER_ORIGINS = frozenset({"selected", "obligation", "previous"})
 
 
 def _utc_text(value: object | None = None) -> str:
@@ -133,7 +133,7 @@ class MarketDataStore:
                     instrument_uid TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     open_time_utc TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'pending', 'unresolved')),
+                    state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'source_absent', 'pending', 'unresolved')),
                     evidence TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
@@ -205,6 +205,32 @@ class MarketDataStore:
                 );
                 CREATE INDEX IF NOT EXISTS instrument_schedule_bindings_latest
                     ON instrument_schedule_bindings(source, instrument_uid, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS market_data_roster (
+                    source TEXT NOT NULL,
+                    instrument_uid TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    instrument_type TEXT NOT NULL,
+                    short_name TEXT,
+                    origin TEXT NOT NULL CHECK(origin IN ('selected', 'obligation', 'previous')),
+                    window_lower_utc TEXT,
+                    requirements_json TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    PRIMARY KEY (source, instrument_uid, interval)
+                );
+                CREATE TABLE IF NOT EXISTS interval_checks (
+                    source TEXT NOT NULL,
+                    instrument_uid TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    open_time_utc TEXT NOT NULL,
+                    checks INTEGER NOT NULL,
+                    first_checked_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    next_check_at TEXT,
+                    PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
+                );
+                CREATE INDEX IF NOT EXISTS interval_checks_due
+                    ON interval_checks(source, instrument_uid, interval, next_check_at);
                 """
             )
             # SQLite не умеет добавить значение в CHECK. Ранняя версия change
@@ -213,7 +239,8 @@ class MarketDataStore:
             definition = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='interval_coverage'"
             ).fetchone()[0]
-            if "'received'" not in definition:
+            if "'source_absent'" not in definition:
+                self._backup_before_migration(conn, "interval_coverage")
                 conn.executescript(
                     """
                     ALTER TABLE interval_coverage RENAME TO interval_coverage_v1;
@@ -222,7 +249,7 @@ class MarketDataStore:
                         instrument_uid TEXT NOT NULL,
                         interval TEXT NOT NULL,
                         open_time_utc TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'pending', 'unresolved')),
+                        state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'source_absent', 'pending', 'unresolved')),
                         evidence TEXT NOT NULL,
                         observed_at TEXT NOT NULL,
                         PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
@@ -235,6 +262,15 @@ class MarketDataStore:
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
             self._set_default(conn, "schedule_max_change_id", "0")
+
+    def _backup_before_migration(self, conn: sqlite3.Connection, table: str) -> None:
+        """Согласованная копия файла базы перед пересозданием таблицы с данными."""
+        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = self.path.with_name(f"{self.path.name}.before-schema-{SCHEMA_VERSION}-{stamp}.bak")
+        with sqlite3.connect(target) as backup:
+            conn.backup(backup)
 
     @staticmethod
     def _set_default(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -275,6 +311,27 @@ class MarketDataStore:
     def save_live_state(self, value, *, kind, source, instrument_uid, interval="", open_time=None):
         with self._lock, self._connect() as conn:
             self._write_live(conn, self._live_key(kind, source, instrument_uid, interval, open_time), value)
+
+    def take_live_states(self, *, kind, source) -> list[tuple[str, str, dict]]:
+        """Забирает и удаляет одной транзакцией все состояния вида: (uid, ТФ, значение)."""
+        prefix = "live:" + kind + ":"
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute("SELECT key, value FROM metadata WHERE substr(key,1,?)=?",
+                                    (len(prefix), prefix)).fetchall()
+                taken = []
+                for key, value in rows:
+                    identity = json.loads(key[len(prefix):])
+                    if identity[0] != source:
+                        continue
+                    taken.append((identity[1], identity[2], json.loads(value)))
+                    conn.execute("DELETE FROM metadata WHERE key=?", (key,))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return taken
 
     def accept_observation(self, observation, *, source=SOURCE_TBANK, reconcile_sequence=None):
         """Единое атомарное принятие нормализованного stream/RPC наблюдения.
@@ -631,7 +688,8 @@ class MarketDataStore:
         )
         if not emit:
             return None
-        status = {"source": source, "instrument_uid": instrument_uid, "interval": interval, "open_time_utc": stamp, "state": state, "evidence": evidence, "observed_at": observed_at}
+        status = {"source": source, "instrument_uid": instrument_uid, "interval": interval, "open_time_utc": stamp,
+                  "state": EXPORTED_STATE.get(state, state), "evidence": evidence, "observed_at": observed_at}
         return self._append_change(conn, "interval_status", {"interval_status": status})
 
     def record_observation(
@@ -1032,6 +1090,113 @@ class MarketDataStore:
                 producer_id=excluded.producer_id,acknowledged_through=MAX(consumer_checkpoints.acknowledged_through,excluded.acknowledged_through),acknowledged_at=excluded.acknowledged_at""", (consumer_id, producer_id, acknowledged, now))
             conn.commit()
         return {"producer_id": info.producer_id, "consumer_id": consumer_id, "acknowledged_through": acknowledged}
+
+    # ── состав пар и проверки полноты (add-independent-market-data-lanes) ──
+    def save_roster(self, *, source: str, entries: Iterable[dict], observed_at: object | None = None) -> None:
+        """Сохраняет пары состава; остальные пары, кроме обязательств, становятся прошлыми.
+
+        ``entries``: ``instrument_uid``, ``interval``, ``ticker``,
+        ``instrument_type``, ``origin`` (``selected``/``obligation``),
+        необязательные ``short_name``, ``window_lower``, ``requirements``.
+        """
+        when = _utc_text(observed_at)
+        rows = []
+        for entry in entries:
+            origin = entry.get("origin", "selected")
+            if origin not in ROSTER_ORIGINS:
+                raise ValueError(f"Неизвестное происхождение пары состава: {origin}")
+            lower = entry.get("window_lower")
+            rows.append((source, entry["instrument_uid"], entry["interval"], entry["ticker"],
+                         entry["instrument_type"], entry.get("short_name"), origin,
+                         None if lower is None else _utc_text(lower),
+                         json.dumps(entry.get("requirements") or {}, ensure_ascii=False, sort_keys=True), when))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                keep = {(row[1], row[2]) for row in rows}
+                for uid, interval in conn.execute(
+                        "SELECT instrument_uid, interval FROM market_data_roster WHERE source=? AND origin='selected'",
+                        (source,)).fetchall():
+                    if (uid, interval) not in keep:
+                        conn.execute("""UPDATE market_data_roster SET origin='previous'
+                            WHERE source=? AND instrument_uid=? AND interval=?""", (source, uid, interval))
+                conn.executemany(
+                    """INSERT INTO market_data_roster(source,instrument_uid,interval,ticker,instrument_type,short_name,
+                    origin,window_lower_utc,requirements_json,confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(source,instrument_uid,interval) DO UPDATE SET ticker=excluded.ticker,
+                    instrument_type=excluded.instrument_type,short_name=excluded.short_name,origin=excluded.origin,
+                    window_lower_utc=COALESCE(excluded.window_lower_utc, market_data_roster.window_lower_utc),
+                    requirements_json=excluded.requirements_json,confirmed_at=excluded.confirmed_at""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def set_roster_window(self, *, source: str, instrument_uid: str, interval: str, window_lower: object) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("""UPDATE market_data_roster SET window_lower_utc=?
+                WHERE source=? AND instrument_uid=? AND interval=?""",
+                (_utc_text(window_lower), source, instrument_uid, interval))
+
+    def roster(self, *, source: str, origins: Iterable[str] = ("selected", "obligation")) -> list[dict]:
+        wanted = tuple(origins)
+        marks = ",".join("?" for _ in wanted)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(f"""SELECT * FROM market_data_roster WHERE source=? AND origin IN ({marks})
+                ORDER BY instrument_uid, interval""", (source, *wanted)).fetchall()
+        return [{"instrument_uid": row["instrument_uid"], "interval": row["interval"], "ticker": row["ticker"],
+                 "instrument_type": row["instrument_type"], "short_name": row["short_name"], "origin": row["origin"],
+                 "window_lower": None if row["window_lower_utc"] is None
+                 else pd.Timestamp(row["window_lower_utc"]).tz_convert("UTC").tz_localize(None),
+                 "requirements": json.loads(row["requirements_json"]), "confirmed_at": row["confirmed_at"]}
+                for row in rows]
+
+    def window_snapshot(self, *, source: str, instrument_uid: str, interval: str, lower: object, upper: object) -> dict:
+        """Полученные свечи, состояния покрытия и проверки окна пары без сети.
+
+        Границы включительные, моменты — UTC-naive открытия баров.
+        """
+        low, high = _utc_text(lower), _utc_text(upper)
+        identity = (source, instrument_uid, interval, low, high)
+        with self._lock, self._connect() as conn:
+            received = conn.execute("""SELECT open_time_utc FROM candle_current WHERE source=? AND instrument_uid=?
+                AND interval=? AND is_complete=1 AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+            states = conn.execute("""SELECT open_time_utc, state, evidence FROM interval_coverage WHERE source=?
+                AND instrument_uid=? AND interval=? AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+            checks = conn.execute("""SELECT * FROM interval_checks WHERE source=? AND instrument_uid=? AND interval=?
+                AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+
+        def stamp(value):
+            return pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+
+        return {"received": {stamp(row[0]) for row in received},
+                "states": {stamp(row["open_time_utc"]): (row["state"], row["evidence"]) for row in states},
+                "checks": {stamp(row["open_time_utc"]): {
+                    "checks": row["checks"], "first_checked_at": stamp(row["first_checked_at"]),
+                    "last_checked_at": stamp(row["last_checked_at"]),
+                    "next_check_at": None if row["next_check_at"] is None else stamp(row["next_check_at"])}
+                    for row in checks}}
+
+    def record_interval_checks(self, *, source: str, instrument_uid: str, interval: str,
+                               open_times: Iterable[object], checked_at: object, next_check_at: object | None) -> None:
+        """Пакетная отметка пустой проверки интервалов: +1 к числу, новый срок."""
+        when = _utc_text(checked_at)
+        due = None if next_check_at is None else _utc_text(next_check_at)
+        rows = [(source, instrument_uid, interval, _utc_text(stamp), when, when, due) for stamp in open_times]
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany("""INSERT INTO interval_checks(source,instrument_uid,interval,open_time_utc,checks,
+                    first_checked_at,last_checked_at,next_check_at) VALUES (?,?,?,?,1,?,?,?)
+                    ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
+                    checks=interval_checks.checks+1,last_checked_at=excluded.last_checked_at,
+                    next_check_at=excluded.next_check_at""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
     def current_frame(self, *, source: str, instrument_uid: str, interval: str) -> pd.DataFrame:
         with self._lock, self._connect() as conn:

@@ -88,6 +88,7 @@ from src.data.export_api import MarketDataExportServer
 from src.data.reconciliation import MarketDataReconciler
 from src.data.poller import LiveMarketDataPoller
 from src.data.ingestion import IngestionWorker
+from src.data.lanes import CalendarLane, CompletenessLane, EvidenceLane
 from src.data.stream_ingestion import StreamSupervisor
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
@@ -429,12 +430,19 @@ def _launch(
         backup_count=LOGGING_BACKUP_COUNT,
     )
     log.info("Робот v%s запущен", __version__)
+    # Независимые полосы: данные собираются с момента запуска процесса, пока
+    # пользователь выбирает инструменты (add-independent-market-data-lanes).
+    early = None
+    if not history and MARKET_DATA_SETTINGS.independent_lanes:
+        early = _start_early_market_data(
+            state_dir, client_provider if client_provider is not None else default_client_provider())
     if instruments is None:
         instruments = select_instruments(
             validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
             client_provider=client_provider,
             market_now=None if clock is None else clock.now(),
             historical=history,
+            request_budget=None if early is None else early.request_budget,
         ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
         if not isinstance(instruments, HistorySelection):
             instruments = [normalize_instrument(item) for item in instruments]
@@ -500,6 +508,59 @@ def _launch(
     channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
     bus.subscribe_all(channels)
+    if early is not None:
+        timeline, market_store, request_budget = early.timeline, early.market_store, early.request_budget
+        market_calendar, market_reconciler, data_cache = early.market_calendar, early.market_reconciler, early.data_cache
+    else:
+        timeline, market_store, request_budget, market_calendar, market_reconciler, data_cache = _build_market_data(
+            state_dir=state_dir, clock=clock, provider=provider, history=history, market_calendar=market_calendar)
+    if history:
+        data_cache.set_boundary_checks(report.boundaries)
+
+    htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
+    PROFILES["triple_screen"] = TripleScreenFilter(
+        provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
+    )
+
+    storage = None
+    export_server = None
+    market_poller = None
+    try:
+        if not history and MARKET_DATA_EXPORT_ENABLED:
+            export_server = MarketDataExportServer(
+                market_store, MARKET_DATA_EXPORT_TOKEN or "",
+                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
+            )
+            export_server.start()
+        runtime = _build_runtime(
+            instruments, data_cache, bus, state_dir, clock=clock, session=session,
+            client_provider=provider,
+        )
+        storage = runtime.storage
+        live_waiter = None
+        if not history:
+            market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider, early=early)
+            live_waiter = market_poller.wait_startup
+        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
+    finally:
+        if market_poller is not None:
+            market_poller.close()
+        elif early is not None:
+            early.poller.close()
+        if export_server is not None:
+            export_server.close()
+        if history:
+            _finish_history(
+                storage, session, data_cache, timeline, state_dir, market_data_sync
+            )
+        close_channels(channels)
+    return 0, None, selection or instruments
+
+
+def _build_market_data(*, state_dir, clock, provider, history, market_calendar=None):
+    """Часы, рыночная база, арбитр, календарь, сверка и владелец входа."""
+    settings = MARKET_DATA_SETTINGS
+    lanes = not history and settings.independent_lanes
     timeline = MultiTimeframeScheduler(
         timeframes=_timeframes(),
         sleep_secs=SLEEP_SECONDS if clock is None else clock.pause_secs,
@@ -508,9 +569,13 @@ def _launch(
     )
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
     from src.data.request_budget import RequestBudget
+    # Полосы: без глобального окна темпа (свежий опрос ограничен для пары),
+    # раздельные сервисы и доли полос (design 2).
     request_budget = None if history else RequestBudget(
-        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute,
-        per_minute_by_service={"instruments": 200})
+        timeline.now, 0 if lanes else DATA_REFRESH_MIN_INTERVAL,
+        per_minute=settings.unary_requests_per_minute,
+        per_minute_by_service={"instruments": settings.instrument_requests_per_minute if lanes else 200},
+        lane_shares=settings.lane_shares() if lanes else None)
     if market_store is not None:
         from src.market_calendar.service import MarketCalendar
 
@@ -547,48 +612,60 @@ def _launch(
         request_budget=request_budget,
         recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
     )
-    if history:
-        data_cache.set_boundary_checks(report.boundaries)
-
-    htf_provider = HtfFrameProvider(cache=data_cache, timeline=timeline)
-    PROFILES["triple_screen"] = TripleScreenFilter(
-        provider=htf_provider, params=TRIPLE_SCREEN_PARAMS
-    )
-
-    storage = None
-    export_server = None
-    market_poller = None
-    try:
-        if not history and MARKET_DATA_EXPORT_ENABLED:
-            export_server = MarketDataExportServer(
-                market_store, MARKET_DATA_EXPORT_TOKEN or "",
-                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
-            )
-            export_server.start()
-        runtime = _build_runtime(
-            instruments, data_cache, bus, state_dir, clock=clock, session=session,
-            client_provider=provider,
-        )
-        storage = runtime.storage
-        live_waiter = None
-        if not history:
-            market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider)
-            live_waiter = market_poller.wait_startup
-        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
-    finally:
-        if market_poller is not None:
-            market_poller.close()
-        if export_server is not None:
-            export_server.close()
-        if history:
-            _finish_history(
-                storage, session, data_cache, timeline, state_dir, market_data_sync
-            )
-        close_channels(channels)
-    return 0, None, selection or instruments
+    return timeline, market_store, request_budget, market_calendar, market_reconciler, data_cache
 
 
-def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
+class _EarlyMarketData:
+    """Слой данных боевого режима, собранный до выбора инструментов."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+
+def _start_early_market_data(state_dir, provider):
+    """Рыночная база, арбитр, календарь, владелец входа и фоновые полосы до выбора.
+
+    Состав — сохранённые пары прошлого запуска и незавершённых сделок; граница
+    запуска — момент старта процесса (design 9).
+    """
+    settings = MARKET_DATA_SETTINGS
+    timeline, market_store, request_budget, market_calendar, market_reconciler, data_cache = _build_market_data(
+        state_dir=state_dir, clock=None, provider=provider, history=False)
+    log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
+    for name in settings.deprecated_overrides():
+        log.warning("Параметр [market_data] %s не используется при независимых полосах", name)
+    worker = IngestionWorker(data_cache, settings=settings)
+    completeness = CompletenessLane(worker)
+    evidence = EvidenceLane(worker, completeness)
+    worker.evidence = evidence
+    lanes = [CalendarLane(market_reconciler, timeline), evidence, completeness]
+    registered = _register_saved_roster(data_cache, market_store)
+    poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, lanes=lanes,
+                                  status_interval=settings.lane_status_log_interval_secs)
+    poller.start_background()
+    log.info("Полосы данных запущены до выбора инструментов: пар сохранённого состава %d", registered)
+    return _EarlyMarketData(timeline=timeline, market_store=market_store, request_budget=request_budget,
+                            market_calendar=market_calendar, market_reconciler=market_reconciler,
+                            data_cache=data_cache, worker=worker, completeness=completeness, poller=poller)
+
+
+def _register_saved_roster(data_cache, market_store):
+    """Пары прошлого запуска регистрируются у владельца входа, без сети."""
+    count = 0
+    for entry in market_store.roster(source=data_cache._market_source):
+        instrument = Instrument(entry["short_name"] or entry["ticker"], entry["ticker"], entry["instrument_type"],
+                                entry["short_name"], entry["instrument_uid"])
+        min_bars = max(int((entry["requirements"] or {}).get("min_bars", 1)), 1)
+        try:
+            data_cache.register_live_pair(instrument, entry["instrument_uid"], entry["interval"], min_bars)
+            count += 1
+        except ValueError as exc:
+            log.warning("Пара сохранённого состава %s %s не зарегистрирована: %s",
+                        entry["ticker"], entry["interval"], exc)
+    return count
+
+
+def _start_live_ingestion(data_cache, runtime, instruments, client_provider, early=None):
     """Сеть live-данных принадлежит фоновым полосам; бот только читает кэш.
 
     Main thread передаёт owner неизменяемые потребности сохранённых
@@ -596,8 +673,11 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
     финансовую SQLite из другого потока.
     """
     settings = MARKET_DATA_SETTINGS
-    log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
-    worker = IngestionWorker(data_cache, settings=settings)
+    if early is None:
+        log.info("Live-ingestion: эффективный профиль %s", settings.as_dict())
+        worker = IngestionWorker(data_cache, settings=settings)
+    else:
+        worker = early.worker
     # Roster уважает роли lifecycle: инструменты исполнения (в том числе
     # DRAINING с обязательствами) и рынка, без автоматического rollover.
     lifecycle = getattr(runtime, "contract_lifecycle", None)
@@ -625,6 +705,9 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
             if key in boundaries:
                 data_cache.note_execution_lower(instrument, boundaries[key][0])
         runtime.ingestion_worker = worker
+    if early is not None:
+        _retire_unselected_pairs(data_cache, instruments, worker)
+        worker.roster_dirty = True
     stream = None
     if settings.live_transport == "stream":
         provider = client_provider or default_client_provider()
@@ -635,9 +718,28 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider):
             stream = StreamSupervisor(data_cache, worker, lambda: factory(
                 TINKOFF_TOKEN, control_queue_max_messages=settings.stream_control_queue_max_messages),
                 settings=settings)
-    poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
+    if early is not None:
+        poller = early.poller
+        poller.attach_stream(stream)
+    else:
+        poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
     poller.start()
     return poller
+
+
+def _retire_unselected_pairs(data_cache, instruments, worker):
+    """Пары сохранённого состава, не выбранные сейчас и без обязательств, снимаются."""
+    tickers = {instrument.ticker for instrument in instruments}
+    uids = {instrument.uid for instrument in instruments if getattr(instrument, "uid", None)}
+    for pair in data_cache.live_pairs():
+        instrument = pair["instrument"]
+        if pair["uid"] in uids or instrument.ticker in tickers:
+            continue
+        if worker.execution_boundary(pair["key"][0]) is not None:
+            continue
+        if data_cache.unregister_live_pair(pair["uid"], pair["timeframe"]):
+            log.info("Пара %s %s прошлого запуска не выбрана — снята с обслуживания",
+                     instrument.ticker, pair["timeframe"])
 
 
 def _canonical_execution_boundaries(boundaries, aliases):
@@ -890,7 +992,8 @@ def _build_runtime(
                 contracts[card.uid] = ContractMeta(card.uid, float(card.price_step), float(card.step_cost),
                     float(card.go_buy), float(card.go_sell), currency=(card.currency or "RUB").upper(), expiration_date=card.expiration_date)
     else:
-        contracts = _load_contracts_metadata(instruments, client_provider=client_provider)
+        contracts = _load_contracts_metadata(instruments, client_provider=client_provider,
+                                             request_budget=getattr(data_cache, "_request_budget", None))
     broker.set_contracts(contracts)
     storage.set_contract_metadata(contracts)
     storage.set_names(_instrument_names(instruments))
@@ -936,6 +1039,14 @@ def _build_runtime(
             if instrument is not None and callable(mark_processed):
                 mark_processed(instrument, "1m", stamp)
 
+    runtime_ref: list = []
+
+    def journal_ids(key):
+        """Ключ инструмента и его псевдонимы, под которыми сделки лежат в журнале."""
+        aliases = (getattr(runtime_ref[0], "execution_aliases", None) or {}) if runtime_ref else {}
+        canonical = aliases.get(key, key)
+        return [canonical, *(alias for alias, target in aliases.items() if target == canonical and alias != canonical)]
+
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
         intent_since[0] = as_aware(trade_manager._clock.now())
@@ -945,6 +1056,12 @@ def _build_runtime(
             if pending_bar is not None:
                 commit_bar(*pending_bar)
                 pending_bar = None
+            # Свечи минут, пройденных как «у источника нет»: только отметка в
+            # журнале сделки, исполнение задним числом не переигрывается.
+            drain_late = getattr(data_cache, "drain_late_source_absent", None)
+            for uid, minute, ohlc in (drain_late() if callable(drain_late) else ()):
+                trade_manager.record_late_candle(journal_ids(uid), minute, ohlc,
+                                                 observed_at=trade_manager._clock.now())
             batches = {}
             initial_boundaries = None
             for instrument in lifecycle.execution_instruments():
@@ -981,6 +1098,12 @@ def _build_runtime(
                         # исходный DataFrame.
                         if isinstance(protected, type(fresh)):
                             fresh = protected
+                    skipped = getattr(data_cache, "source_absent_between", None)
+                    absent = skipped(instrument, last, fresh) if callable(skipped) and not fresh.empty else []
+                    if absent:
+                        # Пометка пропуска — до продвижения границы исполнения.
+                        trade_manager.record_source_absent(journal_ids(ticker), absent,
+                                                           observed_at=trade_manager._clock.now())
                     for row in fresh.itertuples(index=False):
                         stamp = to_aware_utc(row.datetime).to_pydatetime()
                         values = (float(row.open), float(row.low), float(row.high), float(row.close))
@@ -1022,13 +1145,15 @@ def _build_runtime(
             log.warning("Сбой обработки бара исполнением: %s", exc)
             return False
 
-    return _Runtime(
+    runtime = _Runtime(
         post_tick=on_bar,
         trade_manager=trade_manager,
         action_executor=action_executor,
         storage=storage,
         contract_lifecycle=lifecycle,
     )
+    runtime_ref.append(runtime)
+    return runtime
 
 
 def _dispatch_evidence(data_cache, instruments, storage, intent_since):
@@ -1132,7 +1257,7 @@ def _instrument_names(instruments) -> dict[str, str]:
     return names
 
 
-def _load_contracts_metadata(instruments, client_provider=None):
+def _load_contracts_metadata(instruments, client_provider=None, request_budget=None):
     """Кэш метаданных контрактов из источника данных прогона.
 
     Акции и фьючерсы грузятся по-разному: у фьючерса есть шаг, стоимость шага,
@@ -1166,7 +1291,9 @@ def _load_contracts_metadata(instruments, client_provider=None):
 
     contracts: dict[str, object] = {}
     loaders = {"future": load_futures_contracts, "share": load_share_contracts}
-    with context as client:
+    with context as raw_client:
+        # Через общий арбитр: каталоги — сервис инструментов, их квота мала.
+        client = raw_client if request_budget is None else request_budget.wrap_client(raw_client, lane="interactive")
         for instrument_type, tickers in by_type.items():
             loader = loaders.get(instrument_type)
             if loader is None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Sequence
 from uuid import uuid4
@@ -168,6 +168,18 @@ def _entry_ttl_seconds(timeframe: str) -> int:
     if minutes < 240:
         return 4 * 3600
     return 24 * 3600
+
+
+def pd_timestamp_iso(value) -> str:
+    """Минута как UTC ISO без пояса — тот же вид, что у рыночной базы."""
+    stamp = value if not isinstance(value, str) else datetime.fromisoformat(value)
+    if getattr(stamp, "tzinfo", None) is not None:
+        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamp.isoformat()
+
+
+def _instrument_ids(value) -> tuple[str, ...]:
+    return (value,) if isinstance(value, str) else tuple(dict.fromkeys(value))
 
 
 class TradeManager:
@@ -1828,6 +1840,101 @@ class TradeManager:
         self._equity_unknown = False
         self._record_portfolio_budget()
         return True
+
+    _OPEN_PHASES_SQL = "phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')"
+
+    def record_source_absent(self, instrument_ids, minutes, *, observed_at):
+        """Исполнение проходит минуты «у источника нет»: явная пометка в журнале сделки.
+
+        Пишется до продвижения границы исполнения, идемпотентно по минуте и
+        сделке. Вместе с минутой сохраняются действовавшие стоп и цели — по ним
+        позже оценивается поздно пришедшая свеча (решение владельца 13.10.2026).
+        ``instrument_ids`` — ключ инструмента или все его псевдонимы журнала.
+        """
+        ids = _instrument_ids(instrument_ids)
+        rows = [(pd_timestamp_iso(minute), evidence) for minute, evidence in minutes]
+        if not rows:
+            return 0
+        written = 0
+        with self._storage.transaction() as connection:
+            trades = connection.execute(
+                "SELECT t.trade_id,t.side,p.confirmed_stop FROM trades t LEFT JOIN protection p ON p.trade_id=t.trade_id "
+                f"WHERE t.instrument_id IN ({','.join('?' * len(ids))}) AND t.{self._OPEN_PHASES_SQL}", ids).fetchall()
+            for trade_id, side, stop in trades:
+                targets = [row[0] for row in connection.execute(
+                    "SELECT price FROM targets WHERE trade_id=? ORDER BY target_index", (trade_id,))]
+                for minute, evidence in rows:
+                    payload = {"minute": minute, "evidence": evidence, "side": side, "stop": stop, "targets": targets,
+                               "reason": "source-absent-minute"}
+                    event_id = f"source-absent:{trade_id}:{minute}"
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                        (event_id, trade_id, "MARKET_DATA_SOURCE_ABSENT",
+                         json.dumps(payload, sort_keys=True), as_aware(observed_at).isoformat()))
+                    written += cursor.rowcount
+                    if cursor.rowcount:
+                        self._traces.record_in_transaction(connection, calculation_trace(
+                            "execution.source_absent_minute",
+                            inputs={"minute": MeasuredValue(minute, "utc_minute"),
+                                    "evidence": MeasuredValue(evidence, "coverage_evidence"),
+                                    "side": MeasuredValue(side, "side"),
+                                    "stop": MeasuredValue(stop, "price"),
+                                    "targets": MeasuredValue(targets, "price")},
+                            result=MeasuredValue("skipped", "execution"),
+                            reason="source-absent-minute",
+                            formula="минута без свечи у источника после всех проверок: без стопа, тейка и переоценки",
+                            links=TraceLinks(trade_id=trade_id, event_id=event_id)))
+        if written:
+            log.warning("Исполнение %s прошло минут без свечи у источника: %d", ids[0], len(rows))
+        return written
+
+    def record_late_candle(self, instrument_ids, minute, ohlc, *, observed_at):
+        """Свеча минуты, пройденной исполнением как «у источника нет»: факты не меняются.
+
+        В журнал пишется позднее поступление и признак возможного касания
+        стопа или цели, действовавших в момент пропуска.
+        """
+        ids = _instrument_ids(instrument_ids)
+        stamp = pd_timestamp_iso(minute)
+        open_price, high, low, close = (Decimal(str(value)) for value in ohlc)
+        written = 0
+        with self._storage.transaction() as connection:
+            skipped = connection.execute(
+                "SELECT e.trade_id,e.payload_json FROM events e JOIN trades t ON t.trade_id=e.trade_id "
+                f"WHERE e.event_type='MARKET_DATA_SOURCE_ABSENT' AND t.instrument_id IN ({','.join('?' * len(ids))}) "
+                "AND e.event_id LIKE ?", (*ids, f"source-absent:%:{stamp}")).fetchall()
+            for trade_id, payload_json in skipped:
+                payload = json.loads(payload_json)
+                stop = None if payload.get("stop") is None else Decimal(payload["stop"])
+                targets = [Decimal(value) for value in payload.get("targets") or ()]
+                buy = payload.get("side") == "BUY"
+                touched_stop = stop is not None and (low <= stop if buy else high >= stop)
+                touched_target = any((high >= target if buy else low <= target) for target in targets)
+                reason = ("late-candle-touched-stop" if touched_stop
+                          else "late-candle-touched-target" if touched_target else "late-candle")
+                event_id = f"late-candle:{trade_id}:{stamp}"
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                    (event_id, trade_id, "MARKET_DATA_LATE_CANDLE",
+                     json.dumps({"minute": stamp, "open": str(open_price), "high": str(high), "low": str(low),
+                                 "close": str(close), "touched_stop": touched_stop, "touched_target": touched_target,
+                                 "reason": reason}, sort_keys=True), as_aware(observed_at).isoformat()))
+                written += cursor.rowcount
+                if cursor.rowcount:
+                    self._traces.record_in_transaction(connection, calculation_trace(
+                        "execution.late_candle",
+                        inputs={"minute": MeasuredValue(stamp, "utc_minute"),
+                                "high": MeasuredValue(high, "price"), "low": MeasuredValue(low, "price"),
+                                "side": MeasuredValue(payload.get("side"), "side"),
+                                "stop": MeasuredValue(stop, "price"), "targets": MeasuredValue(targets, "price")},
+                        result=MeasuredValue({"touched_stop": touched_stop, "touched_target": touched_target}, "flag"),
+                        reason=reason,
+                        formula="BUY: low <= стоп, high >= цель; SELL: high >= стоп, low <= цель; факты не меняются",
+                        links=TraceLinks(trade_id=trade_id, event_id=event_id)))
+                if cursor.rowcount and (touched_stop or touched_target):
+                    log.warning("Поздняя свеча %s %s могла задеть %s сделки %s; исполнение не переигрывается",
+                                ids[0], stamp, "стоп" if touched_stop else "цель", trade_id)
+        return written
 
     def observe_bars(self, prices, bar_times, *, timeframe="1m", gap_before=False):
         """Journal closed holding bars directly, independently of notifications."""
