@@ -14,11 +14,13 @@ from src.events.types import EventType
 from src.notifier.console import ConsoleChannel
 from src.notifier.templates import render
 
-SPEC = Path(__file__).resolve().parents[3] / "openspec/changes/console-event-first-format/specs/notification/spec.md"
+SPEC = Path(__file__).resolve().parents[3] / "openspec/specs/notification/spec.md"
 
 
-def _golden(index: int) -> str:
-    return SPEC.read_text().split("```text\n")[index].split("\n```")[0] + "\n"
+def _golden(scenario: str) -> str:
+    """Буквальный блок ```text из сценария основной спеки notification."""
+    section = SPEC.read_text().split(f"#### Scenario: {scenario}\n", 1)[1]
+    return section.split("```text\n", 1)[1].split("\n```", 1)[0] + "\n"
 
 
 def _at(hour: int, minute: int) -> datetime:
@@ -85,7 +87,7 @@ def test_full_trading_sequence_matches_approved_text(monkeypatch) -> None:
         code="risk-cost-ratio", diagnostics={"risk_amount": Decimal("55"), "costs_amount": Decimal("40"),
             "slippage_amount": Decimal("10"), "payoff_ratio": Decimal("1.5"), "threshold": Decimal("2")},
         side="BUY", event_id="mtss"))
-    assert stream.getvalue() == _golden(1)
+    assert stream.getvalue() == _golden("Утверждённый эталон торговых событий")
 
 
 def test_grouped_data_sequence_matches_approved_text(monkeypatch) -> None:
@@ -105,7 +107,7 @@ def test_grouped_data_sequence_matches_approved_text(monkeypatch) -> None:
         channel.handle(Event.market_data_status(name, timeframe=tf, session="open",
             data_state="delayed", observed_at=observed, expected_bar=datetime(2026, 10, 13, 13, 0)))
     channel.handle(Event.tick_finished(tick_id="data", completed=False))
-    assert stream.getvalue() == _golden(2)
+    assert stream.getvalue() == _golden("Утверждённый эталон одновременных состояний данных")
 
 
 def test_startup_overview_is_always_silent_and_color_is_text_neutral() -> None:
