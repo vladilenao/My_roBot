@@ -135,6 +135,11 @@ class IngestionWorker:
         self._execution_lock = Lock()
         self._execution_obligations = {}
         self._execution_cursor = 0
+        # Независимые полосы (add-independent-market-data-lanes): живая полоса
+        # не ведёт восстановление и календарь, потеря доставки уходит полосе
+        # доказательств.
+        self.lanes_enabled = bool(getattr(self.settings, "independent_lanes", False))
+        self.evidence = None
 
     def set_execution_obligations(self, boundaries):
         """Main-thread snapshot of unfinished financial work, never a DB read here."""
@@ -142,6 +147,11 @@ class IngestionWorker:
                     for key, (stamp, inclusive) in boundaries.items() if stamp is not None}
         with self._execution_lock:
             self._execution_obligations = snapshot
+
+    def execution_boundary(self, instrument_key):
+        """Граница исполнения незавершённой сделки инструмента: (момент, включительно) или None."""
+        with self._execution_lock:
+            return self._execution_obligations.get(instrument_key)
 
     # ── вход supervisor ──
     def set_stream_pairs(self, pairs, *, held=()):
@@ -165,6 +175,9 @@ class IngestionWorker:
 
     def note_loss(self, uid, timeframe, since, *, reason="delivery_loss"):
         """Известный обрыв/переполнение: range recovery без ожидания deadline."""
+        if self.lanes_enabled and self.evidence is not None:
+            self.evidence.note_loss(uid, timeframe, since)
+            return
         now = _naive(self._timeline.now())
         key = self._pair_key(uid, timeframe)
         if key is None:
@@ -194,6 +207,10 @@ class IngestionWorker:
         try:
             if self._service_need(now):
                 return True
+            if self.lanes_enabled:
+                # Живая полоса: восстановление, сверку и календарь ведут свои полосы.
+                return (self._service_handoff(now) or self._service_fresh(now)
+                        or bool(self._service_conflicts(now)))
             # Расписание — вход детектора, сверки и срока публикации: без него
             # всё UNKNOWN. Не больше одного дешёвого RPC сервиса инструментов
             # за шаг, поэтому не ждёт своей очереди среди recovery и сверки.
@@ -840,14 +857,15 @@ class IngestionWorker:
         traded = [_naive(trade.time) for trade in trades]
         frame = self._cache._closed_member_frame(self._cache._live_members[uid, timeframe], timeframe)
         received = set(frame["datetime"]) if not frame.empty else set()
-        confirmed, probe = 0, lower
+        rows, probe = [], lower
         while probe < end:
             close = _naive(grid.bar_close(probe))
             if probe not in received and not any(probe <= stamp < close for stamp in traded):
-                self._store.set_interval_state(source=self._source, instrument_uid=uid, interval=timeframe,
-                    open_time=probe, state="confirmed_no_trade", evidence="last_trades_empty", observed_at=now)
-                confirmed += 1
+                rows.append((probe, "confirmed_no_trade", "last_trades_empty"))
             probe = close
+        # Одна транзакция и один пересчёт префикса на весь ответ.
+        confirmed = self._store.set_interval_states(source=self._source, instrument_uid=uid, interval=timeframe,
+                                                    rows=rows, observed_at=now) if rows else 0
         if confirmed:
             self._cache.refresh_live_coverage(uid, timeframe)
         return bool(confirmed)
