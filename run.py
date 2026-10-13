@@ -352,6 +352,23 @@ def _source_ping(client_provider):
     return ping
 
 
+def _source_coverage(client_provider):
+    """Счётная проверка покрытия на источнике: у эмулятора есть ``/coverage``."""
+    client_context = getattr(client_provider, "client_context", None)
+    if client_context is None:
+        return None
+
+    def coverage(*, instrument_id, timeframe, start_date, end_date):
+        with client_context() as client:
+            probe = getattr(client, "coverage", None)
+            if probe is None:
+                raise EmulatorError("UNSUPPORTED", "источник не умеет проверять покрытие")
+            return probe(instrument_id=instrument_id, timeframe=timeframe,
+                         from_=start_date, to=end_date)
+
+    return coverage
+
+
 def _launch(
     *,
     state_dir,
@@ -411,6 +428,7 @@ def _launch(
                 requirements=_family_warmup, start=session.start, end=session.end,
                 load_candles=load_candles, client_provider=client_provider, clock=clock,
                 ping=_source_ping(client_provider),
+                coverage=_source_coverage(client_provider),
                 fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
                 fixed_warmup=_warmup_bars())
         else:
@@ -423,6 +441,7 @@ def _launch(
                 client_provider=client_provider,
                 clock=clock,
                 ping=_source_ping(client_provider),
+                coverage=_source_coverage(client_provider),
             )
         if not report.ok:
             print(report.message())

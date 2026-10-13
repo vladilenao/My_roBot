@@ -252,6 +252,39 @@ class TestCandlesConversion:
             )
 
 
+class TestCoverageQuery:
+    def test_query_carries_bounds_interval_and_snapshot(self):
+        http = _Http({"/coverage": {
+            "instrument_id": "uid-1", "interval": "5m",
+            "from": "2024-01-02 09:35:00", "to": "2024-12-31 18:50:00",
+            "count": 208431, "slots": 210817,
+        }})
+        with patch("src.api.emulator_client.request.urlopen", http):
+            with HistoricalClient("http://emulator:8100", snapshot_generation=42) as client:
+                data = client.coverage(
+                    instrument_id="uid-1", timeframe="5m",
+                    from_=datetime(2024, 1, 1, 3, 4), to=datetime(2024, 1, 2, 0, 0),
+                )
+
+        assert data["count"] == 208431
+        url = http.urls()[0]
+        assert "/api/v1/coverage" in url
+        assert "instrument_id=uid-1" in url
+        assert "interval=5m" in url
+        assert "from=2024-01-01+03%3A04%3A00" in url
+        assert "to=2024-01-02+00%3A00%3A00" in url
+        assert "snapshot_generation=42" in url
+
+    def test_omits_bounds_and_snapshot_when_absent(self):
+        http = _Http({"/coverage": {"count": 0}})
+        with patch("src.api.emulator_client.request.urlopen", http):
+            data = _client().coverage(instrument_id="uid-1", timeframe="1m")
+
+        assert data["count"] == 0
+        url = http.urls()[0]
+        assert "from=" not in url and "to=" not in url and "snapshot_generation" not in url
+
+
 class _PagedHttp:
     """Эмулятор `GET /api/v1/candles`: постранично, курсор, `total`.
 
