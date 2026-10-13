@@ -1,6 +1,8 @@
 # Надёжный приём live-свечей
 
-> Реализация change `openspec/changes/reliable-live-candle-ingestion`.
+> Реализация change `reliable-live-candle-ingestion` (архив
+> `openspec/changes/archive/2026-10-13-reliable-live-candle-ingestion`; нормативный
+> текст — `openspec/specs/market-data-stream` и связанные спеки).
 > Это транспорт рыночных **данных**: заявки по-прежнему исполняет симулятор
 > `JournalBroker` (или работает NotifyOnly), реального исполнителя биржи нет.
 
