@@ -16,15 +16,25 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import pandas as pd
+from t_tech.invest.schemas import TradeSourceType
 
 from src.data.ingestion_settings import MarketDataSettings
 from src.data.request_budget import RequestDeferred
-from src.data.timeutil import to_naive
+from src.data.loader import _client_context
+from src.data.timeutil import to_aware_utc, to_naive
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 
 WARMUP_DAYS = (30, 60, 120, 240, 480, 960)
+
+# GetLastTrades отдаёт обезличенные сделки только за последний час; запас на
+# задержку запроса. Проба 8.5: минуты без сделок совпали с минутами без свечей.
+LAST_TRADES_HORIZON = timedelta(minutes=55)
+# Предел ответа документация не называет (проба отдала 7200 сделок без обрезки);
+# тихие минуты бывают у неликвидных пар, поэтому длинный ответ консервативно
+# считается неубедительным, а не доказательством пустоты.
+LAST_TRADES_CONCLUSIVE_LIMIT = 1000
 
 # Консервативный span одного GetCandles (design 8): не больше SDK
 # MAX_INTERVALS и документированных пределов D1; overlap входит внутрь span.
@@ -645,6 +655,8 @@ class IngestionWorker:
             book.next_retry_at = now
             return self._save_book(uid, timeframe, book)
         missing, _ = self._first_missing(pair, now, lower=book.lower, horizon=book.upper)
+        if missing is not None and self._confirm_no_trades(pair, missing, book.upper, now):
+            missing, _ = self._first_missing(pair, now, lower=book.lower, horizon=book.upper)
         if missing is None:
             return self._clear_range(uid, timeframe)
         book.checkpoint = missing
@@ -657,6 +669,59 @@ class IngestionWorker:
             return self._park(pair, book, now, missing)
         self._reconciler_empty(uid, timeframe, missing)
         return self._save_book(uid, timeframe, book)
+
+    def _confirm_no_trades(self, pair, missing, upper, now):
+        """Доказательство отсутствия сделок для пропусков последнего часа.
+
+        Один GetLastTrades на недавний диапазон. Интервал без единой сделки
+        получает confirmed_no_trade; интервал со сделками остаётся пропуском.
+        Пустой GetCandles сам по себе ничего не доказывает.
+        """
+        uid, timeframe = pair["uid"], pair["timeframe"]
+        grid = self._timeline.grid(timeframe)
+        # Только интервалы целиком внутри последнего часа: старше доказать нечем.
+        horizon = now - LAST_TRADES_HORIZON
+        lower = _naive(missing)
+        if lower < horizon:
+            lower = _naive(grid.current_candle_start(horizon))
+            if lower < horizon:
+                lower = _naive(grid.bar_close(lower))
+        end = min(_naive(grid.bar_close(upper)), _naive(grid.current_candle_start(now)))
+        if lower >= end or (self._cache._client_provider is None and self._cache._token is None):
+            return False
+        try:
+            with _client_context(self._cache._client_provider, self._cache._token) as client:
+                rpc = getattr(client.market_data, "get_last_trades", None)
+                if rpc is None:  # эмулятор и исторический прогон: доказательства нет
+                    return False
+                # Профиль свечей UNSPECIFIED включает дилерские свечи выходного дня,
+                # поэтому и сделки берутся из всех источников.
+                response = self._budget.call(rpc, instrument_id=uid,
+                    from_=to_aware_utc(lower).to_pydatetime(), to=to_aware_utc(end).to_pydatetime(),
+                    trade_source=TradeSourceType.TRADE_SOURCE_ALL,
+                    key=("last_trades", uid, timeframe, lower), wait=False)
+        except RequestDeferred:
+            return False
+        except Exception as exc:
+            log.debug("GetLastTrades %s %s: %s", uid, timeframe, exc)
+            return False
+        trades = list(getattr(response, "trades", ()))
+        if len(trades) >= LAST_TRADES_CONCLUSIVE_LIMIT:
+            return False
+        traded = [_naive(trade.time) for trade in trades]
+        frame = self._cache._closed_member_frame(self._cache._live_members[uid, timeframe], timeframe)
+        received = set(frame["datetime"]) if not frame.empty else set()
+        confirmed, probe = 0, lower
+        while probe < end:
+            close = _naive(grid.bar_close(probe))
+            if probe not in received and not any(probe <= stamp < close for stamp in traded):
+                self._store.set_interval_state(source=self._source, instrument_uid=uid, interval=timeframe,
+                    open_time=probe, state="confirmed_no_trade", evidence="last_trades_empty", observed_at=now)
+                confirmed += 1
+            probe = close
+        if confirmed:
+            self._cache.refresh_live_coverage(uid, timeframe)
+        return bool(confirmed)
 
     def _reconciler_empty(self, uid, timeframe, missing):
         if self._reconciler is not None:

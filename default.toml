@@ -22,7 +22,8 @@ export_port = 8101
 # Транспорт live-свечей: "polling" или "stream" (подписка с резервным опросом).
 # Параметры приёма и восстановления — docs/market-data/live-ingestion.md; их
 # значения по умолчанию — инженерный профиль, а не гарантия брокера.
-live_transport = "polling"
+# Stream выбран после read-only пробы брокера (8.5); откат — "polling".
+live_transport = "stream"
 
 [instruments]
 fallback_type = "future"

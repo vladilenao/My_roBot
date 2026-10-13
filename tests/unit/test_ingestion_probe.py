@@ -127,3 +127,24 @@ def test_live_mode_compares_stream_with_rpc_and_detects_corrections():
     assert result["compared"] == 1
     assert "u:1m:2026-10-12T12:00:00+00:00" in result["corrections"]
     assert result["mismatches"]  # последняя версия потока отличается от RPC
+
+
+def test_no_trade_mode_compares_candle_minutes_with_last_trades(monkeypatch):
+    monkeypatch.setattr("src.api.instruments.find_working_instrument", lambda client, ticker, kind="share", **kw: "uid")
+    end = datetime(2026, 10, 13, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(probe, "utc_now", lambda: end + timedelta(seconds=20))
+    data = MarketData()
+    start = end - timedelta(minutes=55)  # фиктивный GetCandles: 40 свечей от начала окна
+    traded = [start + timedelta(minutes=index, seconds=5) for index in range(40) if index != 7]  # в 09:12 сделок нет
+    data.get_last_trades = lambda *, instrument_id, from_, to: SimpleNamespace(
+        trades=[SimpleNamespace(time=moment) for moment in traded if from_ <= moment < to])
+    client = SimpleNamespace(market_data=data, instruments=Instruments())
+    def forbidden():
+        raise AssertionError("в режиме no-trade поток не открывается")
+    report = probe.run_probe(client, forbidden, ["NGZ6:future"], listen_seconds=1, check_after=0,
+                             live_minutes=0, cold_days=1, no_trade_only=True)
+    result = report["no_trade:NGZ6"]
+    assert report["mode"] == "no-trade-evidence" and set(report) >= {"instruments", "no_trade:NGZ6"}
+    assert result["with_candle"] == 40 and result["with_trades"] == 39 and result["neither"] == 15
+    assert result["candle_without_trades"] == ["2026-10-13T09:12:00+00:00"] and not result["agrees"]
+    assert "no_trade" in probe.summary(report)

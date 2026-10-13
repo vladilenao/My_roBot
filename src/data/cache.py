@@ -734,6 +734,17 @@ class MarketDataCache:
             self._live_generation += 1
             self._data_changed.notify_all()
 
+    def refresh_live_coverage(self, uid, timeframe):
+        """Пересчёт префикса после нового доказательства без свечи (no-trade)."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is None:
+                return
+            self._advance_live_coverage(uid, timeframe, member)
+            self._refresh_member_state(uid, timeframe, member)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+
     def set_live_gap(self, uid, timeframe, gap):
         """Recovery-владелец сообщает об активном/парковочном диапазоне пары."""
         with self._lock:
