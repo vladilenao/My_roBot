@@ -20,6 +20,7 @@ import pandas as pd
 from t_tech.invest.schemas import TradeSourceType
 
 from src.data.ingestion_settings import MarketDataSettings
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.request_budget import RequestDeferred
 from src.data.loader import _client_context
 from src.data.timeutil import to_aware_utc, to_naive
@@ -456,7 +457,7 @@ class IngestionWorker:
                                   end_date=gap + period, wait_for_budget=False)
                 after = self._store.coverage_state(source=self._source, instrument_uid=pair["uid"],
                                                    interval="1m", open_time=gap)
-                if after not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if after not in RESOLVED_INTERVAL_STATES:
                     if self._reconciler is not None:
                         self._reconciler.record_empty_recovery(
                             instrument_uid=pair["uid"], interval="1m", open_time=gap)
@@ -577,7 +578,7 @@ class IngestionWorker:
                 state = self._store.coverage_state(
                     source=self._source, instrument_uid=pair["uid"], interval=pair["timeframe"], open_time=due.open
                 )
-                if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state in RESOLVED_INTERVAL_STATES:
                     continue
                 stamps = [due.open]
                 start, end = due.open, due.close

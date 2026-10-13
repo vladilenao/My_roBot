@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from src.api.retry import api_call_with_retry
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.market_store import MarketDataStore
 from src.data.timeutil import to_aware_utc, to_naive
 from src.scheduler.timing import tf_period_minutes
@@ -202,7 +203,7 @@ class MarketDataReconciler:
         state = self._store.coverage_state(
             source=self._source, instrument_uid=instrument_uid, interval=interval, open_time=open_time,
         )
-        if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
+        if state in RESOLVED_INTERVAL_STATES:
             return state
         if self._market_calendar is not None and not self._calendar_evidence:
             return state or "unresolved"

@@ -14,6 +14,7 @@ from src.data.timeutil import to_naive
 from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.request_budget import RequestDeferred
 from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
@@ -573,7 +574,7 @@ class MarketDataCache:
                                                       interval=timeframe, open_time=probe)
         else:
             state = reconciler.interval_state(instrument_uid=uid, interval=timeframe, open_time=probe, now=now)
-        if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+        if state not in RESOLVED_INTERVAL_STATES:
             return None
         following = _naive(grid.bar_close(probe))
         if state == "scheduled_closed" and reconciler is not None:
@@ -978,7 +979,7 @@ class MarketDataCache:
                     open_time=probe, now=self._timeline.now(),
                 ) if self._market_reconciler is not None else self._market_store.coverage_state(
                     source=self._market_source, instrument_uid=instrument_id, interval=timeframe, open_time=probe))
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     self._report_coverage_block(key, probe, state)
                     return frame.loc[allowed].copy()
                 probe += pd.Timedelta(minutes=1)
@@ -1153,7 +1154,7 @@ class MarketDataCache:
             while probe < _naive(right):
                 state = self._market_reconciler.interval_state(instrument_uid=uid,
                     interval=timeframe, open_time=probe, now=self._timeline.now())
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     if floor is None or probe >= floor:
                         return False
                     # До запуска: доказательства нет и получить его нельзя —
@@ -1670,7 +1671,7 @@ class MarketDataCache:
                         instrument_uid=instrument_id, interval=timeframe,
                         open_time=probe, now=self._timeline.now(),
                     )
-                    if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    if state not in RESOLVED_INTERVAL_STATES:
                         self._report_coverage_block(key, probe, state)
                         return ordered.loc[allowed].copy()
                     probe += period
