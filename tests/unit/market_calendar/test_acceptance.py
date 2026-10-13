@@ -248,8 +248,9 @@ def test_10_changed_day_gets_new_version_and_old_evidence_keeps_its_version(tmp_
     reconciler.reconcile(instrument_uid="uid", interval="1m", candles=candles("2026-10-13 20:49", "2026-10-14 03:59"),
                          now=utc("2026-10-14 04:01"))
     first = store.schedule_days(source="tbank", exchange=FUTURES)[0].version
-    evidence = lambda: [row for row in store.changes_after(store.producer_id, 0, limit=1000)["changes"]
-                        if row["kind"] == "interval_status"]
+    def evidence():
+        return [row for row in store.changes_after(store.producer_id, 0, limit=1000)["changes"]
+                if row["kind"] == "interval_status"]
     before = {row["interval_status"]["evidence"] for row in evidence()}
     assert any(first in item for item in before)
 

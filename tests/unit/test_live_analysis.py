@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 import io
@@ -7,7 +6,6 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from src.bot import TradingBot
 from src.bot.live_analysis import LiveAnalysis

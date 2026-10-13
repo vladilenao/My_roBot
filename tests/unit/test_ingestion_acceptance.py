@@ -26,7 +26,7 @@ auth/quota, stale generation, blocked read-stop, correction during commit, resta
 financial commit — в test_stream_ingestion и test_live_execution_pin; сквозной старт — ниже.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from queue import Empty, Queue
 from unittest.mock import MagicMock, patch
