@@ -75,7 +75,8 @@ def setup(tmp_path, *, started, now, stored, market, timeframes=("1m",), setting
         cache.register_live_pair(item, "uid", timeframe)
         cache.mark_live_history("uid", timeframe, done=True)
     worker = IngestionWorker(cache, settings=settings or MarketDataSettings(independent_lanes=True))
-    evidence, completeness = EvidenceLane(worker), CompletenessLane(worker)
+    completeness = CompletenessLane(worker)
+    evidence = EvidenceLane(worker, completeness)
     worker.evidence = evidence
     clock[0] = pd.Timestamp(now)
     return SimpleNamespace(clock=clock, store=store, cache=cache, worker=worker, evidence=evidence,
@@ -271,3 +272,19 @@ def test_evidence_lane_reports_pending_recent_minute(tmp_path):
     evidence = env.cache.pair_status(env.item, "1m")["lanes"]["evidence"]
     assert evidence["missing"] == "2026-10-12T12:04:00Z" and evidence["attempts"] >= 1
     assert evidence["next_check_at"] is not None
+
+
+def test_evidence_covers_needed_minutes_before_process_start(tmp_path):
+    # Перезапуск посреди сессии: тихая минута и недогруженная свеча за полчаса
+    # до старта ещё доказуемы GetLastTrades и нужны окну прогрева пары.
+    market = Market({"1m": [stamp for stamp in minutes("2026-10-12 12:00", "2026-10-12 12:34")
+                            if stamp != pd.Timestamp("2026-10-12 12:05")]})
+    stored = [str(stamp) for stamp in minutes("2026-10-12 12:00", "2026-10-12 12:34")
+              if stamp not in (pd.Timestamp("2026-10-12 12:05"), pd.Timestamp("2026-10-12 12:10"))]
+    env = setup(tmp_path, started="2026-10-12 12:30:30", now="2026-10-12 12:35:30", stored={"1m": stored},
+                market=market)
+    env.cache.register_live_pair(env.item, "uid", "1m", 40)
+    env.cache.mark_live_history("uid", "1m", done=True)
+    run(env.evidence)
+    assert state(env, "2026-10-12 12:05") == "confirmed_no_trade"
+    assert state(env, "2026-10-12 12:10") == "received"

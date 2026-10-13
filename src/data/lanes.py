@@ -38,11 +38,14 @@ class EvidenceLane:
 
     name = "evidence"
 
-    def __init__(self, worker):
+    def __init__(self, worker, completeness=None):
         self._worker = worker
         self._cache = worker._cache
         self._timeline = worker._timeline
         self.settings = worker.settings
+        # Нижняя граница нужного — окно полноты пары: тихие минуты прямо перед
+        # запуском ещё доказуемы GetLastTrades, позже — только «у источника нет».
+        self._completeness = completeness
         self._window = timedelta(seconds=self.settings.evidence_window_secs)
         self._retry = tuple(timedelta(seconds=value) for value in self.settings.evidence_retry_secs)
         self._next: dict[tuple[str, str], pd.Timestamp] = {}
@@ -71,12 +74,18 @@ class EvidenceLane:
             return max(lower, _naive(loss)), horizon
         return lower, None
 
+    def _need_lower(self, pair, now):
+        if self._completeness is not None:
+            return self._completeness.window_lower(pair, now)
+        return self._cache.live_floor(pair["uid"], pair["timeframe"])
+
     def _pending_pair(self, pair, now):
         lower, horizon = self._bounds(pair, now)
-        floor = self._cache.live_floor(pair["uid"], pair["timeframe"])
-        if floor is not None:
-            lower = max(lower, floor)
-        missing, horizon = self._worker._first_missing(pair, now, lower=lower, horizon=horizon)
+        need = self._need_lower(pair, now)
+        if need is not None:
+            lower = max(lower, need)
+        missing, horizon = self._worker._first_missing(pair, now, lower=lower, horizon=horizon,
+                                                       floor=self._completeness is None)
         if missing is None:
             self._losses.pop((pair["uid"], pair["timeframe"]), None)
         return missing, horizon
@@ -111,10 +120,11 @@ class EvidenceLane:
             self._worker.errors[uid, timeframe] = str(exc)
             self._schedule(pair, missing, now)
             return
-        remaining, _ = self._worker._first_missing(pair, now, lower=missing, horizon=horizon)
+        floor = self._completeness is None
+        remaining, _ = self._worker._first_missing(pair, now, lower=missing, horizon=horizon, floor=floor)
         if remaining is not None:
             self._worker._confirm_no_trades(pair, remaining, horizon, now)
-            remaining, _ = self._worker._first_missing(pair, now, lower=remaining, horizon=horizon)
+            remaining, _ = self._worker._first_missing(pair, now, lower=remaining, horizon=horizon, floor=floor)
         if remaining is None:
             self._losses.pop((uid, timeframe), None)
             self._next.pop((uid, timeframe), None)

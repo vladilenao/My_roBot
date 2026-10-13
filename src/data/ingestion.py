@@ -685,7 +685,8 @@ class IngestionWorker:
         shifted = now - timedelta(seconds=self.settings.candle_publication_timeout_secs)
         return self._cache.expected_live_open(pair["key"], shifted)
 
-    def _first_missing(self, pair, now, lower=None, horizon=None):
+    def _first_missing(self, pair, now, lower=None, horizon=None, floor=True):
+        """Первый недоказанный интервал от ``lower``; ``floor`` — не раньше запуска."""
         uid, timeframe = pair["uid"], pair["timeframe"]
         horizon = horizon if horizon is not None else self._horizon(pair, now)
         if horizon is None:
@@ -701,7 +702,7 @@ class IngestionWorker:
                 if not state.get("coverage_lower"):
                     return None, horizon
                 lower = _naive(state["coverage_lower"])
-        floor = self._cache.live_floor(uid, timeframe)
+        floor = self._cache.live_floor(uid, timeframe) if floor else None
         if floor is not None:
             lower = max(_naive(lower), floor)  # вариант «б»: не раньше запуска
         probe, steps = _naive(lower), 0

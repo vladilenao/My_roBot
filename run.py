@@ -635,7 +635,8 @@ def _start_early_market_data(state_dir, provider):
     for name in settings.deprecated_overrides():
         log.warning("Параметр [market_data] %s не используется при независимых полосах", name)
     worker = IngestionWorker(data_cache, settings=settings)
-    evidence, completeness = EvidenceLane(worker), CompletenessLane(worker)
+    completeness = CompletenessLane(worker)
+    evidence = EvidenceLane(worker, completeness)
     worker.evidence = evidence
     lanes = [CalendarLane(market_reconciler, timeline), evidence, completeness]
     registered = _register_saved_roster(data_cache, market_store)
