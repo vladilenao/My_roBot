@@ -234,6 +234,21 @@ class HistoricalClient:
             params["to"] = _bounds(to)
         return self._get("/api/v1/coverage", params)
 
+    def trading_schedules(self, *, instrument_id: str, from_, to) -> dict:
+        """Расписание инструмента на том же snapshot_generation, что и свечи."""
+        params = {"instrument_id": instrument_id, "from": _bounds(from_), "to": _bounds(to)}
+        if self._snapshot_generation is not None:
+            params["snapshot_generation"] = self._snapshot_generation
+        payload = self._get("/api/v1/trading-schedules", params)
+        if not isinstance(payload, dict):
+            raise EmulatorError("INVALID_RESPONSE", "Эмулятор вернул некорректное расписание")
+        if self._snapshot_generation is not None and (
+            type(payload.get("snapshot_generation")) is not int
+            or payload["snapshot_generation"] != self._snapshot_generation
+        ):
+            raise EmulatorError("SNAPSHOT_MISMATCH", "Эмулятор вернул расписание другого снимка")
+        return payload
+
     def get_all_candles(
         self,
         *,
@@ -432,6 +447,11 @@ class EmulatorClientProvider(ClientProvider):
             self._base_url, timeout=self._timeout,
             snapshot_generation=self._snapshot_generation,
         )
+
+    def calendar_source(self, store, *, token=None, request_budget=None, horizon_days=7, refresh_seconds=3600):
+        from src.market_calendar.service import EmulatorScheduleSource
+
+        return EmulatorScheduleSource(store, self, horizon_days=horizon_days)
 
     def prepare_snapshot(self) -> dict:
         """Один раз догнать журнал и закрепить свечной снимок за провайдером."""

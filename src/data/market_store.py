@@ -19,8 +19,10 @@ from typing import Any, Iterable
 import pandas as pd
 
 from src.scheduler.timing import tf_period_minutes
+from src.market_calendar.serialization import canonical_day_json, day_version
+from src.market_calendar.intervals import normalize_exchange, trading_date
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SOURCE_TBANK = "tbank_exchange"
 INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "pending", "unresolved"})
 RESOLVED_INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade"})
@@ -57,6 +59,19 @@ class SourceInfo:
             "min_after_id": self.min_after_id,
             "max_change_id": self.max_change_id,
         }
+
+
+@dataclass(frozen=True)
+class StoredScheduleDay:
+    source: str
+    exchange: str
+    trading_date: str
+    version: str
+    raw_json: str
+    is_trading_day: bool
+    observed_at: str
+    last_confirmed_at: str
+    schedule_change_id: int
 
 
 class MarketDataStore:
@@ -166,6 +181,30 @@ class MarketDataStore:
                     assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
                     PRIMARY KEY(source,instrument_uid,interval,assignment_id)
                 );
+                CREATE TABLE IF NOT EXISTS trading_schedule_days (
+                    source TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    trading_date TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    is_trading_day INTEGER NOT NULL CHECK(is_trading_day IN (0, 1)),
+                    observed_at TEXT NOT NULL,
+                    last_confirmed_at TEXT NOT NULL,
+                    schedule_change_id INTEGER NOT NULL UNIQUE,
+                    PRIMARY KEY (source, exchange, trading_date, version)
+                );
+                CREATE INDEX IF NOT EXISTS trading_schedule_days_latest
+                    ON trading_schedule_days(source, exchange, trading_date, schedule_change_id DESC);
+                CREATE TABLE IF NOT EXISTS instrument_schedule_bindings (
+                    source TEXT NOT NULL,
+                    instrument_uid TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    schedule_change_id INTEGER NOT NULL UNIQUE,
+                    PRIMARY KEY (source, instrument_uid, observed_at)
+                );
+                CREATE INDEX IF NOT EXISTS instrument_schedule_bindings_latest
+                    ON instrument_schedule_bindings(source, instrument_uid, observed_at DESC);
                 """
             )
             # SQLite не умеет добавить значение в CHECK. Ранняя версия change
@@ -195,6 +234,7 @@ class MarketDataStore:
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
+            self._set_default(conn, "schedule_max_change_id", "0")
 
     @staticmethod
     def _set_default(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -348,6 +388,10 @@ class MarketDataStore:
             return {"state": "conflict", "revision": revision, "changed": False}
 
         payload = {**candle, "revision": revision}
+        # Прежнее состояние интервала — в той же транзакции: «свеча вне
+        # расписания» видна без отдельного запроса на каждую свечу страницы.
+        previous = conn.execute("""SELECT state FROM interval_coverage
+            WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?""", identity).fetchone()
         conn.execute("""INSERT INTO candle_current(source,instrument_uid,interval,open_time_utc,open,high,low,close,volume,is_complete,revision,received_at)
             VALUES (:source,:instrument_uid,:interval,:open_time_utc,:open,:high,:low,:close,:volume,:is_complete,:revision,:received_at)
             ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
@@ -360,7 +404,8 @@ class MarketDataStore:
         facts.update(published_at=candle["received_at"], input_ready_at=candle["received_at"],
                      canonical_source=observation.actual_source)
         self._write_live(conn, facts_key, facts)
-        return {"state": "accepted", "revision": revision, "changed": True}
+        return {"state": "accepted", "revision": revision, "changed": True,
+                "previous_coverage": None if previous is None else previous["state"]}
 
     def pin_input(self, *, source, instrument_uid, interval, open_time):
         """Закрепляет выбранную revision до внешней финансовой обработки."""
@@ -530,6 +575,50 @@ class MarketDataStore:
                 conn.rollback()
                 raise
 
+    def set_interval_states(self, *, source: str, instrument_uid: str, interval: str,
+                            rows: Iterable[tuple[object, str, str]], observed_at: object | None = None) -> int:
+        """Пакет состояний одного ряда в одной транзакции и с одним пересчётом префикса.
+
+        Полученный интервал (``received``) не понижается. Возвращает число
+        изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
+        это тысячи минут, по транзакции на каждую слишком дорого.
+        """
+        prepared = []
+        for open_time, state, evidence in rows:
+            if state not in INTERVAL_STATES:
+                raise ValueError(f"Неизвестное состояние интервала: {state}")
+            prepared.append((_utc_text(open_time), state, evidence))
+        if not prepared:
+            return 0
+        when = _utc_text(observed_at)
+        changed = 0
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for stamp, state, evidence in prepared:
+                    current = conn.execute(
+                        "SELECT state FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+                        (source, instrument_uid, interval, stamp)).fetchone()
+                    if current is not None and current["state"] == "received":
+                        continue
+                    if self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True):
+                        changed += 1
+                pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
+                cursor = conn.execute(
+                    "SELECT received_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                    (source, instrument_uid, interval),
+                ).fetchone()
+                latest = max(stamp for stamp, _, _ in prepared)
+                horizon = None if cursor is None or cursor[0] is None else max(latest, cursor[0])
+                if pair.get("coverage_lower") and horizon is not None and horizon >= _utc_text(pair["coverage_lower"]):
+                    self._resolve_contiguous_prefix(conn, source, instrument_uid, interval,
+                                                    pair["coverage_lower"], horizon)
+                conn.commit()
+                return changed
+            except Exception:
+                conn.rollback()
+                raise
+
     def _upsert_coverage(self, conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str, stamp: str, state: str, evidence: str, observed_at: str, *, emit: bool) -> int | None:
         old = conn.execute("SELECT state,evidence FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?", (source, instrument_uid, interval, stamp)).fetchone()
         if old is not None and old["state"] == state and old["evidence"] == evidence:
@@ -561,6 +650,132 @@ class MarketDataStore:
                 "INSERT INTO source_observations(source,instrument_uid,kind,payload_json,observed_at) VALUES (?,?,?,?,?)",
                 (source, instrument_uid, kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), _utc_text(observed_at)),
             )
+
+    def record_schedule_day(self, *, source: str, exchange: str, day: object, observed_at: object | None = None) -> bool:
+        """Сохраняет новую версию сырого дня либо подтверждает прежнюю.
+
+        Возвращает ``True`` только если содержание дня изменилось и получило
+        новый отдельный курсор ленты расписаний.
+        """
+        exchange = normalize_exchange(exchange)
+        raw_json = canonical_day_json(day)
+        version = day_version(day)
+        day_key = trading_date(day).isoformat()
+        is_trading_day = int(bool(getattr(day, "is_trading_day", False)))
+        when = _utc_text(observed_at)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    """SELECT 1 FROM trading_schedule_days
+                    WHERE source=? AND exchange=? AND trading_date=? AND version=?""",
+                    (source, exchange, day_key, version),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute(
+                        """UPDATE trading_schedule_days SET last_confirmed_at=?
+                        WHERE source=? AND exchange=? AND trading_date=? AND version=?""",
+                        (when, source, exchange, day_key, version),
+                    )
+                    conn.commit()
+                    return False
+                change_id = self._next_schedule_change_id(conn)
+                conn.execute(
+                    """INSERT INTO trading_schedule_days(
+                    source,exchange,trading_date,version,raw_json,is_trading_day,
+                    observed_at,last_confirmed_at,schedule_change_id)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (source, exchange, day_key, version, raw_json, is_trading_day, when, when, change_id),
+                )
+                conn.commit()
+                return True
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def schedule_days(self, *, source: str, exchange: str) -> tuple[StoredScheduleDay, ...]:
+        """Последняя версия каждого сохранённого дня режима торгов."""
+        exchange = normalize_exchange(exchange)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT source,exchange,trading_date,version,raw_json,is_trading_day,
+                observed_at,last_confirmed_at,schedule_change_id FROM trading_schedule_days
+                WHERE source=? AND exchange=? AND schedule_change_id IN (
+                    SELECT MAX(schedule_change_id) FROM trading_schedule_days
+                    WHERE source=? AND exchange=? GROUP BY trading_date
+                ) ORDER BY trading_date""",
+                (source, exchange, source, exchange),
+            ).fetchall()
+        return tuple(
+            StoredScheduleDay(
+                source=row["source"], exchange=row["exchange"], trading_date=row["trading_date"],
+                version=row["version"], raw_json=row["raw_json"], is_trading_day=bool(row["is_trading_day"]),
+                observed_at=row["observed_at"], last_confirmed_at=row["last_confirmed_at"],
+                schedule_change_id=row["schedule_change_id"],
+            )
+            for row in rows
+        )
+
+    def record_schedule_binding(
+        self, *, source: str, instrument_uid: str, exchange: str, observed_at: object | None = None
+    ) -> bool:
+        """Фиксирует смену режима торгов UID без дублирования прежней связи."""
+        exchange = normalize_exchange(exchange)
+        when = _utc_text(observed_at)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                latest = conn.execute(
+                    """SELECT exchange FROM instrument_schedule_bindings
+                    WHERE source=? AND instrument_uid=? ORDER BY observed_at DESC LIMIT 1""",
+                    (source, instrument_uid),
+                ).fetchone()
+                if latest is not None and latest["exchange"] == exchange:
+                    conn.commit()
+                    return False
+                change_id = self._next_schedule_change_id(conn)
+                conn.execute(
+                    """INSERT INTO instrument_schedule_bindings(
+                    source,instrument_uid,exchange,observed_at,schedule_change_id)
+                    VALUES (?,?,?,?,?)""",
+                    (source, instrument_uid, exchange, when, change_id),
+                )
+                conn.commit()
+                return True
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def schedule_binding(self, *, source: str, instrument_uid: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """SELECT exchange FROM instrument_schedule_bindings
+                WHERE source=? AND instrument_uid=? ORDER BY observed_at DESC LIMIT 1""",
+                (source, instrument_uid),
+            ).fetchone()
+        return None if row is None else normalize_exchange(row["exchange"])
+
+    def schedule_last_confirmed_at(self, *, source: str, exchange: str) -> str | None:
+        exchange = normalize_exchange(exchange)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """SELECT MAX(last_confirmed_at) AS last_confirmed_at FROM trading_schedule_days
+                WHERE source=? AND exchange=?""",
+                (source, exchange),
+            ).fetchone()
+        return None if row is None or row["last_confirmed_at"] is None else str(row["last_confirmed_at"])
+
+    @staticmethod
+    def _next_schedule_change_id(conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT value FROM metadata WHERE key='schedule_max_change_id'").fetchone()
+        current = int(row[0]) if row is not None else 0
+        next_id = current + 1
+        conn.execute(
+            """INSERT INTO metadata(key,value) VALUES ('schedule_max_change_id',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (str(next_id),),
+        )
+        return next_id
 
     def coverage_state(self, *, source: str, instrument_uid: str, interval: str, open_time: object) -> str | None:
         with self._lock, self._connect() as conn:
@@ -743,6 +958,61 @@ class MarketDataStore:
         for row in rows:
             result.append({"change_id": row["change_id"], "kind": row["kind"], "recorded_at": row["recorded_at"], **json.loads(row["payload_json"])})
         return {"producer_id": info.producer_id, "next_after_id": result[-1]["change_id"] if result else after_id, "has_more": has_more, "changes": result}
+
+    def schedule_changes_after(self, producer_id: str, after_id: int, limit: int = 500) -> dict[str, Any]:
+        """Отдельная лента расписаний: свечной курсор её не затрагивает."""
+        info = self.source_info()
+        if producer_id != info.producer_id:
+            raise ProducerMismatch()
+        limit = max(1, min(int(limit), 1000))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT schedule_change_id AS change_id, 'schedule_day' AS kind,
+                source,exchange,NULL AS instrument_uid,trading_date,version,raw_json,is_trading_day,observed_at,last_confirmed_at
+                FROM trading_schedule_days WHERE schedule_change_id>?
+                UNION ALL SELECT schedule_change_id, 'schedule_binding', source,exchange,instrument_uid,NULL,NULL,NULL,NULL,observed_at,NULL
+                FROM instrument_schedule_bindings WHERE schedule_change_id>?
+                ORDER BY change_id LIMIT ?""", (after_id, after_id, limit + 1)).fetchall()
+        has_more, rows = len(rows) > limit, rows[:limit]
+        changes = []
+        for row in rows:
+            value = {"change_id": row["change_id"], "kind": row["kind"], "source": row["source"],
+                     "exchange": row["exchange"], "observed_at": row["observed_at"]}
+            if row["kind"] == "schedule_binding":
+                value["instrument_uid"] = row["instrument_uid"]
+            if row["kind"] == "schedule_day":
+                value["day"] = {"trading_date": row["trading_date"], "version": row["version"],
+                                "raw_json": row["raw_json"], "is_trading_day": bool(row["is_trading_day"]),
+                                "last_confirmed_at": row["last_confirmed_at"]}
+            changes.append(value)
+        return {"producer_id": info.producer_id, "next_after_id": changes[-1]["change_id"] if changes else after_id,
+                "has_more": has_more, "changes": changes}
+
+    def acknowledge_schedule(self, consumer_id: str, producer_id: str, change_id: int) -> dict[str, Any]:
+        """Подтверждает только ленту расписаний в отдельном namespace курсора."""
+        if not consumer_id or not consumer_id.replace("-", "").isalnum() or consumer_id.lower() != consumer_id:
+            raise ValueError("consumer_id должен содержать строчные латинские буквы, цифры и дефисы")
+        info = self.source_info()
+        if producer_id != info.producer_id:
+            raise ProducerMismatch()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value FROM metadata WHERE key='schedule_max_change_id'").fetchone()
+            maximum = int(row[0]) if row is not None else 0
+            if change_id < 0 or change_id > maximum:
+                raise ValueError("change_id вне доступного диапазона расписаний")
+            key, now = f"trading-schedules:{consumer_id}", _utc_text()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                old = conn.execute("SELECT acknowledged_through FROM consumer_checkpoints WHERE consumer_id=?", (key,)).fetchone()
+                acknowledged = max(change_id, int(old[0])) if old else change_id
+                conn.execute("""INSERT INTO consumer_checkpoints(consumer_id,producer_id,acknowledged_through,acknowledged_at)
+                    VALUES(?,?,?,?) ON CONFLICT(consumer_id) DO UPDATE SET
+                    producer_id=excluded.producer_id,acknowledged_through=MAX(consumer_checkpoints.acknowledged_through,excluded.acknowledged_through),acknowledged_at=excluded.acknowledged_at""",
+                    (key, producer_id, acknowledged, now))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"producer_id": info.producer_id, "consumer_id": consumer_id, "acknowledged_through": acknowledged}
 
     def acknowledge(self, consumer_id: str, producer_id: str, change_id: int) -> dict[str, Any]:
         if not consumer_id or not consumer_id.replace("-", "").isalnum() or consumer_id.lower() != consumer_id:

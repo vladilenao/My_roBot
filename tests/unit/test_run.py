@@ -407,6 +407,37 @@ class TestRuntimeComposition:
         broker.track_bar.assert_called_once()
 
 
+    def test_closed_market_tick_without_bars_completes_and_keeps_clearing_behaviour(self):
+        # Задача 5.4 календаря: в перерыв/после закрытия свежих 1m нет, но
+        # post_tick отрабатывает. Адресный брокер не ведёт CSV-клиринг
+        # (journal=None, снят в a317d9c) — календарь это не меняет.
+        broker = MagicMock()
+        broker.drain_addressed_events.return_value = []
+        broker.drain_events.return_value = [MagicMock()]
+        broker.run_clearing_if_due.return_value = True
+        manager = MagicMock()
+        storage = MagicMock()
+        storage.load_trades.return_value = ()
+        storage.execution_bar_boundaries.return_value = {}
+        cache = MagicMock()
+        cache.frame_for.return_value = pd.DataFrame()
+        bus = MagicMock()
+        with patch("run.trading_enabled", return_value=True), patch(
+            "src.trade_journal.storage.Storage", return_value=storage
+        ), patch(
+            "src.broker.create_addressable_journal_broker", return_value=broker
+        ), patch(
+            "src.trade_management.manager.TradeManager", return_value=manager
+        ), patch("run._load_contracts_metadata", return_value={}), patch(
+            "run.print_contract_metadata"
+        ), patch("run._risk_limits"), patch("run._broker_event", side_effect=lambda event: event):
+            runtime = run._build_runtime([SELECTOR_NG], cache, bus, run.runtime_dir())
+            assert runtime.post_tick(("1m",)) is True
+
+        broker.track_bar.assert_not_called()
+        broker.run_clearing_if_due.assert_not_called()
+
+
 class TestInstrumentNames:
     def test_share_named_by_ticker(self):
         names = run._instrument_names(
@@ -501,6 +532,22 @@ class TestHistoryStartShift:
         selector.assert_not_called()
         channels.assert_not_called()
         assert (code, shifted, instruments) == (2, None, ready)
+
+
+def test_historical_preflight_calendar_loads_once_before_returning_expectation():
+    from src.history.preflight import Pair
+
+    unknown = SimpleNamespace(phase=SimpleNamespace(value="unknown"))
+    known = SimpleNamespace(phase=SimpleNamespace(value="closed"))
+    calendar = MagicMock()
+    calendar.expectation.side_effect = [unknown, known]
+
+    result = run._historical_calendar_expectation(calendar)(
+        Pair("NG", "future", "1m", "uid-1", "NG-1.25"), datetime(2026, 10, 13, 12)
+    )
+
+    assert result is known
+    calendar.service.assert_called_once_with(datetime(2026, 10, 13, 12))
 
 
 class TestRunHistoryRetry:

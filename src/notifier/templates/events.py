@@ -322,7 +322,8 @@ def render(event: Event, tz_offset_hours: float = 0.0, *, now: datetime | None =
     """Цельный блок или None для типов без пользовательского представления."""
     when = _when(event, tz_offset_hours, now)
     if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:
-        return _live_information(event, tz_offset_hours).render(width=width, color=color)
+        block = _live_information(event, tz_offset_hours)
+        return block.render(width=width, color=color) if block is not None else None
     if event.get("analysis_mode") == "historical":
         when = _dated(event.bar_time, tz_offset_hours)
     if event.type is EventType.DECISION:
@@ -347,9 +348,51 @@ def _dated(value, offset):
     return local.strftime("%d.%m.%Y %H:%M:%S") + " " + zone
 
 
+def _published_when(value: Any) -> str:
+    """Короткое московское время публикации, даже если событие связано со старой свечой."""
+    stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+
+
+def _bar_clock(value: Any, offset: float) -> str:
+    stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone(timedelta(hours=offset))).strftime("%H:%M")
+
+
 _DATA_HOLDS = {"BOOTSTRAPPING": "прогрев", "RECONCILING": "согласование с историей", "READY": "готово",
                "GAP_HOLD": "удержание: пропуск", "CONFLICT_HOLD": "удержание: расхождение версий",
                "INTEGRITY_HOLD": "удержание: изменена исполненная минута"}
+
+
+_NEXT_EVENT_LABELS = {
+    "session_open": "открытие торгов", "session_close": "закрытие торгов",
+    "break_start": "начало перерыва", "break_end": "конец перерыва",
+    "bar_close": "закрытие свечи", "publication_deadline": "срок публикации свечи",
+    "schedule_refresh": "обновление расписания",
+}
+_SCHEDULE_SOURCES = {"tbank": "брокер", "emulator": "снимок эмулятора"}
+
+
+def next_event_label(kind) -> str:
+    return _NEXT_EVENT_LABELS.get(kind, "событие")
+
+
+def schedule_summary(schedule) -> str:
+    """Источник и короткая версия расписания без технического кода режима."""
+    if not schedule:
+        return ""
+    parts = [_SCHEDULE_SOURCES.get(schedule.get("source"), "источник неизвестен")]
+    if schedule.get("digest"):
+        parts.append(f"версия {schedule['digest']}")
+    if schedule.get("snapshot_generation") is not None:
+        parts.append(f"снимок {schedule['snapshot_generation']}")
+    if schedule.get("stale"):
+        parts.append("обновление не удалось")
+    return " · ".join(parts)
 
 
 def ingestion_summary(ingestion) -> str:
@@ -370,43 +413,47 @@ def ingestion_summary(ingestion) -> str:
     return "Источник данных: " + " · ".join(parts)
 
 
-def _live_information(event, offset):
+def _live_information(event: Event, offset: float) -> Block | None:
+    """Короткий пользовательский итог; диагностические поля остаются в Event."""
     if event.type is EventType.STARTUP_ANALYSIS:
-        details = [f"Период: {event.timeframe}", f"Свеча закрылась: {_dated(event.bar_time, offset)}",
-                   f"Опубликовано: {_dated(event.get('published_at'), offset)}",
-                   f"Прогрев: {event.get('available_bars')}/{event.get('required_bars')} свечей",
-                   "Информационный обзор · не заявка и не торговый допуск"]
-        labels = {**_LABELS, "FILTERED": "ОТКЛОНЕНО ФИЛЬТРОМ"}
-        for row in event.get("results", ()):
-            details.append(f"{row['strategy']} / {row['filter_profile']}: " +
-                           (row['reason'] or labels.get(row['outcome'], row['outcome'])))
-            if row["indicators"]:
-                details.append(row["indicators"])
-        if event.get("reason"):
-            details.append("Причина: " + event.get("reason"))
-        return Block(_dated(event.get("published_at"), offset), event.instrument, "СТАРТОВЫЙ ОБЗОР", "muted", details=tuple(details))
+        signals = [row for row in event.get("results", ()) if row.get("outcome") in {"BUY", "SELL"}]
+        reason = event.get("reason") or next((row.get("reason") for row in event.get("results", ())
+                                                if row.get("reason")), "")
+        if not signals and not reason:
+            return None
+        when = _published_when(event.get("published_at"))
+        summary = ", ".join(_LABELS[row["outcome"]] for row in signals)
+        details = [f"Свеча: {_dated(event.bar_time, offset)} · только обзор"]
+        if reason:
+            details.append(f"Причина: {reason}")
+        return Block(when, event.instrument, "СТАРТОВЫЙ ОБЗОР", "warning" if reason else "muted",
+                     suffix=f" · {event.timeframe}" + (f" · {summary}" if summary else ""),
+                     details=tuple(details))
+
     state = event.get("data_state")
-    label = {"warming_up": "ПРОГРЕВ", "waiting_bar": "ОЖИДАНИЕ СВЕЧИ", "delayed": "ЗАДЕРЖКА ДАННЫХ",
-             "coverage_blocked": "НЕПОЛНОЕ ПОКРЫТИЕ", "current": "ДАННЫЕ АКТУАЛЬНЫ", "rate_limited": "ЛИМИТ API"}.get(state, state)
-    if event.get("session") == "waiting_session" and state not in {"delayed", "coverage_blocked", "warming_up", "rate_limited"}:
-        label = "РЫНОК ЗАКРЫТ · ОЖИДАЕМ ВОЗОБНОВЛЕНИЯ ТОРГОВ"
-    details = [f"Период: {event.timeframe}", f"Полученная свеча: {_dated(event.get('received_bar'), offset)}",
-               f"Последний анализ: {_dated(event.get('analyzed_bar'), offset)}"]
-    if event.get("analysis_mode") == "overview":
-        details.append("Последний анализ — стартовый обзор")
-    if event.get("expected_bar"):
-        details.append(f"Ожидаем закрытый интервал до: {_dated(event.get('expected_bar'), offset)}")
-        deadline = event.get("publication_deadline")
-        if deadline and state == "delayed":
-            observed = datetime.fromisoformat(str(event.get("observed_at")))
-            due = deadline if isinstance(deadline, datetime) else datetime.fromisoformat(str(deadline))
-            details.append(f"Задержка после срока публикации: {max(0, int((observed-due).total_seconds()))} с")
-    if event.get("next_open"):
-        details.append(f"Следующее открытие: {_dated(event.get('next_open'), offset)}")
-    summary = ingestion_summary(event.get("ingestion"))
-    if summary:
-        details.append(summary)
-    if event.get("reason"):
-        details.append("Причина: " + event.get("reason"))
-    return Block(_dated(event.get("observed_at"), offset), event.instrument, label,
-                 "warning" if state in {"delayed", "coverage_blocked", "rate_limited"} else "muted", details=tuple(details))
+    reason = event.get("reason") or ""
+    when = _published_when(event.get("observed_at"))
+    if state == "rate_limited":
+        return Block(when, "СИСТЕМА", "ЛИМИТ API", "warning", suffix=" · ждём сброса")
+    if state in {"current", "waiting_bar"} and not reason:
+        return None
+    if state == "warming_up":
+        label = "ПРОГРЕВ"
+        count = f"{event.get('available_bars')}/{event.get('required_bars')} свечей"
+        suffix = f" · {event.timeframe} · {count}"
+        details = () if reason.startswith("Недостаточно истории:") else ((f"Причина: {reason}",) if reason else ())
+    elif state == "coverage_blocked":
+        label, suffix = "ДАННЫЕ НЕПОЛНЫЕ", f" · {event.timeframe}"
+        details = (f"Причина: {reason}",) if reason else ()
+    elif state == "delayed":
+        label, suffix = "ЗАДЕРЖКА ДАННЫХ", f" · {event.timeframe}"
+        expected = event.get("expected_bar")
+        if expected:
+            suffix += f" · свеча {_bar_clock(expected, offset)}"
+        details = (f"Причина: {reason}",) if reason else ()
+    elif reason:
+        label, suffix = "ДАННЫЕ НЕДОСТУПНЫ", f" · {event.timeframe}"
+        details = (f"Причина: {reason}",)
+    else:
+        return None
+    return Block(when, event.instrument, label, "warning", suffix=suffix, details=details)

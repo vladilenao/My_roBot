@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.broker import ExecutionEvent, ExecutionStatus
 from src.history.report import (
+    CalendarScheduleMetadata,
     MarketDataSync,
     REPORT_JSON,
     REPORT_TXT,
@@ -150,6 +151,51 @@ class TestCollectResult:
 
 
 class TestWriteReport:
+    def test_calendar_schedule_is_written_to_both_reports(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        schedule = CalendarScheduleMetadata(
+            source="emulator",
+            snapshot_generation=42,
+            snapshot_pinned=True,
+            exchanges=("MOEX",),
+            day_versions=(("MOEX", "2026-10-13", "version-1"),),
+            missing_dates=("2026-10-14",),
+            unavailable_reason="часть дат отсутствует в снимке",
+        )
+
+        txt, js = write_report(
+            tmp_path, _metrics(calendar_schedule=schedule), collect_result(storage)
+        )
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+        text = txt.read_text(encoding="utf-8")
+
+        assert payload["calendar_schedule"] == {
+            "source": "emulator",
+            "snapshot_generation": 42,
+            "snapshot_pinned": True,
+            "exchanges": ["MOEX"],
+            "day_versions": [
+                {"exchange": "MOEX", "date": "2026-10-13", "version": "version-1"}
+            ],
+            "missing_dates": ["2026-10-14"],
+            "unavailable_reason": "часть дат отсутствует в снимке",
+        }
+        assert "Источник: emulator" in text
+        assert "Снимок: закреплён (42)" in text
+        assert "Режимы торгов: MOEX" in text
+        assert "MOEX 2026-10-13: version-1" in text
+        assert "Даты без расписания: 2026-10-14" in text
+        assert "Причина недоступности расписания: часть дат отсутствует в снимке" in text
+
+    def test_calendar_schedule_is_omitted_when_absent(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, js = write_report(tmp_path, _metrics(), collect_result(storage))
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "calendar_schedule" not in payload
+        assert "Расписание торгов:" not in txt.read_text(encoding="utf-8")
+
     def test_sync_snapshot_is_written_to_both_reports(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
         sync = MarketDataSync(

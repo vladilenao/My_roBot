@@ -116,7 +116,9 @@ warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
   "type": "object",
   "required": ["session", "data_state", "observed_at", "reason"],
   "properties": {
-    "session": {"type": "string"}, "data_state": {"type": "string"},
+    "session": {"type": "string"}, "phase": {"type": "string"}, "break_kind": {"type": "string"},
+    "last_due": {"type": "object"}, "next_event": {"type": "object"}, "schedule": {"type": "object"},
+    "data_state": {"type": "string"},
     "observed_at": {"type": "string"}, "reason": {"type": "string"},
     "received_bar": {"type": "string"}, "analyzed_bar": {"type": "string"},
     "analysis_mode": {"type": "string"}, "expected_bar": {"type": "string"},

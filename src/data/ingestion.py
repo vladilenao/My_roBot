@@ -193,6 +193,11 @@ class IngestionWorker:
         try:
             if self._service_need(now):
                 return True
+            # Расписание — вход детектора, сверки и срока публикации: без него
+            # всё UNKNOWN. Не больше одного дешёвого RPC сервиса инструментов
+            # за шаг, поэтому не ждёт своей очереди среди recovery и сверки.
+            if self._service_calendar(now):
+                return True
             if self._service_handoff(now):
                 return True
             # После оборота свежей очереди — одна auxiliary задача; ни один
@@ -212,6 +217,22 @@ class IngestionWorker:
             if not self.step(now):
                 return True
         return False
+
+    def next_wakeup_delay(self, now=None):
+        """Пауза до ближайшего календарного события; не создаёт торговый тик."""
+        if self._reconciler is None:
+            return None
+        current = _naive(now or self._timeline.now())
+        events = []
+        for pair in self._cache.live_pairs():
+            expectation = self._reconciler.calendar_expectation(
+                instrument_uid=pair["uid"], interval=pair["timeframe"], now=current
+            )
+            if expectation is not None and expectation.next_event is not None:
+                events.append(expectation.next_event.at)
+        if not events:
+            return None
+        return max(0.0, (min(events) - current).total_seconds())
 
     # ── потребности прогрева и регистрации ──
     def _service_need(self, now):
@@ -385,7 +406,7 @@ class IngestionWorker:
     # ── auxiliary: recovery, сверка, конфликты, календарь по очереди ──
     def _service_auxiliary(self, now):
         kinds = (self._service_recovery, self._service_execution_gap, self._service_old_gap, self._service_recent,
-                 self._service_conflicts, self._service_calendar)
+                 self._service_conflicts)
         for offset in range(len(kinds)):
             index = (self._aux_turn + offset) % len(kinds)
             if kinds[index](now):
@@ -410,7 +431,7 @@ class IngestionWorker:
             floor = self._cache.live_floor(pair["uid"], "1m")
             if floor is not None:
                 lower = max(lower, _naive(floor))
-            horizon = self._horizon(pair["key"], now)
+            horizon = self._horizon(pair, now)
             if horizon is None or lower > horizon:
                 continue
             gap, _ = self._first_missing(pair, now, lower=lower, horizon=horizon)
@@ -546,14 +567,29 @@ class IngestionWorker:
             self._recent_at[identity] = now + interval
             grid = self._timeline.grid(pair["timeframe"])
             last = pair["last_closed"]
-            stamps = [last]
-            for _ in range(self.settings.recent_reconciliation_bars - 1):
-                stamps.insert(0, _naive(grid.previous_candle_start(stamps[0])))
-            start = stamps[0]
+            expectation = None if self._reconciler is None else self._reconciler.calendar_expectation(
+                instrument_uid=pair["uid"], interval=pair["timeframe"], now=now
+            )
+            if expectation is not None and expectation.phase.value in {"break", "closed"}:
+                due = expectation.last_due
+                if due is None:
+                    continue
+                state = self._store.coverage_state(
+                    source=self._source, instrument_uid=pair["uid"], interval=pair["timeframe"], open_time=due.open
+                )
+                if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    continue
+                stamps = [due.open]
+                start, end = due.open, due.close
+            else:
+                stamps = [last]
+                for _ in range(self.settings.recent_reconciliation_bars - 1):
+                    stamps.insert(0, _naive(grid.previous_candle_start(stamps[0])))
+                start, end = stamps[0], grid.bar_close(last)
             fences = self._cache.reconciliation_fences(pair["uid"], pair["timeframe"], pd.DataFrame({"datetime": stamps}))
             try:
                 self._cache._load(pair["instrument"], pair["timeframe"], start_date=start,
-                                  end_date=grid.bar_close(last), wait_for_budget=False, fences=fences)
+                                   end_date=end, wait_for_budget=False, fences=fences)
             except RequestDeferred:
                 self._recent_at[identity] = now
                 raise
@@ -589,14 +625,26 @@ class IngestionWorker:
         book.lower, book.checkpoint = floor, max(book.checkpoint, floor)
         self._save_book(pair["uid"], pair["timeframe"], book)
 
-    def _horizon(self, key, now):
+    def _horizon(self, pair, now):
         """Последний ожидаемый закрытый интервал, чей срок публикации истёк."""
+        if self._reconciler is not None:
+            due = self._reconciler.due_bar(instrument_uid=pair["uid"], interval=pair["timeframe"], now=now)
+            if due is not None and now >= due.publication_deadline:
+                return due.open
+            timeout = self.settings.candle_publication_timeout_by_tf.get(
+                pair["timeframe"], self.settings.candle_publication_timeout_secs
+            )
+            previous = self._reconciler.last_due_before(
+                instrument_uid=pair["uid"], interval=pair["timeframe"], now=now - timedelta(seconds=timeout)
+            )
+            if previous is not None:
+                return previous.open
         shifted = now - timedelta(seconds=self.settings.candle_publication_timeout_secs)
-        return self._cache.expected_live_open(key, shifted)
+        return self._cache.expected_live_open(pair["key"], shifted)
 
     def _first_missing(self, pair, now, lower=None, horizon=None):
         uid, timeframe = pair["uid"], pair["timeframe"]
-        horizon = horizon if horizon is not None else self._horizon(pair["key"], now)
+        horizon = horizon if horizon is not None else self._horizon(pair, now)
         if horizon is None:
             return None, None
         grid = self._timeline.grid(timeframe)

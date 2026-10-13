@@ -1,7 +1,8 @@
 # Календарь торгов и ожидание свечей
 
-> Проектное решение change `openspec/changes/add-trading-calendar-expectations`.
-> **Не реализовано.** Нормативный текст — дельты спецификаций этого change.
+> Проектное решение архивного change `openspec/changes/archive/2026-10-13-add-trading-calendar-expectations`.
+> Реализовано в пакете `src/market_calendar/`. Нормативный текст — основные
+> спецификации OpenSpec.
 > Строится поверх `reliable-live-candle-ingestion` и согласовано с
 > `remove-mandatory-preflight-gap-scan`.
 
@@ -95,8 +96,8 @@ flowchart TD
 | ТФ | Границы бара | Статус правила |
 | --- | --- | --- |
 | 1m, 5m, 15m, 30m, 1h | UTC-сетка | подтверждено |
-| 4h | сетка от 00:00 UTC | по документации, нужен контрактный тест |
-| 1d, 1w, 1M | календарные сутки, неделя, месяц брокера; не биржевой день фьючерса и не «30 дней» | проверить |
+| 4h | сетка от 00:00 UTC | подтверждено свечами брокера |
+| 1d, 1w, 1M | сутки, неделя с понедельника и месяц с 1-го числа по UTC; не биржевой день фьючерса и не «30 дней» | подтверждено свечами брокера |
 
 Бар ожидается, если он пересекается с окном торгов. Бар на конце сессии
 закрывается по своей сетке, а не по времени конца сессии или последней сделки.
@@ -279,23 +280,23 @@ Read-only проба 8.5 (12–13 октября 2026, SBER, GAZP, NGZ6):
 | Прошлые даты | недоступны: `from` раньше текущей даты отклоняется |
 | Дилерские свечи `UNSPECIFIED` | есть, их окна — в расписании того же режима |
 | Задержка публикации 1m/5m | p95 0,085 с |
+| Границы 4h, 1d, 1w, 1M | UTC: 00:00, понедельник, 1-е число (свечи брокера 13.10) |
 
 ## Открытые технические проверки
 
 Пока проверка не пройдена, соответствующее календарное доказательство не
 включается.
 
-1. Границы 1d, 1w, 1M у брокера.
-2. Задержка публикации старших ТФ.
-3. Отдаёт ли GetLastTrades дилерские сделки выходного дня (проба в выходной).
-4. Типы интервалов других режимов торгов и праздничных будних дней.
+1. Задержка публикации старших ТФ.
+2. Отдаёт ли GetLastTrades дилерские сделки выходного дня (проба в выходной).
+3. Типы интервалов других режимов торгов и праздничных будних дней.
 
 ## Ссылки
 
-- OpenSpec: [proposal](../../openspec/changes/add-trading-calendar-expectations/proposal.md),
-  [design](../../openspec/changes/add-trading-calendar-expectations/design.md),
-  [tasks](../../openspec/changes/add-trading-calendar-expectations/tasks.md),
-  [спецификация календаря](../../openspec/changes/add-trading-calendar-expectations/specs/trading-calendar/spec.md).
+- OpenSpec: [proposal](../../openspec/changes/archive/2026-10-13-add-trading-calendar-expectations/proposal.md),
+  [design](../../openspec/changes/archive/2026-10-13-add-trading-calendar-expectations/design.md),
+  [tasks](../../openspec/changes/archive/2026-10-13-add-trading-calendar-expectations/tasks.md),
+  [спецификация календаря](../../openspec/specs/trading-calendar/spec.md).
 - Приём и восстановление свечей: [README рыночных данных](README.md),
   `openspec/changes/reliable-live-candle-ingestion`.
 - Стартовый обзор и сообщения ожидания: [сценарий живого анализа](../live-session-analysis.md).

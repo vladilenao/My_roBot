@@ -36,6 +36,33 @@ class MarketDataSync:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class CalendarScheduleMetadata:
+    """Использованное историческим прогоном расписание торгов."""
+
+    source: str
+    snapshot_generation: int | None = None
+    snapshot_pinned: bool = False
+    exchanges: tuple[str, ...] = ()
+    day_versions: tuple[tuple[str, str, str], ...] = ()
+    missing_dates: tuple[str, ...] = ()
+    unavailable_reason: str | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "source": self.source,
+            "snapshot_generation": self.snapshot_generation,
+            "snapshot_pinned": self.snapshot_pinned,
+            "exchanges": list(self.exchanges),
+            "day_versions": [
+                {"exchange": exchange, "date": day, "version": version}
+                for exchange, day, version in self.day_versions
+            ],
+            "missing_dates": list(self.missing_dates),
+            "unavailable_reason": self.unavailable_reason,
+        }
+
+
 def _stamp(moment) -> str:
     if moment is None:
         return ""
@@ -85,6 +112,7 @@ class RunMetrics:
     horizon_end: datetime | None = None
     horizon_limited: bool = False
     market_data_sync: MarketDataSync = field(default_factory=MarketDataSync)
+    calendar_schedule: CalendarScheduleMetadata | None = None
     rollover: dict | None = None
     boundary_checks: tuple = ()
     last_processed_bar: datetime | None = None
@@ -173,6 +201,29 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
     )
     if sync.reason:
         head.append(f"Причина неподтверждения: {sync.reason}")
+    schedule = metrics.calendar_schedule
+    if schedule is not None:
+        snapshot = (
+            f"закреплён ({schedule.snapshot_generation})"
+            if schedule.snapshot_pinned
+            else "не закреплён"
+        )
+        head.extend([
+            "Расписание торгов:",
+            f"Источник: {schedule.source}",
+            f"Снимок: {snapshot}",
+            "Режимы торгов: " + (", ".join(schedule.exchanges) or "нет"),
+        ])
+        if schedule.day_versions:
+            head.append("Версии дней:")
+            head.extend(
+                f"  {exchange} {day}: {version}"
+                for exchange, day, version in schedule.day_versions
+            )
+        if schedule.missing_dates:
+            head.append("Даты без расписания: " + ", ".join(schedule.missing_dates))
+        if schedule.unavailable_reason:
+            head.append(f"Причина недоступности расписания: {schedule.unavailable_reason}")
     if metrics.horizon_start is not None and metrics.horizon_end is not None:
         head.append(
             f"Проверенный горизонт: {_stamp(metrics.horizon_start)} — "
@@ -273,6 +324,8 @@ def write_report(
         "last_processed_bar": _stamp(metrics.last_processed_bar),
         "terminal_gap": metrics.terminal_gap,
     }
+    if metrics.calendar_schedule is not None:
+        payload["calendar_schedule"] = metrics.calendar_schedule.to_json()
     txt_path.write_text(
         "\n".join(_lines(metrics, result, origin)) + "\n", encoding="utf-8"
     )

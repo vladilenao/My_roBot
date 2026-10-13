@@ -69,6 +69,7 @@ from src.history.selection import HistorySelection
 from src.history.warmup import obligation_requirements, warmup_requirements
 from src.history.contract_lifecycle import ConstantContractLifecycle, RolloverLifecycle
 from src.history.report import (
+    CalendarScheduleMetadata,
     MarketDataSync,
     REPORT_TXT,
     RunMetrics,
@@ -369,6 +370,33 @@ def _source_coverage(client_provider):
     return coverage
 
 
+def _historical_calendar_expectation(market_calendar):
+    """Загружает календарь снимка только во время предпроверки границы."""
+    from src.market_calendar.rules import candle_rule
+
+    def expectation(pair, now):
+        if not pair.instrument_id:
+            return None
+        timeout = MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf.get(
+            pair.timeframe, MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        )
+        result = market_calendar.expectation(
+            pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+            timedelta(seconds=timeout),
+        )
+        if result.phase.value == "unknown":
+            # В отличие от live-тиков preflight допускает один запрос к
+            # эмулятору, чтобы проверить границу того же snapshot.
+            market_calendar.service(to_naive(now).to_pydatetime())
+            result = market_calendar.expectation(
+                pair.instrument_id, candle_rule(pair.timeframe), to_naive(now).to_pydatetime(),
+                timedelta(seconds=timeout),
+            )
+        return result
+
+    return expectation
+
+
 def _launch(
     *,
     state_dir,
@@ -422,6 +450,21 @@ def _launch(
         session.contract_selection = selection
         instruments = selection.instruments
 
+    provider = client_provider if history or client_provider is not None else default_client_provider()
+    market_calendar = None
+    if history:
+        from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
+
+        snapshot_store = SnapshotScheduleStore()
+        market_calendar = MarketCalendar(
+            snapshot_store,
+            EmulatorScheduleSource(snapshot_store, provider),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
+        calendar_expectation = _historical_calendar_expectation(market_calendar)
+    else:
+        calendar_expectation = None
+
     if history:
         if selection is not None and selection.families:
             report = run_chain_preflight(selection,
@@ -430,7 +473,7 @@ def _launch(
                 ping=_source_ping(client_provider),
                 coverage=_source_coverage(client_provider),
                 fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-                fixed_warmup=_warmup_bars())
+                fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
         else:
             report = run_preflight(
                 active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
@@ -442,6 +485,7 @@ def _launch(
                 clock=clock,
                 ping=_source_ping(client_provider),
                 coverage=_source_coverage(client_provider),
+                calendar_expectation=calendar_expectation,
             )
         if not report.ok:
             print(report.message())
@@ -465,11 +509,28 @@ def _launch(
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
     from src.data.request_budget import RequestBudget
     request_budget = None if history else RequestBudget(
-        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute)
+        timeline.now, DATA_REFRESH_MIN_INTERVAL, per_minute=MARKET_DATA_SETTINGS.unary_requests_per_minute,
+        per_minute_by_service={"instruments": 200})
+    if market_store is not None:
+        from src.market_calendar.service import MarketCalendar
+
+        market_calendar = MarketCalendar(
+            market_store,
+            provider.calendar_source(
+                market_store, token=TINKOFF_TOKEN, request_budget=request_budget,
+                horizon_days=MARKET_DATA_SETTINGS.schedule_horizon_days,
+                refresh_seconds=MARKET_DATA_SETTINGS.schedule_refresh_interval_secs,
+            ),
+            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        )
     market_reconciler = None if market_store is None else MarketDataReconciler(
         market_store, source="tbank_exchange", token=TINKOFF_TOKEN,
-        client_provider=client_provider,
+        client_provider=provider,
         request_budget=request_budget,
+        market_calendar=market_calendar,
+        calendar_evidence=MARKET_DATA_SETTINGS.calendar_evidence,
+        candle_publication_timeout_secs=MARKET_DATA_SETTINGS.candle_publication_timeout_secs,
+        candle_publication_timeout_by_tf=MARKET_DATA_SETTINGS.candle_publication_timeout_by_tf,
     )
     data_cache = MarketDataCache(
         loader=load_candles,
@@ -479,9 +540,10 @@ def _launch(
         data_backfill_window_seconds=None if clock is not None else DATA_BACKFILL_WINDOW_SECONDS,
         freshness_tolerance_bars=CATCH_UP_BARS,
         clock=clock,
-        client_provider=client_provider,
+        client_provider=provider,
         market_store=market_store,
         market_reconciler=market_reconciler,
+        market_calendar=market_calendar,
         request_budget=request_budget,
         recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
     )
@@ -505,12 +567,12 @@ def _launch(
             export_server.start()
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
-            client_provider=client_provider,
+            client_provider=provider,
         )
         storage = runtime.storage
         live_waiter = None
         if not history:
-            market_poller = _start_live_ingestion(data_cache, runtime, instruments, client_provider)
+            market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider)
             live_waiter = market_poller.wait_startup
         _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
     finally:
@@ -596,6 +658,19 @@ def _family_warmup(family):
                               TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
 
 
+def _calendar_schedule(data_cache) -> CalendarScheduleMetadata | None:
+    """Расписание, которым пользовался прогон; None — календаря у прогона нет."""
+    calendar = getattr(data_cache, "market_calendar", None)
+    usage = getattr(calendar, "usage", None)
+    if not callable(usage):
+        return None
+    try:
+        return CalendarScheduleMetadata(**usage())
+    except Exception as exc:  # отчёт не должен падать из-за диагностики
+        log.warning("Сводка расписания для отчёта не собрана: %s", exc)
+        return None
+
+
 def _finish_history(
     storage, session, data_cache, timeline, state_dir,
     market_data_sync: MarketDataSync | None = None,
@@ -633,6 +708,7 @@ def _finish_history(
         last_processed_bar=last_processed if isinstance(last_processed, datetime) else None,
         terminal_gap=bool(getattr(session, "terminal_gap", None)),
         rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
+        calendar_schedule=_calendar_schedule(data_cache),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)

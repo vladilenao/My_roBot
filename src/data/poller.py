@@ -76,7 +76,9 @@ class LiveMarketDataPoller:
                 log.warning("Фоновое обслуживание live-данных не удалось: %s", exc)
                 worked = False
             if not worked:
-                self._wake.wait(self._poll_seconds)
+                calendar_delay = self._worker.next_wakeup_delay()
+                timeout = self._poll_seconds if calendar_delay is None else max(0.05, min(self._poll_seconds, calendar_delay))
+                self._wake.wait(timeout)
                 self._wake.clear()
 
     def _run(self) -> None:

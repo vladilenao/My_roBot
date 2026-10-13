@@ -14,6 +14,11 @@ from src.data.timeutil import to_aware_utc, to_naive
 from src.scheduler.timing import tf_period_minutes
 from src.data.request_budget import RequestDeferred
 from src.logging_setup import get_logger
+from src.market_calendar.service import MarketCalendar
+from src.market_calendar.rules import candle_rule
+from src.market_calendar.core import expected_bars
+from src.market_calendar.intervals import exchange_date
+from src.scheduler.timing import CandleScheduler
 
 log = get_logger(__name__)
 
@@ -33,7 +38,11 @@ class SessionCalendar:
     def covers(self, stamp: object) -> bool:
         point = to_naive(stamp)
         if self.covered_dates:
-            return point.normalize() in self.covered_dates
+            # Метки дней брокера — даты по МСК: окно субботней дилерской сессии
+            # с 23:00 UTC пятницы покрыто субботой, а не пятницей. Окно
+            # известного дня — факт и тогда, когда лежит в соседних сутках.
+            return (pd.Timestamp(exchange_date(point.to_pydatetime())) in self.covered_dates
+                    or any(start <= point < end for start, end in self.intervals))
         lower = self.coverage_start
         upper = self.coverage_end
         if lower is None or upper is None:
@@ -59,7 +68,7 @@ class MarketDataReconciler:
     не превращает пустой ответ в ``confirmed_no_trade``.
     """
 
-    def __init__(self, store: MarketDataStore, *, source: str, token=None, client_provider=None, refresh_seconds: int = 300, request_budget=None) -> None:
+    def __init__(self, store: MarketDataStore, *, source: str, token=None, client_provider=None, refresh_seconds: int = 300, request_budget=None, market_calendar: MarketCalendar | None = None, calendar_evidence: bool = True, candle_publication_timeout_secs: float = 65, candle_publication_timeout_by_tf: dict[str, float] | None = None) -> None:
         self._store = store
         self._source = source
         self._token = token
@@ -67,6 +76,13 @@ class MarketDataReconciler:
         self._refresh = pd.Timedelta(seconds=refresh_seconds)
         self._calendars: dict[str, tuple[pd.Timestamp, SessionCalendar | None]] = {}
         self._budget = request_budget
+        self._market_calendar = market_calendar
+        self._calendar_evidence = calendar_evidence
+        self._publication_timeout = timedelta(seconds=candle_publication_timeout_secs)
+        self._publication_timeout_by_tf = {
+            timeframe: timedelta(seconds=seconds)
+            for timeframe, seconds in (candle_publication_timeout_by_tf or {}).items()
+        }
         self._ranges: dict[str, list[SessionCalendar]] = {}
         self._calendar_tasks = {}
         self._calendar_retry = {}
@@ -83,6 +99,9 @@ class MarketDataReconciler:
         нормальной публикации.
         """
         if candles is None or candles.empty or "datetime" not in candles:
+            return
+        if self._market_calendar is not None:
+            self._reconcile_calendar(instrument_uid, interval, candles, now)
             return
         calendar = self._calendar_for(instrument_uid, now)
         stamps = sorted({to_naive(value) for value in candles["datetime"]})
@@ -111,6 +130,73 @@ class MarketDataReconciler:
                 )
                 probe += step
 
+    def _reconcile_calendar(self, instrument_uid: str, interval: str, candles: pd.DataFrame, now: object) -> None:
+        """Единый expected-sequence, включая хвост до последнего due бара."""
+        current = to_naive(now).to_pydatetime()
+        calendar = self._market_calendar.calendar_for(instrument_uid, current)
+        rule = candle_rule(interval)
+        grid = CandleScheduler(interval)
+        stamps = sorted({to_naive(value).to_pydatetime() for value in candles["datetime"]})
+        if not stamps:
+            return
+        ranges = [(grid.bar_close(left), right) for left, right in zip(stamps, stamps[1:])]
+        timeout = self._publication_timeout_for(interval)
+        expectation = self._market_calendar.expectation(instrument_uid, rule, current, timeout)
+        if expectation.last_due is not None:
+            ranges.append((grid.bar_close(stamps[-1]), expectation.last_due.close))
+
+        for start, end in ranges:
+            if end <= start:
+                continue
+            marker = (instrument_uid, interval, start, end, bool(calendar), self._calendar_evidence)
+            if marker in self._scanned:
+                continue
+            self._scanned.add(marker)
+            rows = []
+            if calendar is None:
+                rows = [(opened, "unresolved", "schedule_unavailable") for opened in self._grid_opens(grid, start, end)]
+            else:
+                due = {bar.open: bar for bar in expected_bars(calendar, rule, start, end, timeout)}
+                for opened in self._grid_opens(grid, start, end):
+                    closed = grid.bar_close(opened)
+                    bar = due.get(opened)
+                    if bar is not None:
+                        rows.append((opened, "pending", self._schedule_evidence(calendar, bar.open, bar.close)))
+                    elif self._calendar_covers(calendar, opened, closed):
+                        if self._calendar_evidence and rule.rule_confirmed:
+                            rows.append((opened, "scheduled_closed", self._schedule_evidence(calendar, opened, closed)))
+                        else:
+                            rows.append((opened, "unresolved", "calendar_evidence_disabled"))
+                    else:
+                        rows.append((opened, "unresolved", "schedule_unavailable"))
+            self._store.set_interval_states(source=self._source, instrument_uid=instrument_uid, interval=interval,
+                                            rows=rows, observed_at=now)
+
+    @staticmethod
+    def _grid_opens(grid, start, end):
+        opened = grid.current_candle_start(start)
+        if opened < start:
+            opened = grid.bar_close(opened)
+        while opened < end:
+            yield opened
+            opened = grid.bar_close(opened)
+
+    @staticmethod
+    def _calendar_covers(calendar, opened, closed) -> bool:
+        return calendar.day(exchange_date(opened)) is not None or any(
+            window.start < closed and opened < window.end
+            for day in calendar.days for window in day.windows
+        )
+
+    @staticmethod
+    def _schedule_evidence(calendar, opened, closed) -> str:
+        day = next((day for day in calendar.days if any(
+            window.start < closed and opened < window.end for window in day.windows
+        )), None)
+        if day is None:
+            day = calendar.day(exchange_date(opened))
+        return f"applicable_trading_schedule:{calendar.exchange}:{day.trading_date if day else exchange_date(opened)}:{day.version if day else 'none'}"
+
     def interval_state(self, *, instrument_uid: str, interval: str, open_time: object, now: object) -> str:
         """Возвращает долговечное либо вычисленное состояние минуты."""
         state = self._store.coverage_state(
@@ -118,6 +204,8 @@ class MarketDataReconciler:
         )
         if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
             return state
+        if self._market_calendar is not None and not self._calendar_evidence:
+            return state or "unresolved"
         calendar = self._calendar_for(instrument_uid, now, at=open_time)
         if calendar is not None and calendar.covers(open_time) and not calendar.is_open(open_time):
             if state is not None:
@@ -126,6 +214,50 @@ class MarketDataReconciler:
                     evidence="applicable_trading_schedule", observed_at=now)
             return "scheduled_closed"
         return state or "unresolved"
+
+    @property
+    def market_calendar(self) -> MarketCalendar | None:
+        return self._market_calendar
+
+    def due_bar(self, *, instrument_uid: str, interval: str, now: object):
+        """Кандидат публикационного срока из общего календаря либо ``None``."""
+        if self._market_calendar is None:
+            return None
+        return self._market_calendar.expectation(
+            instrument_uid, candle_rule(interval), to_naive(now).to_pydatetime(), self._publication_timeout_for(interval)
+        ).last_due
+
+    def calendar_known(self, *, instrument_uid: str, now: object) -> bool:
+        return self._market_calendar is not None and self._market_calendar.calendar_for(
+            instrument_uid, to_naive(now).to_pydatetime()
+        ) is not None
+
+    def calendar_expectation(self, *, instrument_uid: str, interval: str, now: object):
+        if self._market_calendar is None:
+            return None
+        return self._market_calendar.expectation(
+            instrument_uid, candle_rule(interval), to_naive(now).to_pydatetime(), self._publication_timeout_for(interval)
+        )
+
+    def expected_bars(self, *, instrument_uid: str, interval: str, lower: object, upper: object):
+        if self._market_calendar is None:
+            return ()
+        upper_at = to_naive(upper).to_pydatetime()
+        calendar = self._market_calendar.calendar_for(instrument_uid, upper_at)
+        if calendar is None:
+            return ()
+        return expected_bars(calendar, candle_rule(interval), to_naive(lower).to_pydatetime(),
+                             upper_at + timedelta(microseconds=1), self._publication_timeout_for(interval))
+
+    def last_due_before(self, *, instrument_uid: str, interval: str, now: object):
+        if self._market_calendar is None:
+            return None
+        return self._market_calendar.expectation(
+            instrument_uid, candle_rule(interval), to_naive(now).to_pydatetime(), self._publication_timeout_for(interval)
+        ).last_due
+
+    def _publication_timeout_for(self, interval: str) -> timedelta:
+        return self._publication_timeout_by_tf.get(interval, self._publication_timeout)
 
     def recovery_candidate(self, *, instrument_uid: str, interval: str, now=None) -> pd.Timestamp | None:
         return self._store.first_recovery_candidate(
@@ -144,6 +276,9 @@ class MarketDataReconciler:
     def _calendar_for(self, instrument_uid: str, now: object, at=None) -> SessionCalendar | None:
         current = to_naive(now)
         point = to_naive(at if at is not None else now)
+        if self._market_calendar is not None:
+            calendar = self._market_calendar.calendar_for(instrument_uid, current.to_pydatetime())
+            return _session_calendar_from_trading_calendar(calendar)
         if self._budget is not None:
             if instrument_uid not in self._ranges:
                 self._ranges[instrument_uid] = []
@@ -217,6 +352,8 @@ class MarketDataReconciler:
 
     def service_calendar(self, now):
         """Один RPC календаря из общего бюджета; выполняется вне lock кэша."""
+        if self._market_calendar is not None:
+            return self._market_calendar.service(to_naive(now).to_pydatetime())
         if self._budget is None or not self._calendar_tasks:
             return False
         current = to_naive(now)
@@ -350,6 +487,35 @@ def _calendar_from_response(response: object, exchange: str, observed_at=None) -
     return SessionCalendar(exchange, tuple(sorted(result)), min(dates), max(dates) + pd.Timedelta(days=1),
                            to_naive(observed_at) if observed_at is not None else None,
                            covered_dates=tuple(dates))
+
+
+def _session_calendar_from_trading_calendar(calendar) -> SessionCalendar | None:
+    """Временная проекция общей модели для старого API reconcilier.
+
+    Сверка ещё использует ``SessionCalendar`` до задач раздела 4; загрузка и
+    хранение расписания уже принадлежат ``MarketCalendar``.
+    """
+    if calendar is None:
+        return None
+    # Те же минутные окна, что у разбора ответа брокера (16:00:01 → минута 16:00).
+    intervals = tuple(sorted({
+        _minute_window(window.start, window.end)
+        for day in calendar.days
+        for window in day.windows
+        if window.kind in ("continuous", "unknown")
+    }))
+    dates = tuple(pd.Timestamp(day.trading_date) for day in calendar.days)
+    if not dates:
+        return None
+    return SessionCalendar(
+        calendar.exchange,
+        intervals,
+        min(dates),
+        max(dates) + pd.Timedelta(days=1),
+        pd.Timestamp(min(day.observed_at for day in calendar.days)),
+        calendar.source,
+        dates,
+    )
 
 
 def _jsonable(value: object) -> dict[str, Any]:

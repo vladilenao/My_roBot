@@ -253,7 +253,8 @@ def test_market_data_status_carries_ingestion_diagnostics_and_hold_reason(tmp_pa
     assert ingestion["transport"] == "polling" and ingestion["data_hold"] == "GAP_HOLD"
     assert ingestion["gap"]["state"] == "parked" and ingestion.get("processed_through") is None
     assert "не восстановлен" in status.get("reason")
-    assert "Источник данных: опрос · удержание: пропуск" in render(status, 3)
+    assert "не восстановлен" in render(status, 3)
+    assert "Источник данных" not in render(status, 3)
     assert "удержание: пропуск" in telegram_render(status, tz_offset_hours=3)
     assert "token" not in str(status.to_dict()).lower()
 

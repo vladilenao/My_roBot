@@ -132,14 +132,18 @@ class Event:
 
     @classmethod
     def market_data_status(cls, instrument: str, *, timeframe: str, session: str,
-                           data_state: str, observed_at: datetime, reason: str = "",
+                            data_state: str, observed_at: datetime, reason: str = "",
+                            phase: str = "unknown", break_kind: str | None = None,
+                            last_due: Any = None, next_event: Any = None, schedule: Any = None,
                            received_bar: Any = None, analyzed_bar: Any = None,
                            analysis_mode: str = "", expected_bar: Any = None,
                            publication_deadline: Any = None, next_open: Any = None,
                            available_bars: int = 0, required_bars: int = 0,
                            coverage_complete: bool = False, ingestion: dict | None = None) -> "Event":
         return cls._make(EventType.MARKET_DATA_STATUS, instrument=instrument, timeframe=timeframe,
-                         payload={"session": session, "data_state": data_state,
+                          payload={"session": session, "phase": phase, "break_kind": break_kind,
+                                   "last_due": last_due, "next_event": next_event, "schedule": schedule,
+                                   "data_state": data_state,
                                   "observed_at": observed_at, "reason": reason,
                                   "received_bar": received_bar, "analyzed_bar": analyzed_bar,
                                   "analysis_mode": analysis_mode, "expected_bar": expected_bar,
