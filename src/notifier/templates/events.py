@@ -165,6 +165,10 @@ def _financial(event: Event) -> list[str]:
 
 def _decision(event: Event, when: str) -> Block:
     details = _context(event)
+    if event.get("analysis_mode") == "historical":
+        details.append("Информационный результат · торговых действий задним числом нет")
+        return Block(when, event.instrument, "ИСТОРИЧЕСКИЙ КОНТЕКСТ", "muted",
+                     suffix=" · " + _side(event)[0], details=tuple(details))
     if event.get("filtered_out"):
         details.append("Причина: отклонено фильтром")
         return Block(when, event.instrument, "ОТКЛОНЕНО", "warning", details=tuple(details))
@@ -317,6 +321,10 @@ def render(event: Event, tz_offset_hours: float = 0.0, *, now: datetime | None =
            width: int = 96, color: bool = False) -> str | None:
     """Цельный блок или None для типов без пользовательского представления."""
     when = _when(event, tz_offset_hours, now)
+    if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:
+        return _live_information(event, tz_offset_hours).render(width=width, color=color)
+    if event.get("analysis_mode") == "historical":
+        when = _dated(event.bar_time, tz_offset_hours)
     if event.type is EventType.DECISION:
         block = _decision(event, when)
     elif event.type is EventType.REJECTED:
@@ -326,3 +334,79 @@ def render(event: Event, tz_offset_hours: float = 0.0, *, now: datetime | None =
     else:
         block = _system(event, when) or _execution(event, when)
     return block.render(width=width, color=color) if block is not None else None
+
+
+def _dated(value, offset):
+    if value is None:
+        return "неизвестно"
+    stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    local = stamp.astimezone(timezone(timedelta(hours=offset)))
+    zone = "МСК" if offset == 3 else "UTC" if offset == 0 else f"UTC{offset:+g}"
+    return local.strftime("%d.%m.%Y %H:%M:%S") + " " + zone
+
+
+_DATA_HOLDS = {"BOOTSTRAPPING": "прогрев", "RECONCILING": "согласование с историей", "READY": "готово",
+               "GAP_HOLD": "удержание: пропуск", "CONFLICT_HOLD": "удержание: расхождение версий",
+               "INTEGRITY_HOLD": "удержание: изменена исполненная минута"}
+
+
+def ingestion_summary(ingestion) -> str:
+    """Одна строка о транспорте и готовности входа; пусто без среза owner."""
+    if not ingestion:
+        return ""
+    transport = "поток" if ingestion.get("transport") == "stream" else "опрос"
+    parts = [transport]
+    if ingestion.get("transport") == "stream" and ingestion.get("epoch") is not None:
+        parts.append(f"поколение {ingestion['epoch']}")
+    if ingestion.get("fallback"):
+        parts.append("резервный опрос вместо потока")
+    hold = ingestion.get("data_hold")
+    if hold:
+        parts.append(_DATA_HOLDS.get(hold, hold))
+    if ingestion.get("pre_cutover_gaps"):
+        parts.append(f"пробелов до запуска без подтверждения: {ingestion['pre_cutover_gaps']}")
+    return "Источник данных: " + " · ".join(parts)
+
+
+def _live_information(event, offset):
+    if event.type is EventType.STARTUP_ANALYSIS:
+        details = [f"Период: {event.timeframe}", f"Свеча закрылась: {_dated(event.bar_time, offset)}",
+                   f"Опубликовано: {_dated(event.get('published_at'), offset)}",
+                   f"Прогрев: {event.get('available_bars')}/{event.get('required_bars')} свечей",
+                   "Информационный обзор · не заявка и не торговый допуск"]
+        labels = {**_LABELS, "FILTERED": "ОТКЛОНЕНО ФИЛЬТРОМ"}
+        for row in event.get("results", ()):
+            details.append(f"{row['strategy']} / {row['filter_profile']}: " +
+                           (row['reason'] or labels.get(row['outcome'], row['outcome'])))
+            if row["indicators"]:
+                details.append(row["indicators"])
+        if event.get("reason"):
+            details.append("Причина: " + event.get("reason"))
+        return Block(_dated(event.get("published_at"), offset), event.instrument, "СТАРТОВЫЙ ОБЗОР", "muted", details=tuple(details))
+    state = event.get("data_state")
+    label = {"warming_up": "ПРОГРЕВ", "waiting_bar": "ОЖИДАНИЕ СВЕЧИ", "delayed": "ЗАДЕРЖКА ДАННЫХ",
+             "coverage_blocked": "НЕПОЛНОЕ ПОКРЫТИЕ", "current": "ДАННЫЕ АКТУАЛЬНЫ", "rate_limited": "ЛИМИТ API"}.get(state, state)
+    if event.get("session") == "waiting_session" and state not in {"delayed", "coverage_blocked", "warming_up", "rate_limited"}:
+        label = "РЫНОК ЗАКРЫТ · ОЖИДАЕМ ВОЗОБНОВЛЕНИЯ ТОРГОВ"
+    details = [f"Период: {event.timeframe}", f"Полученная свеча: {_dated(event.get('received_bar'), offset)}",
+               f"Последний анализ: {_dated(event.get('analyzed_bar'), offset)}"]
+    if event.get("analysis_mode") == "overview":
+        details.append("Последний анализ — стартовый обзор")
+    if event.get("expected_bar"):
+        details.append(f"Ожидаем закрытый интервал до: {_dated(event.get('expected_bar'), offset)}")
+        deadline = event.get("publication_deadline")
+        if deadline and state == "delayed":
+            observed = datetime.fromisoformat(str(event.get("observed_at")))
+            due = deadline if isinstance(deadline, datetime) else datetime.fromisoformat(str(deadline))
+            details.append(f"Задержка после срока публикации: {max(0, int((observed-due).total_seconds()))} с")
+    if event.get("next_open"):
+        details.append(f"Следующее открытие: {_dated(event.get('next_open'), offset)}")
+    summary = ingestion_summary(event.get("ingestion"))
+    if summary:
+        details.append(summary)
+    if event.get("reason"):
+        details.append("Причина: " + event.get("reason"))
+    return Block(_dated(event.get("observed_at"), offset), event.instrument, label,
+                 "warning" if state in {"delayed", "coverage_blocked", "rate_limited"} else "muted", details=tuple(details))

@@ -201,6 +201,7 @@ class JournalBroker(BrokerPort):
         self._addressed_trades: dict[str, AddressedTrade] = {}
         self._scheduled_actions: list[ScheduledAction] = []
         self._processing_due: list[ScheduledAction] = []
+        self._recovery_guard_closes: set[str] = set()
         self._processed_addressed_bars: set[tuple[str, datetime]] = set()
         self.increase_allowed = None
         # Addressed SQLite runtime starts with no CSV-derived state. Legacy CSV
@@ -282,6 +283,33 @@ class JournalBroker(BrokerPort):
                 self._scheduled_actions.append(ScheduledAction(pending.action, pending.submitted_at))
                 self._command_events[pending.action.command_id] = self._command_outcome(pending.action, pending.submitted_at, ExecutionStatus.ACK, "next-bar")
 
+    def resume_gap_entry_guard_close(self, recovered: object, action: CloseTrade) -> bool:
+        """Allow only the persisted pre-REJECTED guard-close after restart.
+
+        The trade snapshot has revision N+1 because the slippage guard marked
+        it REJECTED after queuing its close at N. TradeManager has already
+        proven the durable fill/trace/order origin before this narrow marker is
+        installed; arbitrary stale closes cannot create it.
+        """
+        plan = getattr(recovered, "plan", None)
+        state = getattr(recovered, "state", None)
+        trade = None if plan is None else self._addressed_trades.get(plan.trade_id)
+        if (
+            plan is None or state is None or trade is None
+            or action.trade_id != plan.trade_id
+            or action.state_revision + 1 != state.state_revision
+            or action.reason != "gap-entry"
+            or not action.command_id.startswith(f"{plan.trade_id}:gap-entry:")
+            or state.quantity <= 0
+            or trade.revision != state.state_revision
+        ):
+            return False
+        self._recovery_guard_closes.add(action.command_id)
+        return True
+
+    def has_recovery_guard_close(self, action: TradeAction) -> bool:
+        return isinstance(action, CloseTrade) and action.command_id in self._recovery_guard_closes
+
     def _resume_pending_increases(self, trade: AddressedTrade, recovered: object) -> None:
         scheduled = {s.action.command_id for s in self._scheduled_actions}
         for pending in getattr(recovered, "pending_increases", ()):
@@ -312,7 +340,7 @@ class JournalBroker(BrokerPort):
         trade = self._addressed_trades.get(action.trade_id)
         if trade is None:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "unknown-trade")
-        elif action.state_revision != trade.revision:
+        elif action.state_revision != trade.revision and not self.has_recovery_guard_close(action):
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
         elif isinstance(action, (OpenTrade, AddToTrade)) and trade.plan.algorithm_version == "economics-v2" and action.order_type is not EntryOrderType.LIMIT:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "limit-entry-required")
@@ -870,11 +898,14 @@ class JournalBroker(BrokerPort):
         accepted_limit = isinstance(action, (OpenTrade, AddToTrade)) and action.order_type is EntryOrderType.LIMIT
         accepted_v2 = (trade.plan.algorithm_version == "economics-v2" and self._command_events.get(action.command_id)
                        and self._command_events[action.command_id].status is ExecutionStatus.ACK)
-        if not isinstance(action, MoveStop) and not accepted_limit and not accepted_v2 and action.state_revision != trade.revision:
+        recovery_guard = self.has_recovery_guard_close(action)
+        if not isinstance(action, MoveStop) and not accepted_limit and not accepted_v2 and not recovery_guard and action.state_revision != trade.revision:
             event = self._command_outcome(action, now, ExecutionStatus.REJECT, "stale-state-revision")
             self._addressed_events.append(event)
             return event
         event = self._execute_action(trade, action, now, fill_price, bar=bar)
+        if recovery_guard:
+            self._recovery_guard_closes.discard(action.command_id)
         if accepted_limit or trade.plan.algorithm_version == "economics-v2":
             self._command_events[action.command_id] = event
         self._addressed_events.append(event)

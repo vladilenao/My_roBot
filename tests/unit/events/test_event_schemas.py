@@ -8,6 +8,7 @@
 
 import json
 import re
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -94,6 +95,13 @@ def _samples() -> dict[EventType, Event]:
               "status": "fill", "quantity": 2, "price": Decimal("100.5"),
               "fee": Decimal("1"), "reason": "confirmed", "side": "BUY"}
     return {
+        EventType.STARTUP_ANALYSIS: Event.startup_analysis("SBER", published_at=datetime(2026, 10, 12),
+            available_bars=100, required_bars=50, coverage_complete=True, results=[{
+                "assignment_id": "sber", "strategy": "macd_rsi_stoch", "filter_profile": "raw",
+                "outcome": "HOLD", "indicators": "RSI=45", "reason": "",
+            }]),
+        EventType.MARKET_DATA_STATUS: Event.market_data_status("SBER", timeframe="1h", session="unknown",
+            data_state="waiting_bar", observed_at=datetime(2026, 10, 12)),
         EventType.DECISION: Event.decision("NG-10.26", outcome="signal_buy", side="BUY"),
         EventType.SIGNAL: Event.signal("NG-10.26", side="BUY", quantity=1, entry=1, stop=2),
         EventType.REJECTED: Event.rejected("NG-10.26", reason="мало"),
