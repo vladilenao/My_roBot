@@ -9,11 +9,15 @@ from t_tech.invest.schemas import TradeSourceType
 
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
+from src.data.ingestion_settings import MarketDataSettings
 from src.data.market_store import MarketDataStore
 from src.data.reconciliation import MarketDataReconciler, SessionCalendar, _calendar_from_response
 from src.data.request_budget import RequestBudget, RequestDeferred
 from src.instruments import Instrument
 from src.scheduler.timing import MultiTimeframeScheduler
+
+# Прежняя общая очередь — откат при independent_lanes = false.
+LEGACY_QUEUE = MarketDataSettings(independent_lanes=False)
 
 
 def candles(*stamps):
@@ -138,7 +142,7 @@ def test_cold_start_warmup_reads_local_store_without_candle_stream(tmp_path):
                             market_source="tbank_exchange", client_provider=Provider())
     instrument = Instrument("SBER", "SBER", "share")
     assert cache.prepare_live_history(instrument, "1h", 1).empty  # торговое чтение без сети
-    IngestionWorker(cache).run_until_idle()
+    IngestionWorker(cache, settings=LEGACY_QUEUE).run_until_idle()
     result = cache.prepare_live_history(instrument, "1h", 1)
     assert len(result) == 1
     assert catalogs  # UID узнан дешёвым запросом каталога
@@ -182,7 +186,7 @@ def test_bounded_window_in_middle_of_hour_includes_last_closed_hour(tmp_path):
                            data_backfill_window_seconds=3600, market_store=store)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
     _registered(cache, store, item, "1h", ["2026-10-12 07:00"])
-    IngestionWorker(cache).run_until_idle()
+    IngestionWorker(cache, settings=LEGACY_QUEUE).run_until_idle()
     assert calls == [pd.Timestamp("2026-10-12 08:00")]
     assert cache.frame_for(item, "1h")["datetime"].max() == pd.Timestamp("2026-10-12 08:00")
 
@@ -205,7 +209,7 @@ def test_closed_session_finalization_requests_only_that_bar(tmp_path):
         market_reconciler=rec, data_backfill_window_seconds=3600)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
     _registered(cache, store, item, "1h", ["2026-10-12 19:00"])
-    IngestionWorker(cache).run_until_idle()
+    IngestionWorker(cache, settings=LEGACY_QUEUE).run_until_idle()
     assert calls == [(pd.Timestamp("2026-10-12 20:00"), pd.Timestamp("2026-10-12 21:00"))]
 
 
@@ -287,7 +291,7 @@ def test_permanent_old_gap_does_not_starve_fresh_pairs_and_cache_read(tmp_path):
             _registered(cache, store, item, tf, ["2026-10-09 19:00"])
         store.set_interval_state(source="tbank_exchange", instrument_uid=item.uid, interval="1m",
             open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
-    worker = IngestionWorker(cache)
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     lane = threading.Thread(target=worker.step)
     lane.start()
     assert entered.wait(1)
@@ -405,7 +409,7 @@ def _no_trade_setup(tmp_path, now, stored, exchange, trades):
                             market_reconciler=rec, client_provider=Provider())
     item = Instrument("NGZ6", "NGZ6", "future", "NGZ6", "uid")
     _registered(cache, store, item, "1m", stored)
-    worker = IngestionWorker(cache)
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     worker.run_until_idle()
     clock[0] = target
     return cache, store, worker, clock, requests

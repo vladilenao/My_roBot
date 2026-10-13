@@ -145,7 +145,7 @@ def test_end_to_end_stream_startup_overlap_internal_and_trailing_gap(tmp_path):
                             live_cutover=datetime(2026, 10, 12, 11, 30))
     item = Instrument("SBER", "SBER", "share", "SBER", "u")
     cache.prepare_live_history(item, "1m", 30)
-    settings = MarketDataSettings(live_transport="stream", candle_publication_timeout_secs=30,
+    settings = MarketDataSettings(independent_lanes=False, live_transport="stream", candle_publication_timeout_secs=30,
                                   stream_ack_timeout_seconds=5)
     worker = IngestionWorker(cache, settings=settings)
     session = Session()

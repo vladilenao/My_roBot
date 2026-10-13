@@ -51,9 +51,10 @@ def test_invalid_lane_keys_are_rejected(tmp_path, body):
 
 def test_old_config_is_accepted_and_round_keys_are_reported_as_deprecated(tmp_path):
     old = _settings(tmp_path, "recovery_round_timeout_secs = 900\n")
-    assert old.deprecated_overrides() == ()  # прежняя очередь: параметр действует
-    lanes = _settings(tmp_path, "independent_lanes = true\nrecovery_round_timeout_secs = 900\n")
-    assert lanes.deprecated_overrides() == ("recovery_round_timeout_secs",)
+    assert old.independent_lanes is True                                    # полосы — режим по умолчанию
+    assert old.deprecated_overrides() == ("recovery_round_timeout_secs",)
+    legacy = _settings(tmp_path, "independent_lanes = false\nrecovery_round_timeout_secs = 900\n")
+    assert legacy.deprecated_overrides() == ()  # прежняя очередь: параметр действует
 
 
 def test_default_profile_is_not_reported_as_deprecated(tmp_path):

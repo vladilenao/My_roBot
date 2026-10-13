@@ -92,7 +92,7 @@ class MarketDataSettings:
     candle_publication_timeout_by_tf: dict[str, float] = field(default_factory=dict)
     # Независимые полосы получения данных. Числа — инженерные гипотезы:
     # половина квоты брокера остаётся другим приложениям пользователя.
-    independent_lanes: bool = False  # включается по умолчанию после приёмки (design, план перехода)
+    independent_lanes: bool = True
     instrument_requests_per_minute: int = 150
     quote_lane_shares: dict[str, float] = field(
         default_factory=lambda: {"live": 50, "evidence": 25, "completeness": 25})
