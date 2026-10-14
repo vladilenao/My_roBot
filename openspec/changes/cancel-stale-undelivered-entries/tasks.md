@@ -31,8 +31,8 @@
 
 ## 4. Приёмка на копии журнала
 
-- [ ] 4.1 Снять копию `data/trades.sqlite3` через backup API (`mode=ro`) в scratchpad. Рабочую базу не менять, полный робот на копии не запускать.
-- [ ] 4.2 На копии выполнить одно снятие с `since` = момент запуска. Ожидается:
+- [x] 4.1 Снять копию `data/trades.sqlite3` через backup API (`mode=ro`) в scratchpad. Рабочую базу не менять, полный робот на копии не запускать.
+- [x] 4.2 На копии выполнить одно снятие с `since` = момент запуска. Ожидается:
   - сделки `share-phor-ma:PHOR:1h:2026-10-13T13:00:00:BUY` и `future-ed-macd:EDZ6:1h:2026-10-13T15:00:00:BUY` в `CANCELLED`;
   - их резервации `RELEASED`;
   - активный риск 0 из 1901,75 ₽, строки outbox в `UNDELIVERED`;
@@ -40,5 +40,5 @@
 
 ## 5. Завершение
 
-- [ ] 5.1 Описать правило в `docs/trade-management/portfolio-risk.md` рядом с описанием таймаута входа: когда снимается недоставленное увеличение, причина в уведомлениях и CSV, отличие от `entry-timeout`.
-- [ ] 5.2 Прогнать `pytest tests/` и `openspec validate cancel-stale-undelivered-entries --strict`. Коммиты делать только с зелёными тестами, сообщения на русском.
+- [x] 5.1 Описать правило в `docs/trade-management/portfolio-risk.md` рядом с описанием таймаута входа: когда снимается недоставленное увеличение, причина в уведомлениях и CSV, отличие от `entry-timeout`.
+- [x] 5.2 Прогнать `pytest tests/` и `openspec validate cancel-stale-undelivered-entries --strict`. Коммиты делать только с зелёными тестами, сообщения на русском.
