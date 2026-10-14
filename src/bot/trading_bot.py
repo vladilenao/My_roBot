@@ -93,6 +93,7 @@ class TradingBot:
         contract_lifecycle=None,
         market_data_settings=None,
         live_data_waiter=None,
+        pattern_worker=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -110,6 +111,7 @@ class TradingBot:
         self._market_data_settings = market_data_settings or MarketDataSettings()
         # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
         self._await_live_data = live_data_waiter
+        self._pattern_worker = pattern_worker
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
@@ -335,6 +337,7 @@ class TradingBot:
             if frame.empty:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
+            self._submit_pattern_bar(instrument, tf, frame)
             context = self._context_cache.get_context(instrument, tf) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
             log.debug(
@@ -348,6 +351,24 @@ class TradingBot:
             self._manage(instrument, tf_assignments, frame, context, tf)
             if tf_assignments:
                 self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
+
+    def _submit_pattern_bar(self, instrument: Instrument, timeframe: str, frame) -> None:
+        """Единственная точка передачи уже закрытого бара фоновому анализу."""
+        worker = self._pattern_worker
+        if worker is None:
+            return
+        uid = getattr(instrument, "uid", None)
+        if not uid:
+            return
+        close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
+        worker.submit(ticker=instrument.ticker, instrument_uid=uid, timeframe=timeframe, close_time=close)
+
+    def _prime_pattern_bar(self, instrument: Instrument, timeframe: str, frame) -> None:
+        worker = self._pattern_worker
+        uid = getattr(instrument, "uid", None)
+        if worker is not None and uid and not frame.empty:
+            close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
+            worker.prime(instrument_uid=uid, timeframe=timeframe, close_time=close)
 
     # ── ПУНКТ 4.2: анализ по каждой привязке «стратегия × профиль» одного ТФ ──
     def _analyze(

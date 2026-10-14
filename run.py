@@ -26,6 +26,13 @@ from src.config import (
     MARKET_DATA_EXPORT_PORT,
     MARKET_DATA_SETTINGS,
     MARKET_DATA_EXPORT_TOKEN,
+    MARKET_STRUCTURE_PATTERNS_ENABLED,
+    MARKET_STRUCTURE_QUEUE_MAXSIZE,
+    MARKET_STRUCTURE_REDIS_DB,
+    MARKET_STRUCTURE_REDIS_HOST,
+    MARKET_STRUCTURE_REDIS_PASSWORD,
+    MARKET_STRUCTURE_REDIS_PORT,
+    MARKET_STRUCTURE_RETENTION_DAYS,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
     SHARE_STRATEGIES,
@@ -541,7 +548,31 @@ def _launch(
         if not history:
             market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider, early=early)
             live_waiter = market_poller.wait_startup
-        _run_bot(instruments, bus, runtime, data_cache, timeline, session=session, live_waiter=live_waiter)
+        pattern_worker = None
+        if not history and MARKET_STRUCTURE_PATTERNS_ENABLED:
+            import redis
+            from src.market_structure.worker import PatternWorker
+
+            pattern_worker = PatternWorker(
+                market_store,
+                redis.Redis(
+                    host=MARKET_STRUCTURE_REDIS_HOST,
+                    port=MARKET_STRUCTURE_REDIS_PORT,
+                    db=MARKET_STRUCTURE_REDIS_DB,
+                    password=MARKET_STRUCTURE_REDIS_PASSWORD,
+                    decode_responses=True,
+                ),
+                recovery_requester=getattr(getattr(runtime, "ingestion_worker", None), "note_loss", None),
+                queue_maxsize=MARKET_STRUCTURE_QUEUE_MAXSIZE,
+                retention_days=MARKET_STRUCTURE_RETENTION_DAYS,
+            )
+            pattern_worker.start()
+        try:
+            _run_bot(instruments, bus, runtime, data_cache, timeline, session=session,
+                     live_waiter=live_waiter, pattern_worker=pattern_worker)
+        finally:
+            if pattern_worker is not None:
+                pattern_worker.stop()
     finally:
         if market_poller is not None:
             market_poller.close()
@@ -819,7 +850,8 @@ def _finish_history(
 
 
 
-def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None) -> None:
+def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
+             pattern_worker=None) -> None:
     def post_tick(ready_tfs):
         worker = getattr(runtime, "ingestion_worker", None)
         if worker is not None and runtime.storage is not None:
@@ -840,6 +872,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         tick_timeout_secs=TICK_TIMEOUT_SECS,
         market_data_settings=MARKET_DATA_SETTINGS,
         live_data_waiter=live_waiter,
+        pattern_worker=pattern_worker,
         context_cache=MarketContextCache(
             data_cache=data_cache,
             trend_analyzer=TrendAnalyzer(),

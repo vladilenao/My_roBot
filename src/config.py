@@ -25,6 +25,9 @@ MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 CLOUDFLARE_URL = os.getenv("CLOUDFLARE_URL")
+# Пароль Redis — секрет, поэтому он остаётся только в окружении. Адрес и
+# поведение контура паттернов задаются в [market_structure] robot.toml.
+MARKET_STRUCTURE_REDIS_PASSWORD = os.getenv("MARKET_STRUCTURE_REDIS_PASSWORD")
 
 # Словарь таймфреймов (используется в загрузчике); всегда из кода
 TIMEFRAMES = {
@@ -70,6 +73,14 @@ _DEFAULTS = {
     "market_data_export_enabled": False,
     "market_data_export_host": "127.0.0.1",
     "market_data_export_port": 8101,
+    # Паттерны публикуются в Redis Stream только в live-режиме. Пароль Redis
+    # намеренно не хранится в robot.toml.
+    "market_structure_patterns_enabled": False,
+    "market_structure_redis_host": "127.0.0.1",
+    "market_structure_redis_port": 6379,
+    "market_structure_redis_db": 0,
+    "market_structure_queue_maxsize": 1024,
+    "market_structure_retention_days": 90,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -136,6 +147,12 @@ MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
 MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
+MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]
+MARKET_STRUCTURE_REDIS_HOST = _CONFIG["market_structure_redis_host"]
+MARKET_STRUCTURE_REDIS_PORT = _CONFIG["market_structure_redis_port"]
+MARKET_STRUCTURE_REDIS_DB = _CONFIG["market_structure_redis_db"]
+MARKET_STRUCTURE_QUEUE_MAXSIZE = _CONFIG["market_structure_queue_maxsize"]
+MARKET_STRUCTURE_RETENTION_DAYS = _CONFIG["market_structure_retention_days"]
 # Эффективные параметры live-ingestion: транспорт, сроки публикации/recovery,
 # лимиты stream и бюджет запросов. Исторический режим их не использует.
 MARKET_DATA_SETTINGS = MarketDataSettings.from_flat(_CONFIG)

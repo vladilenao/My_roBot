@@ -25,6 +25,16 @@ export_port = 8101
 # Stream выбран после read-only пробы брокера (8.5); откат — "polling".
 live_transport = "stream"
 
+# Паттерны завершённых свечей пишутся в Redis Stream market.events.
+# Пароль задаётся только переменной окружения MARKET_STRUCTURE_REDIS_PASSWORD.
+[market_structure]
+patterns_enabled = true  # Включает публикацию свечных паттернов только в live-режиме.
+redis_host = "127.0.0.1"  # Имя хоста или IP-адрес Redis.
+redis_port = 6379  # TCP-порт Redis.
+redis_db = 0  # Номер логической базы Redis для stream market.events.
+queue_maxsize = 1024  # Максимум необработанных закрытых свечей в фоновой очереди.
+retention_days = 90  # Сколько суток хранить события в Redis Stream; более старые удаляются.
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"
