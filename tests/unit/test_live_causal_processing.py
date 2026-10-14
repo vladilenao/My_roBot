@@ -273,3 +273,52 @@ def test_status_line_shows_unconfirmed_gaps_before_start():
     from src.notifier.templates.events import ingestion_summary
     line = ingestion_summary({"transport": "polling", "data_hold": "READY", "pre_cutover_gaps": 2})
     assert line == "Источник данных: опрос · готово · пробелов до запуска без подтверждения: 2"
+
+
+def runtime_with_manager(cache, tmp_path):
+    manager = MagicMock()
+    manager._clock.now.return_value = datetime(2026, 10, 14, 4, 26, 39, tzinfo=timezone.utc)
+    broker = MagicMock()
+    broker.drain_events.return_value = []
+    broker.drain_addressed_events.return_value = []
+    storage = MagicMock()
+    storage.load_trades.return_value = ()
+    storage.execution_bar_boundaries.return_value = {}
+    with patch("run.trading_enabled", return_value=True), patch(
+        "src.trade_journal.storage.Storage", return_value=storage
+    ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+        "src.trade_management.manager.TradeManager", return_value=manager
+    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
+        runtime = run._build_runtime([ITEM], cache, MagicMock(), tmp_path)
+    return runtime, manager
+
+
+def test_first_live_step_cancels_undelivered_increases_before_bar_without_ready_data(tmp_path):
+    """cancel-stale-undelivered-entries: снятие в начале шага, не дожидаясь данных инструмента."""
+    cache, _, _ = live_cache(tmp_path, "1m")
+    cache.set_live_gap(UID, "1m", {"state": "active"})           # минутные данные не подтверждены
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.cancel_undelivered_increases.assert_called_once_with(datetime(2026, 10, 14, 4, 26, 39, tzinfo=timezone.utc))
+
+
+def test_cancellation_failure_does_not_stop_the_step(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+    manager.cancel_undelivered_increases.side_effect = RuntimeError("database is locked")
+
+    runtime.post_tick({"1m"})                                    # исключение не выходит наружу
+
+    manager.cancel_undelivered_increases.assert_called_once()
+
+
+def test_without_live_session_undelivered_increases_are_not_cancelled(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    cache.live_session_enabled = False                            # как в историческом прогоне
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.cancel_undelivered_increases.assert_not_called()

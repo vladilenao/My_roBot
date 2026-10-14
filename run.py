@@ -1044,7 +1044,8 @@ def _build_runtime(
     # owner (design 9a). Начало торгового шага отличает текущее намерение
     # от удержанного раньше, актуальность которого не доказана.
     intent_since = [None]
-    if not historical and getattr(data_cache, "live_session_enabled", False) is True:
+    live_dispatch = not historical and getattr(data_cache, "live_session_enabled", False) is True
+    if live_dispatch:
         trade_manager.configure_dispatch_eligibility(
             _dispatch_evidence(data_cache, instruments, storage, intent_since), lambda: data_cache._lock)
     trade_manager.configure_visual_context(instruments)
@@ -1117,6 +1118,13 @@ def _build_runtime(
     def on_bar(ready_tfs: set[str]) -> None:
         nonlocal pending_bar
         intent_since[0] = as_aware(trade_manager._clock.now())
+        if live_dispatch:
+            # Удержанный в своём шаге вход или добор больше не станет актуальным:
+            # снимается до исполнения бара, не дожидаясь данных инструмента.
+            try:
+                trade_manager.cancel_undelivered_increases(intent_since[0])
+            except Exception as exc:
+                log.warning("Не удалось снять недоставленные входы и доборы: %s", exc)
         try:
             # The simulator has already advanced if a durable write failed.
             # Retry those same events before asking it to execute another bar.
@@ -1229,7 +1237,7 @@ def _dispatch_evidence(data_cache, instruments, storage, intent_since):
     Вызывается в финансовом потоке под guard кэша: срез качества не меняется
     между проверкой и локальной доставкой.
     """
-    from src.trade_management.manager import DispatchDataEvidence
+    from src.trade_management.manager import DispatchDataEvidence, created_before_step
     by_key = {instrument_key(item): item for item in instruments}
 
     def inspect(instrument_id, action, command):
@@ -1241,7 +1249,7 @@ def _dispatch_evidence(data_cache, instruments, storage, intent_since):
         timeframe = json.loads(row[0]).get("timeframe", "") if row else ""
         work = bool(timeframe) and data_cache.pair_status(instrument, timeframe)["state"] == "READY"
         since = intent_since[0]
-        current = True if since is not None and as_aware(command.created_at) >= since else None
+        current = True if since is not None and not created_before_step(command.created_at, since) else None
         return DispatchDataEvidence(execution, work, current)
 
     return inspect

@@ -154,6 +154,22 @@ def plan_reference_entry(plan_json: str) -> Decimal:
     return Decimal(str(json.loads(plan_json)["reference_entry"]))
 
 
+UNDELIVERED = "UNDELIVERED"
+UNDELIVERED_REASON = "entry-undelivered"
+
+
+def created_before_step(created_at, since) -> bool:
+    """Команда создана раньше начала торгового шага ``since``: её актуальность не доказать.
+
+    Единственное определение и для допуска доставки, и для снятия недоставленных
+    увеличений; наивное время журнала трактуется как UTC.
+    """
+    if since is None:
+        return False
+    stamp = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
+    return as_aware(stamp) < as_aware(since)
+
+
 def _entry_ttl_seconds(timeframe: str) -> int:
     """Срок ожидания исполнения входа в секундах по таймфрейму сделки.
 
@@ -274,6 +290,35 @@ class TradeManager:
         if callable(drain):
             for event in drain():
                 self.consume(event)
+
+    def cancel_undelivered_increases(self, since, now=None) -> tuple[ExecutionEvent, ...]:
+        """Снять неактуальные недоставленные входы и доборы (cancel-stale-undelivered-entries).
+
+        Команда, созданная раньше начала текущего шага и не доставленная брокеру,
+        уже никогда не пройдёт допуск по актуальности. Брокер о ней не знает,
+        поэтому снятие локальное и не ждёт рыночных данных: outbox переводится
+        в UNDELIVERED под guard доставки, затем reducer получает CANCEL.
+        """
+        now = as_aware(now or self._clock.now())
+        candidates = [(command, outbox_status) for command, outbox_status in self._storage.undelivered_increases()
+                      if outbox_status == UNDELIVERED or created_before_step(command.created_at, since)]
+        if not candidates:
+            return ()
+        fresh = [command.command_id for command, outbox_status in candidates if outbox_status != UNDELIVERED]
+        marked = set(self._storage.mark_outbox_undelivered(fresh))
+        events = []
+        for command, outbox_status in candidates:
+            if outbox_status != UNDELIVERED and command.command_id not in marked:
+                continue  # доставка успела взять команду: она не снимается
+            event = ExecutionEvent(execution_id=f"{command.command_id}:undelivered-local-cancel",
+                command_id=command.command_id, order_id=command.command_id, trade_id=command.trade_id,
+                status=ExecutionStatus.CANCEL, filled_quantity=0, price=None, fee=Decimal(0),
+                timestamp=now, reason=UNDELIVERED_REASON)
+            log.info("Снят недоставленный %s %s: команда создана до начала шага и не отправлена брокеру",
+                     "вход" if command.payload.get("type") != "AddToTrade" else "добор", command.trade_id)
+            self.consume(event)
+            events.append(event)
+        return tuple(events)
 
     def drain_contract(self, ticker, *, market_close=None):
         """Отменить увеличения и закрыть остаток; не создавать второе ожидание."""
@@ -763,6 +808,9 @@ class TradeManager:
             return deny("invalid-command")
         if action.command_id != command.command_id or action.trade_id != command.trade_id:
             return deny("command-identity-mismatch")
+        outbox = connection.execute("SELECT status FROM outbox WHERE command_id=?", (command.command_id,)).fetchone()
+        if outbox is not None and outbox[0] == UNDELIVERED:
+            return deny("undelivered-cancelled")
         record = connection.execute(
             "SELECT t.instrument_id,t.phase,t.state_revision,t.plan_json,p.quantity,o.status "
             "FROM trades t JOIN positions p USING(trade_id) JOIN orders o USING(trade_id) "
