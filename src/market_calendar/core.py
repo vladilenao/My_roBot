@@ -14,7 +14,7 @@ from typing import Literal
 
 from src.scheduler.timing import CandleScheduler
 
-from .intervals import IntervalKind, SessionWindow, exchange_date
+from .intervals import SessionWindow, exchange_date
 from .rules import CandleRule
 
 ScheduleSource = Literal["tbank", "emulator"]

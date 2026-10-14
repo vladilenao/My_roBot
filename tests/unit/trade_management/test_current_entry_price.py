@@ -11,7 +11,6 @@ from src.instruments import Instrument
 from src.portfolio.models import ContractMeta
 from src.trade_management.audit import calculation_trace, MeasuredValue
 from datetime import datetime
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 

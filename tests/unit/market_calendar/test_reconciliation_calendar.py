@@ -1,10 +1,10 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pandas as pd
 
 from src.data.market_store import MarketDataStore
 from src.data.reconciliation import MarketDataReconciler
-from src.market_calendar import CANDLE_RULES, CalendarDay, SessionWindow, TradingCalendar, expect
+from src.market_calendar import CalendarDay, SessionWindow, TradingCalendar, expect
 
 
 def _frame(*stamps):

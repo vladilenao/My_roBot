@@ -345,7 +345,8 @@ def test_schedule_is_requested_from_now_and_past_dates_are_not_requested(tmp_pat
 
 def _broker_day(day, intervals):
     """Форма TradingDay из ответа брокера (проба 8.5, 13.10.2026)."""
-    utc = lambda value: pd.Timestamp(f"{day} {value}", tz="UTC").to_pydatetime()
+    def utc(value):
+        return pd.Timestamp(f"{day} {value}", tz="UTC").to_pydatetime()
     return SimpleNamespace(date=pd.Timestamp(day, tz="UTC").to_pydatetime(), is_trading_day=True,
         intervals=[SimpleNamespace(type=kind, interval=SimpleNamespace(start_ts=utc(a), end_ts=utc(b)))
                    for kind, a, b in intervals])
@@ -361,7 +362,8 @@ def test_broker_schedule_auctions_and_clearing_are_breaks_and_exchange_case_is_i
     response = SimpleNamespace(exchanges=[SimpleNamespace(exchange="MOEX_MRNG_EVNG_E_WKND_DLR", days=[shares])])
     cal = _calendar_from_response(response, "moex_mrng_evng_e_wknd_dlr")
     assert cal is not None and len(cal.intervals) == 3  # дубли схлопнуты
-    at = lambda value: pd.Timestamp(f"2026-10-13 {value}")
+    def at(value):
+        return pd.Timestamp(f"2026-10-13 {value}")
     assert not cal.is_open(at("03:55"))  # аукцион открытия
     assert cal.is_open(at("05:59")) and cal.is_open(at("06:00")) and cal.is_open(at("15:54"))
     assert not cal.is_open(at("15:57"))  # аукцион закрытия
