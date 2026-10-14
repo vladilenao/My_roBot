@@ -194,7 +194,7 @@ class CompletenessLane:
             period = grid.bar_close(grid.current_candle_start(now)) - grid.current_candle_start(now)
             candidates.append(_naive(grid.current_candle_start(now - period * bars * GRID_SLACK)))
         if timeframe == "1m":
-            obligation = self._worker.execution_boundary(pair["key"][0])
+            obligation = self._worker.execution_boundary(pair["uid"])
             if obligation is not None:
                 stamp, inclusive = obligation
                 candidates.append(stamp if inclusive else _naive(grid.bar_close(stamp)))
@@ -222,7 +222,7 @@ class CompletenessLane:
         return min(_naive(horizon), boundary)
 
     def _level(self, pair):
-        obligated = self._worker.execution_boundary(pair["key"][0]) is not None
+        obligated = self._worker.execution_boundary(pair["uid"]) is not None
         if obligated and pair["timeframe"] == "1m":
             return 0
         if obligated:

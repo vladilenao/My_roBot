@@ -78,6 +78,7 @@ def setup(tmp_path, *, started, now, stored, market, timeframes=("1m",), setting
     completeness = CompletenessLane(worker)
     evidence = EvidenceLane(worker, completeness)
     worker.evidence = evidence
+    worker.completeness = completeness
     clock[0] = pd.Timestamp(now)
     return SimpleNamespace(clock=clock, store=store, cache=cache, worker=worker, evidence=evidence,
                            completeness=completeness, item=item)
@@ -186,7 +187,7 @@ def test_obligation_minutes_go_first(tmp_path):
     env = setup(tmp_path, started="2026-10-12 07:59:30", now="2026-10-12 12:00:05",
                 stored={"1m": ["2026-10-12 07:59"], "1h": ["2026-10-05 07:00"]}, market=market,
                 timeframes=("1m", "1h"))
-    env.worker.set_execution_obligations({"uid": (pd.Timestamp("2026-10-12 08:30"), True)})  # ключ — instrument_key
+    env.worker.set_execution_obligations({"uid": (pd.Timestamp("2026-10-12 08:30"), True)})  # ключ — UID пары
     assert env.completeness.step()
     assert market.calls[0][0] == "1m" and market.calls[0][1] <= pd.Timestamp("2026-10-12 08:30")
 
@@ -288,3 +289,47 @@ def test_evidence_covers_needed_minutes_before_process_start(tmp_path):
     run(env.evidence)
     assert state(env, "2026-10-12 12:05") == "confirmed_no_trade"
     assert state(env, "2026-10-12 12:10") == "received"
+
+
+def test_restart_with_unfinished_trade_resumes_check_schedule(tmp_path):
+    """14.10: минута ED 14:06 после двух проверок выпала из окна перезапуска (fix-live-pair-identity)."""
+    missing = pd.Timestamp("2026-10-13 14:06")
+    market = Market({"1m": [stamp for stamp in minutes("2026-10-13 14:00", "2026-10-14 06:00") if stamp != missing]})
+    before = setup(tmp_path, started="2026-10-13 13:59:30", now="2026-10-13 15:05:05",
+                   stored={"1m": ["2026-10-13 13:59"]}, market=market)
+    run(before.completeness)
+    before.clock[0] += timedelta(hours=1, seconds=1)
+    before.completeness.wake()
+    run(before.completeness)
+    checks = lambda env: env.store.window_snapshot(source=SOURCE, instrument_uid="uid", interval="1m",
+                                                   lower=missing, upper=missing)["checks"][missing]
+    assert checks(before)["checks"] == 2
+
+    # Перезапуск: полосы стартуют до выбора, обязательств ещё нет — окно от границы запуска.
+    after = setup(tmp_path, started="2026-10-14 04:22:30", now="2026-10-14 04:23:05", stored={"1m": []}, market=market)
+    pair = after.cache.live_pair("uid", "1m")
+    run(after.completeness)
+    assert after.completeness.window_lower(pair, after.clock[0]) > missing
+    assert after.completeness._level(pair) == 3
+
+    after.worker.set_execution_obligations({"uid": (pd.Timestamp("2026-10-13 14:00"), True)})
+    assert after.completeness._skip_until == {}                       # изменение обязательств будит полосу
+    assert after.completeness.window_lower(pair, after.clock[0]) <= pd.Timestamp("2026-10-13 14:00")
+    assert after.completeness._level(pair) == 0
+    due, later = after.completeness.holes(pair, after.clock[0])
+    assert missing not in due and later == checks(after)["next_check_at"]   # счётчик не начат заново
+
+    after.clock[0] = pd.Timestamp(checks(after)["next_check_at"]) + timedelta(seconds=1)
+    after.completeness.wake()
+    run(after.completeness)
+    assert state(after, missing) == "source_absent"
+    assert checks(after)["checks"] == 3
+
+
+def test_unchanged_obligations_do_not_wake_completeness(tmp_path):
+    env = setup(tmp_path, started="2026-10-12 09:59:30", now="2026-10-12 12:00:05",
+                stored={"1m": ["2026-10-12 09:59"]}, market=Market({}))
+    env.worker.set_execution_obligations({"uid": (pd.Timestamp("2026-10-12 08:30"), True)})
+    env.completeness._skip_until[("uid", "1m")] = env.clock[0] + timedelta(hours=1)
+    env.worker.set_execution_obligations({"uid": (pd.Timestamp("2026-10-12 08:30"), True)})   # каждый тик
+    assert ("uid", "1m") in env.completeness._skip_until
