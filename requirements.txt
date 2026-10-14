@@ -6,5 +6,7 @@ t-tech-investments
 ipython-autotime
 python-dotenv
 requests
+redis>=5
+PyYAML>=6
 matplotlib==3.11.0
 pytest

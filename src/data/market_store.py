@@ -231,6 +231,16 @@ class MarketDataStore:
                 );
                 CREATE INDEX IF NOT EXISTS interval_checks_due
                     ON interval_checks(source, instrument_uid, interval, next_check_at);
+                CREATE TABLE IF NOT EXISTS pattern_event_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS pattern_event_outbox_due
+                    ON pattern_event_outbox(delivered_at, next_attempt_at);
                 """
             )
             # SQLite не умеет добавить значение в CHECK. Ранняя версия change
@@ -1209,6 +1219,90 @@ class MarketDataStore:
             frame[key] = frame[key].astype(float)
         frame["is_complete"] = frame["is_complete"].astype(bool)
         return frame
+
+    def pattern_context(self, *, source: str, instrument_uid: str, interval: str,
+                        close_time: object) -> dict[str, object]:
+        """Две завершённые свечи и их покрытие из одного SQLite-снимка."""
+        upper = _utc_text(close_time)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(
+                    """SELECT open_time_utc, open, high, low, close
+                    FROM candle_current WHERE source=? AND instrument_uid=? AND interval=?
+                    AND is_complete=1 AND open_time_utc < ?
+                    ORDER BY open_time_utc DESC LIMIT 2""",
+                    (source, instrument_uid, interval, upper),
+                ).fetchall()
+                rows = list(reversed(rows))
+                coverage = {}
+                if rows:
+                    marks = [row["open_time_utc"] for row in rows]
+                    placeholders = ",".join("?" for _ in marks)
+                    coverage_rows = conn.execute(
+                        f"""SELECT open_time_utc, state FROM interval_coverage
+                        WHERE source=? AND instrument_uid=? AND interval=?
+                        AND open_time_utc IN ({placeholders})""",
+                        (source, instrument_uid, interval, *marks),
+                    ).fetchall()
+                    coverage = {row["open_time_utc"]: row["state"] for row in coverage_rows}
+                    unresolved = conn.execute(
+                        """SELECT open_time_utc FROM interval_coverage
+                        WHERE source=? AND instrument_uid=? AND interval=?
+                        AND open_time_utc>=? AND open_time_utc<?
+                        AND state IN ('pending','unresolved')
+                        ORDER BY open_time_utc LIMIT 1""",
+                        (source, instrument_uid, interval, rows[0]["open_time_utc"], upper),
+                    ).fetchone()
+                else:
+                    unresolved = None
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        candles = [
+            {"datetime": row["open_time_utc"], "open": float(row["open"]), "high": float(row["high"]),
+             "low": float(row["low"]), "close": float(row["close"])}
+            for row in rows
+        ]
+        missing = next((row["open_time_utc"] for row in rows
+                        if coverage.get(row["open_time_utc"]) in {None, "pending", "unresolved"}), None)
+        if missing is None and unresolved is not None:
+            missing = unresolved["open_time_utc"]
+        if missing is None and len(rows) != 2:
+            missing = upper
+        return {"candles": candles, "has_gap": missing is not None, "missing_open_time": missing}
+
+    def enqueue_pattern_event(self, *, event_id: str, payload_json: str) -> None:
+        now = _utc_text()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO pattern_event_outbox(event_id,payload_json,attempts,next_attempt_at)
+                VALUES (?,?,0,?) ON CONFLICT(event_id) DO NOTHING""",
+                (event_id, payload_json, now),
+            )
+
+    def pending_pattern_events(self, *, limit: int = 100) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT event_id,payload_json,attempts FROM pattern_event_outbox
+                WHERE delivered_at IS NULL AND next_attempt_at<=?
+                ORDER BY next_attempt_at,event_id LIMIT ?""", (_utc_text(), limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_pattern_event_delivered(self, event_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE pattern_event_outbox SET delivered_at=?, last_error=NULL WHERE event_id=?",
+                         (_utc_text(), event_id))
+
+    def defer_pattern_event(self, event_id: str, error: str) -> None:
+        retry_at = _utc_text(datetime.now(timezone.utc) + pd.Timedelta(seconds=1))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE pattern_event_outbox SET attempts=attempts+1,next_attempt_at=?,last_error=?
+                WHERE event_id=?""", (retry_at, error[:1000], event_id),
+            )
 
 
 class ProducerMismatch(Exception):

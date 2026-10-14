@@ -50,6 +50,14 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "export_port": "market_data_export_port",
         **{name: f"market_data_{name}" for name in setting_names()},
     },
+    "market_structure": {
+        "patterns_enabled": "market_structure_patterns_enabled",
+        "redis_host": "market_structure_redis_host",
+        "redis_port": "market_structure_redis_port",
+        "redis_db": "market_structure_redis_db",
+        "queue_maxsize": "market_structure_queue_maxsize",
+        "retention_days": "market_structure_retention_days",
+    },
     "instruments": {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
@@ -103,6 +111,12 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_data_export_enabled": bool,
     "market_data_export_host": str,
     "market_data_export_port": int,
+    "market_structure_patterns_enabled": bool,
+    "market_structure_redis_host": str,
+    "market_structure_redis_port": int,
+    "market_structure_redis_db": int,
+    "market_structure_queue_maxsize": int,
+    "market_structure_retention_days": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -534,6 +548,25 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [notifier.telegram] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
+        if key == "market_structure_redis_host" and not value.strip():
+            raise ConfigError(f"{path}: [market_structure] redis_host не должен быть пустым")
+        if key in {
+            "market_structure_redis_port",
+            "market_structure_queue_maxsize",
+            "market_structure_retention_days",
+        } and (isinstance(value, bool) or value < 1):
+            option = key.removeprefix("market_structure_")
+            raise ConfigError(
+                f"{path}: [market_structure] {option} должен быть целым числом > 0, "
+                f"получено {value!r}"
+            )
+        if key == "market_structure_redis_port" and value > 65535:
+            raise ConfigError(f"{path}: [market_structure] redis_port не может быть больше 65535")
+        if key == "market_structure_redis_db" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [market_structure] redis_db должен быть целым числом >= 0, "
+                f"получено {value!r}"
+            )
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
             continue
@@ -859,10 +892,6 @@ def _candidate_files(
         return files
 
     files: list[Path] = []
-    external = app_dir() / CONFIG_FILENAME
-    if external.is_file():
-        files.append(external)
-
     if getattr(sys, "frozen", False):
         bundled = Path(getattr(sys, "_MEIPASS", os.getcwd())) / BUNDLED_FILENAME
         if bundled.is_file():
@@ -871,6 +900,10 @@ def _candidate_files(
         dev_default = _root_dir() / BUNDLED_FILENAME
         if dev_default.is_file():
             files.append(dev_default)
+
+    external = app_dir() / CONFIG_FILENAME
+    if external.is_file():
+        files.append(external)
 
     return files
 

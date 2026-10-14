@@ -252,6 +252,7 @@ class LiveAnalysis:
                 self.bot._bus.publish(Event.startup_analysis(self.bot._display_name(instrument),
                     published_at=self.timeline.now(), bar_time=close, timeframe=tf, results=rows,
                     available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
+                self.bot._prime_pattern_bar(instrument, tf, frame)
                 self.publish_status(instrument, tf, frame)
 
     def publish_status(self, instrument, tf, frame):
@@ -397,6 +398,8 @@ class LiveAnalysis:
                     frame = self.cache.frame_for(instrument, tf)
                     bindings = self._bindings(instrument, tf)
                     self.publish_status(instrument, tf, frame)
+                    if not frame.empty:
+                        self.bot._submit_pattern_bar(instrument, tf, frame)
                     for binding in bindings:
                         cursor_key = binding.id, instrument_key(instrument)
                         cursor = self.cursors.get(cursor_key)

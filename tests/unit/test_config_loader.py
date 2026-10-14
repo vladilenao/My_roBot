@@ -52,6 +52,21 @@ def test_external_config_overrides_bundled_defaults(tmp_path):
     assert cfg["timeframe"] == "5m"
 
 
+def test_default_lookup_applies_robot_toml_after_bundled_defaults(tmp_path, monkeypatch):
+    import src.config_loader as loader
+
+    bundled = tmp_path / "default.toml"
+    bundled.write_text("[robot]\ntimeframe = \"1h\"\n", encoding="utf-8")
+    external = tmp_path / "robot.toml"
+    external.write_text("[robot]\ntimeframe = \"5m\"\n", encoding="utf-8")
+    monkeypatch.setattr(loader, "app_dir", lambda: tmp_path)
+    monkeypatch.setattr(loader, "_root_dir", lambda: tmp_path)
+
+    cfg = loader.load_config(_defaults())
+
+    assert cfg["timeframe"] == "5m"
+
+
 def test_bundled_default_used_when_no_external(tmp_path):
     bundled = tmp_path / "default.toml"
     bundled.write_text("[robot]\ntimeframe = \"5m\"\n", encoding="utf-8")

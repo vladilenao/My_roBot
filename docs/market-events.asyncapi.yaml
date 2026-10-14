@@ -1,0 +1,105 @@
+asyncapi: 3.0.0
+info:
+  title: My_roBot market events
+  version: 1.0.0
+  description: Неизменяемые интеграционные события о рынке. Версия 1 содержит свечные поглощения.
+servers:
+  redis:
+    host: '{redis_host}'
+    protocol: redis
+    description: Redis Streams с AOF appendfsync always и retention по умолчанию 90 суток.
+    variables:
+      redis_host:
+        default: localhost:6379
+channels:
+  marketEvents:
+    address: market.events
+    messages:
+      patternDetected:
+        $ref: '#/components/messages/PatternDetected'
+operations:
+  publishPattern:
+    action: send
+    channel:
+      $ref: '#/channels/marketEvents'
+    messages:
+      - $ref: '#/channels/marketEvents/messages/patternDetected'
+  consumePattern:
+    action: receive
+    channel:
+      $ref: '#/channels/marketEvents'
+    messages:
+      - $ref: '#/channels/marketEvents/messages/patternDetected'
+components:
+  messages:
+    PatternDetected:
+      name: PatternDetected
+      title: Найденное свечное поглощение
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/PatternEvent'
+  schemas:
+    PatternEvent:
+      type: object
+      additionalProperties: false
+      oneOf:
+        - properties:
+            event_type: {const: bullish_engulfing}
+            direction: {const: long}
+        - properties:
+            event_type: {const: bearish_engulfing}
+            direction: {const: short}
+      required: [schema_version, event_id, ticker, timeframe, timestamp, published_at, source, event_type, direction, payload]
+      properties:
+        schema_version:
+          type: integer
+          const: 1
+        event_id:
+          type: string
+          minLength: 1
+          description: Постоянный ключ source/schema_version/ticker/timeframe/timestamp/event_type для дедупликации.
+        ticker:
+          type: string
+          minLength: 1
+        timeframe:
+          type: string
+          minLength: 1
+        timestamp:
+          type: string
+          format: date-time
+          description: "Предметное время: закрытие текущей свечи, UTC ISO 8601."
+        published_at:
+          type: string
+          format: date-time
+          description: Время Redis TIME непосредственно перед успешной попыткой XADD, UTC ISO 8601.
+        source:
+          type: string
+          const: candle_patterns
+        event_type:
+          type: string
+          enum: [bullish_engulfing, bearish_engulfing]
+        direction:
+          type: string
+          enum: [long, short]
+        payload:
+          type: object
+          additionalProperties: true
+          required: [body_overlap_ratio, previous_candle, current_candle]
+          properties:
+            body_overlap_ratio:
+              type: number
+              minimum: 0
+              maximum: 1
+            previous_candle:
+              $ref: '#/components/schemas/Ohlc'
+            current_candle:
+              $ref: '#/components/schemas/Ohlc'
+    Ohlc:
+      type: object
+      additionalProperties: false
+      required: [open, high, low, close]
+      properties:
+        open: {type: number}
+        high: {type: number}
+        low: {type: number}
+        close: {type: number}

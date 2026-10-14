@@ -48,6 +48,37 @@ def test_preliminary_candle_not_exported_but_completed_version_is(tmp_path):
     assert store.current_frame(source="tbank_exchange", instrument_uid="uid-1", interval="1m").iloc[0]["is_complete"]
 
 
+def test_pattern_context_reads_two_candles_and_coverage_in_one_contract(tmp_path):
+    store = _store(tmp_path)
+    first = _frame(stamp="2026-10-09 12:00:00", close=99)
+    second = _frame(stamp="2026-10-09 12:01:00", close=101)
+    store.record_candles(source="tbank_exchange", instrument_uid="uid-1", interval="1m",
+                         candles=pd.concat([first, second], ignore_index=True))
+
+    context = store.pattern_context(source="tbank_exchange", instrument_uid="uid-1", interval="1m",
+                                    close_time="2026-10-09T12:02:00Z")
+
+    assert not context["has_gap"]
+    assert [item["close"] for item in context["candles"]] == [99.0, 101.0]
+
+
+def test_pattern_context_blocks_pending_coverage_inside_range(tmp_path):
+    store = _store(tmp_path)
+    store.record_candles(source="tbank_exchange", instrument_uid="uid-1", interval="1m",
+                         candles=pd.concat([
+                             _frame(stamp="2026-10-09 12:00:00"),
+                             _frame(stamp="2026-10-09 12:01:00"),
+                         ], ignore_index=True))
+    store.set_interval_state(source="tbank_exchange", instrument_uid="uid-1", interval="1m",
+                             open_time="2026-10-09 12:01:00", state="pending", evidence="test")
+
+    context = store.pattern_context(source="tbank_exchange", instrument_uid="uid-1", interval="1m",
+                                    close_time="2026-10-09T12:02:00Z")
+
+    assert context["has_gap"]
+    assert context["missing_open_time"] == "2026-10-09T12:01:00Z"
+
+
 def test_checkpoint_is_monotonic_and_bound_to_producer(tmp_path):
     store = _store(tmp_path)
     store.record_candles(source="tbank_exchange", instrument_uid="uid-1", interval="1m", candles=_frame())
