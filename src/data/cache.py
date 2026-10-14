@@ -1243,6 +1243,21 @@ class MarketDataCache:
         """UID пары из live-регистрации, иначе из карточки инструмента."""
         return self._uids.get(self._key(instrument, timeframe)) or getattr(instrument, "uid", None)
 
+    def pair_uid(self, instrument, timeframe="1m"):
+        """Адрес рыночной пары для торговой стороны: UID, даже если в карточке его нет.
+
+        Live-выбор строит инструменты без UID, а пара сохранённого состава
+        зарегистрирована под UID раньше выбора — её находим по тикеру и типу.
+        """
+        uid = self.instrument_uid(instrument, timeframe)
+        if uid:
+            return uid
+        with self._lock:
+            found = {pair_uid for (pair_uid, tf), member in self._live_members.items()
+                     if tf == timeframe and member["instrument"].ticker == instrument.ticker
+                     and member["instrument"].instrument_type == instrument.instrument_type}
+        return found.pop() if len(found) == 1 else None
+
     def calendar_expectation(self, instrument, timeframe, now=None):
         uid = self.instrument_uid(instrument, timeframe)
         if not uid or self._market_reconciler is None:

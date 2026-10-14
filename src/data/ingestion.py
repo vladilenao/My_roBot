@@ -140,15 +140,26 @@ class IngestionWorker:
         # доказательств.
         self.lanes_enabled = bool(getattr(self.settings, "independent_lanes", False))
         self.evidence = None
+        # Полоса полноты просыпается при изменении обязательств исполнения.
+        self.completeness = None
         # Состав пар сохраняется для раннего старта следующего запуска.
         self.roster_dirty = False
 
     def set_execution_obligations(self, boundaries):
-        """Main-thread snapshot of unfinished financial work, never a DB read here."""
+        """Main-thread snapshot of unfinished financial work, never a DB read here.
+
+        Ключ — UID рыночной пары. Изменение набора будит полосу полноты: окно и
+        очерёдность пар пересчитываются сразу, а не через период пересчёта.
+        """
         snapshot = {key: (_naive(stamp), bool(inclusive))
                     for key, (stamp, inclusive) in boundaries.items() if stamp is not None}
         with self._execution_lock:
+            changed = snapshot != self._execution_obligations
             self._execution_obligations = snapshot
+        if changed:
+            self.roster_dirty = True
+            if self.completeness is not None:
+                self.completeness.wake()
 
     def persist_roster(self):
         """Текущие пары владельца — сохранённый состав для раннего старта."""
@@ -159,7 +170,7 @@ class IngestionWorker:
             entries.append({
                 "instrument_uid": pair["uid"], "interval": pair["timeframe"], "ticker": instrument.ticker,
                 "instrument_type": instrument.instrument_type, "short_name": getattr(instrument, "short_name", None),
-                "origin": "obligation" if self.execution_boundary(pair["key"][0]) is not None else "selected",
+                "origin": "obligation" if self.execution_boundary(pair["uid"]) is not None else "selected",
                 "requirements": {"min_bars": int(pair["min_bars"] or 1)},
             })
         try:
@@ -168,10 +179,10 @@ class IngestionWorker:
             self.roster_dirty = True
             log.warning("Состав пар не сохранён: %s", exc)
 
-    def execution_boundary(self, instrument_key):
-        """Граница исполнения незавершённой сделки инструмента: (момент, включительно) или None."""
+    def execution_boundary(self, uid):
+        """Граница исполнения незавершённой сделки пары с этим UID: (момент, включительно) или None."""
         with self._execution_lock:
-            return self._execution_obligations.get(instrument_key)
+            return self._execution_obligations.get(uid)
 
     # ── вход supervisor ──
     def set_stream_pairs(self, pairs, *, held=()):

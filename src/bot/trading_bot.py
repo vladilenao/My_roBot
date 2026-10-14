@@ -112,6 +112,8 @@ class TradingBot:
         # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
         self._await_live_data = live_data_waiter
         self._pattern_worker = pattern_worker
+        # Пары, о пропуске которых без UID уже предупредили (до появления UID).
+        self._pattern_uid_missing: set[tuple[str, str]] = set()
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
@@ -357,15 +359,26 @@ class TradingBot:
         worker = self._pattern_worker
         if worker is None:
             return
-        uid = getattr(instrument, "uid", None)
+        uid = self._pattern_uid(instrument, timeframe)
+        missing = (instrument_key(instrument), timeframe)
         if not uid:
+            if missing not in self._pattern_uid_missing:
+                self._pattern_uid_missing.add(missing)
+                log.warning("Паттерны: UID пары %s %s неизвестен — закрытые бары не анализируются",
+                            self._display_name(instrument), timeframe)
             return
+        self._pattern_uid_missing.discard(missing)
         close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
         worker.submit(ticker=instrument.ticker, instrument_uid=uid, timeframe=timeframe, close_time=close)
 
+    def _pattern_uid(self, instrument: Instrument, timeframe: str):
+        """UID пары у рыночного слоя: карточка live-инструмента его не содержит."""
+        resolve = getattr(self._data_cache, "pair_uid", None)
+        return resolve(instrument, timeframe) if callable(resolve) else getattr(instrument, "uid", None)
+
     def _prime_pattern_bar(self, instrument: Instrument, timeframe: str, frame) -> None:
         worker = self._pattern_worker
-        uid = getattr(instrument, "uid", None)
+        uid = self._pattern_uid(instrument, timeframe) if worker is not None else None
         if worker is not None and uid and not frame.empty:
             close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
             worker.prime(instrument_uid=uid, timeframe=timeframe, close_time=close)

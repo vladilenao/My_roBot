@@ -669,6 +669,7 @@ def _start_early_market_data(state_dir, provider):
     completeness = CompletenessLane(worker)
     evidence = EvidenceLane(worker, completeness)
     worker.evidence = evidence
+    worker.completeness = completeness
     lanes = [CalendarLane(market_reconciler, timeline), evidence, completeness]
     registered = _register_saved_roster(data_cache, market_store)
     poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, lanes=lanes,
@@ -725,9 +726,11 @@ def _start_live_ingestion(data_cache, runtime, instruments, client_provider, ear
         runtime.execution_aliases = {alias: instrument_key(instrument)
                                      for instrument in instruments
                                      for alias in (instrument_key(instrument), instrument.ticker)}
-        boundaries = _canonical_execution_boundaries(
-            storage.execution_bar_boundaries(), runtime.execution_aliases)
-        worker.set_execution_obligations(boundaries)
+        runtime.execution_instruments = list(instruments)
+        journal = storage.execution_bar_boundaries()
+        boundaries = _canonical_execution_boundaries(journal, runtime.execution_aliases)
+        worker.set_execution_obligations(_market_obligations(
+            journal, runtime.execution_aliases, instruments, data_cache))
         for instrument in instruments:
             key = instrument_key(instrument)
             for timeframe, count in obligation_requirements(
@@ -766,7 +769,7 @@ def _retire_unselected_pairs(data_cache, instruments, worker):
         instrument = pair["instrument"]
         if pair["uid"] in uids or instrument.ticker in tickers:
             continue
-        if worker.execution_boundary(pair["key"][0]) is not None:
+        if worker.execution_boundary(pair["uid"]) is not None:
             continue
         if data_cache.unregister_live_pair(pair["uid"], pair["timeframe"]):
             log.info("Пара %s %s прошлого запуска не выбрана — снята с обслуживания",
@@ -784,6 +787,35 @@ def _canonical_execution_boundaries(boundaries, aliases):
         elif boundary[0] == previous[0]:
             result[key] = (boundary[0], boundary[1] or previous[1])
     return result
+
+
+def _market_obligations(boundaries, aliases, instruments, data_cache):
+    """Обязательства журнала под UID рыночной пары (fix-live-pair-identity).
+
+    Live-инструменты выбора не знают UID, поэтому их адрес — тикер, а полосы
+    ищут обязательство по UID пары. Не найденная пара остаётся под прежним
+    ключом: её переведёт следующий тик, когда пара зарегистрируется.
+    """
+    by_key = {instrument_key(instrument): instrument for instrument in instruments}
+    result = {}
+    for key, boundary in _canonical_execution_boundaries(boundaries, aliases).items():
+        instrument = by_key.get(key)
+        uid = (data_cache.pair_uid(instrument, "1m") if instrument is not None
+               else _journal_pair_uid(data_cache, key))
+        target = uid or key
+        previous = result.get(target)
+        if previous is None or boundary[0] < previous[0]:
+            result[target] = boundary
+        elif boundary[0] == previous[0]:
+            result[target] = (boundary[0], boundary[1] or previous[1])
+    return result
+
+
+def _journal_pair_uid(data_cache, identity):
+    """UID единственной 1m-пары, чей UID или тикер совпадает с адресом сделки в журнале."""
+    found = {pair["uid"] for pair in data_cache.live_pairs()
+             if pair["timeframe"] == "1m" and identity in (pair["uid"], pair["instrument"].ticker)}
+    return found.pop() if len(found) == 1 else None
 
 
 def _family_warmup(family):
@@ -855,8 +887,9 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
     def post_tick(ready_tfs):
         worker = getattr(runtime, "ingestion_worker", None)
         if worker is not None and runtime.storage is not None:
-            worker.set_execution_obligations(_canonical_execution_boundaries(
-                runtime.storage.execution_bar_boundaries(), runtime.execution_aliases))
+            worker.set_execution_obligations(_market_obligations(
+                runtime.storage.execution_bar_boundaries(), runtime.execution_aliases,
+                runtime.execution_instruments, data_cache))
         return runtime.post_tick(ready_tfs)
 
     TradingBot(
@@ -902,6 +935,7 @@ class _Runtime:
         self.contract_lifecycle = contract_lifecycle
         self.ingestion_worker = None
         self.execution_aliases = {}
+        self.execution_instruments = []
 
 
 def _build_runtime(
