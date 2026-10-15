@@ -106,6 +106,13 @@ def _text(value) -> str:
     return str(getattr(value, "value", value))
 
 
+def hold_signature(hold) -> tuple:
+    """Удержание как сравнимый кортеж: сдвиг его момента — смена причины."""
+    if not hold:
+        return ()
+    return tuple(sorted((str(key), str(value)) for key, value in hold.items()))
+
+
 @dataclass(frozen=True)
 class LivePairState:
     source: str
@@ -129,6 +136,8 @@ class LivePairState:
     coverage_complete: bool = False
     reason: str = ""
     ingestion: dict | None = None
+    # Удержание данных: вид и UTC-моменты; фразу собирает шаблон канала.
+    hold: dict | None = None
 
     def observe(self, *, now: datetime, session: str, expected_bar: datetime | None,
                  timeout_secs: float, received_bar: datetime | None = None,
@@ -183,7 +192,8 @@ class LivePairState:
                 "analysis_mode": self.analysis_mode, "expected_bar": self.expected_bar,
                 "publication_deadline": self.publication_deadline, "next_open": self.next_open,
                 "available_bars": self.available_bars, "required_bars": self.required_bars,
-                "coverage_complete": self.coverage_complete, "ingestion": self.ingestion}
+                "coverage_complete": self.coverage_complete, "ingestion": self.ingestion,
+                "hold": self.hold}
 
 
 class StatusCadence:
@@ -195,7 +205,8 @@ class StatusCadence:
 
     def due(self, state: LivePairState, now: datetime) -> bool:
         key = (state.source, state.instrument_uid, state.timeframe)
-        signature = (state.session, state.data_state, state.reason, state.coverage_complete)
+        signature = (state.session, state.data_state, state.reason, hold_signature(state.hold),
+                     state.coverage_complete)
         previous = self._last.get(key)
         if previous is not None and previous[0] == signature and now - previous[1] < self._repeat:
             return False

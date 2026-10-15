@@ -252,10 +252,18 @@ def test_market_data_status_carries_ingestion_diagnostics_and_hold_reason(tmp_pa
     ingestion = status.get("ingestion")
     assert ingestion["transport"] == "polling" and ingestion["data_hold"] == "GAP_HOLD"
     assert ingestion["gap"]["state"] == "parked" and ingestion.get("processed_through") is None
-    assert "не восстановлен" in status.get("reason")
-    assert "не восстановлен" in " ".join(render(status, 3).split())
-    assert "Источник данных" not in render(status, 3)
-    assert "удержание: пропуск" in telegram_render(status, tz_offset_hours=3)
+    hold = status.get("hold")
+    assert hold["kind"] == "gap" and hold["state"] == "parked"
+    assert hold["lower"] == datetime(2026, 10, 12, 12, 1, tzinfo=timezone.utc)
+    assert hold["next_retry_at"] == datetime(2026, 10, 12, 12, 10, tzinfo=timezone.utc)
+    assert "не восстановлен" not in status.get("reason")
+    console = " ".join(render(status).split())
+    assert "Пропуск 15:01–15:02 не восстановлен; следующая проверка 15:10" in console
+    assert "UTC" not in console and "T12:" not in console
+    assert "Источник данных" not in render(status)
+    telegram = telegram_render(status, tz_offset_hours=3)
+    assert "удержание: пропуск" in telegram
+    assert "следующая проверка 12.10.2026 15:10:00 МСК" in telegram
     assert "token" not in str(status.to_dict()).lower()
 
 

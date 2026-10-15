@@ -10,11 +10,14 @@ from typing import Any, Iterable
 
 from src.events.event import Event
 from src.events.types import EventType
+from src.notifier.templates.holds import UNKNOWN_SCHEDULE, data_reason
 from src.trade_journal.export import reason_label
 
 COLORS = {"buy": "\x1b[32m", "sell": "\x1b[35m", "warning": "\x1b[33m",
           "error": "\x1b[31m", "muted": "\x1b[90m"}
 RESET = "\x1b[0m"
+# Консоль целиком по Москве: MOEX и FORTS живут в UTC+3 без летнего времени.
+MOSCOW = timezone(timedelta(hours=3))
 SIDES = {"BUY": "ПОКУПКА", "SELL": "ПРОДАЖА"}
 CONSTRAINTS = {"risk": "риск", "margin": "ГО", "max-quantity": "предел количества",
                "requested-quantity": "явный запрос", "profile": "профиль"}
@@ -62,20 +65,43 @@ def timeframe(value: str) -> str:
     return value
 
 
-def when(event: Event, tz_offset_hours: float, now: datetime | None) -> str:
+def moscow(value: Any) -> datetime | None:
+    """Момент по Москве; наивное значение — UTC, неразборчивое — None."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(MOSCOW)
+
+
+def headline(event: Event, now: datetime | None) -> datetime:
+    """Момент заголовка: наблюдение, закрытие бара или публикация — по Москве."""
     if event.type is EventType.MARKET_DATA_STATUS:
         stamp = event.get("observed_at") or now
     else:
         stamp = event.bar_time or now
+    return moscow(stamp) or datetime.now(MOSCOW)
+
+
+def when(event: Event, now: datetime | None) -> str:
+    return headline(event, now).strftime("%H:%M")
+
+
+def clock(value: Any, anchor: datetime) -> str:
+    """Короткая московская запись момента относительно даты заголовка блока."""
+    stamp = moscow(value)
     if stamp is None:
-        stamp = datetime.now(timezone.utc)
-    if not isinstance(stamp, datetime):
-        stamp = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-    if event.type is EventType.MARKET_DATA_STATUS or event.bar_time is None:
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        return stamp.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
-    return (stamp + timedelta(hours=tz_offset_hours)).strftime("%H:%M")
+        return ""
+    if stamp.date() == anchor.date():
+        return stamp.strftime("%H:%M")
+    if stamp.year == anchor.year:
+        return stamp.strftime("%d.%m %H:%M")
+    return stamp.strftime("%d.%m.%Y %H:%M")
 
 
 def _name(event: Event) -> str:
@@ -307,14 +333,7 @@ def _system(event: Event, stamp: str) -> Block | None:
     return None
 
 
-def _bar_clock(value: Any, offset: float) -> str:
-    stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if stamp.tzinfo is not None:
-        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
-    return (stamp + timedelta(hours=offset)).strftime("%H:%M")
-
-
-def status_row(event: Event, tz_offset_hours: float) -> str:
+def status_row(event: Event, anchor: datetime) -> str:
     state = event.get("data_state")
     value = _name(event)
     if event.timeframe:
@@ -326,11 +345,12 @@ def status_row(event: Event, tz_offset_hours: float) -> str:
         value += " · " + ("пробел в истории для анализа" if "пробел" in reason.lower() else reason)
     elif state == "delayed":
         expected = event.get("expected_bar")
-        value += " · " + (f"не получена свеча {_bar_clock(expected, tz_offset_hours)}" if expected else "ожидание свечи")
+        shown = clock(expected, anchor)
+        value += " · " + (f"не получена свеча {shown}" if shown else "ожидание свечи")
     elif state == "recovered":
         value += " · данные снова доступны"
     else:
-        reason = event.get("reason")
+        reason = data_reason(event, lambda moment: clock(moment, anchor))
         if reason:
             value += " · " + reason
     return value
@@ -338,45 +358,47 @@ def status_row(event: Event, tz_offset_hours: float) -> str:
 
 def status_label(event: Event) -> str | None:
     state = event.get("data_state")
-    if state in {"current", "waiting_bar"} and not event.get("reason"):
+    if state in {"current", "waiting_bar"} and not event.get("reason") and not event.get("hold"):
         return None
     if state == "rate_limited":
         return "СИСТЕМА"
     if state in DATA_LABELS:
         return DATA_LABELS[state]
-    if event.get("reason") == "Применимое торговое расписание неизвестно":
+    if event.get("hold"):
+        return "ДАННЫЕ НЕДОСТУПНЫ"
+    if event.get("reason") == UNKNOWN_SCHEDULE:
         return "РАСПИСАНИЕ НЕИЗВЕСТНО"
     if event.get("reason"):
         return "ДАННЫЕ НЕДОСТУПНЫ"
     return None
 
 
-def render_status_group(events: Iterable[Event], tz_offset_hours: float = 0.0,
-                        *, width: int = 96, color: bool = False) -> str | None:
+def render_status_group(events: Iterable[Event], *, width: int = 96, color: bool = False) -> str | None:
     items = tuple(events)
     if not items:
         return None
     first = items[0]
     label = status_label(first)
-    stamp = when(first, tz_offset_hours, None)
+    anchor = headline(first, None)
+    stamp = anchor.strftime("%H:%M")
     if label == "СИСТЕМА":
         return Block(stamp, label, "Лимит API · ожидание сброса", role="warning").render(width=width, color=color)
     if label is None:
         return None
     count = len(items)
     word = "пар" if 11 <= count % 100 <= 14 else "пара" if count % 10 == 1 else "пары" if 2 <= count % 10 <= 4 else "пар"
-    rows = tuple(status_row(item, tz_offset_hours) for item in items)
+    rows = tuple(status_row(item, anchor) for item in items)
     return Block(stamp, label, f"{count} {word}", rows, "warning", data_group=True).render(width=width, color=color)
 
 
-def render(event: Event, tz_offset_hours: float = 0.0, *, now: datetime | None = None,
+def render(event: Event, *, now: datetime | None = None,
            width: int = 96, color: bool = False, linked: bool = False) -> str | None:
     """Вернуть видимый текст одного события без завершающего перевода строки."""
     if event.type is EventType.STARTUP_ANALYSIS:
         return None
     if event.type is EventType.MARKET_DATA_STATUS:
-        return render_status_group((event,), tz_offset_hours, width=width, color=color)
-    stamp = when(event, tz_offset_hours, now)
+        return render_status_group((event,), width=width, color=color)
+    stamp = when(event, now)
     if event.type is EventType.DECISION:
         block = _decision(event, stamp)
     elif event.type is EventType.SIGNAL:

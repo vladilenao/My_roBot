@@ -56,7 +56,7 @@ class TestConsoleChannel:
     def test_shared_api_limit_is_one_line_per_episode(self) -> None:
         clock = [datetime(2026, 10, 13, 11, 30, tzinfo=timezone.utc)]
         stream = io.StringIO()
-        channel = ConsoleChannel(stream=stream, now=lambda: clock[0], tz_offset_hours=3)
+        channel = ConsoleChannel(stream=stream, now=lambda: clock[0])
 
         def status(instrument: str, state: str) -> Event:
             return Event.market_data_status(instrument, timeframe="15m", session="open",
@@ -77,7 +77,7 @@ class TestConsoleChannel:
         monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
         observed = datetime(2026, 10, 13, 13, 15)
         stream = io.StringIO()
-        channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+        channel = ConsoleChannel(stream=stream)
         channel.handle(Event.tick_started(tick_id="cycle"))
         for instrument in ("SBER", "PHOR", "VTBR"):
             channel.handle(Event.market_data_status(instrument, timeframe="15m", session="open",
@@ -95,7 +95,7 @@ class TestConsoleChannel:
 
     def test_close_flushes_unfinished_status_batch(self) -> None:
         stream = io.StringIO()
-        channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+        channel = ConsoleChannel(stream=stream)
         channel.handle(Event.tick_started(tick_id="interrupted"))
         channel.handle(Event.market_data_status("SBER", timeframe="15m", session="open",
             data_state="delayed", observed_at=datetime(2026, 10, 13, 13, 15),
@@ -278,7 +278,6 @@ class TestConsoleChannel:
         channel = ConsoleChannel(
             stream=stream,
             supported_types={EventType.DECISION, EventType.ERROR},
-            tz_offset_hours=-7,
             now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc),
         )
         bus = EventBus()
@@ -619,3 +618,21 @@ class TestTelegramChannel:
         channel.close(timeout=2.0)
 
         assert channel._closed is True
+
+
+def test_console_repeats_hold_only_when_its_boundary_moves() -> None:
+    clock = [datetime(2026, 10, 15, 8, 0, 5, tzinfo=timezone.utc)]
+    stream = io.StringIO()
+    channel = ConsoleChannel(stream=stream, now=lambda: clock[0])
+
+    def held(through: datetime) -> Event:
+        return Event.market_data_status("SBER", timeframe="15m", session="open", data_state="waiting_bar",
+            observed_at=clock[0], hold={"kind": "execution_barrier", "through": through})
+
+    channel.handle(held(datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)))
+    clock[0] += timedelta(minutes=1)
+    channel.handle(held(datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)))
+    assert stream.getvalue().count("ДАННЫЕ НЕДОСТУПНЫ") == 1
+    channel.handle(held(datetime(2026, 10, 15, 8, 15, tzinfo=timezone.utc)))
+    assert stream.getvalue().count("ДАННЫЕ НЕДОСТУПНЫ") == 2
+    assert "не подтверждена до 11:15" in stream.getvalue()

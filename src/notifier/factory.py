@@ -31,7 +31,6 @@ def build_channels(names=None, *, state_dir=None) -> list[Channel]:
             events = config.NOTIFIER_CONSOLE_EVENTS
             channels.append(
                 ConsoleChannel(
-                    tz_offset_hours=config.BAR_TIME_TZ_OFFSET_HOURS,
                     supported_types=parse_event_types(events),
                 )
             )

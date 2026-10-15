@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 import io
@@ -82,7 +82,7 @@ def test_friday_overview_is_immediate_dated_and_read_only():
     assert len(reviews) == 4
     assert all(event.get("results")[0]["outcome"] == "BUY" for event in reviews)
     assert reviews[0].bar_time.date() == datetime(2026, 10, 9).date()
-    assert render(reviews[0], 3) is None
+    assert render(reviews[0]) is None
     assert "09.10.2026" in telegram_render(reviews[0], tz_offset_hours=3)
     assert "Стартовый обзор" in telegram_render(reviews[0], tz_offset_hours=3)
     manager.actions_for_signal.assert_not_called()
@@ -115,7 +115,9 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
     decisions = [e for e in events[before:] if e.type is EventType.DECISION and e.instrument == "SBER" and e.timeframe == "1h"]
     # Текущий бар ждёт непрерывную базовую 1m UID и не теряется (задача 6.3).
     assert [e.bar_time.hour for e in decisions] == [8, 9]
-    assert "базовая 1m" in live.states["SBER", "1h"].reason
+    held = live.states["SBER", "1h"]
+    assert held.reason == ""
+    assert held.hold == {"kind": "execution_barrier", "through": datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)}
     data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
     clock[0] += timedelta(seconds=5)
     live.worker.run_until_idle()
@@ -200,7 +202,7 @@ def test_informational_events_show_only_useful_overviews_in_console():
     live, _, _, events, _ = setup()
     live.bootstrap()
     stream = io.StringIO()
-    console = ConsoleChannel(stream=stream, tz_offset_hours=3)
+    console = ConsoleChannel(stream=stream)
     for event in events:
         console.handle(event)
     text = stream.getvalue()
@@ -407,3 +409,25 @@ def test_old_market_store_migration_preserves_candles_coverage_cursors_and_analy
     reopened.mark_analyzed(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", open_time="2026-10-09 19:00")
     again = MarketDataStore(path)
     assert again.analysis_cursor(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy") == pd.Timestamp("2026-10-09 19:00")
+
+
+def test_holds_are_structured_utc_moments_without_phrases():
+    from types import SimpleNamespace
+    from src.bot.live_analysis import LiveAnalysis
+
+    live = LiveAnalysis.__new__(LiveAnalysis)
+    live.bot = SimpleNamespace(_protection_timeframe="1m")
+    live.current = lambda *args: False
+    utc = timezone.utc
+    assert live._hold(None, "15m", {"data_hold": "INTEGRITY_HOLD",
+                                    "incident": {"open_time": "2026-10-15T07:42:00"}}, None) == {
+        "kind": "integrity", "minute": datetime(2026, 10, 15, 7, 42, tzinfo=utc)}
+    assert live._hold(None, "15m", {"data_hold": "CONFLICT_HOLD"}, None) == {"kind": "conflict"}
+    assert live._hold(None, "15m", {"data_hold": "RECONCILING"}, None) == {"kind": "reconciling"}
+    assert live._hold(None, "15m", {"data_hold": "GAP_HOLD", "gap": {
+        "lower": "2026-10-15T07:00:00+00:00", "upper": "2026-10-15T07:15:00+00:00", "state": "active"}}, None) == {
+        "kind": "gap", "state": "active", "lower": datetime(2026, 10, 15, 7, tzinfo=utc),
+        "upper": datetime(2026, 10, 15, 7, 15, tzinfo=utc)}
+    assert live._hold(None, "15m", {"data_hold": "INTEGRITY_HOLD", "incident": {}}, None) == {
+        "kind": "integrity", "minute": None}
+    assert live._hold(None, "15m", {"data_hold": "READY"}, datetime(2026, 10, 15, 8)) is None

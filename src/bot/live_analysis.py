@@ -20,6 +20,20 @@ from src.strategies.contracts import SignalType
 log = get_logger(__name__)
 
 
+def _utc_moment(value):
+    """Момент удержания как tz-aware UTC; неразборчивое значение — None."""
+    if value is None or value == "":
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    return stamp.to_pydatetime()
+
+
 class LiveAnalysis:
     def __init__(self, bot):
         self.bot = bot
@@ -101,11 +115,12 @@ class LiveAnalysis:
         """Критический 1m-префикс UID должен быть доказан до закрытия бара."""
         ready = getattr(self.cache, "execution_ready", None)
         if not callable(ready):
-            return ""
+            return None
         last_minute = pd.Timestamp(close) - pd.Timedelta(minutes=1)
         if ready(instrument, last_minute):
-            return ""
-        return f"Удержано: базовая 1m не подтверждена до {last_minute:%d.%m.%Y %H:%M} UTC"
+            return None
+        # Граница — закрытие бара, как у bar_time; фразу соберёт шаблон канала.
+        return {"kind": "execution_barrier", "through": _utc_moment(close)}
 
     def _ingestion(self, instrument, tf):
         """Технический срез owner для market_data_status (design 11, задача 8.3)."""
@@ -123,26 +138,26 @@ class LiveAnalysis:
                 "cutover": status.get("cutover"), "pre_cutover_gaps": status.get("pre_cutover_gaps", 0),
                 "lanes": status.get("lanes") or {}}
 
-    def _hold_reason(self, instrument, tf, ingestion, close):
+    def _hold(self, instrument, tf, ingestion, close):
+        """Удержание пары структурно: вид и UTC-моменты, без русской фразы."""
         state = ingestion.get("data_hold")
         if state == "INTEGRITY_HOLD":
             incident = ingestion.get("incident") or {}
-            return f"Удержано: изменена уже исполненная минута {incident.get('open_time', '')}".strip()
+            return {"kind": "integrity", "minute": _utc_moment(incident.get("open_time"))}
         if state == "CONFLICT_HOLD":
-            return "Удержано: расхождение версий свечи, идёт согласующая проверка"
+            return {"kind": "conflict"}
         if state == "GAP_HOLD":
             gap = ingestion.get("gap") or {}
-            if gap.get("state") == "parked":
-                return (f"Пропуск {gap.get('lower')}–{gap.get('upper')} не восстановлен; "
-                        f"следующая проверка {gap.get('next_retry_at')}")
-            return f"Восстановление пропуска {gap.get('lower')}–{gap.get('upper')}"
+            hold = {"kind": "gap", "state": gap.get("state") or "active",
+                    "lower": _utc_moment(gap.get("lower")), "upper": _utc_moment(gap.get("upper"))}
+            if hold["state"] == "parked":
+                hold["next_retry_at"] = _utc_moment(gap.get("next_retry_at"))
+            return hold
         if state == "RECONCILING":
-            return "Согласование потока с историей"
-        if state == "BOOTSTRAPPING" and ingestion.get("history_error"):
-            return "Прогрев: " + ingestion["history_error"]
+            return {"kind": "reconciling"}
         if tf != self.bot._protection_timeframe and close is not None and self.current(instrument, tf, close):
             return self._execution_barrier(instrument, close)
-        return ""
+        return None
 
     def next_wakeup(self):
         """Ближайший дедлайн публикации или закрытие бара активных пар."""
@@ -286,7 +301,7 @@ class LiveAnalysis:
         if not reason and not self.cache.coverage_for(instrument, tf, frame.tail(required)):
             reason = "Неразрешённый пробел в диапазоне прогрева"
         unknown_schedule = "Применимое торговое расписание неизвестно"
-        state = replace(state, available_bars=len(frame), coverage_complete=not bool(reason), reason=reason)
+        state = replace(state, available_bars=len(frame), coverage_complete=not bool(reason), reason=reason, hold=None)
         if reason:
             state = replace(state, data_state="warming_up" if len(frame) < required else "coverage_blocked")
         elif session == "unknown":
@@ -295,15 +310,18 @@ class LiveAnalysis:
         if error:
             state = replace(state, reason=error.replace(instrument.ticker, self.bot._display_name(instrument)))
         if ingestion and state.reason in {"", unknown_schedule}:
-            hold = self._hold_reason(instrument, tf, ingestion, close)
-            if hold:
+            if ingestion.get("data_hold") == "BOOTSTRAPPING" and ingestion.get("history_error"):
+                # Текст исключения прогрева — причина, а не момент удержания.
+                state = replace(state, reason="Прогрев: " + ingestion["history_error"])
+            else:
                 # Удержание блокирует торговлю и важнее общей пометки о
-                # расписании; причины прогрева/покрытия остаются первыми.
-                state = replace(state, reason=hold + ("; расписание неизвестно" if state.reason == unknown_schedule else ""))
+                # расписании; причины прогрева/покрытия остаются первыми,
+                # пометка о неизвестном расписании остаётся в reason.
+                state = replace(state, hold=self._hold(instrument, tf, ingestion, close))
         state = replace(state, ingestion=ingestion)
         budget = self.cache._request_budget
         if budget.retry_after is not None and now < budget.retry_after:
-            state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API")
+            state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API", hold=None)
         self.states[key] = state
         if self.cadence.due(state, now):
             self.bot._bus.publish(Event.market_data_status(self.bot._display_name(instrument),
@@ -416,7 +434,7 @@ class LiveAnalysis:
                                     # Курсор не двигается: решение дождётся
                                     # непрерывной базовой 1m, а не потеряется.
                                     key = self._key(instrument, tf)
-                                    self.states[key] = replace(self.states[key], reason=barrier)
+                                    self.states[key] = replace(self.states[key], reason="", hold=barrier)
                                     break
                             publish = None
                             try:

@@ -31,7 +31,7 @@ def test_full_trading_sequence_matches_approved_text(monkeypatch) -> None:
     monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
     clock = [_at(11, 5)]
     stream = io.StringIO()
-    channel = ConsoleChannel(stream=stream, now=lambda: clock[0], tz_offset_hours=3)
+    channel = ConsoleChannel(stream=stream, now=lambda: clock[0])
 
     def send(event: Event) -> None:
         channel.handle(event)
@@ -93,7 +93,7 @@ def test_full_trading_sequence_matches_approved_text(monkeypatch) -> None:
 def test_grouped_data_sequence_matches_approved_text(monkeypatch) -> None:
     monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
     stream = io.StringIO()
-    channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+    channel = ConsoleChannel(stream=stream)
     channel.handle(Event.tick_started(tick_id="data"))
     observed = datetime(2026, 10, 13, 13, 15)
     for name, tf, count in (("PHOR", "1h", 42), ("SBER", "15m", 37), ("VTBR", "15m", 51)):
