@@ -162,6 +162,47 @@ def test_live_decision_is_published_once_right_before_its_admission():
     assert trading[index + 1].get("event_id") == live_decisions[0].get("event_id") != ""
 
 
+def test_live_admission_receives_raw_signal_and_filter_reason_reaches_console():
+    from dataclasses import replace
+
+    manager = Mock()
+    manager.management_obligations.return_value = ()
+    manager.manage.return_value = ()
+    manager.actions_for_signal.return_value = SignalAdmission(
+        rejections=(RejectionReason(code="filter-rejected", message="покупка против нисходящего тренда"),))
+    live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00",
+                                             cutover=datetime(2026, 10, 12, 6, 0), manager=manager)
+    signal_filter = Mock()
+    signal_filter.apply.side_effect = lambda decision, ctx, **kw: replace(decision, signal_type=SignalType.HOLD)
+    live.bot._signal_filter = signal_filter
+    live.bot._context_cache = Mock()
+    live.bootstrap()
+    data["SBER", "1h"] = frame("2026-10-12 09:00")
+    data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
+    clock[0] += timedelta(seconds=5)
+    live.worker.run_until_idle()
+    before = len(events)
+    live.step()
+
+    admitted = [call.args[1] for call in manager.actions_for_signal.call_args_list
+                if call.args[0].id == "SBER-1h"]
+    assert [decision.signal_type for decision in admitted] == [SignalType.BUY]
+    sber = [e for e in events[before:] if e.instrument == "SBER" and e.timeframe == "1h"
+            and e.type in {EventType.DECISION, EventType.REJECTED}]
+    live_decision = next(e for e in sber if e.type is EventType.DECISION and e.get("analysis_mode") == "live")
+    assert live_decision.get("filtered_out") is False and live_decision.get("side") == "BUY"
+    # Информационные старые бары по-прежнему показывают результат фильтра.
+    assert all(e.get("filtered_out") for e in sber if e.type is EventType.DECISION and e.get("analysis_mode") == "historical")
+    rejection = sber[sber.index(live_decision) + 1]
+    assert rejection.type is EventType.REJECTED and rejection.get("code") == "filter-rejected"
+    stream = io.StringIO()
+    console = ConsoleChannel(stream=stream)
+    console.handle(live_decision)
+    console.handle(rejection)
+    assert "Покупка против нисходящего тренда" in stream.getvalue()
+    assert "ОТКЛОНЕНО ФИЛЬТРОМ" not in stream.getvalue()
+
+
 def test_state_messages_continue_without_successful_analysis_and_do_not_spam():
     live, cache, data, events, clock = setup()
     live.bootstrap()
