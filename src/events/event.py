@@ -19,7 +19,7 @@ from src.events.schema import DIAGNOSTIC_PAYLOAD_FIELDS
 from src.events.visual import VisualSnapshot, freeze
 
 _EXECUTION_AMOUNTS = frozenset(
-    {"price", "stop", "take_profit", "pnl", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
+    {"price", "stop", "previous_stop", "take_profit", "pnl", "pnl_at_stop", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
      "budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess"}
 )
 

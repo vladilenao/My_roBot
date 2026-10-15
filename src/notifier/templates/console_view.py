@@ -21,6 +21,11 @@ MOSCOW = timezone(timedelta(hours=3))
 SIDES = {"BUY": "ПОКУПКА", "SELL": "ПРОДАЖА"}
 CONSTRAINTS = {"risk": "риск", "margin": "ГО", "max-quantity": "предел количества",
                "requested-quantity": "явный запрос", "profile": "профиль"}
+# Безубыток в консоли объясняется развёрнуто; остальные причины переноса —
+# подписи общего словаря причин журнала.
+STOP_MOVE_REASONS = {"cost-aware-break-even": "Безубыток всей сделки: учтены прибыль целей и расходы"}
+# Пара «прежний → новый» склеивается до переноса строк и раскрывается после.
+_GLUE = "\u00a0"
 DATA_LABELS = {"warming_up": "ПРОГРЕВ", "coverage_blocked": "ДАННЫЕ НЕПОЛНЫЕ",
                "delayed": "ЗАДЕРЖКА ДАННЫХ", "recovered": "ДАННЫЕ ВОССТАНОВЛЕНЫ"}
 
@@ -145,6 +150,7 @@ class Block:
             lines.append(prefix.rstrip())
         for detail in self.details:
             lines.extend(_detail_lines(detail, width, 24 if self.data_group else 21))
+        lines = [line.replace(_GLUE, " ") for line in lines]
         if color and self.role:
             lines[0] = lines[0].replace(self.label, COLORS[self.role] + self.label + RESET, 1)
             if self.highlight:
@@ -166,6 +172,29 @@ def _financial(event: Event) -> tuple[str, ...]:
     elif event.get("fees_known") is False:
         detail += " · накопленные издержки частично неизвестны"
     return result, detail
+
+
+def _stop_move(event: Event, name: str) -> tuple[str, tuple[str, ...]]:
+    """Перенос стопа: «стоп перенесён A → B», причина, остаток и оценка до стопа."""
+    new = price(event.get("stop"))
+    old = event.get("previous_stop")
+    value = f"{name} · стоп перенесён " + (f"{price(old)}{_GLUE}→{_GLUE}{new}" if old is not None else f"на {new}")
+    code = str(event.get("reason") or "")
+    reason = STOP_MOVE_REASONS.get(code) or (reason_label(code) if reason_label(code) != code else "")
+    parts = [reason] if reason else []
+    if event.get("quantity_remaining") is not None:
+        parts.append(f"остаток {event.get('quantity_remaining')}")
+    result = event.get("pnl_at_stop")
+    if result is not None and event.get("pnl_units") == "RUB":
+        amount = Decimal(str(result))
+        if amount > 0:
+            parts.append(f"зафиксировано {money(amount, estimate=True)} до комиссий")
+        elif amount < 0:
+            parts.append(f"риск до стопа {money(-amount, estimate=True)}")
+        else:
+            parts.append(f"риск до стопа {money(amount)}")
+    detail = " · ".join(parts)
+    return value, (detail[0].upper() + detail[1:],) if detail else ()
 
 
 def _decision(event: Event, stamp: str) -> Block | None:
@@ -302,6 +331,10 @@ def _execution(event: Event, stamp: str, linked: bool = False) -> Block | None:
     elif kind is EventType.TRADE_CANCELLED:
         label, role = "ОТМЕНА", "warning"
         value = f"{name} · {reason_label(event.get('reason'))}"
+    elif kind is EventType.STOP_MOVED:
+        label = "ЗАЩИТА"
+        value, moved = _stop_move(event, name)
+        details.extend(moved)
     elif kind is EventType.PROTECTION_ARMED:
         label = "ЗАЩИТА"
         value = f"{name} · стоп {price(event.get('stop'))} · цель {price(event.get('take_profit'))}"

@@ -114,6 +114,7 @@ OPTIONAL_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
 for _event_type in (EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT, EventType.TARGET_HIT, EventType.TRADE_CLOSED):
     OPTIONAL_PAYLOAD_FIELDS[_event_type] += FINANCIAL_PAYLOAD_FIELDS
 OPTIONAL_PAYLOAD_FIELDS[EventType.TARGET_HIT] += ("target_number",)
+OPTIONAL_PAYLOAD_FIELDS[EventType.STOP_MOVED] += ("previous_stop", "quantity_remaining", "pnl_at_stop", "pnl_units")
 OPTIONAL_PAYLOAD_FIELDS[EventType.POSITION_ADDED] += ("requested_quantity", "selected_quantity", "limiting_constraint")
 for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT,
                    EventType.TARGET_HIT, EventType.TRADE_CLOSED, EventType.STOP_MOVED,

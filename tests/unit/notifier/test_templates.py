@@ -149,7 +149,7 @@ def test_other_visible_types_remain_event_first(kind: EventType, label: str) -> 
 
 
 def test_silent_types_and_color_roles() -> None:
-    for kind in (EventType.STOP_MOVED, EventType.RESERVATION_CHANGED, EventType.RATE_LIMITED):
+    for kind in (EventType.RESERVATION_CHANGED, EventType.RATE_LIMITED):
         assert shown(broker(kind)) is None
     for event, code in (
         (Event.decision("SBER", outcome="signal_buy", side="BUY", price=100), "32"),
