@@ -23,6 +23,7 @@ from src.scheduler.timing import tf_period_minutes
 from src.strategies.contracts import Decision, SignalType
 from src.strategies.indicators.macd.indicator import MacdIndicator
 from src.strategies.indicators.stochastic.indicator import StochasticIndicator
+from src.trade_management.audit import CalculationTrace, MeasuredValue, TraceLinks, TraceOutcome, calculation_trace
 
 log = get_logger(__name__)
 
@@ -149,15 +150,80 @@ class TripleScreenFilter:
         instrument: str = "",
         timeframe: str = "",
     ) -> Decision:
+        return self._evaluate(decision, instrument, timeframe).decision
+
+    def apply_with_trace(
+        self, decision: Decision, ctx, instrument: str = "", timeframe: str = ""
+    ) -> tuple[Decision, CalculationTrace]:
+        """Решение трёх экранов и трасса с таймфреймами и значениями индикаторов."""
+        screens = self._evaluate(decision, instrument, timeframe)
+        blocked = screens.reason != "entry-allowed"
+        return screens.decision, calculation_trace(
+            "filter.triple_screen",
+            inputs={
+                "signal": MeasuredValue(decision.signal_type.value, "signal"),
+                "instrument": MeasuredValue(str(instrument), "instrument-id"),
+                "timeframe": MeasuredValue(timeframe, "timeframe"),
+                "tf_htf": MeasuredValue(screens.tf_htf, "timeframe"),
+                "tf_int": MeasuredValue(screens.tf_int, "timeframe"),
+                "screen1": MeasuredValue(_side(screens.screen1.direction), "signal"),
+                "screen1_bars": MeasuredValue(screens.screen1.bars, "bars"),
+                "macd_hist": MeasuredValue(list(screens.screen1.values), "macd-histogram"),
+                "screen2": MeasuredValue(_side(screens.screen2.direction), "signal"),
+                "screen2_bars": MeasuredValue(screens.screen2.bars, "bars"),
+                "stoch_k": MeasuredValue(screens.screen2.values[-1] if screens.screen2.values else None, "%K"),
+                "oversold": MeasuredValue(self.params.oversold, "%K"),
+                "overbought": MeasuredValue(self.params.overbought, "%K"),
+            },
+            result=MeasuredValue(screens.decision.signal_type.value, "signal"),
+            reason=screens.reason,
+            formula="BUY: MACD hist slope up on TF_htf and %K < oversold on TF_int; "
+                    "SELL: slope down and %K > overbought; otherwise HOLD",
+            links=TraceLinks(signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED if blocked else TraceOutcome.ACCEPTED,
+        )
+
+    @staticmethod
+    def rejection_text(trace: CalculationTrace) -> str:
+        """Какой экран не пройден и почему — по входам трассы; пусто при пропуске."""
+        inputs = {key: value.value for key, value in trace.inputs.items()}
+        if trace.reason == "binding-context-missing":
+            return "triple_screen: нет инструмента или таймфрейма привязки"
+        if trace.reason == "timeframe-hierarchy-unavailable":
+            return f"triple_screen: рабочий таймфрейм {inputs['timeframe']} несовместим с иерархией экранов"
+        if trace.reason not in {"screen1-not-confirmed", "screen2-not-confirmed", "screens-not-confirmed"}:
+            return ""
+        side = inputs["signal"]
+        action = "покупку" if side == SignalType.BUY.value else "продажу"
+        parts = []
+        if inputs["screen1"] != side:
+            if inputs["screen1"] is None and len(inputs["macd_hist"]) < 2:
+                why = f"мало закрытых свечей ({inputs['screen1_bars']})"
+            else:
+                why = {SignalType.BUY.value: "наклон гистограммы вверх",
+                       SignalType.SELL.value: "наклон гистограммы вниз"}.get(inputs["screen1"], "наклон гистограммы не определён")
+            parts.append(f"экран 1 (MACD {inputs['tf_htf']}) не подтверждает {action}: {why}")
+        if inputs["screen2"] != side:
+            k = inputs["stoch_k"]
+            if k is None:
+                why = f"мало закрытых свечей ({inputs['screen2_bars']})"
+            elif side == SignalType.BUY.value:
+                why = f"%K {_number(k)} не ниже {inputs['oversold']}"
+            else:
+                why = f"%K {_number(k)} не выше {inputs['overbought']}"
+            parts.append(f"экран 2 (Stochastic {inputs['tf_int']}) не подтверждает {action}: {why}")
+        return "; ".join(parts)
+
+    def _evaluate(self, decision: Decision, instrument, timeframe: str) -> _Screens:
         if decision.signal_type is SignalType.HOLD:
-            return decision
+            return _Screens(decision, "entry-allowed")
         if not instrument or not timeframe:
             log.warning(
                 "triple_screen: нет контекста привязки (instrument=%r, timeframe=%r) — "
                 "сигнал %s отклонён.",
                 instrument, timeframe, decision.signal_type.value,
             )
-            return replace(decision, signal_type=SignalType.HOLD)
+            return _Screens(replace(decision, signal_type=SignalType.HOLD), "binding-context-missing")
 
         try:
             tf_int, tf_htf = tf_hierarchy(timeframe, self.params.multiplier, self.ladder)
@@ -166,7 +232,7 @@ class TripleScreenFilter:
                 "triple_screen: %s — сигнал %s отклонён.",
                 exc, decision.signal_type.value,
             )
-            return replace(decision, signal_type=SignalType.HOLD)
+            return _Screens(replace(decision, signal_type=SignalType.HOLD), "timeframe-hierarchy-unavailable")
 
         max_close = decision.bar_time
         macd = MacdIndicator(
@@ -189,60 +255,89 @@ class TripleScreenFilter:
         )
         screen2 = self._screen2_direction(intf, stoch, tf_int)
 
-        if (
-            decision.signal_type is SignalType.BUY
-            and screen1 is SignalType.BUY
-            and screen2 is SignalType.BUY
-        ):
-            return decision
-        if (
-            decision.signal_type is SignalType.SELL
-            and screen1 is SignalType.SELL
-            and screen2 is SignalType.SELL
-        ):
-            return decision
-        return replace(decision, signal_type=SignalType.HOLD)
+        failed1 = screen1.direction is not decision.signal_type
+        failed2 = screen2.direction is not decision.signal_type
+        if not failed1 and not failed2:
+            return _Screens(decision, "entry-allowed", tf_int, tf_htf, screen1, screen2)
+        reason = ("screens-not-confirmed" if failed1 and failed2
+                  else "screen1-not-confirmed" if failed1 else "screen2-not-confirmed")
+        return _Screens(replace(decision, signal_type=SignalType.HOLD), reason, tf_int, tf_htf, screen1, screen2)
 
     # ── экран 1: направление на старшем ТФ ──
     def _screen1_direction(
         self, frame: pd.DataFrame, macd: MacdIndicator, tf_htf: str
-    ) -> SignalType | None:
+    ) -> _Screen:
+        bars = 0 if frame is None else len(frame)
         if frame is None or frame.empty or len(frame) < macd.warmup + 2:
             log.warning(
                 "triple_screen: недостаточно закрытых свечей %s для экрана 1 — "
                 "направление не подтверждено.", tf_htf,
             )
-            return None
+            return _Screen(None, bars)
         hist = macd.compute(frame)[
             f"macdh_{self.params.macd_fast}_{self.params.macd_slow}_{self.params.macd_signal}"
         ].dropna()
         if len(hist) < 2:
             log.warning("triple_screen: не хватает гистограммы MACD на %s.", tf_htf)
-            return None
+            return _Screen(None, bars, tuple(_rounded(v) for v in hist.tail(2)))
+        values = (_rounded(hist.iloc[-2]), _rounded(hist.iloc[-1]))
         if hist.iloc[-1] > hist.iloc[-2]:
-            return SignalType.BUY
+            return _Screen(SignalType.BUY, bars, values)
         if hist.iloc[-1] < hist.iloc[-2]:
-            return SignalType.SELL
-        return None
+            return _Screen(SignalType.SELL, bars, values)
+        return _Screen(None, bars, values)
 
     # ── экран 2: коррекция на среднем ТФ ──
     def _screen2_direction(
         self, frame: pd.DataFrame, stoch: StochasticIndicator, tf_int: str
-    ) -> SignalType | None:
+    ) -> _Screen:
+        bars = 0 if frame is None else len(frame)
         if frame is None or frame.empty or len(frame) < stoch.warmup + 1:
             log.warning(
                 "triple_screen: недостаточно закрытых свечей %s для экрана 2 — "
                 "коррекция не подтверждена.", tf_int,
             )
-            return None
+            return _Screen(None, bars)
         k_col = f"stochk_{self.params.stoch_k}_{self.params.stoch_d}_{self.params.stoch_smooth_k}"
         k = stoch.compute(frame)[k_col].dropna()
         if len(k) < 1:
             log.warning("triple_screen: не хватает %K на %s.", tf_int)
-            return None
+            return _Screen(None, bars)
         last = k.iloc[-1]
+        values = (_rounded(last),)
         if last < self.params.oversold:
-            return SignalType.BUY
+            return _Screen(SignalType.BUY, bars, values)
         if last > self.params.overbought:
-            return SignalType.SELL
-        return None
+            return _Screen(SignalType.SELL, bars, values)
+        return _Screen(None, bars, values)
+
+
+@dataclass(frozen=True)
+class _Screen:
+    """Итог одного экрана: подтверждённое направление и значения индикатора."""
+
+    direction: SignalType | None
+    bars: int = 0
+    values: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class _Screens:
+    decision: Decision
+    reason: str
+    tf_int: str = ""
+    tf_htf: str = ""
+    screen1: _Screen = _Screen(None)
+    screen2: _Screen = _Screen(None)
+
+
+def _rounded(value) -> float:
+    return round(float(value), 6)
+
+
+def _number(value: float) -> str:
+    return f"{value:.1f}".replace(".", ",")
+
+
+def _side(direction: SignalType | None) -> str | None:
+    return None if direction is None else direction.value

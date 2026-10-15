@@ -1460,7 +1460,30 @@ class TradeManager:
                 log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(submitted)
 
+    def _entry_filter_refusal(self, assignment, decision, instrument, context, timeframe) -> SignalAdmission | None:
+        """Фильтр профиля привязки — первый шаг допуска нового входа.
+
+        Решение фильтра пишется трассой со ссылкой на привязку; отказ идёт
+        штатным недопуском ``filter-rejected`` с причиной фильтра. Как и в
+        циклах робота, без рыночного контекста фильтр не применяется.
+        """
+        judge = getattr(self._signal_filter, "judge", None)
+        if not callable(judge) or context is None:
+            return None
+        verdict = judge(decision, context, profile_name=assignment.filter_profile,
+                        instrument=instrument_key(instrument), timeframe=timeframe)
+        if verdict.trace is not None:
+            self._traces.record(replace(verdict.trace, links=replace(verdict.trace.links, assignment_id=assignment.id)))
+        if not verdict.rejected:
+            return None
+        log.info("actions_for_signal %s: вход отклонён фильтром %s — %s",
+                 instrument.ticker, assignment.filter_profile, verdict.reason)
+        return SignalAdmission(rejections=(rejection_reason("filter-rejected", message=verdict.reason),))
+
     def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
+        refused = self._entry_filter_refusal(assignment, decision, instrument, context, timeframe)
+        if refused is not None:
+            return refused
         live_market = None
         if self._live_market_provider is not None:
             live_market = self._live_market_provider(instrument)
