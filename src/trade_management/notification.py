@@ -157,7 +157,30 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
                            "sequence": sequence, "revision": row["state_revision"], "as_of": utc(event.timestamp).isoformat(),
                            "instrument": getattr(instrument, "short_name", None) or "контракт не указан",
                            "side": row["side"], "timeframe": plan.get("timeframe", ""), **quantity_context(instrument, meta),
-                           "price_step": row["price_step"], "plan": original,
+                           "price_step": row["price_step"], "step_cost": row["step_cost"], "plan": original,
                            "state": {"phase": phase, "quantity": row["quantity"], "average_entry": row["average_price"],
                                      "stop": row["confirmed_stop"], "targets": current_targets},
                            "fills": detailed, "fill_groups": groups, "stops": stops, "market": market, "financial": financial})
+
+
+def stop_move_fields(visual):
+    """Явные поля ``stop_moved`` из снимка сделки после подтверждения переноса.
+
+    Уровни берутся из записи переноса этого события, остаток — из состояния.
+    ``pnl_at_stop`` — валовой результат остатка при исполнении по новому стопу
+    без комиссий: отрицательный — риск до стопа, положительный — фиксируемая
+    прибыль. Без средней, шага или стоимости шага деньги не выдумываются.
+    """
+    state = visual["state"]
+    move = next((stop for stop in visual.get("stops", ()) if stop["key"] == visual["event_key"]), None)
+    new = (move or {}).get("new", state.get("stop"))
+    fields = {"stop": Decimal(str(new)), "quantity_remaining": state["quantity"], "pnl_units": "RAW"}
+    if move is not None and move.get("old") is not None:
+        fields["previous_stop"] = Decimal(str(move["old"]))
+    average, step, cost = state.get("average_entry"), visual.get("price_step"), visual.get("step_cost")
+    if None not in (average, step, cost) and Decimal(str(step)) > 0:
+        direction = 1 if visual["side"] == "BUY" else -1
+        fields["pnl_at_stop"] = (direction * (fields["stop"] - Decimal(str(average))) * state["quantity"]
+                                 * Decimal(str(cost)) / Decimal(str(step)))
+        fields["pnl_units"] = "RUB"
+    return fields

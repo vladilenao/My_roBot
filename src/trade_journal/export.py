@@ -118,6 +118,7 @@ REASON_LABELS = {
     "pattern-profitable-same-formation": "добор по той же формации",
     "cost-aware-break-even": "безубыток всей сделки",
     "atr-trailing-stop": "трейлинг по ATR",
+    "ma-cloud-protective-stop": "подтяжка за облаком MA",
     "STOP": "стоп", "CLOSE": "закрытие", "REDUCE": "частичный выход",
     "next-bar": "вход перенесён на следующий бар",
     "entry-timeout": "вход не исполнен в отведённое время",

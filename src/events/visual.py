@@ -78,7 +78,7 @@ def visual_schema():
                        "sequence": integer, "revision": integer, "as_of": text, "instrument": text,
                        "side": {"type": "string", "enum": ["BUY", "SELL"]}, "timeframe": text,
                        "unit": {"type": "string", "enum": ["lot", "contract"]}, "lot_size": integer,
-                       "price_step": text, "plan": plan, "state": state,
+                       "price_step": text, "step_cost": text, "plan": plan, "state": state,
                        "fills": {"type": "array", "items": fill, "maxItems": HISTORY_LIMIT},
                        "fill_groups": {"type": "array", "items": group},
                        "stops": {"type": "array", "items": stop, "maxItems": HISTORY_LIMIT},

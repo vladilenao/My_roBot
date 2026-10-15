@@ -1118,7 +1118,21 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     "occurred_at": {
       "type": "string"
     },
-    "visual": {"$ref": "visual-snapshot.json"}
+    "previous_stop": {
+      "type": "string"
+    },
+    "quantity_remaining": {
+      "type": "number"
+    },
+    "pnl_at_stop": {
+      "type": "string"
+    },
+    "pnl_units": {
+      "type": "string"
+    },
+    "visual": {
+      "$ref": "visual-snapshot.json"
+    }
   },
   "additionalProperties": false
 }

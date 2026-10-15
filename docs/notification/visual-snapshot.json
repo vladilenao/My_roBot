@@ -17,6 +17,7 @@
     "unit": {"type": "string", "enum": ["lot", "contract"]},
     "lot_size": {"type": "integer", "minimum": 0},
     "price_step": {"type": "string"},
+    "step_cost": {"type": "string"},
     "plan": {
       "type": "object", "additionalProperties": false,
       "required": ["entry", "stop", "quantity", "targets", "trailing_quantity", "algorithm_version"],
