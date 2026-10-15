@@ -48,6 +48,8 @@ from src.config import (
     LOGGING_LEVEL,
     LOGGING_MAX_BYTES,
     LOGGING_BACKUP_COUNT,
+    TELEGRAM_BOT_TOKEN,
+    CLOUDFLARE_URL,
     CLEARING_TIMES,
     INITIAL_DEPOSIT,
     DATABASE_FILE,
@@ -435,6 +437,8 @@ def _launch(
         level=LOGGING_LEVEL,
         max_bytes=LOGGING_MAX_BYTES,
         backup_count=LOGGING_BACKUP_COUNT,
+        secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
+                 MARKET_DATA_EXPORT_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
     )
     log.info("Робот v%s запущен", __version__)
     # Независимые полосы: данные собираются с момента запуска процесса, пока
