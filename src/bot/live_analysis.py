@@ -481,6 +481,8 @@ class LiveAnalysis:
                         self._prime_management_pair(instrument, tf, needs[tf])
                     frame = self.cache.frame_for(instrument, tf)
                     self.publish_status(instrument, tf, frame)
+                    # Свечи для графиков переноса стопа и итога сделки.
+                    self.bot._remember_market(instrument, tf, frame)
                     if not bindings:
                         # ТФ плана открытой сделки без привязок: только сопровождение.
                         self._manage_unbound(instrument, tf, frame, needs[tf], managed, execution_complete)
