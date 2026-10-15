@@ -191,7 +191,7 @@ class LiveAnalysis:
             decision = self.bot._signal_filter.apply(raw, context, profile_name=binding.filter_profile,
                 instrument=instrument, timeframe=tf)
         filtered = raw.signal_type is not SignalType.HOLD and decision.signal_type is SignalType.HOLD
-        return decision, context, ta, filtered
+        return decision, context, ta, filtered, raw
 
     def register_needs(self):
         """Потребности прогрева без сети: owner передаёт их фоновой полосе."""
@@ -255,7 +255,7 @@ class LiveAnalysis:
                         quality = self._quality(instrument, binding, frame, prepare=True)
                         row["reason"] = (reason + "; " + quality) if reason and quality else quality
                         if not row["reason"]:
-                            decision, _, ta, filtered = self._calculate(instrument, binding, frame)
+                            decision, _, ta, filtered, _ = self._calculate(instrument, binding, frame)
                             row["outcome"] = "FILTERED" if filtered else decision.signal_type.name
                             row["indicators"] = self.bot._ta_digest(ta)
                             any_calculated = True
@@ -473,6 +473,7 @@ class LiveAnalysis:
             self.cache.refresh_live()
             self.diagnose_clearing()
             execution_complete = self.bot._post_tick({self.bot._protection_timeframe}) is not False if self.bot._post_tick else True
+            admits_signals = getattr(self.bot._trade_manager, "actions_for_signal", None) is not None
             for instrument in self.bot._instruments:
                 needs = self.bot._management_needs(instrument)
                 for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)} | set(needs)):
@@ -509,8 +510,13 @@ class LiveAnalysis:
                                     break
                             publish = None
                             try:
-                                decision, context, _, filtered = self._calculate(instrument, binding, asof)
+                                decision, context, _, filtered, raw = self._calculate(instrument, binding, asof)
                                 current = self.current(instrument, tf, decision.bar_time) and stamp == frame["datetime"].iloc[-1]
+                                if current and execution_complete and admits_signals:
+                                    # Фильтр входа применяет допуск менеджера: в консоли
+                                    # СИГНАЛ и под ним ОТКЛОНЕНО с причиной фильтра, а
+                                    # противоположный сигнал доходит до сопровождения сырым.
+                                    decision, filtered = raw, False
                                 publish = partial(self.bot._publish_decision, decision, instrument,
                                     filter_profile=binding.filter_profile, filtered_out=filtered, timeframe=tf,
                                     analysis_mode="live" if current else "historical")

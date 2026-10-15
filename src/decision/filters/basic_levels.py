@@ -53,3 +53,12 @@ class BasicLevelsFilter:
             links=TraceLinks(signal_id=decision.event_id),
             outcome=TraceOutcome.REJECTED if blocked else TraceOutcome.ACCEPTED,
         )
+
+    @staticmethod
+    def rejection_text(trace: CalculationTrace) -> str:
+        """Человеческая причина отказа по входам трассы; пусто, если вход пропущен."""
+        if trace.reason != "trend-opposes-entry":
+            return ""
+        if trace.inputs["signal"].value == SignalType.BUY.value:
+            return "покупка против нисходящего тренда"
+        return "продажа против восходящего тренда"
