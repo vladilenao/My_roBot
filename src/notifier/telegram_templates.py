@@ -7,6 +7,7 @@ from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.notifier.templates.holds import data_reason
 from src.events.visual import breaks_of, utc
+from src.trade_journal.reasons import REASON_LABELS
 
 PHASES = {"PLANNED": "План создан", "ENTRY_PENDING": "В работе, ждёт подтверждения",
           "OPEN": "Открыта", "BUILDING": "Открыта · добор", "REDUCING": "Частично закрыта",
@@ -307,6 +308,9 @@ def render(event, *, root=False, tz_offset_hours=0):
         if fill:
             verb = "Куплено" if fill["side"] == "BUY" else "Продано"
             lines.append(f"{verb}: {quantity(fill['quantity'], unit)} по <code>{price(fill['price'], step)}</code>")
+            if fill["role"] == "REDUCE" and REASON_LABELS.get(fill.get("reason") or ""):
+                # Только русская подпись: сырой код причины пользователю не показывается.
+                lines.append("Причина: " + escape(REASON_LABELS[fill["reason"]]))
         if state.get("average_entry") is not None:
             lines.append("Средняя входа: " + price(state["average_entry"], step))
         lines += ["Остаток: " + quantity(state["quantity"], unit)] + _levels(state, step, unit, current=True)

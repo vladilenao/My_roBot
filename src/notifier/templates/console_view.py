@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.holds import UNKNOWN_SCHEDULE, data_reason
-from src.trade_journal.export import reason_label
+from src.trade_journal.reasons import reason_label
 
 COLORS = {"buy": "\x1b[32m", "sell": "\x1b[35m", "warning": "\x1b[33m",
           "error": "\x1b[31m", "muted": "\x1b[90m"}

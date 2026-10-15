@@ -10,9 +10,15 @@ from src.notifier.telegram_delivery import markup
 from src.notifier.telegram_templates import event_role
 
 
+# Этапы с кнопкой в корневой карточке; ЦЕЛЬN — по номеру цели.
+STAGE_ROLES = {"СТОП", "Частичный выход", "Итог"}
+PARTIAL_EXIT_TITLE = "<b>Частичный выход · подтверждено</b>"
+
+
 def event_navigation(event):
+    """Единственное правило ролей этапа: для доставки и для навигации до HTTP."""
     role = event_role(event)
-    roles = [role] if role.startswith("ЦЕЛЬ") or role in {"СТОП", "Итог"} else []
+    roles = [role] if role.startswith("ЦЕЛЬ") or role in STAGE_ROLES else []
     visual = event.get("visual")
     if role == "Итог" and visual:
         fill = next((f for f in visual["fills"] if f["key"] == visual["event_key"]), None)
@@ -29,9 +35,7 @@ def descriptor(operation, trade_id):
     if operation["method"] not in {"sendPhoto", "sendMessage"} or not operation["operation_key"].endswith(":post"):
         return result
     result["root"] = operation["event_key"] == f"signal:{trade_id}"
-    data = json.loads(operation["data_json"])
-    lines = (data.get("caption") or data.get("text") or "").splitlines()
-    title = lines[1] if len(lines) > 1 else ""
+    title = _title(operation)
     target = re.fullmatch(r"<b>(ЦЕЛЬ\d+) · (?:подтверждено|частично исполнена)</b>", title)
     if target:
         result["roles"] = [target[1]]
@@ -45,6 +49,15 @@ def descriptor(operation, trade_id):
     return result
 
 
+def _title(operation):
+    """Заголовок основного поста — вторая строка подписи; у прочих операций пусто."""
+    if operation["method"] not in {"sendPhoto", "sendMessage"} or not operation["operation_key"].endswith(":post"):
+        return ""
+    data = json.loads(operation["data_json"])
+    lines = (data.get("caption") or data.get("text") or "").splitlines()
+    return lines[1] if len(lines) > 1 else ""
+
+
 def register_confirmed(repo, trade_id):
     """Повторяемая локальная регистрация, без HTTP и без отката root_text."""
     posts = [op for op in repo.trade_operations(trade_id)
@@ -52,6 +65,9 @@ def register_confirmed(repo, trade_id):
              and op["method"] in {"sendPhoto", "sendMessage"}]
     for op in posts:
         nav = descriptor(op, trade_id)
+        if "Частичный выход" not in nav["roles"] and _title(op) == PARTIAL_EXIT_TITLE:
+            # Пост доставлен до появления роли: известный заголовок, навигация не переписывается.
+            nav = dict(nav, roles=[*nav["roles"], "Частичный выход"])
         if nav["root"] and repo.root(trade_id) is None:
             data = json.loads(op["data_json"])
             repo.set_root(trade_id, op["message_id"], "photo" if op["method"] == "sendPhoto" else "text",
