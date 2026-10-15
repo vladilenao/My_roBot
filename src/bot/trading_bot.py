@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
-from src.config import BAR_TIME_TZ_OFFSET_HOURS
+from src.config import BAR_TIME_TZ_OFFSET_HOURS, TIMEFRAMES
 from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
@@ -22,6 +22,7 @@ from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
 from src.history.contract_lifecycle import ConstantContractLifecycle, ContractLifecycleError
+from src.history.warmup import obligation_requirements
 
 log = get_logger(__name__)
 
@@ -331,7 +332,13 @@ class TradingBot:
     ) -> None:
         assignments = self._strategies_for(instrument)
         assigned_tfs = {assignment.timeframe for assignment in assignments}
-        management_tfs = {self._protection_timeframe} if self._trade_manager is not None else set()
+        # Защитный 1m нужен действиям, не связанным с баром (таймаут входа,
+        # экспирация); профиль на нём не считается — менеджер сопровождает
+        # сделку только кадром таймфрейма её плана.
+        management_tfs = (
+            {self._protection_timeframe} | set(self._management_needs(instrument))
+            if self._trade_manager is not None else set()
+        )
         for tf in sorted(
             (assigned_tfs | management_tfs) & ready_tfs,
             key=lambda timeframe: (timeframe != self._protection_timeframe, timeframe),
@@ -744,6 +751,21 @@ class TradingBot:
                     self._future_strategies.get(FAMILIES[instrument.family][0], []))
             return self._future_strategies.get(instrument.ticker[:2].upper(), [])
         return self._share_strategies.get(instrument.ticker, [])
+
+    # ── ТФ и прогрев сопровождения незавершённых сделок инструмента ──
+    def _management_needs(self, instrument: Instrument) -> dict[str, int]:
+        """Таймфреймы планов незавершённых сделок с прогревом их профилей.
+
+        Сделка сопровождается на таймфрейме своего плана, даже если привязок
+        на нём в конфигурации не осталось; служебный 1m из требований не
+        считается таймфреймом сопровождения, если на нём нет самой сделки.
+        """
+        obligations = getattr(self._trade_manager, "management_obligations", None)
+        if not callable(obligations):
+            return {}
+        trades = obligations(instrument_key(instrument))
+        planned = {trade.plan.timeframe for trade in trades if trade.plan.timeframe in TIMEFRAMES}
+        return {tf: count for tf, count in obligation_requirements(trades).items() if tf in planned}
 
     # ── ТФ, задействованные привязками инструмента ──
     def _assigned_timeframes(self, instrument: Instrument) -> set[str]:

@@ -170,6 +170,17 @@ def created_before_step(created_at, since) -> bool:
     return as_aware(stamp) < as_aware(since)
 
 
+def _known_timeframe(timeframe: str) -> bool:
+    """Таймфрейм плана распознан и пригоден для сопровождения по барам."""
+    if not timeframe:
+        return False
+    try:
+        tf_period_minutes(timeframe)
+    except ValueError:
+        return False
+    return True
+
+
 def _entry_ttl_seconds(timeframe: str) -> int:
     """Срок ожидания исполнения входа в секундах по таймфрейму сделки.
 
@@ -254,6 +265,7 @@ class TradeManager:
         self._signal_filter = signal_filter
         self._risk = PortfolioRiskManager()
         self._traces = CalculationTraceRepository(storage)
+        self._unknown_timeframe_reported: set[str] = set()
         self._contract_expiry_block_days = contract_expiry_block_days
         self._direction_limits = {
             instrument_type: frozenset(str(direction).lower() for direction in directions)
@@ -437,6 +449,15 @@ class TradeManager:
                 if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
                     submitted.append(action)
         return tuple(submitted)
+
+    def management_obligations(self, instrument_id: str) -> tuple[RecoveredTrade, ...]:
+        """Незавершённые сделки инструмента — источник ТФ сопровождения.
+
+        Читает только журнал, без регистрации у брокера: цикл зовёт его на
+        каждом шаге, чтобы знать таймфреймы планов, которые надо загружать и
+        обходить, даже когда привязок на них в конфигурации не осталось.
+        """
+        return tuple(trade for trade in self._storage.load_trades() if trade.plan.instrument_id == instrument_id)
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -1156,7 +1177,14 @@ class TradeManager:
         timeframe: str | None = None,
         now: datetime | None = None,
     ) -> tuple[TradeAction, ...]:
-        """Protect each live trade of the instrument from the provided frame."""
+        """Protect each live trade of the instrument from the provided frame.
+
+        Профиль сопровождения считается только для сделок, чей таймфрейм плана
+        совпадает с ``timeframe`` кадра: бар другого таймфрейма не двигает стоп,
+        не даёт сигнальных выходов и не меняет состояние профиля. Действия, не
+        связанные с баром (экспирация, переход контракта, таймаут входа),
+        выполняются на любом вызове.
+        """
         now = now or as_aware(self._clock.now())
         if self.contract_lifecycle is not None and self.contract_lifecycle.retiring(instrument_key(instrument), now):
             return self.drain_contract(instrument_key(instrument))
@@ -1175,6 +1203,11 @@ class TradeManager:
                 continue
             profile_cls = PROFILE_CLASSES.get(plan.profile.name)
             if profile_cls is None:
+                continue
+            if not _known_timeframe(plan.timeframe):
+                self._report_unknown_timeframe(plan)
+                continue
+            if plan.timeframe != timeframe:
                 continue
             market = build_management_market(
                 contract=meta,
@@ -1207,6 +1240,27 @@ class TradeManager:
                 except (ValueError, TradeManagementException) as exc:
                     log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(results)
+
+    def _report_unknown_timeframe(self, plan: TradePlan) -> None:
+        """Сделка без распознанного таймфрейма плана не сопровождается по барам.
+
+        Действующая защита остаётся у брокера; причина видна в аудите и логе
+        один раз на сделку за запуск, а не на каждом баре.
+        """
+        if plan.trade_id in self._unknown_timeframe_reported:
+            return
+        self._unknown_timeframe_reported.add(plan.trade_id)
+        log.warning("manage %s: таймфрейм плана %r неизвестен — сопровождение по барам не выполняется, "
+                    "действует текущий стоп", plan.trade_id, plan.timeframe)
+        self._traces.record(calculation_trace(
+            "management.timeframe",
+            inputs={"plan_timeframe": MeasuredValue(plan.timeframe or None, "timeframe")},
+            result=MeasuredValue([], "actions"),
+            reason="management-timeframe-unknown",
+            formula="known plan timeframe -> management on its closed bars",
+            links=TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
 
     def _enrich_owned_market(self, recovered, market):
         """Supply durable factors and causality to versioned profile management."""
@@ -1317,6 +1371,23 @@ class TradeManager:
         plan, state = owned.plan, owned.state
         profile_cls = PROFILE_CLASSES.get(plan.profile.name)
         if profile_cls is None:
+            return ()
+        if plan.timeframe != timeframe:
+            # Сигнал своей связки с другого таймфрейма (например, после смены
+            # tf в конфигурации) сделку не сопровождает: ни добора, ни выхода.
+            log.info("actions_for_signal %s: сигнал %s на %s не относится к сделке %s на %s",
+                     plan.instrument_id, decision.event_id, timeframe, plan.trade_id, plan.timeframe or "?")
+            self._traces.record(calculation_trace(
+                "management.timeframe",
+                inputs={"plan_timeframe": MeasuredValue(plan.timeframe or None, "timeframe"),
+                        "signal_timeframe": MeasuredValue(timeframe, "timeframe"),
+                        "signal": MeasuredValue(decision.signal_type.value, "signal")},
+                result=MeasuredValue([], "actions"),
+                reason="management-timeframe-mismatch",
+                formula="signal timeframe == plan timeframe -> management by signal",
+                links=TraceLinks(assignment_id=assignment.id, trade_id=plan.trade_id, signal_id=decision.event_id),
+                outcome=TraceOutcome.REJECTED,
+            ))
             return ()
         market = build_management_market(
             contract=meta,

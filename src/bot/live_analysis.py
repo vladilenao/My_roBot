@@ -203,6 +203,10 @@ class LiveAnalysis:
                     for need_tf, count in self._required(binding).items():
                         self.cache.prepare_live_history(instrument, need_tf, count,
                                                         max_close=self._warmup_close(instrument, need_tf))
+            # ТФ планов открытых сделок загружаются с прогревом их профилей,
+            # даже если привязок на этом ТФ в конфигурации не осталось.
+            for tf, count in self.bot._management_needs(instrument).items():
+                self.cache.prepare_live_history(instrument, tf, count, max_close=self._warmup_close(instrument, tf))
 
     def bootstrap(self):
         """Стартовый пакет состояний имеет явную границу для консольной группировки."""
@@ -225,9 +229,16 @@ class LiveAnalysis:
                                                 max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
             except Exception as exc:
                 self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} 1m")
+            needs = self.bot._management_needs(instrument)
+            for tf in sorted(set(needs) - {a.timeframe for a in self.bot._strategies_for(instrument)}):
+                try:
+                    frame = self._prime_management_pair(instrument, tf, needs[tf])
+                    self.publish_status(instrument, tf, frame)
+                except Exception as exc:
+                    self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} {tf}")
             for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
                 bindings = self._bindings(instrument, tf)
-                required = max(self._required(a)[tf] for a in bindings)
+                required = max([*(self._required(a)[tf] for a in bindings), needs.get(tf, 0)])
                 rows, frame, reason = [], pd.DataFrame(), ""
                 try:
                     frame = self.cache.prepare_live_history(instrument, tf, required,
@@ -269,6 +280,57 @@ class LiveAnalysis:
                     available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
                 self.bot._prime_pattern_bar(instrument, tf, frame)
                 self.publish_status(instrument, tf, frame)
+
+    def _management_cursor(self, instrument, tf):
+        return "management", instrument_key(instrument), tf
+
+    def _prime_management_pair(self, instrument, tf, required):
+        """ТФ плана открытой сделки без привязок: прогрев, состояние данных, курсор.
+
+        На таком ТФ нет стратегий и решений — только сопровождение сделок по
+        закрытию его баров. Последний уже имеющийся бар считается обработанным.
+        """
+        reason = ""
+        try:
+            frame = self.cache.prepare_live_history(instrument, tf, required,
+                                                    max_close=self._warmup_close(instrument, tf))
+        except Exception as exc:
+            reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+            frame = self.cache.frame_for(instrument, tf)
+        close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
+        self.states[self._key(instrument, tf)] = LivePairState("tbank_exchange", instrument_key(instrument), tf,
+            received_bar=close, analyzed_bar=None, analysis_mode="", available_bars=len(frame),
+            required_bars=required, coverage_complete=not reason and len(frame) >= required, reason=reason)
+        self.cursors[self._management_cursor(instrument, tf)] = frame["datetime"].iloc[-1] if not frame.empty else None
+        return frame
+
+    def _manage_unbound(self, instrument, tf, frame, required, managed, execution_complete):
+        """Сопровождение сделок на ТФ плана без привязок по новому текущему бару.
+
+        Решения принимает менеджер только на закрытии бара этого ТФ и только
+        по его истории; без доказанного 1m-префикса, полного прогрева и
+        покрытия курсор не двигается — бар дождётся данных, а не потеряется.
+        """
+        if frame.empty:
+            return
+        key = self._management_cursor(instrument, tf)
+        stamp = frame["datetime"].iloc[-1]
+        cursor = self.cursors.get(key)
+        if cursor is not None and stamp <= cursor:
+            return
+        close = self.timeline.grid(tf).bar_close(stamp)
+        if not self.current(instrument, tf, close):
+            self.cursors[key] = stamp
+            return
+        if not execution_complete or self._execution_barrier(instrument, close):
+            return
+        if len(frame) < required or not self.cache.coverage_for(instrument, tf, frame.tail(required)):
+            return
+        management_key = instrument_key(instrument), tf, stamp
+        if management_key not in managed:
+            self.bot._manage(instrument, [], frame.tail(required).reset_index(drop=True).copy(), None, tf)
+            managed.add(management_key)
+        self.cursors[key] = stamp
 
     def publish_status(self, instrument, tf, frame):
         now = self.timeline.now()
@@ -412,10 +474,17 @@ class LiveAnalysis:
             self.diagnose_clearing()
             execution_complete = self.bot._post_tick({self.bot._protection_timeframe}) is not False if self.bot._post_tick else True
             for instrument in self.bot._instruments:
-                for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                    frame = self.cache.frame_for(instrument, tf)
+                needs = self.bot._management_needs(instrument)
+                for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)} | set(needs)):
                     bindings = self._bindings(instrument, tf)
+                    if not bindings and self._key(instrument, tf) not in self.states:
+                        self._prime_management_pair(instrument, tf, needs[tf])
+                    frame = self.cache.frame_for(instrument, tf)
                     self.publish_status(instrument, tf, frame)
+                    if not bindings:
+                        # ТФ плана открытой сделки без привязок: только сопровождение.
+                        self._manage_unbound(instrument, tf, frame, needs[tf], managed, execution_complete)
+                        continue
                     if not frame.empty:
                         self.bot._submit_pattern_bar(instrument, tf, frame)
                     for binding in bindings:
@@ -448,7 +517,11 @@ class LiveAnalysis:
                                     work_frame = asof.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
                                     management_key = instrument_key(instrument), tf, stamp
                                     if management_key not in managed:
-                                        self.bot._manage(instrument, bindings, work_frame, context, tf)
+                                        # Кадр сопровождения покрывает и прогрев профилей
+                                        # открытых сделок этого ТФ, а не только привязки.
+                                        depth = max(self._required(binding)[tf], needs.get(tf, 0))
+                                        management_frame = asof.tail(depth).reset_index(drop=True).copy()
+                                        self.bot._manage(instrument, bindings, management_frame, context, tf)
                                         managed.add(management_key)
                                     # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО
                                     # идут в консоли одним блоком с СИГНАЛ.

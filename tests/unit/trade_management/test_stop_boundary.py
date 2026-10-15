@@ -42,7 +42,7 @@ def _plan(side: str = "BUY", profile: str = "levels_rr") -> TradePlan:
     return TradePlan(
         "trade-1", "assignment-1", "NGV6", side, "signal-1", Decimal("100"), stop,
         (TargetPlan("tp-1", target, Decimal("1")),),
-        ProfileSnapshot(profile, "1", {"buffer": Decimal("1")}), NOW,
+        ProfileSnapshot(profile, "1", {"buffer": Decimal("1")}), NOW, timeframe="1m",
     )
 
 
@@ -247,7 +247,7 @@ def test_one_rejected_action_does_not_block_the_other_in_the_same_pass(tmp_path,
         )
         instrument = type("Instrument", (), {"ticker": "NGV6"})()
 
-        submitted = manager.manage(instrument, (), frame, now=NOW)
+        submitted = manager.manage(instrument, (), frame, timeframe="1m", now=NOW)
 
         assert [action.command_id for action in submitted] == ["stop-good"]
         assert storage.connection.execute(
