@@ -1018,9 +1018,9 @@ class TradeManager:
         """Runtime metadata, independent of the notification channel."""
         self._visual_instruments.update({instrument_key(i): i for i in instruments})
 
-    def remember_market(self, instrument, timeframe, frame, as_of):
+    def remember_market(self, instrument, timeframe, frame, as_of, breaks=None):
         self._visual_instruments[instrument_key(instrument)] = instrument
-        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of)
+        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of, breaks)
 
     def _notify_execution(self, event):
         if self._execution_observer is None:

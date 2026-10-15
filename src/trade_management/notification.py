@@ -44,7 +44,7 @@ def quantity_context(instrument=None, meta=None):
     return result
 
 
-def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=None, diagnostics=None):
+def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=None, diagnostics=None, breaks=None):
     as_of = utc(as_of or plan.created_at)
     name = getattr(instrument, "short_name", None) or (
         instrument.ticker if getattr(instrument, "instrument_type", "") == "share" else "контракт не указан")
@@ -58,7 +58,7 @@ def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=Non
                            "side": plan.side, "timeframe": plan.timeframe, **quantity_context(instrument, meta),
                            "plan": data, "state": {"phase": "ENTRY_PENDING", "quantity": 0, "targets": ()},
                            "fills": (), "fill_groups": (), "stops": (),
-                           "market": market_snapshot(frame, plan.timeframe, as_of),
+                           "market": market_snapshot(frame, plan.timeframe, as_of, breaks),
                            "financial": {"units": "RUB", "fees_known": False, "fees_source": "unknown"}})
 
 
@@ -115,7 +115,7 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
         stops.append({"key": fact["event_id"], "time": fact["occurred_at"], "old": previous,
                       "new": price, "reason": json.loads(fact["command_json"])["reason"] if fact["action_type"] == "MOVESTOP" else "entry-protection"})
         previous = price
-    market = market or {"candles": (), "limited": False, "gaps": False,
+    market = market or {"candles": (), "breaks": (), "limited": False, "gaps": False,
                         "history_limited": False, "stop_history_limited": False}
     detailed, groups, stops, market = bounded_history(fills, stops, market)
     initial_targets = tuple({"id": t["target_id"], "number": i + 1, "price": Decimal(t["price"]),

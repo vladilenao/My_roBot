@@ -63,6 +63,12 @@
           "type": "object", "additionalProperties": false, "required": ["time", "open", "high", "low", "close"],
           "properties": {"time": {"type": "string"}, "open": {"type": "string"}, "high": {"type": "string"}, "low": {"type": "string"}, "close": {"type": "string"}}
         }},
+        "breaks": {"type": "array", "maxItems": 80, "items": {
+          "type": "object", "additionalProperties": false, "required": ["after", "before", "kind", "missing"],
+          "properties": {"after": {"type": "string"}, "before": {"type": "string"},
+                         "kind": {"type": "string", "enum": ["closed", "no_trade", "schedule_unavailable", "missing"]},
+                         "missing": {"type": "integer", "minimum": 1}}
+        }},
         "limited": {"type": "boolean"}, "gaps": {"type": "boolean"}, "history_limited": {"type": "boolean"},
         "stop_history_limited": {"type": "boolean"}, "boundary_stop": {"type": "string"}
       }

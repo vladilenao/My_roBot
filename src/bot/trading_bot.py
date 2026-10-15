@@ -13,6 +13,7 @@ from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
 from src.events.event import Event
+from src.events.visual import CANDLE_LIMIT
 from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
 from src.notifier.errors import is_rate_limit
@@ -395,7 +396,8 @@ class TradingBot:
     ) -> None:
         remember_market = getattr(self._trade_manager, "remember_market", None)
         if callable(remember_market):
-            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
+            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]),
+                            breaks=self._chart_breaks(instrument, tf, frame))
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -649,6 +651,18 @@ class TradingBot:
             )
         )
 
+    def _chart_breaks(self, instrument, timeframe, frame):
+        """Вид разрывов окна графика от слоя данных; сбой не мешает торговле."""
+        classify = getattr(self._data_cache, "chart_breaks", None)
+        if not callable(classify) or frame is None or len(frame) == 0 or not timeframe:
+            return None
+        try:
+            breaks = classify(instrument, timeframe, frame.tail(CANDLE_LIMIT + 1))
+        except Exception as exc:
+            log.warning("График: разрывы окна не классифицированы (%s).", type(exc).__name__)
+            return None
+        return breaks if isinstance(breaks, Mapping) else None
+
     def _publish_signal(
         self,
         plan,
@@ -664,7 +678,8 @@ class TradingBot:
         economics = plan.economics
         contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
         meta = contract_for(instrument_key(instrument)) if callable(contract_for) else None
-        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
+        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics,
+                                 self._chart_breaks(instrument, plan.timeframe, frame))
         self._bus.publish(
             Event.signal(
                 self._display_name(instrument),
