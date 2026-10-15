@@ -20,6 +20,11 @@ from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)
 
+# Вид разрыва графика по тяжести и вид разрешённых состояний покрытия
+# (telegram-trade-cards, data-cache «Классификация разрывов окна»).
+_CHART_BREAK_ORDER = ("closed", "no_trade", "schedule_unavailable", "missing")
+_CHART_RESOLVED_KINDS = {"scheduled_closed": "closed", "confirmed_no_trade": "no_trade", "source_absent": "no_trade"}
+
 
 def _synchronized(method):
     """Защищает кадры при фоновом приёме и основном торговом цикле."""
@@ -1226,6 +1231,55 @@ class MarketDataCache:
         if floor is not None:
             self._pre_cutover_gaps[uid, timeframe] = unconfirmed
         return True
+
+    def chart_breaks(self, instrument, timeframe, frame) -> dict:
+        """Вид каждого разрыва окна для графика сделки.
+
+        Ключ — (открытие свечи перед разрывом, открытие свечи после), UTC-naive;
+        значение — ``{"kind", "missing"}``. Источник — долговечное покрытие и
+        уже известный календарь того же рыночного слоя. Без сети, без записи
+        и без влияния на готовность: при любой неясности разрыв остаётся
+        ``schedule_unavailable``, а не пропуском и не полными данными.
+        """
+        if frame is None or frame.empty:
+            return {}
+        grid = self._timeline.grid(timeframe)
+        stamps = sorted({_naive(value) for value in frame["datetime"]})
+        gaps = {}
+        for left, right in zip(stamps, stamps[1:]):
+            probes, probe = [], _naive(grid.bar_close(left))
+            while probe < right:
+                probes.append(probe)
+                following = _naive(grid.bar_close(probe))
+                if following <= probe:
+                    break
+                probe = following
+            if probes:
+                gaps[left, right] = probes
+        unknown = {key: {"kind": "schedule_unavailable", "missing": len(probes)} for key, probes in gaps.items()}
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not gaps or not uid or self._market_store is None or self._market_reconciler is None:
+            return unknown
+        try:
+            window = self._market_store.window_snapshot(source=self._market_source, instrument_uid=uid,
+                                                        interval=timeframe, lower=stamps[0], upper=stamps[-1])
+            calendars = self._market_reconciler.stored_calendars(uid, self._timeline.now())
+        except Exception as exc:
+            log.warning("График %s %s: покрытие окна недоступно (%s).", uid, timeframe, type(exc).__name__)
+            return unknown
+
+        def kind(probe):
+            state = window["states"].get(probe, (None, None))[0]
+            if state in _CHART_RESOLVED_KINDS:
+                return _CHART_RESOLVED_KINDS[state]
+            calendar = next((item for item in calendars if item.covers(probe)), None)
+            if calendar is None:
+                return "schedule_unavailable"
+            closed = _naive(grid.bar_close(probe))
+            return "missing" if any(start < closed and probe < end for start, end in calendar.intervals) else "closed"
+
+        return {key: {"kind": max((kind(probe) for probe in probes), key=_CHART_BREAK_ORDER.index),
+                      "missing": len(probes)} for key, probes in gaps.items()}
 
     def calendar_for(self, instrument):
         uid = self._uids.get(self._key(instrument, "1m")) or getattr(instrument, "uid", None)

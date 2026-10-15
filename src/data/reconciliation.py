@@ -281,17 +281,7 @@ class MarketDataReconciler:
             calendar = self._market_calendar.calendar_for(instrument_uid, current.to_pydatetime())
             return _session_calendar_from_trading_calendar(calendar)
         if self._budget is not None:
-            if instrument_uid not in self._ranges:
-                self._ranges[instrument_uid] = []
-                for payload, observed in self._store.observations(source=self._source,
-                        instrument_uid=instrument_uid, kind="trading_schedule"):
-                    if "coverage_start" not in payload or "coverage_end" not in payload:
-                        continue
-                    self._ranges[instrument_uid].append(SessionCalendar(payload["exchange"],
-                        tuple((to_naive(item["start"]), to_naive(item["end"])) for item in payload["intervals"]),
-                        to_naive(payload["coverage_start"]), to_naive(payload["coverage_end"]), observed,
-                        self._source, tuple(to_naive(day) for day in payload.get("covered_dates", ()))))
-            found = next((cal for cal in reversed(self._ranges[instrument_uid]) if cal.covers(point)), None)
+            found = next((cal for cal in reversed(self._saved_ranges(instrument_uid)) if cal.covers(point)), None)
             if found is None or (point >= current.normalize() and current - found.observed_at >= self._refresh):
                 if point.normalize() < current.normalize():
                     # TradingSchedules отклоняет `from` раньше текущей даты
@@ -417,6 +407,38 @@ class MarketDataReconciler:
 
     def session_calendar(self, instrument_uid, now):
         return self._calendar_for(instrument_uid, now)
+
+    def stored_calendars(self, instrument_uid: str, now: object) -> tuple[SessionCalendar, ...]:
+        """Уже известные календари пары, новые первыми: без сети и без постановки загрузки.
+
+        Для представления (график сделки): прошлое доказывают только
+        сохранённые дни, а отключённое календарное доказательство не
+        подменяется расписанием.
+        """
+        if self._market_calendar is not None:
+            if not self._calendar_evidence:
+                return ()
+            exchange = self._market_calendar.exchange_for(instrument_uid)
+            calendar = self._market_calendar.calendar(exchange, to_naive(now).to_pydatetime()) if exchange else None
+            projected = _session_calendar_from_trading_calendar(calendar)
+            return (projected,) if projected is not None else ()
+        if self._budget is not None:
+            return tuple(reversed(self._saved_ranges(instrument_uid)))
+        cached = self._calendars.get(instrument_uid)
+        return (cached[1],) if cached is not None and cached[1] is not None else ()
+
+    def _saved_ranges(self, instrument_uid: str) -> list[SessionCalendar]:
+        if instrument_uid not in self._ranges:
+            self._ranges[instrument_uid] = []
+            for payload, observed in self._store.observations(source=self._source,
+                    instrument_uid=instrument_uid, kind="trading_schedule"):
+                if "coverage_start" not in payload or "coverage_end" not in payload:
+                    continue
+                self._ranges[instrument_uid].append(SessionCalendar(payload["exchange"],
+                    tuple((to_naive(item["start"]), to_naive(item["end"])) for item in payload["intervals"]),
+                    to_naive(payload["coverage_start"]), to_naive(payload["coverage_end"]), observed,
+                    self._source, tuple(to_naive(day) for day in payload.get("covered_dates", ()))))
+        return self._ranges[instrument_uid]
 
     def recheck(self, instrument_uid, interval, now):
         """Ограниченная переоценка 1000 старых статусов на новое доказательство."""

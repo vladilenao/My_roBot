@@ -13,7 +13,10 @@
     {"id": "add-before-target", "stage": "stop", "variant": "add", "expected": {"stage": "stop", "markers": 3, "candles": 20, "needles": ["СТОП перенесён и подтверждён", "Остаток: 2 лота"]}},
     {"id": "target-then-stop", "stage": "final", "variant": "target-stop", "expected": {"stage": "final", "markers": 3, "candles": 22, "result": "ИТОГ +0.5 ₽", "needles": ["СТОП: 1 лот × 297.25", "+6.5 ₽", "+0.5 ₽"]}},
     {"id": "partial-reduce", "stage": "tp1", "variant": "reduce", "expected": {"stage": null, "needles": ["Частичный выход", "Остаток: 1 лот"], "absent": ["Сделка закрыта"]}},
-    {"id": "long-window", "stage": "final", "variant": "long", "expected": {"stage": "final", "markers": 0, "candles": 80, "before_window": 3, "result": "ИТОГ +92 ₽", "needles": ["ограниченное окно", "+92 ₽"]}},
-    {"id": "gap", "stage": "stop", "variant": "gap", "expected": {"stage": "stop", "markers": 2, "candles": 18, "needles": ["неполная история", "пропуски не дорисованы"]}}
+    {"id": "long-window", "stage": "final", "variant": "long", "expected": {"stage": "final", "markers": 0, "candles": 80, "before_window": 3, "result": "ИТОГ +92 ₽", "needles": ["окно: 80 свечей с", "+92 ₽"], "absent": ["расписание", "пропуски данных"], "breaks": ["closed", "closed", "closed"]}, "breaks": "closed"},
+    {"id": "gap", "stage": "stop", "variant": "gap", "expected": {"stage": "stop", "markers": 2, "candles": 18, "needles": ["пропуски данных: 1", "пропуски не дорисованы"], "breaks": ["missing"], "notes": ["пропуски данных: 1"]}, "breaks": "missing"},
+    {"id": "night-between-sessions", "stage": "plan", "variant": "night", "breaks": "closed", "expected": {"stage": "plan", "markers": 0, "candles": 17, "breaks": ["closed"], "notes": [], "needles": ["Вход: 300.00"], "absent": ["График:", "неполная", "расписание"]}},
+    {"id": "weekend", "stage": "plan", "variant": "weekend", "breaks": "closed", "expected": {"stage": "plan", "markers": 0, "candles": 17, "breaks": ["closed"], "notes": [], "absent": ["График:"]}},
+    {"id": "schedule-unavailable-night", "stage": "plan", "variant": "night", "expected": {"stage": "plan", "markers": 0, "candles": 17, "breaks": ["schedule_unavailable"], "notes": ["расписание недоступно: 1 разрыв"], "needles": ["расписание недоступно: 1 разрыв"], "absent": ["пропуски данных"]}}
   ]
 }

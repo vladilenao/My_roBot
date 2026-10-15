@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
-from src.events.visual import utc
+from src.events.visual import breaks_of, utc
 
 PHASES = {"PLANNED": "План создан", "ENTRY_PENDING": "В работе, ждёт подтверждения",
           "OPEN": "Открыта", "BUILDING": "Открыта · добор", "REDUCING": "Частично закрыта",
@@ -35,11 +35,36 @@ def money(value, *, signed=False, units="RUB"):
     return amount + (" ₽" if units == "RUB" else " в единицах цены")
 
 
-def quantity(number, unit="contract"):
+def plural(number, forms):
     number = int(number)
-    forms = ("лот", "лота", "лотов") if unit == "lot" else ("контракт", "контракта", "контрактов")
     form = forms[2] if 11 <= number % 100 <= 14 else forms[0] if number % 10 == 1 else forms[1] if 2 <= number % 10 <= 4 else forms[2]
     return f"{number} {form}"
+
+
+def quantity(number, unit="contract"):
+    return plural(number, ("лот", "лота", "лотов") if unit == "lot" else ("контракт", "контракта", "контрактов"))
+
+
+def chart_notes(visual, offset=0):
+    """Обстоятельства неполноты графика: только те, что есть в снимке.
+
+    Ночь, выходные и интервалы без сделок неполнотой не являются.
+    """
+    market = visual["market"]
+    breaks = breaks_of(market, visual.get("timeframe"))
+    notes = []
+    if market.get("limited") and market["candles"]:
+        start = utc(market["candles"][0]["time"]) + timedelta(hours=offset)
+        notes.append(f"окно: {plural(len(market['candles']), ('свеча', 'свечи', 'свечей'))} с {start:%d.%m %H:%M}")
+    missing = sum(item["kind"] == "missing" for item in breaks)
+    if missing:
+        notes.append(f"пропуски данных: {missing}")
+    unavailable = sum(item["kind"] == "schedule_unavailable" for item in breaks)
+    if unavailable:
+        notes.append(f"расписание недоступно: {plural(unavailable, ('разрыв', 'разрыва', 'разрывов'))}")
+    if market.get("history_limited") or market.get("stop_history_limited"):
+        notes.append("неполная история исполнений")
+    return notes
 
 
 def timeframe_label(value):
@@ -284,6 +309,7 @@ def render(event, *, root=False, tz_offset_hours=0):
             lines.append("Средняя входа: " + price(state["average_entry"], step))
         lines += ["Остаток: " + quantity(state["quantity"], unit)] + _levels(state, step, unit, current=True)
         lines += [""] + _financial(visual["financial"], final=False)
-    if visual["market"]["limited"] or visual["market"]["gaps"] or visual["market"]["history_limited"] or visual["market"]["stop_history_limited"]:
-        lines.append("<i>График: ограниченное окно / неполная история; пропуски не дорисованы.</i>")
+    notes = chart_notes(visual, tz_offset_hours)
+    if notes:
+        lines.append("<i>График: " + "; ".join(notes) + ("; пропуски не дорисованы." if visual["market"]["gaps"] else ".") + "</i>")
     return "\n".join(lines)
