@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
+from src.notifier.templates.holds import data_reason
 from src.events.visual import breaks_of, utc
 
 PHASES = {"PLANNED": "План создан", "ENTRY_PENDING": "В работе, ждёт подтверждения",
@@ -223,8 +224,9 @@ def render(event, *, root=False, tz_offset_hours=0):
             summary = ingestion_summary(event.get("ingestion"))
             if summary:
                 lines.append(escape(summary))
-        if event.get("reason"):
-            lines.append("Причина: " + escape(event.get("reason")))
+        reason = data_reason(event, dated) if event.type is EventType.MARKET_DATA_STATUS else event.get("reason")
+        if reason:
+            lines.append("Причина: " + escape(reason))
         return "\n".join(lines)
     if not visual:
         role = event_role(event)

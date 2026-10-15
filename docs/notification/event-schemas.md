@@ -109,6 +109,13 @@ warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
 и `pre_cutover_gaps` (пробелы прогрева до запуска без доказательства расписания).
 Удержание не означает потерю данных или отсутствие сделок.
 
+Необязательный `hold` — удержание пары структурно, без готовой фразы: `kind`
+(`execution_barrier`/`integrity`/`conflict`/`gap`/`reconciling`) и его моменты как UTC
+ISO8601 — `through` (закрытие бара, до которого не доказана базовая 1m), `minute`
+(открытие изменённой исполненной минуты), `lower`/`upper` и `next_retry_at` (пропуск,
+`state` active|parked). Фразу с временем собирает шаблон канала в своём поясе; `reason`
+фразу удержания не дублирует. Нет удержания — `null`.
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -124,7 +131,8 @@ warming_up/waiting_bar/delayed/coverage_blocked/current/rate_limited.
     "analysis_mode": {"type": "string"}, "expected_bar": {"type": "string"},
     "publication_deadline": {"type": "string"}, "next_open": {"type": "string"},
     "available_bars": {"type": "number"}, "required_bars": {"type": "number"},
-    "coverage_complete": {"type": "boolean"}, "ingestion": {"type": "object"}
+    "coverage_complete": {"type": "boolean"}, "ingestion": {"type": "object"},
+    "hold": {"type": "object"}
   },
   "additionalProperties": false
 }

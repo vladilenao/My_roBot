@@ -36,7 +36,7 @@ def test_market_status_is_event_first_and_omits_transport_diagnostics() -> None:
     delayed = Event.market_data_status("VTBR", timeframe="15m", session="open",
         data_state="delayed", observed_at=datetime(2026, 10, 13, 13, 15),
         expected_bar=datetime(2026, 10, 13, 13, 0))
-    assert shown(delayed, tz_offset_hours=3) == (
+    assert shown(delayed) == (
         "16:15  ЗАДЕРЖКА ДАННЫХ  1 пара\n"
         "                        VTBR · 15м · не получена свеча 16:00"
     )
@@ -53,7 +53,7 @@ def test_decision_and_standalone_rejection_keep_event_first_context() -> None:
     buy = Event.decision("SBER", outcome="signal_buy", side="BUY", price="100.123456",
         strategy="macd_rsi_stoch", filter_profile="raw", timeframe="15m", bar_time=NOW)
     assert shown(buy) == (
-        "13:05  СИГНАЛ        SBER · 15м · ПОКУПКА · цена 100.123\n"
+        "16:05  СИГНАЛ        SBER · 15м · ПОКУПКА · цена 100.123\n"
         "                     macd_rsi_stoch / raw"
     )
     filtered = Event.decision("SBER", outcome="filtered", side="BUY", filtered_out=True)
@@ -65,7 +65,7 @@ def test_decision_and_standalone_rejection_keep_event_first_context() -> None:
 def test_bar_time_offset_and_moscow_publication_are_separate() -> None:
     decision = Event.decision("SBER", outcome="signal_buy", side="BUY", price=300,
         bar_time=datetime(2026, 10, 9, 20, 0))
-    assert shown(decision, tz_offset_hours=3).startswith("23:00  СИГНАЛ")
+    assert shown(decision).startswith("23:00  СИГНАЛ")
     assert shown(Event.error(operation="тик")).startswith("16:05  СБОЙ")
 
 
@@ -168,3 +168,75 @@ def test_narrow_terminal_wraps_without_losing_reason() -> None:
     text = shown(event, width=30)
     assert all(len(line) <= 30 for line in text.splitlines())
     assert "Не хватает свободного бюджета для сделки" in " ".join(line.strip() for line in text.splitlines()).replace("  ", " ")
+
+
+def test_execution_barrier_hold_is_moscow_time_without_zone() -> None:
+    held = Event.market_data_status("SBER", timeframe="15m", session="open", data_state="waiting_bar",
+        observed_at=datetime(2026, 10, 15, 8, 0, 5, tzinfo=timezone.utc),
+        hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)})
+    assert shown(held) == (
+        "11:00  ДАННЫЕ НЕДОСТУПНЫ  1 пара\n"
+        "                        SBER · 15м · Удержано: базовая 1m не подтверждена до 11:00"
+    )
+
+
+def _status(instrument: str, observed_at: datetime, **payload) -> Event:
+    return Event.market_data_status(instrument, timeframe="15m", session="open",
+        data_state=payload.pop("data_state", "waiting_bar"), observed_at=observed_at, **payload)
+
+
+def test_hold_moments_are_short_relative_to_group_date() -> None:
+    utc = timezone.utc
+    morning = datetime(2026, 10, 15, 4, 0, tzinfo=utc)
+    night_gap = _status("SBER", morning, hold={"kind": "gap", "state": "active",
+        "lower": datetime(2026, 10, 14, 20, 45, tzinfo=utc), "upper": datetime(2026, 10, 14, 21, 0, tzinfo=utc)})
+    assert shown(night_gap).endswith("SBER · 15м · Восстановление пропуска 14.10 23:45–00:00")
+    new_year = _status("SBER", datetime(2027, 1, 2, 7, 0, tzinfo=utc), hold={"kind": "integrity",
+        "minute": datetime(2026, 12, 31, 15, 0, tzinfo=utc)})
+    assert shown(new_year).endswith("Удержано: изменена уже исполненная минута 31.12.2026 18:00")
+    parked = _status("SBER", datetime(2026, 10, 15, 7, 20, tzinfo=utc), hold={"kind": "gap", "state": "parked",
+        "lower": datetime(2026, 10, 15, 7, 0, tzinfo=utc), "upper": datetime(2026, 10, 15, 7, 15, tzinfo=utc),
+        "next_retry_at": datetime(2026, 10, 15, 7, 30, tzinfo=utc)})
+    assert " ".join(shown(parked).split()).endswith("Пропуск 10:00–10:15 не восстановлен; следующая проверка 10:30")
+    unknown = _status("SBER", morning, hold={"kind": "integrity", "minute": None})
+    assert shown(unknown).endswith("Удержано: изменена уже исполненная минута")
+    for event in (night_gap, new_year, parked, unknown):
+        assert "UTC" not in shown(event) and "МСК" not in shown(event)
+
+
+def test_hold_with_unknown_schedule_stays_a_data_hold() -> None:
+    held = _status("GAZP", datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc),
+        reason="Применимое торговое расписание неизвестно",
+        hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)})
+    assert shown(held) == (
+        "11:00  ДАННЫЕ НЕДОСТУПНЫ  1 пара\n"
+        "                        GAZP · 15м · Удержано: базовая 1m не подтверждена до 11:00; расписание\n"
+        "                        неизвестно"
+    )
+
+
+def test_console_time_ignores_computer_timezone(monkeypatch) -> None:
+    import time
+    decision = Event.decision("SBER", outcome="signal_buy", side="BUY", price=300,
+        bar_time=datetime(2026, 10, 15, 7, 0))
+    status = _status("SBER", datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc),
+        hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8, 0)})
+    outputs = []
+    try:
+        for zone in ("UTC", "Europe/Moscow", "America/New_York"):
+            monkeypatch.setenv("TZ", zone)
+            time.tzset()
+            outputs.append((shown(decision), shown(status)))
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+    assert len(set(outputs)) == 1
+    assert outputs[0][0].startswith("10:00  СИГНАЛ")
+
+
+def test_telegram_keeps_its_own_dated_hold_phrase() -> None:
+    from src.notifier.telegram_templates import render as telegram_render
+    held = _status("SBER", datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc),
+        hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)})
+    assert "Причина: Удержано: базовая 1m не подтверждена до 15.10.2026 11:00:00 МСК" in telegram_render(
+        held, tz_offset_hours=3)
