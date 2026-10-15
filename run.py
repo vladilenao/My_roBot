@@ -659,13 +659,14 @@ def _cluster_gate(*, history, market_store, data_cache, state_dir):
         copy_store(runtime_dir() / FILE_NAME, state_dir / FILE_NAME)
         store = ClusterEventStore(state_dir / FILE_NAME)
         catch_up(store, _cluster_redis(), stream=CLUSTER_SETTINGS.stream)
-        return ClusterGate(store, cache_candles(data_cache), CLUSTER_SETTINGS), None
+        return ClusterGate(store, cache_candles(data_cache), CLUSTER_SETTINGS, uid_for=data_cache.pair_uid), None
     store = ClusterEventStore(state_dir / FILE_NAME)
     consumer = ClusterEventsConsumer(store, _cluster_redis(), stream=CLUSTER_SETTINGS.stream,
                                      group=CLUSTER_SETTINGS.consumer_group)
     consumer.start()
-    gate = ClusterGate(store, store_candles(market_store, SOURCE_TBANK), CLUSTER_SETTINGS,
-                       consumer=consumer, live=True)
+    # Инструменты live-выбора без UID: адрес пары свечей знает кэш (pair_uid).
+    gate = ClusterGate(store, store_candles(market_store, SOURCE_TBANK, data_cache.pair_uid), CLUSTER_SETTINGS,
+                       consumer=consumer, live=True, uid_for=data_cache.pair_uid)
     return gate, consumer
 
 
