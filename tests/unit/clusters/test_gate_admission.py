@@ -212,3 +212,40 @@ def test_trace_inputs_reproduce_verdict(tmp_path):
     assert datetime.fromisoformat(trace.inputs["close_at_entry"].value["open_time_utc"].replace("Z", "+00:00")) \
         == datetime(2026, 10, 15, 13, 49, tzinfo=timezone.utc)
     assert Decimal(str(trace.inputs["price"].value)) == Decimal("104.63")
+
+
+def test_live_instrument_without_uid_uses_pair_uid(tmp_path):
+    """Live-выбор строит фьючерс без UID: свечи и трасса берут адрес пары из кэша."""
+    from src.clusters.gate import store_candles
+
+    frame = candles(history(), signal_day()).assign(is_complete=True)
+    reads = []
+
+    class Store:
+        def current_frame(self, *, source, instrument_uid, interval):
+            reads.append((source, instrument_uid, interval))
+            return frame
+
+    selected = Instrument("BR-11.26", "BRX6", "future", short_name="BR-11.26", uid=None, family="BR")
+    pair_uid = {"BRX6": "b2d0f863"}.get
+    gate = ClusterGate(_store(tmp_path), store_candles(Store(), "tbank_exchange", lambda i: pair_uid(i.ticker)),
+                       ClusterSettings(), uid_for=lambda i: pair_uid(i.ticker))
+
+    verdict = gate.evaluate(_assignment(), _decision(), selected)
+    trace = gate.trace(verdict, _assignment(), _decision(), selected, "5m", rejected=False)
+
+    assert verdict.verdict == "veto"
+    assert reads == [("tbank_exchange", "b2d0f863", "1m")]
+    assert trace.inputs["instrument_uid"].value == "b2d0f863"
+
+
+def test_card_without_uid_reads_nothing():
+    from src.clusters.gate import store_candles
+
+    class Store:
+        def current_frame(self, **kwargs):
+            raise AssertionError("без UID журнал не читается")
+
+    selected = Instrument("BR-11.26", "BRX6", "future", short_name="BR-11.26")
+
+    assert store_candles(Store(), "tbank_exchange")(selected).empty

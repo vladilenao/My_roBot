@@ -24,13 +24,22 @@ log = get_logger(__name__)
 _MONTHS = "FGHJKMNQUVXZ"
 _CONTRACT = re.compile(r"^([A-Za-z]+)([FGHJKMNQUVXZ])(\d)$")
 CandleSource = Callable[[object], pd.DataFrame]
+UidResolver = Callable[[object], str | None]
 
 
-def store_candles(market_store, source: str) -> CandleSource:
-    """Live: 1m свечи из локального журнала робота (``candle_current``), только завершённые."""
+def card_uid(instrument) -> str | None:
+    return getattr(instrument, "uid", None) or None
+
+
+def store_candles(market_store, source: str, uid_for: UidResolver = card_uid) -> CandleSource:
+    """Live: 1m свечи из локального журнала робота (``candle_current``), только завершённые.
+
+    Live-выбор строит инструменты без UID, поэтому адрес пары берётся через
+    ``uid_for`` (в роботе — ``MarketDataCache.pair_uid``), а не из карточки.
+    """
 
     def read(instrument) -> pd.DataFrame:
-        uid = getattr(instrument, "uid", None)
+        uid = uid_for(instrument)
         if not uid:
             return pd.DataFrame(columns=["datetime", "high", "low", "close"])
         frame = market_store.current_frame(source=source, instrument_uid=uid, interval="1m")
@@ -74,9 +83,10 @@ class ClusterGate:
 
     def __init__(self, store: ClusterEventStore, candles: CandleSource, settings: ClusterSettings, *,
                  consumer=None, live: bool = False,
-                 clock: Callable[[], datetime] | None = None) -> None:
+                 clock: Callable[[], datetime] | None = None, uid_for: UidResolver = card_uid) -> None:
         self._store = store
         self._candles = candles
+        self._uid_for = uid_for
         self._settings = settings
         self._consumer = consumer
         self._live = live
@@ -137,7 +147,7 @@ class ClusterGate:
         """Трасса ``filter.cluster``: всё, чтобы воспроизвести вердикт и собрать отчёт."""
         inputs = {
             "instrument": MeasuredValue(instrument.ticker, "instrument-ticker"),
-            "instrument_uid": MeasuredValue(getattr(instrument, "uid", None) or "", "instrument-id"),
+            "instrument_uid": MeasuredValue(self._uid_for(instrument) or "", "instrument-id"),
             "short_name": MeasuredValue(getattr(instrument, "short_name", None) or "", "instrument-name"),
             "timeframe": MeasuredValue(timeframe, "timeframe"),
             "side": MeasuredValue(decision.signal_type.value, "signal"),
