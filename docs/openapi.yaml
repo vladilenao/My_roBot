@@ -1,17 +1,24 @@
 openapi: 3.0.3
 info:
-  title: My Robot — экспорт рыночных данных
-  version: 1.0.0-proposal
+  title: My Robot — локальный API
+  version: 1.1.0-proposal
   description: |
-    Контракт локального экспорта My Robot. Historical Broker API Emulator
-    забирает завершённые версии свечей и состояния покрытия из локального
-    журнала, сохраняет их и подтверждает курсор.
+    Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
+    по умолчанию слушает только loopback и публикует этот файл по
+    `/openapi.yaml`, Swagger UI — по `/docs`.
+
+    * MarketDataExport — Historical Broker API Emulator забирает завершённые
+      версии свечей и состояния покрытия из локального журнала, сохраняет их
+      и подтверждает курсор.
+    * Clusters — отчёт кластерного фильтра входа (данные ClusterSource).
 servers:
   - url: /
     description: Тот же узел, где опубликован Swagger UI; по умолчанию loopback.
 tags:
   - name: MarketDataExport
     description: Чтение изменений локального рыночного журнала.
+  - name: Clusters
+    description: Отчёт кластерного фильтра входа.
 paths:
   /openapi.yaml:
     get:
@@ -224,6 +231,117 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '409': {$ref: '#/components/responses/ProducerMismatch'}
+  /api/v1/clusters/report:
+    get:
+      tags: [Clusters]
+      summary: Отчёт кластерного фильтра за день или период
+      description: |
+        Отчёт по вердиктам кластерного фильтра для сигналов стратегий за период
+        из `period` календарных дней, который заканчивается днём `date`
+        включительно (день — по времени закрытия бара сигнала, МСК). Без
+        `period` — отчёт за один день `date`.
+
+        Группы вердиктов (`veto_strong`, `veto`, `confirm`, `neutral`,
+        `unknown`) показывают число сигналов, сколько из них стали сделками,
+        чистый итог этих сделок и движение цены через 15 и 60 минут после
+        сигнала по всем сигналам группы, в том числе не ставшим сделками.
+        `veto_effect` — что изменил бы запрет. `signals` — каждый сигнал
+        периода с той же причиной, что была в консоли.
+
+        Движение цены — в базисных пунктах (1 б.п. = 0,01 %) со знаком
+        направления сигнала: плюс — цена пошла в сторону сигнала. Сигнал, у
+        которого горизонт ещё не наступил, есть в `signals`, но не входит в
+        статистику движения (`price_move.*.n` меньше `signals`).
+
+        Ответ — `application/hal+json`: ссылки `_links.previous` и
+        `_links.next` ведут на соседние периоды той же длины; клиент берёт их
+        из ответа, а не собирает адрес сам.
+      operationId: getClustersReport
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Последний день периода.
+          schema:
+            type: string
+            format: date
+          example: '2026-10-15'
+        - name: period
+          in: query
+          required: false
+          description: Длина периода в календарных днях, заканчивая `date` включительно.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 366
+            default: 1
+      responses:
+        '200':
+          description: Отчёт за период.
+          content:
+            application/hal+json:
+              schema:
+                $ref: '#/components/schemas/ClustersReport'
+              example:
+                period: {from: '2026-10-15', to: '2026-10-15', days: 1}
+                mode: shadow
+                generated_at: '2026-10-15T21:00:00Z'
+                horizons_min: [15, 60]
+                groups:
+                  - verdict: veto
+                    signals: 1
+                    trades: 1
+                    trades_net_pnl: {amount: '-1455.94', currency: RUB}
+                    trades_won: 0
+                    trades_lost: 1
+                    price_move:
+                      '15': {n: 1, mean_bps: '-39.11', median_bps: '-39.11', hit_rate: '0.00'}
+                      '60': {n: 1, mean_bps: '-74.27', median_bps: '-74.27', hit_rate: '0.00'}
+                veto_effect:
+                  includes: [veto_strong, veto]
+                  trades_removed: 1
+                  winners_removed: 0
+                  winners_net_pnl: {amount: '0.00', currency: RUB}
+                  losers_removed: 1
+                  losers_net_pnl: {amount: '-1455.94', currency: RUB}
+                  net_effect: {amount: '1455.94', currency: RUB}
+                signals:
+                  - signal_id: 'future-br-macd:BRX6:5m:2026-10-15T13:50:00:SELL'
+                    bar_close: '2026-10-15T13:50:00Z'
+                    instrument: BRX6
+                    assignment_id: future-br-macd
+                    strategy: macd_rsi_stoch
+                    timeframe: 5m
+                    side: SELL
+                    price: '104.63'
+                    verdict: veto
+                    reason: climax
+                    message: 'Вход на кульминации: ход до входа +2,16σ (порог 1,5σ) · середина 2ч диапазона · 16:40 всплеск продаж ×9,6 после хода +2,45σ'
+                    trade:
+                      trade_id: 'future-br-macd:BRX6:5m:2026-10-15T13:50:00:SELL'
+                      net_pnl: {amount: '-1455.94', currency: RUB}
+                    price_move:
+                      '15': {status: final, move_bps: '-39.11'}
+                      '60': {status: final, move_bps: '-74.27'}
+                _links:
+                  self: {href: '/api/v1/clusters/report?date=2026-10-15&period=1'}
+                  previous: {href: '/api/v1/clusters/report?date=2026-10-14&period=1'}
+        '400':
+          description: Неверная дата или длина периода.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: BAD_PERIOD
+                message: Дата отчёта позже сегодняшней.
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503':
+          description: База сделок или кластерных событий робота временно недоступна.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 components:
   securitySchemes:
     ExportToken:
@@ -506,5 +624,178 @@ components:
           example: CURSOR_EXPIRED
         message:
           type: string
+    Decimal:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]+)?$'
+      description: Десятичное число строкой.
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount: {$ref: '#/components/schemas/Decimal'}
+        currency: {type: string, example: RUB}
+    HalLink:
+      type: object
+      additionalProperties: false
+      required: [href]
+      properties:
+        href:
+          type: string
+          description: Относительный адрес ресурса.
+    ClusterVerdict:
+      type: string
+      enum: [veto_strong, veto, confirm, neutral, unknown]
+      description: |
+        veto_strong — запрет и цена у края 2ч диапазона по направлению входа;
+        veto — запрет; confirm — подтверждение; neutral — без влияния;
+        unknown — кластерных данных нет, вход пропущен как без фильтра.
+    ClusterVerdictReason:
+      type: string
+      enum: [climax, initiative, no_evidence, no_coverage, contract_mismatch, data_degraded, consumer_lag, no_sigma_history, candles_missing]
+    PriceMoveStats:
+      type: object
+      additionalProperties: false
+      required: [n]
+      properties:
+        n:
+          type: integer
+          minimum: 0
+          description: Сигналов, у которых горизонт уже наступил.
+        mean_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+        median_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+        hit_rate:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+          description: Доля сигналов, после которых цена пошла в их сторону (0..1).
+    PriceMove:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [pending, final, no_data]
+        move_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+    ClustersReportGroup:
+      type: object
+      additionalProperties: false
+      required: [verdict, signals, trades, trades_net_pnl, trades_won, trades_lost, price_move]
+      properties:
+        verdict: {$ref: '#/components/schemas/ClusterVerdict'}
+        signals: {type: integer, minimum: 0}
+        trades:
+          type: integer
+          minimum: 0
+          description: Сколько сигналов группы стали сделкой (есть исполнение).
+        trades_net_pnl: {$ref: '#/components/schemas/Money'}
+        trades_won: {type: integer, minimum: 0}
+        trades_lost: {type: integer, minimum: 0}
+        price_move:
+          type: object
+          description: Ключ — горизонт в минутах из horizons_min.
+          additionalProperties: {$ref: '#/components/schemas/PriceMoveStats'}
+    ClustersReportSignal:
+      type: object
+      additionalProperties: false
+      required: [signal_id, bar_close, instrument, assignment_id, strategy, timeframe, side, price, verdict, reason, message, trade, price_move]
+      properties:
+        signal_id:
+          type: string
+          description: Идентификатор входного события стратегии; по нему вердикт связан со сделкой.
+        bar_close: {type: string, format: date-time}
+        instrument:
+          type: string
+          description: Тикер контракта или акции (BRX6, SBER).
+        assignment_id: {type: string}
+        strategy: {type: string}
+        timeframe: {type: string, example: 5m}
+        side:
+          type: string
+          enum: [BUY, SELL]
+        price: {$ref: '#/components/schemas/Decimal'}
+        verdict: {$ref: '#/components/schemas/ClusterVerdict'}
+        reason: {$ref: '#/components/schemas/ClusterVerdictReason'}
+        message:
+          type: string
+          description: Тот же текст, что был в консоли в строке «Кластеры».
+        trade:
+          type: object
+          nullable: true
+          description: null — сигнал не стал сделкой.
+          additionalProperties: false
+          required: [trade_id, net_pnl]
+          properties:
+            trade_id: {type: string}
+            net_pnl:
+              allOf: [{$ref: '#/components/schemas/Money'}]
+              nullable: true
+              description: null — сделка ещё открыта.
+        price_move:
+          type: object
+          additionalProperties: {$ref: '#/components/schemas/PriceMove'}
+    ClustersReport:
+      type: object
+      additionalProperties: false
+      required: [period, mode, generated_at, horizons_min, groups, veto_effect, signals, _links]
+      properties:
+        period:
+          type: object
+          additionalProperties: false
+          required: [from, to, days]
+          properties:
+            from: {type: string, format: date}
+            to: {type: string, format: date}
+            days: {type: integer, minimum: 1}
+        mode:
+          type: string
+          enum: [off, shadow, enforce, mixed]
+          description: Режим фильтра у привязок в периоде; mixed — режимы различались.
+        generated_at: {type: string, format: date-time}
+        horizons_min:
+          type: array
+          items: {type: integer}
+        groups:
+          type: array
+          description: Только группы, в которых есть хотя бы один сигнал.
+          items: {$ref: '#/components/schemas/ClustersReportGroup'}
+        veto_effect:
+          type: object
+          additionalProperties: false
+          required: [includes, trades_removed, winners_removed, winners_net_pnl, losers_removed, losers_net_pnl, net_effect]
+          properties:
+            includes:
+              type: array
+              items: {$ref: '#/components/schemas/ClusterVerdict'}
+            trades_removed: {type: integer, minimum: 0}
+            winners_removed: {type: integer, minimum: 0}
+            winners_net_pnl: {$ref: '#/components/schemas/Money'}
+            losers_removed: {type: integer, minimum: 0}
+            losers_net_pnl: {$ref: '#/components/schemas/Money'}
+            net_effect:
+              allOf: [{$ref: '#/components/schemas/Money'}]
+              description: Плюс — запрет улучшил бы результат.
+        signals:
+          type: array
+          description: Все сигналы периода по возрастанию bar_close.
+          items: {$ref: '#/components/schemas/ClustersReportSignal'}
+        _links:
+          type: object
+          additionalProperties: false
+          required: [self]
+          properties:
+            self: {$ref: '#/components/schemas/HalLink'}
+            previous:
+              allOf: [{$ref: '#/components/schemas/HalLink'}]
+              description: Предыдущий период той же длины.
+            next:
+              allOf: [{$ref: '#/components/schemas/HalLink'}]
+              description: Следующий период той же длины; нет, если он целиком в будущем.
 security:
   - ExportToken: []

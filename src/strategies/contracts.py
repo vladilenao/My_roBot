@@ -19,6 +19,8 @@ class Assignment:
     filter_profile: str = DEFAULT_FILTER_PROFILE
     priority: int = 0
     timeframe: str = field(kw_only=True)
+    # Кластерный фильтр входа: off / shadow / enforce (src.clusters.settings).
+    clusters: str = field(default="off", kw_only=True)
 
 
 class SignalType(Enum):

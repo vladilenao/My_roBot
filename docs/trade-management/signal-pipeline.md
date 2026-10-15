@@ -91,6 +91,8 @@ sequenceDiagram
     participant RD as ExecutionReducer
 
     TB->>TM: actions_for_signal
+    Note over TM: «Кластеры»: вердикт и трасса filter.cluster<br/>(clusters = shadow/enforce)
+    Note over TM: фильтр привязки (filter.<профиль>)<br/>enforce + запрет → недопуск cluster-climax
     TM->>PF: уровни, стоп, цели
     PF-->>TM: план сделки
     TM->>RM: лимиты по подтверждённым позициям
@@ -134,6 +136,23 @@ original reservation amounts остаются аудитом. Отмена ос�
 unknown-state, а превышение блокирует новые увеличения без бюджетной продажи.
 
 ---
+
+### «Кластеры»: кластерный фильтр входа
+
+Для кандидата нового входа привязки с `clusters = "shadow"` или `"enforce"`
+`TradeManager._plan_entry` до фильтра профиля считает вердикт по событиям
+ClusterSource (Redis Stream `cluster.events`, локальная копия
+`cluster-events.sqlite3`) и 1m свечам робота: `veto_strong`, `veto`,
+`confirm`, `neutral` или `unknown`. Вердикт пишется трассой `filter.cluster`
+и уходит в событие `signal` или `rejected` ключом `clusters`; консоль
+показывает его строкой «Кластеры: …» в блоке ПЛАН или ОТКЛОНЕНО (кроме
+`neutral`). В `shadow` допуск не меняется; в `enforce` запрет не ниже
+`[clusters] enforce_level` после фильтра профиля даёт недопуск
+`cluster-climax`. `unknown` (нет данных, отставание чтения Redis, другой
+контракт у коллектора) никогда не запрещает вход. Сигналы по открытой
+сделке и доборы вердикт не получают. Алгоритм и пример расчёта —
+`openspec/changes/add-cluster-filter/design.md` (D5); отчёт по вердиктам —
+`GET /api/v1/clusters/report` в [OpenAPI](../openapi.yaml).
 
 ## 3. Фазы сделки и время жизни резерва
 

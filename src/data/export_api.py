@@ -20,16 +20,19 @@ from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 _CONSUMER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "market-data" / "openapi.yaml"
+_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
 
 
 class MarketDataExportServer:
     """Управляемый сервер API; ``start`` не блокирует основной цикл робота."""
 
-    def __init__(self, store: MarketDataStore, token: str, host: str = "127.0.0.1", port: int = 8101) -> None:
+    def __init__(self, store: MarketDataStore, token: str, host: str = "127.0.0.1", port: int = 8101,
+                 clusters_report=None) -> None:
         if not token:
             raise ValueError("Для экспортного API требуется непустой токен")
         self.store = store
+        # Отчёт кластерного фильтра (src.clusters.report.ClusterReport); None — сервис недоступен.
+        self.clusters_report = clusters_report
         self.token = token
         self.host = host
         self.port = port
@@ -54,7 +57,7 @@ class MarketDataExportServer:
         self._thread = threading.Thread(target=self._server.serve_forever, name="market-data-export", daemon=True)
         self._thread.start()
         host, port = self.address
-        log.info("Экспорт рыночных данных доступен на http://%s:%s/docs", host, port)
+        log.info("Локальный API робота доступен на http://%s:%s/docs", host, port)
 
     def close(self) -> None:
         if self._server is None:
@@ -116,7 +119,30 @@ class _Handler(BaseHTTPRequestHandler):
             except ProducerMismatch:
                 self._error(HTTPStatus.CONFLICT, "PRODUCER_MISMATCH", "Запрошенный producer_id не совпадает с текущим.")
             return
+        if parsed.path == "/api/v1/clusters/report":
+            self._clusters_report(parse_qs(parsed.query))
+            return
         self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+
+    def _clusters_report(self, query: dict[str, list[str]]) -> None:
+        from src.clusters.report import ReportError
+
+        report = self.export_server.clusters_report
+        if report is None:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "CLUSTERS_UNAVAILABLE", "Отчёт кластерного фильтра не подключён.")
+            return
+        try:
+            day, period = report.parse(_one(query, "date"), _one(query, "period"))
+            payload = report.build(day, period)
+        except ReportError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
+            return
+        except Exception as exc:
+            log.warning("Отчёт кластерного фильтра не собран: %s", type(exc).__name__, exc_info=True)
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "STORE_UNAVAILABLE", "База сделок или кластерных событий недоступна.")
+            return
+        self._send_text(HTTPStatus.OK, json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        "application/hal+json; charset=utf-8")
 
     def do_PUT(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -182,6 +208,6 @@ def _integer(query: dict[str, list[str]], key: str, default: int | None = None, 
 
 
 def _swagger_html() -> str:
-    return """<!doctype html><html><head><meta charset=\"utf-8\"><title>My Robot Market Data API</title>
+    return """<!doctype html><html><head><meta charset=\"utf-8\"><title>My Robot API</title>
 <link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\"></head><body><div id=\"swagger-ui\"></div>
 <script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script><script>SwaggerUIBundle({url:'/openapi.yaml',dom_id:'#swagger-ui',persistAuthorization:true});</script></body></html>"""

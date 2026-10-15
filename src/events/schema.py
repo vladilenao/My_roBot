@@ -43,11 +43,11 @@ _OPTIONAL: dict[EventType, tuple[str, ...]] = {
         "targets", "expected_r", "strategy", "filter_profile", "trade_id", "event_id",
         "risk_amount", "reward_amount", "costs_amount", "payoff_ratio",
         "fixed_reward_amount", "fixed_quantity", "net_reward_amount", "algorithm_version",
-        *DIAGNOSTIC_PAYLOAD_FIELDS,
+        *DIAGNOSTIC_PAYLOAD_FIELDS, "clusters",
     ),
     EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile", "event_id", "algorithm_version",
                          "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold",
-                         *DIAGNOSTIC_PAYLOAD_FIELDS),
+                         *DIAGNOSTIC_PAYLOAD_FIELDS, "clusters"),
     EventType.HEARTBEAT: (),
     EventType.ERROR: ("message",),
     EventType.RATE_LIMITED: ("source",),
@@ -144,6 +144,7 @@ _JSON_TYPES: dict[str, str] = {
     "last_due": "object",
     "next_event": "object",
     "schedule": "object",
+    "clusters": "object",
 }
 
 

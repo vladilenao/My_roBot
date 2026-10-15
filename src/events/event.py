@@ -214,6 +214,7 @@ class Event:
         trade_id: str = "",
         visual: VisualSnapshot | Mapping | None = None,
         event_id: str = "",
+        clusters: Mapping[str, str] | None = None,
     ) -> "Event":
         """Рекомендация: план допущен и уйдёт в заявку, но ещё не исполнен."""
         return cls._make(
@@ -242,6 +243,7 @@ class Event:
                 "trade_id": trade_id,
                 "visual": visual,
                 "event_id": event_id,
+                **({"clusters": dict(clusters)} if clusters else {}),
             },
         )
 
@@ -260,6 +262,7 @@ class Event:
         bar_time: Any = None,
         timeframe: str = "",
         event_id: str = "",
+        clusters: Mapping[str, str] | None = None,
     ) -> "Event":
         """Недопуск сделки на допуске."""
         return cls._make(
@@ -276,6 +279,7 @@ class Event:
                 "filter_profile": filter_profile,
                 "event_id": event_id,
                 **_diagnostics_payload(diagnostics, economics=True),
+                **({"clusters": dict(clusters)} if clusters else {}),
             },
         )
 

@@ -353,6 +353,7 @@ class TestRuntimeComposition:
             direction_limits=run.TRADING_DIRECTIONS,
             clock=None,
             signal_filter=ANY,
+            cluster_gate=None,
         )
         manager.restore.assert_called_once_with()
         limits.assert_called_once_with()

@@ -6,7 +6,7 @@ import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from src.events.event import Event
 from src.events.types import EventType
@@ -222,6 +222,17 @@ def _decision(event: Event, stamp: str) -> Block | None:
                  highlight=SIDES.get(side, ""))
 
 
+_CLUSTER_SHOWN = frozenset({"veto_strong", "veto", "confirm", "unknown"})
+
+
+def _clusters_line(event: Event) -> tuple[str, ...]:
+    """Строка «Кластеры» вердикта кластерного фильтра; для neutral и без фильтра — ничего."""
+    value = event.get("clusters")
+    if not isinstance(value, Mapping) or value.get("verdict") not in _CLUSTER_SHOWN or not value.get("message"):
+        return ()
+    return (f"Кластеры: {value['message']}",)
+
+
 def _plan(event: Event, stamp: str, linked: bool) -> Block:
     count = event.get("quantity")
     count_text = f"{count} {'контракт' if count == 1 else 'контракта' if count in (2, 3, 4) else 'контрактов'}" if count is not None else "объём неизвестен"
@@ -230,7 +241,7 @@ def _plan(event: Event, stamp: str, linked: bool) -> Block:
         side = SIDES.get(event.get("side"), "направление неизвестно")
         value = _name(event) + " · " + side + " · " + value
     targets = event.get("targets") or ()
-    details = ["Цели: " + (" / ".join(price(t) for t in targets) if targets else "нет") + " · ждёт подтверждения"]
+    details = [*_clusters_line(event), "Цели: " + (" / ".join(price(t) for t in targets) if targets else "нет") + " · ждёт подтверждения"]
     risk = event.get("risk_amount")
     risk_line = f"Риск: {money(risk)}"
     reward = event.get("reward_amount")
@@ -265,7 +276,7 @@ def _rejected(event: Event, stamp: str, linked: bool) -> Block:
         reason = f"Риск до стопа {money(risk)} слишком мал для издержек"
     elif reason:
         reason = reason[0].upper() + reason[1:]
-    details = []
+    details = list(_clusters_line(event))
     if code == "risk-cost-ratio" and event.get("costs_amount") is not None:
         costs = money(event.get("costs_amount"))
         slip = money(event.get("slippage_amount")) if event.get("slippage_amount") is not None else "неизвестно"

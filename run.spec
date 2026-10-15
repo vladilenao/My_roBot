@@ -12,6 +12,8 @@ hiddenimports = []
 NAME = os.environ.get('PYINSTALLER_NAME') or 'run'
 # Вшитые дефолты конфигурации (распаковываются в sys._MEIPASS при старте)
 datas += [(os.path.join(SPECPATH, 'default.toml'), '.')]
+# Единый OpenAPI локального API: сервер отдаёт его по /openapi.yaml и /docs.
+datas += [(os.path.join(SPECPATH, 'docs', 'openapi.yaml'), 'docs')]
 datas += collect_data_files('matplotlib', includes=['mpl-data/fonts/ttf/DejaVuSans.ttf', 'mpl-data/matplotlibrc'])
 tmp_ret = collect_all('pandas_ta_classic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

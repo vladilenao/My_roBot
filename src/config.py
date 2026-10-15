@@ -12,6 +12,7 @@ from src.config_loader import (
     load_config,
     validate_triple_screen_hierarchy,
 )
+from src.clusters.settings import ClusterSettings
 from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
@@ -213,6 +214,7 @@ def _to_assignments(raw: dict[str, dict]) -> dict[str, list[Assignment]]:
                     filter_profile=item.get("filter", DEFAULT_FILTER_PROFILE),
                     priority=item.get("priority", 0),
                     timeframe=tf,
+                    clusters=item.get("clusters", "off"),
                 )
             )
         result[ticker] = assignments
@@ -243,6 +245,14 @@ _validate_global_assignment_ids(SHARE_STRATEGIES, FUTURE_STRATEGIES)
 # при отсутствии секции — дефолты (множитель 5, MACD 12/26/9, Stochastic 14/3/3, 20/80).
 TRIPLE_SCREEN_PARAMS: TripleScreenParams = TripleScreenParams.from_config(
     _CONFIG.get("triple_screen_params") or {}
+)
+
+# Кластерный фильтр входа: пороги из [clusters], режим — у каждой привязки.
+CLUSTER_SETTINGS: ClusterSettings = ClusterSettings.from_config(_CONFIG.get("clusters_params") or {})
+CLUSTERS_ENABLED: bool = any(
+    assignment.clusters != "off"
+    for items in (*SHARE_STRATEGIES.values(), *FUTURE_STRATEGIES.values())
+    for assignment in items
 )
 
 # Fail-fast на недопустимую иерархию ТФ: шаг множителя не должен выходить за лестницу TIMEFRAMES.
