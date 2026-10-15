@@ -377,6 +377,8 @@ class SignalAdmission:
     rejections: tuple[RejectionReason, ...] = ()
     plan: TradePlan | None = None
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    # Кластерный вердикт кандидата нового входа (src.clusters.verdict.ClusterVerdict).
+    cluster: object | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "diagnostics", _freeze(self.diagnostics))
@@ -416,6 +418,7 @@ _REJECTION_MESSAGES = {
     "gap-entry": "вход по цене, ушедшей от сигнальной",
     "direction-not-allowed": "направление не разрешено для этого типа инструмента",
     "filter-rejected": "сигнал отклонён фильтром привязки",
+    "cluster-climax": "Кластеры: вход на кульминации",
 }
 
 

@@ -16,6 +16,7 @@ ClusterSource уже публикует в Redis Stream `cluster.events` соб�
 - **Режимы привязки.** `off` — как сейчас; `shadow` — вердикт виден и записан, допуск не меняется; `enforce` — запрет даёт штатный недопуск `cluster-climax`. Нет данных — `unknown`, вход идёт как без фильтра.
 - **Консоль.** Строка «Кластеры: …» с причиной в блоке ПЛАН или ОТКЛОНЕНО сигнала для `veto_strong`, `veto`, `confirm` и `unknown`; `neutral` не печатается. Итоговой строки за день нет.
 - **Отчёт по REST.** `GET /api/v1/clusters/report?date=&period=` на локальном HTTP-сервере робота: группы вердиктов, итог сделок, движение цены через 15 и 60 минут, эффект запрета, список сигналов с причиной. Ответ HAL (`application/hal+json`) со ссылками на соседние периоды.
+- **Включение по умолчанию.** В `default.toml` `clusters = "shadow"` у всех привязок `macd_rsi_stoch` и `export_enabled = true`; без `MARKET_DATA_EXPORT_TOKEN` API не запускается, робот работает дальше.
 - **Единый OpenAPI.** Контракт всех HTTP-сервисов робота — `docs/openapi.yaml`; сервер отдаёт его по `/openapi.yaml` и `/docs` (контракт экспорта перенесён из `docs/market-data/openapi.yaml`).
 
 ## Capabilities

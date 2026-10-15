@@ -308,6 +308,9 @@ ISO8601 — `through` (закрытие бара, до которого не д�
     "limiting_constraint": {
       "type": "string"
     },
+    "clusters": {
+      "type": "object"
+    },
     "visual": {
       "$ref": "visual-snapshot.json"
     }
@@ -324,6 +327,10 @@ ISO8601 — `through` (закрытие бара, до которого не д�
 Экономический отказ содержит R/C/S, payoff при известности, выбранный объём,
 версию и применённый порог. `risk_state=unknown` и `unknown_reason` явно обозначают
 неполные данные портфеля; неизвестный свободный бюджет не отправляется как ноль.
+Необязательный `clusters` — вердикт кластерного фильтра входа того же сигнала
+(`verdict`: `veto_strong`/`veto`/`confirm`/`neutral`/`unknown`, `reason`,
+`message` — текст строки «Кластеры» в консоли); тот же ключ бывает у `signal`.
+Недопуск боевого кластерного запрета имеет `code = cluster-climax`.
 
 ```json
 {
@@ -408,6 +415,9 @@ ISO8601 — `through` (закрытие бара, до которого не д�
     },
     "limiting_constraint": {
       "type": "string"
+    },
+    "clusters": {
+      "type": "object"
     }
   },
   "additionalProperties": false

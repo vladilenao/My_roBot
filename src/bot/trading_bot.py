@@ -517,6 +517,9 @@ class TradingBot:
                 details = provider()
                 if isinstance(details, Mapping):
                     diagnostics = dict(details)
+        # Кластерный вердикт: строка «Кластеры» в блоке ПЛАН или ОТКЛОНЕНО.
+        cluster = getattr(admission, "cluster", None)
+        clusters = cluster.payload() if cluster is not None else None
         if admission.plan is not None:
             quantity = admission.actions[0].quantity if admission.actions else 0
             self._publish_signal(
@@ -527,6 +530,7 @@ class TradingBot:
                 diagnostics=diagnostics,
                 frame=candidate.frame,
                 as_of=candidate.decision.bar_time,
+                clusters=clusters,
             )
         self._dispatch_management_actions(
             admission.actions,
@@ -545,6 +549,7 @@ class TradingBot:
                 diagnostics=diagnostics,
                 filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
+                clusters=clusters,
             )
 
     def _manage(self, instrument: Instrument, assignments: list[Assignment], frame, context, tf: str) -> None:
@@ -705,6 +710,7 @@ class TradingBot:
         diagnostics=None,
         frame=None,
         as_of=None,
+        clusters=None,
     ) -> None:
         """Publish the admitted plan: it is queued, not yet executed."""
         economics = plan.economics
@@ -736,6 +742,7 @@ class TradingBot:
                 event_id=plan.signal_id,
                 bar_time=as_of,
                 visual=visual,
+                clusters=clusters,
             )
         )
 
@@ -749,6 +756,7 @@ class TradingBot:
         diagnostics=None,
         filter_profile: str = "",
         timeframe: str = "",
+        clusters=None,
     ) -> None:
         """Publish why the plan was not admitted."""
         self._bus.publish(
@@ -764,6 +772,7 @@ class TradingBot:
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
                 event_id=decision.event_id or "",
+                clusters=clusters,
             )
         )
 

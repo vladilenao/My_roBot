@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.data.ingestion_settings import SettingError, setting_names, validate_combination, validate_setting
+from src.clusters.settings import ClusterSettings, check_mode
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
@@ -74,6 +75,8 @@ _SECTIONS: dict[str, dict[str, str]] = {
     "strategies.filter": {
         "triple_screen": "triple_screen_params",
     },
+    # Секция целиком — одна таблица параметров кластерного фильтра.
+    "clusters": {},
     "logging": {
         "service_uid": "logging_service_uid",
         "file": "logging_file",
@@ -128,6 +131,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "share_strategies": dict,
     "future_strategies": dict,
     "triple_screen_params": dict,
+    "clusters_params": dict,
     "logging_service_uid": str,
     "logging_file": str,
     "logging_level": str,
@@ -162,7 +166,7 @@ _NOTIFIER_TELEGRAM_EXTRA_KEYS = {"request_timeout", "max_transport_attempts"}
 
 # Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
-_STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority"}
+_STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority", "clusters"}
 _STOP_GEOMETRY_KEYS = frozenset(
     {"min_stop_atr", "min_stop_ticks", "stop_beyond_bar", "max_stop_atr"}
 )
@@ -247,6 +251,11 @@ def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
             f"{path}: привязка стратегии для {ticker!r}: ключ 'tf' "
             f"должен быть строкой"
         )
+    if "clusters" in item:
+        try:
+            check_mode(item["clusters"])
+        except ValueError as exc:
+            raise ConfigError(f"{path}: привязка {item['id']!r}: {exc}") from None
 
 
 def _validate_strategies(value: dict, key: str, path: Path) -> dict[str, dict]:
@@ -570,6 +579,13 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
             continue
+        if key == "clusters_params":
+            try:
+                ClusterSettings.from_config(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}: [clusters] {exc}") from None
+            cleaned[key] = dict(value)
+            continue
         if key == "trade_management_profiles":
             cleaned[key] = _validate_trade_management_profiles(value, path)
             continue
@@ -795,6 +811,9 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
             )
         if not isinstance(mapping, dict):
             raise ConfigError(f"{path}: секция [{section}] должна быть таблицей")
+        if section == "clusters":
+            flat["clusters_params"] = dict(mapping)
+            continue
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):

@@ -68,6 +68,8 @@ from src.config import (
     HIST_DIR,
     HISTORICAL_ROLLOVER,
     TIMEFRAMES,
+    CLUSTER_SETTINGS,
+    CLUSTERS_ENABLED,
 )
 from src.api.client import default_client_provider
 from src.api.emulator_client import EmulatorClientProvider, EmulatorError
@@ -536,16 +538,15 @@ def _launch(
     storage = None
     export_server = None
     market_poller = None
+    cluster_consumer = None
     try:
         if not history and MARKET_DATA_EXPORT_ENABLED:
-            export_server = MarketDataExportServer(
-                market_store, MARKET_DATA_EXPORT_TOKEN or "",
-                host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
-            )
-            export_server.start()
+            export_server = _start_local_api(market_store, state_dir)
+        cluster_gate, cluster_consumer = _cluster_gate(history=history, market_store=market_store,
+                                                       data_cache=data_cache, state_dir=state_dir)
         runtime = _build_runtime(
             instruments, data_cache, bus, state_dir, clock=clock, session=session,
-            client_provider=provider,
+            client_provider=provider, cluster_gate=cluster_gate,
         )
         storage = runtime.storage
         live_waiter = None
@@ -582,6 +583,8 @@ def _launch(
             market_poller.close()
         elif early is not None:
             early.poller.close()
+        if cluster_consumer is not None:
+            cluster_consumer.stop()
         if export_server is not None:
             export_server.close()
         if history:
@@ -590,6 +593,80 @@ def _launch(
             )
         close_channels(channels)
     return 0, None, selection or instruments
+
+
+def _configured_cluster_mode() -> str:
+    """Режим «Кластеров» по всем привязкам: один общий или mixed."""
+    modes = {assignment.clusters for items in (*SHARE_STRATEGIES.values(), *FUTURE_STRATEGIES.values())
+             for assignment in items}
+    return modes.pop() if len(modes) == 1 else "mixed"
+
+
+def _start_local_api(market_store, state_dir):
+    """Локальный HTTP API: экспорт рыночных данных и отчёт кластерного фильтра.
+
+    Без токена в окружении API не запускается, а робот работает дальше: ошибка
+    конфигурации доступа не должна останавливать торговлю.
+    """
+    from src.clusters.report import ClusterReport
+    from src.data.market_store import SOURCE_TBANK
+
+    if not MARKET_DATA_EXPORT_TOKEN:
+        log.warning("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
+        print("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
+        return None
+    report = ClusterReport(
+        state_dir / DATABASE_FILE,
+        lambda uid: market_store.current_frame(source=SOURCE_TBANK, instrument_uid=uid, interval="1m"),
+        configured_mode=_configured_cluster_mode(),
+    )
+    server = MarketDataExportServer(
+        market_store, MARKET_DATA_EXPORT_TOKEN,
+        host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT, clusters_report=report,
+    )
+    server.start()
+    return server
+
+
+def _cluster_redis():
+    import redis
+
+    return redis.Redis(
+        host=MARKET_STRUCTURE_REDIS_HOST,
+        port=MARKET_STRUCTURE_REDIS_PORT,
+        db=MARKET_STRUCTURE_REDIS_DB,
+        password=MARKET_STRUCTURE_REDIS_PASSWORD,
+        decode_responses=True,
+        socket_timeout=10,
+    )
+
+
+def _cluster_gate(*, history, market_store, data_cache, state_dir):
+    """Кластерный фильтр входа: хранилище событий, чтение потока и источник 1m свечей.
+
+    Live — фоновый потребитель Redis, хранилище и свечи в каталоге состояния
+    робота. История — своё хранилище в каталоге прогона: копия боевого (если
+    оно есть) плюс разовая догрузка потока; боевые файлы не меняются.
+    """
+    if not CLUSTERS_ENABLED:
+        return None, None
+    from src.clusters.consumer import ClusterEventsConsumer, catch_up
+    from src.clusters.gate import ClusterGate, cache_candles, store_candles
+    from src.clusters.store import FILE_NAME, ClusterEventStore, copy_store
+    from src.data.market_store import SOURCE_TBANK
+
+    if history:
+        copy_store(runtime_dir() / FILE_NAME, state_dir / FILE_NAME)
+        store = ClusterEventStore(state_dir / FILE_NAME)
+        catch_up(store, _cluster_redis(), stream=CLUSTER_SETTINGS.stream)
+        return ClusterGate(store, cache_candles(data_cache), CLUSTER_SETTINGS), None
+    store = ClusterEventStore(state_dir / FILE_NAME)
+    consumer = ClusterEventsConsumer(store, _cluster_redis(), stream=CLUSTER_SETTINGS.stream,
+                                     group=CLUSTER_SETTINGS.consumer_group)
+    consumer.start()
+    gate = ClusterGate(store, store_candles(market_store, SOURCE_TBANK), CLUSTER_SETTINGS,
+                       consumer=consumer, live=True)
+    return gate, consumer
 
 
 def _build_market_data(*, state_dir, clock, provider, history, market_calendar=None):
@@ -943,7 +1020,7 @@ class _Runtime:
 
 
 def _build_runtime(
-    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None
+    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -1045,6 +1122,7 @@ def _build_runtime(
         direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
         clock=clock,
+        cluster_gate=cluster_gate,
     )
     if historical:
         trade_manager.initialize_account()

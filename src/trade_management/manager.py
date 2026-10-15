@@ -242,9 +242,12 @@ class TradeManager:
         max_entry_deviation_r: Decimal | float | str = Decimal("0.25"),
         live_market_provider=None,
         clock: Clock | Callable[[], datetime] | None = None,
+        cluster_gate: object | None = None,
     ) -> None:
         self._storage = storage
         self._broker = broker
+        # Кластерный фильтр входа (src.clusters.gate.ClusterGate); None — выключен.
+        self._cluster_gate = cluster_gate
         self._clock = as_clock(clock)
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
@@ -1481,9 +1484,26 @@ class TradeManager:
         return SignalAdmission(rejections=(rejection_reason("filter-rejected", message=verdict.reason),))
 
     def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
+        """Допуск нового входа: кластерный вердикт, фильтр привязки, план и портфельный допуск.
+
+        Вердикт «Кластеров» считается до фильтра профиля, чтобы отчёт видел все
+        входные сигналы привязки; недопуск ``cluster-climax`` — только в режиме
+        enforce и только если фильтр профиля сигнал пропустил.
+        """
+        gate = self._cluster_gate
+        cluster = gate.evaluate(assignment, decision, instrument) if gate is not None else None
         refused = self._entry_filter_refusal(assignment, decision, instrument, context, timeframe)
-        if refused is not None:
-            return refused
+        blocked = refused is None and cluster is not None and cluster.blocks(gate.settings.enforce_level)
+        if blocked:
+            log.info("actions_for_signal %s: вход отклонён кластерным фильтром — %s", instrument.ticker, cluster.message)
+            refused = SignalAdmission(rejections=(rejection_reason("cluster-climax"),))
+        if cluster is not None:
+            self._traces.record(gate.trace(cluster, assignment, decision, instrument, timeframe, rejected=blocked))
+        admission = refused if refused is not None else self._plan_new_entry(
+            assignment, decision, instrument, frame, context, meta, timeframe)
+        return admission if cluster is None else replace(admission, cluster=cluster)
+
+    def _plan_new_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
         live_market = None
         if self._live_market_provider is not None:
             live_market = self._live_market_provider(instrument)

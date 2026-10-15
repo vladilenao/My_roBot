@@ -652,7 +652,7 @@ components:
         unknown — кластерных данных нет, вход пропущен как без фильтра.
     ClusterVerdictReason:
       type: string
-      enum: [climax, initiative, no_evidence, no_coverage, contract_mismatch, data_degraded, consumer_lag, no_sigma_history]
+      enum: [climax, initiative, no_evidence, no_coverage, contract_mismatch, data_degraded, consumer_lag, no_sigma_history, candles_missing]
     PriceMoveStats:
       type: object
       additionalProperties: false

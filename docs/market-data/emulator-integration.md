@@ -14,8 +14,9 @@
 
 ## Порядок подключения
 
-1. В `robot.toml` включить `[market_data] export_enabled = true`, а в
-   окружении процесса задать `MARKET_DATA_EXPORT_TOKEN`. Запустить My Robot.
+1. Убедиться, что `[market_data] export_enabled = true` (значение по
+   умолчанию), и задать в окружении процесса `MARKET_DATA_EXPORT_TOKEN`.
+   Запустить My Robot.
 2. Запросить `GET /api/v1/market-data/source`. Сохранить `producer_id` и
    `min_after_id`. Если у этого `producer_id` уже есть сохранённый курсор,
    продолжить с него; новый потребитель начинает с `min_after_id`.
