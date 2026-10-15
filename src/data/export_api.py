@@ -20,7 +20,7 @@ from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 _CONSUMER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "market-data" / "openapi.yaml"
+_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
 
 
 class MarketDataExportServer:
