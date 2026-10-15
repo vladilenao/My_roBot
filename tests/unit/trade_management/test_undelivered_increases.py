@@ -108,7 +108,7 @@ def test_held_entry_is_cancelled_on_next_step_without_waiting_for_data(tmp_path)
         assert reservations(storage) == {"open-1": "RELEASED"}
         assert outbox(storage, "open-1") == "UNDELIVERED"
         assert broker.actions == []
-        assert [(event.status, event.reason) for event, _ in observed] == [(ExecutionStatus.CANCEL, "entry-undelivered")]
+        assert observed == []                       # брокер заявку не получал: уведомления нет
         assert REASON_LABELS["entry-undelivered"] == "вход не доставлен: данные не подтверждены вовремя"
         CsvExporter(storage.connection, tmp_path / "trade_event.csv", tmp_path / "trade_summary.csv").export()
         rows = list(csv.DictReader((tmp_path / "trade_event.csv").open(encoding="utf-8")))
