@@ -51,7 +51,8 @@ def visual_schema():
     target = _object({"id": text, "number": integer, "price": text, "quantity": integer, "filled": integer},
                      ("id", "number", "price", "quantity"))
     targets = {"type": "array", "items": target}
-    fill = _object({"key": text, "time": text, "role": text, "side": text, "quantity": integer, "price": text},
+    fill = _object({"key": text, "time": text, "role": text, "side": text, "quantity": integer, "price": text,
+                    "reason": text},
                    ("key", "time", "role", "side", "quantity", "price"))
     group = _object({"role": text, "side": text, "start": text, "end": text, "quantity": integer,
                      "price": text, "count": integer}, ("role", "side", "start", "end", "quantity", "price", "count"))

@@ -107,3 +107,18 @@ def test_old_facts_remain_immutable_when_new_fills_apply(tmp_path):
         assert facts[0][1]["visual"].to_dict() == snapshot
         assert facts[-1][1]["visual"].data["state"]["quantity"] == 2
         assert not manager.consume(replace(partial))
+
+
+def test_partial_exit_fill_carries_command_reason(tmp_path):
+    facts = []
+    with Storage(tmp_path / "trade.db") as storage:
+        manager, entry = setup(storage, facts)
+        fact(manager, entry, "entry-fill", ExecutionStatus.FILL, 2, 300, 3)
+        exit_ = ReduceTrade("exit", "trade", storage.load_trade("trade").state.state_revision, "ma10-or-cloud-partial-exit", 1)
+        manager.submit_action(exit_)
+        fact(manager, exit_, "exit-fill", ExecutionStatus.FILL, 1, "302.1", "1.5", minute=30)
+
+        snapshot = facts[-1][1]["visual"].to_dict()
+        assert snapshot["fills"][-1]["role"] == "REDUCE"
+        assert snapshot["fills"][-1]["reason"] == "ma10-or-cloud-partial-exit"
+        assert snapshot["fills"][0]["reason"] == "entry"

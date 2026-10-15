@@ -16,7 +16,7 @@ from src.notifier.telegram_chart import build_scene, compact_png, render_png
 from src.notifier.telegram_delivery import DeliveryRepository, markup, namespace
 from src.notifier.telegram_html import split_html
 from src.notifier.telegram_navigation import event_navigation, message_link
-from src.notifier.telegram_templates import event_role, render
+from src.notifier.telegram_templates import render
 from src.notifier.telegram_transport import TelegramTransport
 
 log = get_logger(__name__)
@@ -210,8 +210,9 @@ class TelegramChannel(Channel):
                 parts = split_html(text, MESSAGE_LIMIT)
                 method = "sendMessage"
                 data = {"text": parts[0], "parse_mode": "HTML", "reply_markup": markup(buttons)}
+        navigation = event_navigation(event)
         response = self._operation(repository, key + ":post", method, data, photo,
-                                   trade_id=trade_id, event_key=event_key, navigation=event_navigation(event))
+                                   trade_id=trade_id, event_key=event_key, navigation=navigation)
         if response is None or not response.ok:
             return
         message_id = response.result["message_id"]
@@ -219,14 +220,9 @@ class TelegramChannel(Channel):
             repository.set_root(trade_id, message_id, "photo" if photo else "text", parts[0])
             root = repository.root(trade_id)
         elif trade_id:
-            role = event_role(event)
-            if role.startswith("ЦЕЛЬ") or role in {"СТОП", "Итог"}:
+            # Роли этапа — те же, что сохранены в навигацию до HTTP.
+            for role in navigation["roles"]:
                 repository.add_stage(trade_id, role, message_id)
-            # Terminal target supplies both target and Итог navigation entries.
-            if role == "Итог" and visual:
-                fill = next((f for f in visual["fills"] if f["key"] == visual["event_key"]), None)
-                if fill and fill["role"].startswith("ЦЕЛЬ"):
-                    repository.add_stage(trade_id, fill["role"], message_id)
         continuation_buttons = buttons
         if root:
             link = self._link(root[0])

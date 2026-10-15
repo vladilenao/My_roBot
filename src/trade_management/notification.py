@@ -84,13 +84,16 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
     fills = []
     fee_sources = set()
     for fill in _rows(connection,
-        "SELECT f.*,o.action_type FROM fills f JOIN orders o USING(order_id) WHERE f.trade_id=? ORDER BY f.executed_at,f.rowid",
+        "SELECT f.*,o.action_type,b.payload_json AS command_json FROM fills f JOIN orders o USING(order_id) "
+        "LEFT JOIN outbox b ON b.command_id=o.command_id WHERE f.trade_id=? ORDER BY f.executed_at,f.rowid",
         (event.trade_id,)):
         action, _, target_id = fill["action_type"].partition(":")
         role = f"ЦЕЛЬ{target_numbers[target_id]}" if action == "TARGET" and target_id in target_numbers else action
         side = row["side"] if action in {"OPEN", "ADD"} else ("SELL" if row["side"] == "BUY" else "BUY")
+        reason = json.loads(fill["command_json"]).get("reason") if fill["command_json"] else None
         fills.append({"key": fill["execution_id"], "time": fill["executed_at"], "role": role,
-                      "side": side, "quantity": fill["quantity"], "price": Decimal(fill["price"])})
+                      "side": side, "quantity": fill["quantity"], "price": Decimal(fill["price"]),
+                      **({"reason": reason} if reason else {})})
         fee_sources.add(fill["fee_source"])
     stops = []
     previous = None
