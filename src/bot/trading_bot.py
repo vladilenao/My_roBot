@@ -122,6 +122,8 @@ class TradingBot:
         self._trade_manager = trade_manager
         self._action_executor = action_executor
         self._protection_timeframe = protection_timeframe
+        # Последний переданный менеджеру кадр графика по паре: (бар, длина).
+        self._remembered_markets: dict[tuple[str, str], tuple] = {}
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
@@ -335,8 +337,9 @@ class TradingBot:
         # Защитный 1m нужен действиям, не связанным с баром (таймаут входа,
         # экспирация); профиль на нём не считается — менеджер сопровождает
         # сделку только кадром таймфрейма её плана.
+        management_needs = set(self._management_needs(instrument)) if self._trade_manager is not None else set()
         management_tfs = (
-            {self._protection_timeframe} | set(self._management_needs(instrument))
+            {self._protection_timeframe} | management_needs
             if self._trade_manager is not None else set()
         )
         for tf in sorted(
@@ -358,6 +361,8 @@ class TradingBot:
             )
             if context is not None:
                 log.debug("%s %s | контекст: %s", self._display_name(instrument), tf, context)
+            if tf_assignments or tf in management_needs:
+                self._remember_market(instrument, tf, frame)
             self._manage(instrument, tf_assignments, frame, context, tf)
             if tf_assignments:
                 self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
@@ -401,10 +406,6 @@ class TradingBot:
         tf: str = "",
         entry_candidates: list[_EntryCandidate] | None = None,
     ) -> None:
-        remember_market = getattr(self._trade_manager, "remember_market", None)
-        if callable(remember_market):
-            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]),
-                            breaks=self._chart_breaks(instrument, tf, frame))
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -657,6 +658,30 @@ class TradingBot:
                 analysis_mode=analysis_mode,
             )
         )
+
+    def _remember_market(self, instrument, timeframe, frame) -> None:
+        """Свечи пары для графиков исполнений — общий вход тикового и live-цикла.
+
+        Перенос стопа и закрытие сделки рисуются по этому кадру менеджера;
+        без него сообщение уходит текстом. Повтор того же кадра (тот же
+        последний бар и длина) не пересчитывает снимок и разрывы. Сбой
+        графика не мешает торговле.
+        """
+        remember = getattr(self._trade_manager, "remember_market", None)
+        if not callable(remember) or frame is None or frame.empty or not timeframe:
+            return
+        last = frame["datetime"].iloc[-1]
+        key, signature = (instrument_key(instrument), timeframe), (last, len(frame))
+        if self._remembered_markets.get(key) == signature:
+            return
+        try:
+            remember(instrument, timeframe, frame, self._timeline.grid(timeframe).bar_close(last),
+                     breaks=self._chart_breaks(instrument, timeframe, frame))
+        except Exception as exc:
+            log.warning("График: свечи %s %s не переданы (%s).",
+                        self._display_name(instrument), timeframe, type(exc).__name__)
+            return
+        self._remembered_markets[key] = signature
 
     def _chart_breaks(self, instrument, timeframe, frame):
         """Вид разрывов окна графика от слоя данных; сбой не мешает торговле."""
