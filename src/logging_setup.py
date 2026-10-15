@@ -16,7 +16,10 @@ import contextvars
 import datetime
 import logging
 import logging.handlers
+import re
 from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlsplit
 
 # ── contextvars ────────────────────────────────────────────────
 service_uid_var: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -58,14 +61,64 @@ class _ContextFilter(logging.Filter):
         return True
 
 
+# ── Secrets ────────────────────────────────────────────────────
+REDACTED = "[скрыто]"
+# Секрет короче этого не маскируется по значению: иначе пострадают обычные
+# слова и числа. Короткие значения секретами по смыслу не бывают.
+_MIN_SECRET_LENGTH = 8
+# Форматы, которые маскируются, даже если значение не зарегистрировано:
+# токен Telegram-бота (``123456:AA…``, в т.ч. внутри ``/bot123456:AA…/``)
+# и значение заголовка ``Authorization: Bearer …``.
+_SECRET_PATTERNS = (
+    re.compile(r"(?<![0-9])[0-9]{6,}:[A-Za-z0-9_-]{30,}"),
+    re.compile(r"(?i)(?<=bearer )[A-Za-z0-9._~+/=-]+"),
+)
+_secrets: set[str] = set()
+
+
+def register_secrets(values: Iterable[str | None]) -> None:
+    """Запомнить значения секретов, которые не должны попасть в лог.
+
+    Для адреса (``CLOUDFLARE_URL``) запоминается и его хост: сторонние
+    библиотеки печатают хост отдельно от полного адреса.
+    """
+    for value in values:
+        if not value:
+            continue
+        value = str(value).strip()
+        candidates = {value, value.rstrip("/")}
+        if "://" in value:
+            host = urlsplit(value).hostname
+            if host:
+                candidates.add(host)
+        _secrets.update(c for c in candidates if len(c) >= _MIN_SECRET_LENGTH)
+
+
+def redact(text: str) -> str:
+    """Вернуть текст, в котором секреты заменены на ``[скрыто]``."""
+    # Длинные значения первыми: полный адрес раньше своего хоста.
+    for secret in sorted(_secrets, key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
 # ── Formatter ──────────────────────────────────────────────────
 class _MicrosecondFormatter(logging.Formatter):
-    """Форматтер с реальными микросекундами в timestamp.
+    """Форматтер с реальными микросекундами в timestamp и маскированием секретов.
 
     Логирование использует ``time.strftime``, а на macOS ``%f`` в нём
     не поддерживается и выводится литеральной буквой «f». Поэтому время
     форматируется через ``datetime`` (даёт ``%Y-%m-%d %H:%M:%S.%f``).
+
+    Маскируется уже готовая строка — сообщение, аргументы и traceback, —
+    поэтому секрет не проходит и через записи сторонних библиотек
+    (``urllib3`` печатает адрес запроса Telegram вместе с токеном).
     """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         dt = datetime.datetime.fromtimestamp(record.created)
@@ -90,12 +143,16 @@ def setup_logging(
     *,
     fmt: str = _DEFAULT_FORMAT,
     datefmt: str = _DEFAULT_DATEFMT,
+    secrets: Iterable[str | None] = (),
 ) -> None:
     """Настройка ``logging`` на запись исключительно в файл.
 
     Вызывается **один раз** в ``run.py`` перед созданием ``TradingBot``.
+    ``secrets`` — значения токенов, паролей и секретных адресов, которые
+    заменяются на ``[скрыто]`` в каждой строке лога.
     """
     service_uid_var.set(service_uid)
+    register_secrets(secrets)
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.DEBUG))

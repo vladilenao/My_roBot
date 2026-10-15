@@ -304,3 +304,77 @@ class TestRetryLogging:
         content = log_file.read_text(encoding="utf-8")
         assert "[svc-456]" in content
         assert "GetCandles" in content
+
+
+# Поддельные значения: настоящие секреты в тестах не используются.
+_FAKE_BOT_TOKEN = "123456789:" + "AAFakeTokenForTests_" + "x" * 15
+_FAKE_BROKER_TOKEN = "t.fake-broker-token-for-tests-0123456789"
+_FAKE_PROXY = "https://fake-proxy.example.workers.dev"
+
+
+@pytest.fixture
+def clean_secrets():
+    from src import logging_setup
+
+    saved = set(logging_setup._secrets)
+    logging_setup._secrets.clear()
+    yield
+    logging_setup._secrets.clear()
+    logging_setup._secrets.update(saved)
+
+
+def _read_log(log_file: Path) -> str:
+    for h in logging.getLogger().handlers:
+        h.flush()
+    return log_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.usefixtures("clean_secrets")
+class TestSecretRedaction:
+    """Секреты не попадают в файл лога ни из своих, ни из сторонних логгеров."""
+
+    def test_urllib3_request_line_hides_token_and_proxy(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file),
+                      secrets=(_FAKE_BOT_TOKEN, _FAKE_PROXY))
+        foreign = logging.getLogger("urllib3.connectionpool")  # без адаптера, как в бою
+        foreign.setLevel(logging.DEBUG)
+        foreign.debug("Starting new HTTPS connection (%d): %s:%s", 1, "fake-proxy.example.workers.dev", 443)
+        foreign.debug('%s://%s:%s "%s %s %s" %s %s', "https", "fake-proxy.example.workers.dev", 443,
+                      "POST", f"/bot{_FAKE_BOT_TOKEN}/sendMessage", "HTTP/1.1", 200, None)
+
+        content = _read_log(log_file)
+        assert _FAKE_BOT_TOKEN not in content
+        assert "fake-proxy.example.workers.dev" not in content
+        assert "/bot[скрыто]/sendMessage" in content
+
+    def test_unregistered_telegram_token_is_hidden_by_format(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file))
+        get_logger("test_secret").warning("POST /bot%s/getChat", _FAKE_BOT_TOKEN)
+
+        content = _read_log(log_file)
+        assert _FAKE_BOT_TOKEN not in content
+        assert "/bot[скрыто]/getChat" in content
+
+    def test_registered_value_hidden_in_message_and_traceback(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file), secrets=(_FAKE_BROKER_TOKEN, None, ""))
+        logger = get_logger("test_secret")
+        logger.info("token=%s", _FAKE_BROKER_TOKEN)
+        try:
+            raise RuntimeError(f"Authorization: Bearer {_FAKE_BROKER_TOKEN}")
+        except RuntimeError:
+            logger.exception("Сбой запроса")
+
+        content = _read_log(log_file)
+        assert _FAKE_BROKER_TOKEN not in content
+        assert "token=[скрыто]" in content
+        assert "Bearer [скрыто]" in content
+
+    def test_short_values_and_ordinary_text_untouched(self, tmp_path: Path) -> None:
+        from src.logging_setup import redact, register_secrets
+
+        register_secrets(("abc",))
+        text = "Свеча 2026-10-15T10:00:00 abc, цена 1.1238, заявка 12345:ok"
+        assert redact(text) == text
