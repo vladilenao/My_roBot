@@ -271,6 +271,7 @@ class TradeManager:
         self._max_entry_deviation_r = Decimal(str(max_entry_deviation_r))
         self._live_market_provider = live_market_provider
         self._equity_unknown = False
+        self._enqueued_at: dict[str, datetime] = {}
         self.contract_lifecycle = None
 
     def initialize_account(self):
@@ -291,6 +292,17 @@ class TradeManager:
             for event in drain():
                 self.consume(event)
 
+    def enqueued_at(self, command) -> datetime:
+        """Момент создания команды для проверки «раньше начала шага» (fix-entry-command-enqueue-time).
+
+        Момент постановки в очередь по рыночным часам менеджера — той же шкале, что
+        и начало шага. ``outbox.created_at`` входа хранит время свечи сигнала,
+        которая всегда открылась раньше шага; его сравнение с началом шага признало
+        бы устаревшим любой свежий вход. Для команды, которую этот процесс не
+        ставил (после перезапуска), остаётся запись журнала: она раньше начала шага.
+        """
+        return self._enqueued_at.get(command.command_id, command.created_at)
+
     def cancel_undelivered_increases(self, since, now=None) -> tuple[ExecutionEvent, ...]:
         """Снять неактуальные недоставленные входы и доборы (cancel-stale-undelivered-entries).
 
@@ -301,7 +313,63 @@ class TradeManager:
         """
         now = as_aware(now or self._clock.now())
         candidates = [(command, outbox_status) for command, outbox_status in self._storage.undelivered_increases()
-                      if outbox_status == UNDELIVERED or created_before_step(command.created_at, since)]
+                      if outbox_status == UNDELIVERED or created_before_step(self.enqueued_at(command), since)]
+        return self._cancel_undelivered(candidates, now)
+
+    def expire_pending_entries(self, now=None) -> tuple[TradeAction, ...]:
+        """Снять входы в ожидании с истёкшим сроком по всем инструментам (expire-pending-entries-before-admission).
+
+        Вызывается перед допуском нового входа, чтобы просроченная заявка любого
+        инструмента не занимала бюджет риска. Сроки и причина — те же, что у
+        ``entry-timeout``: подтверждённая заявка снимается отменой через допуск
+        доставки (он же ждёт, пока исполнение обработает минуты простоя), а
+        неотправленная — локально, как ``entry-undelivered``. Только live: без
+        допуска доставки (исторический режим) сверка не выполняется.
+        """
+        if not self._storage.outbox_guard_configured:
+            return ()
+        pending = self._storage.connection.execute(
+            "SELECT 1 FROM trades WHERE phase=? LIMIT 1", (TradePhase.ENTRY_PENDING.value,)).fetchone()
+        if pending is None:
+            return ()
+        now = as_aware(now or self._clock.now())
+        undelivered = {command.trade_id: (command, outbox_status)
+                       for command, outbox_status in self._storage.undelivered_increases()
+                       if command.payload.get("type") == "OpenTrade"}
+        submitted: list[TradeAction] = []
+        local = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if state.phase is not TradePhase.ENTRY_PENDING:
+                continue
+            if self._storage.connection.execute(
+                    "SELECT 1 FROM orders WHERE trade_id=? AND action_type='CANCEL' "
+                    "AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone():
+                continue  # отмена уже ожидает: вторую не создаём
+            ttl = timedelta(seconds=_entry_ttl_seconds(plan.timeframe))
+            if recovered.entry_ack_at is not None:
+                if now - as_aware(recovered.entry_ack_at) <= ttl:
+                    continue
+                log.info("Сверка сроков %s: отмена незаполненного входа %s (истёк срок ожидания исполнения)",
+                         plan.instrument_id, plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason="entry-timeout")
+                if self.submit_action(action, assignment_id=plan.assignment_id):
+                    submitted.append(action)
+            elif plan.trade_id in undelivered:
+                command, outbox_status = undelivered[plan.trade_id]
+                if outbox_status == UNDELIVERED or now - as_aware(self.enqueued_at(command)) > ttl:
+                    local.append((command, outbox_status))
+        if submitted:
+            # Подтверждение отмены освобождает резервацию до расчёта нового входа.
+            self.dispatch(now)
+            self.consume_queued_broker_events()
+        if local:
+            self._cancel_undelivered(local, now)
+        return tuple(submitted)
+
+    def _cancel_undelivered(self, candidates, now) -> tuple[ExecutionEvent, ...]:
+        """Локально снять неотправленные команды: outbox → UNDELIVERED под guard, затем CANCEL."""
         if not candidates:
             return ()
         fresh = [command.command_id for command, outbox_status in candidates if outbox_status != UNDELIVERED]
@@ -316,6 +384,7 @@ class TradeManager:
                 timestamp=now, reason=UNDELIVERED_REASON)
             log.info("Снят недоставленный %s %s: команда создана до начала шага и не отправлена брокеру",
                      "вход" if command.payload.get("type") != "AddToTrade" else "добор", command.trade_id)
+            self._enqueued_at.pop(command.command_id, None)
             self.consume(event)
             events.append(event)
         return tuple(events)
@@ -789,6 +858,7 @@ class TradeManager:
                 # Guard только до локальной доставки. Observer/Telegram и
                 # reducer не держат market lock и не фильтруются по hold.
                 self._storage.mark_outbox_sent(command.command_id, sent_at=now)
+                self._enqueued_at.pop(command.command_id, None)
                 if event is not None:
                     self.consume(event)
                     events.append(event)
@@ -845,7 +915,7 @@ class TradeManager:
             return deny("trade-not-open")
         if isinstance(action, ReduceTrade) and action.quantity > quantity:
             return deny("quantity-exceeds-trade-remainder")
-        evidence = self._dispatch_evidence_for(instrument, action, command)
+        evidence = self._dispatch_evidence_for(instrument, action, replace(command, created_at=self.enqueued_at(command)))
         if not isinstance(evidence, DispatchDataEvidence):
             return deny("data-evidence-unconfirmed")
         if protected:
@@ -955,6 +1025,8 @@ class TradeManager:
     def _notify_execution(self, event):
         if self._execution_observer is None:
             return
+        if event.status is ExecutionStatus.CANCEL and event.reason == UNDELIVERED_REASON:
+            return  # брокер заявку не получал: пользователю уведомление не нужно
         row = self._storage.connection.execute(
             "SELECT o.action_type,t.instrument_id,t.side,p.quantity,p.realized_pnl,p.fees,t.price_step,t.step_cost,o.quantity,b.payload_json "
             "FROM orders o JOIN trades t ON t.trade_id=o.trade_id JOIN positions p ON p.trade_id=t.trade_id "
@@ -1031,6 +1103,10 @@ class TradeManager:
             return SignalAdmission(
                 rejections=(rejection_reason("contract-expiring"),),
             )
+        try:
+            self.expire_pending_entries()
+        except Exception as exc:  # сверка не должна ломать допуск сигнала
+            log.warning("Не удалось сверить сроки ожидающих входов: %s", exc)
         try:
             recovered = self.restore()
             owned = self._owned_trade(recovered, assignment.id)
@@ -2016,6 +2092,7 @@ class TradeManager:
 
     def _insert_action(self, connection, action: TradeAction, now: str) -> None:
         payload = _action_payload(action)
+        self._enqueued_at[action.command_id] = as_aware(self._clock.now())
         connection.execute(
             "INSERT INTO outbox VALUES (?, ?, ?, 'PENDING', ?, NULL)",
             (action.command_id, action.trade_id, json.dumps(payload, sort_keys=True), now),
