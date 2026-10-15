@@ -76,6 +76,7 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
 
 def test_friday_overview_is_immediate_dated_and_read_only():
     manager = Mock()
+    manager.management_obligations.return_value = ()
     live, cache, data, events, clock = setup(manager=manager)
     live.bootstrap()
     reviews = [event for event in events if event.type is EventType.STARTUP_ANALYSIS]
@@ -138,6 +139,7 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
 
 def test_live_decision_is_published_once_right_before_its_admission():
     manager = Mock()
+    manager.management_obligations.return_value = ()
     manager.manage.return_value = ()
     manager.actions_for_signal.return_value = SignalAdmission(
         rejections=(RejectionReason(code="zero-quantity", message="Размер позиции ниже минимального"),))
@@ -332,6 +334,7 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
     bus = EventBus()
     bus.subscribe(Channel())
     manager = Mock()
+    manager.management_obligations.return_value = ()
     manager.manage.side_effect = lambda *args, **kw: operations.append("manage") or ()
     manager.actions_for_signal.side_effect = lambda *args, **kw: operations.append("admit") or SignalAdmission()
     bot = TradingBot([instrument], bus, {"macd_rsi_stoch": object()}, cache, timeline,

@@ -257,6 +257,7 @@ class TradeManagementProfile(ABC):
         return result, calculation_trace(
             f"profile.{self.NAME}.manage",
             inputs={"market": MeasuredValue(dict(context.market), "local-market-inputs"),
+                    "timeframe": MeasuredValue(context.plan.timeframe or None, "timeframe"),
                     "quantity": MeasuredValue(context.state.quantity, "contracts"),
                     "confirmed_stop": MeasuredValue(context.state.confirmed_stop or context.plan.stop_price, "price")},
             result=MeasuredValue(output, "management-intentions"),
