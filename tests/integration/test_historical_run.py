@@ -22,6 +22,7 @@ from src.history.report import REPORT_JSON, REPORT_TXT
 from src.portfolio.models import ContractMeta
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.trade_journal.storage import Storage
+from src.trade_management.intraday_settings import IntradaySettings
 
 TICKER = "NGV6"
 UID = "uid-ngv6"
@@ -246,6 +247,8 @@ def _run_history(state_dir, *, pause=0.0, rows=None, start=START, end=END, crash
             patch.object(run, "EmulatorClientProvider", return_value=StubProvider(client))
         )
         stack.enter_context(patch.object(run, "select_instruments", return_value=[INSTRUMENT]))
+        # Прогон без расписания торгов: сессионная защита запретила бы входы 1m.
+        stack.enter_context(patch.object(run, "INTRADAY_SETTINGS", IntradaySettings(enabled=False)))
         stack.enter_context(patch.object(run, "state_dir_for", return_value=state_dir))
         stack.enter_context(patch.object(run, "setup_logging"))
         stack.enter_context(patch.object(run, "print_contract_metadata"))

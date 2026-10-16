@@ -354,6 +354,8 @@ class TestRuntimeComposition:
             clock=None,
             signal_filter=ANY,
             cluster_gate=None,
+            intraday_settings=run.INTRADAY_SETTINGS,
+            session_calendar=ANY,
         )
         manager.restore.assert_called_once_with()
         limits.assert_called_once_with()

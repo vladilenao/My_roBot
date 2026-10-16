@@ -50,6 +50,8 @@ from src.trade_management.pipeline import (
 )
 from src.trade_management.profiles.base import ManagementContext, PlanningContext, ProfileResult
 from src.trade_management.notification import lifecycle_snapshot
+from src.trade_management import session_guard
+from src.trade_management.intraday_settings import IntradaySettings
 from src.events.visual import market_snapshot, utc
 from src.scheduler.timing import CandleScheduler
 
@@ -243,6 +245,9 @@ class TradeManager:
         live_market_provider=None,
         clock: Clock | Callable[[], datetime] | None = None,
         cluster_gate: object | None = None,
+        intraday_settings: IntradaySettings | None = None,
+        session_calendar: Callable[[object, datetime], object] | None = None,
+        protection_timeframe: str = "1m",
     ) -> None:
         self._storage = storage
         self._broker = broker
@@ -288,6 +293,13 @@ class TradeManager:
         self._equity_unknown = False
         self._enqueued_at: dict[str, datetime] = {}
         self.contract_lifecycle = None
+        # Сессионная защита внутридневных сделок: настройки, провайдер расписания
+        # инструмента (instrument, now) -> TradingCalendar и таймфрейм цикла защиты,
+        # на котором принимаются решения закрытия. Без провайдера правило выключено.
+        self._intraday = intraday_settings
+        self._session_calendar = session_calendar
+        self._protection_timeframe = protection_timeframe
+        self._session_instruments: dict[str, object] = {}
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -653,6 +665,8 @@ class TradeManager:
             row = self._storage.connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
             if row and not self.contract_lifecycle.can_increase(row[0], self._clock.now()):
                 return False
+        if isinstance(action, AddToTrade) and not self._intraday_add_allowed(action):
+            return False
         if isinstance(action, (CloseTrade, ReduceTrade)) and action.reference_price is None and market_close is not None:
             action = replace(action, reference_price=Decimal(str(market_close)))
         now = as_aware(self._clock.now()).isoformat()
@@ -1113,6 +1127,7 @@ class TradeManager:
         if decision.signal_type is SignalType.HOLD:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
+        self._session_instruments[instrument_key(instrument)] = instrument
         if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
             return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
@@ -1137,6 +1152,9 @@ class TradeManager:
             if owned is not None:
                 actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
                 return SignalAdmission(actions=actions)
+            session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
+            if session_rejection is not None:
+                return SignalAdmission(rejections=(session_rejection,))
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except sqlite3.IntegrityError as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -1189,6 +1207,7 @@ class TradeManager:
         выполняются на любом вызове.
         """
         now = now or as_aware(self._clock.now())
+        self._session_instruments[instrument_key(instrument)] = instrument
         if self.contract_lifecycle is not None and self.contract_lifecycle.retiring(instrument_key(instrument), now):
             return self.drain_contract(instrument_key(instrument))
         contract = getattr(self._broker, "contract_for", None)
@@ -1200,9 +1219,12 @@ class TradeManager:
             return self._close_expiring(instrument_key(instrument))
         results: list[TradeAction] = []
         results.extend(self._cancel_stale_entries(instrument_key(instrument), now))
+        results.extend(self._guard_sessions(instrument, frame, timeframe, now))
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
             if plan.instrument_id != instrument_key(instrument) or state.phase not in _MANAGEABLE or state.quantity <= 0:
+                continue
+            if self._open_order(plan.trade_id, "CLOSE", reason=session_guard.SESSION_END):
                 continue
             profile_cls = PROFILE_CLASSES.get(plan.profile.name)
             if profile_cls is None:
@@ -1341,6 +1363,208 @@ class TradeManager:
             if self.submit_action(action, assignment_id=plan.assignment_id):
                 submitted.append(action)
         return tuple(submitted)
+
+    def _session_guard_active(self) -> bool:
+        return self._intraday is not None and self._intraday.enabled and self._session_calendar is not None
+
+    def session_guard_needed(self, timeframes) -> bool:
+        """Есть ли у инструмента незавершённые внутридневные сделки (по таймфреймам их планов)."""
+        return self._session_guard_active() and any(self._intraday.is_intraday(tf) for tf in timeframes)
+
+    def _calendar_for(self, instrument, now: datetime):
+        """Сохранённое расписание режима торгов инструмента; сбой провайдера — как неизвестное."""
+        if instrument is None:
+            return None
+        try:
+            return self._session_calendar(instrument, now)
+        except Exception as exc:  # расписание не должно ломать допуск и защиту
+            log.warning("Расписание сессий %s недоступно: %s", instrument_key(instrument), type(exc).__name__)
+            return None
+
+    def _session_trace(self, *, code: str, action: str | None, timeframe: str | None, now: datetime,
+                       schedule, block, links: TraceLinks, outcome: TraceOutcome,
+                       extra: Mapping[str, MeasuredValue] | None = None):
+        settings = self._intraday
+        inputs = {
+            "plan_timeframe": MeasuredValue(timeframe or None, "timeframe"),
+            "max_timeframe": MeasuredValue(settings.max_timeframe, "timeframe"),
+            "market_time": MeasuredValue(session_guard.naive_utc(now).isoformat(), "utc"),
+            "trading_date": MeasuredValue(schedule.trading_date.isoformat(), "date"),
+            "schedule_version": MeasuredValue(schedule.version, "schedule-day-version"),
+            "entry_sessions": MeasuredValue(list(settings.entry_sessions), "sessions"),
+            "blocks": MeasuredValue([[b.start.isoformat(), b.end.isoformat()] for b in schedule.blocks], "utc-intervals"),
+            "entry_cutoff": MeasuredValue(block.entry_cutoff(settings).isoformat() if block else None, "utc"),
+            "flatten_at": MeasuredValue(block.flatten_at(settings).isoformat() if block else None, "utc"),
+            **(extra or {}),
+        }
+        return calculation_trace(
+            session_guard.ALGORITHM,
+            inputs=inputs,
+            result=MeasuredValue(action, "action"),
+            reason=code,
+            formula="entry: now in allowed block and now < end - no_entry_before_close_min; "
+                    "holding: outside [block start, end - flatten_before_close_min) -> carry or close",
+            links=links,
+            outcome=outcome,
+            algorithm_version=session_guard.ALGORITHM_VERSION,
+        )
+
+    def _intraday_entry_rejection(self, instrument, assignment, decision, timeframe: str | None):
+        """Недопуск нового внутридневного входа вне окна разрешённых сессий (design D4)."""
+        if not self._session_guard_active() or not self._intraday.is_intraday(timeframe):
+            return None
+        now = self._clock.now()
+        verdict = session_guard.entry_decision(self._calendar_for(instrument, now), now, self._intraday)
+        if verdict.allowed:
+            return None
+        log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, rejection_message(verdict.code))
+        self._traces.record(self._session_trace(
+            code=verdict.code, action=None, timeframe=timeframe, now=now, schedule=verdict.schedule,
+            block=verdict.block, links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
+        return rejection_reason(verdict.code)
+
+    def _intraday_add_allowed(self, action: AddToTrade) -> bool:
+        """Добор внутридневной сделки разрешён только там, где был бы допущен вход (design D8)."""
+        if not self._session_guard_active():
+            return True
+        row = self._storage.connection.execute(
+            "SELECT instrument_id, assignment_id, signal_id, plan_json FROM trades WHERE trade_id=?", (action.trade_id,)
+        ).fetchone()
+        if row is None:
+            return True
+        instrument_id, assignment_id, signal_id, plan_json = row
+        timeframe = json.loads(plan_json).get("timeframe")
+        if not self._intraday.is_intraday(timeframe):
+            return True
+        now = self._clock.now()
+        instrument = self._session_instruments.get(instrument_id)
+        verdict = session_guard.entry_decision(self._calendar_for(instrument, now), now, self._intraday)
+        if verdict.allowed:
+            return True
+        log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(verdict.code))
+        self._traces.record(self._session_trace(
+            code=verdict.code, action="AddToTrade", timeframe=timeframe, now=now, schedule=verdict.schedule,
+            block=verdict.block, outcome=TraceOutcome.REJECTED,
+            links=TraceLinks(assignment_id=assignment_id, trade_id=action.trade_id, signal_id=signal_id),
+        ))
+        return False
+
+    def _open_order(self, trade_id: str, action_type: str, *, reason: str | None = None) -> bool:
+        """Есть ли незавершённая заявка типа ``action_type`` (при ``reason`` — с этой причиной)."""
+        query = ("SELECT b.payload_json FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+                 "WHERE o.trade_id=? AND o.action_type=? AND o.status IN ('PENDING','ACK','PARTIAL')")
+        rows = self._storage.connection.execute(query, (trade_id, action_type)).fetchall()
+        if reason is None:
+            return bool(rows)
+        return any(json.loads(payload).get("reason") == reason for payload, in rows)
+
+    def _carry_approved_at(self, trade_id: str) -> datetime | None:
+        row = self._storage.connection.execute(
+            "SELECT profile_state_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+        value = json.loads(row[0] or "{}").get(session_guard.CARRY_STATE_KEY) if row else None
+        return datetime.fromisoformat(value) if value else None
+
+    def _approve_carry(self, trade_id: str, now: datetime, trace) -> None:
+        """Одобренный перенос до следующего рубежа закрытия переживает перезапуск."""
+        with self._storage.transaction() as connection:
+            row = connection.execute("SELECT profile_state_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+            values = {**json.loads(row[0] or "{}"),
+                      session_guard.CARRY_STATE_KEY: session_guard.naive_utc(now).isoformat()}
+            connection.execute("UPDATE trades SET profile_state_json=? WHERE trade_id=?",
+                               (json.dumps(values, sort_keys=True), trade_id))
+            self._traces.record_in_transaction(connection, trace)
+
+    def _guard_sessions(self, instrument, frame, timeframe: str | None, now: datetime) -> tuple[TradeAction, ...]:
+        """Снятие ожидающих входов, закрытие и перенос внутридневных позиций (design D5–D7).
+
+        Решения принимаются только на цикле таймфрейма защиты: его последнее
+        закрытие — самая свежая цена рынка для проверки безубытка.
+        """
+        if not self._session_guard_active() or timeframe != self._protection_timeframe:
+            return ()
+        ticker = instrument_key(instrument)
+        trades = [recovered for recovered in self.restore()
+                  if recovered.plan.instrument_id == ticker and self._intraday.is_intraday(recovered.plan.timeframe)]
+        if not trades:
+            return ()
+        calendar = self._calendar_for(instrument, now)
+        entry = session_guard.entry_decision(calendar, now, self._intraday)
+        holding = session_guard.holding_decision(calendar, now, self._intraday)
+        close = None
+        if frame is not None and len(frame):
+            close = Decimal(str(frame["close"].iloc[-1]))
+        submitted: list[TradeAction] = []
+        for recovered in trades:
+            plan, state = recovered.plan, recovered.state
+            links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
+            if state.phase is TradePhase.ENTRY_PENDING:
+                if entry.code not in (session_guard.SESSION_CLOSED, session_guard.CLOSE_NEAR):
+                    continue
+                if self._open_order(plan.trade_id, "CANCEL"):
+                    continue
+                log.info("manage %s: отмена незаполненного входа %s (конец разрешённой сессии)", ticker, plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason=session_guard.SESSION_END)
+                trace = self._session_trace(code=entry.code, action="CancelEntry", timeframe=plan.timeframe, now=now,
+                                            schedule=entry.schedule, block=entry.block, links=links,
+                                            outcome=TraceOutcome.ACCEPTED)
+                if self._submit_session_action(action, plan, trace, close):
+                    submitted.append(action)
+                continue
+            if state.phase not in _MANAGEABLE or state.quantity <= 0 or not holding.obligated:
+                continue
+            if holding.carry_valid(self._carry_approved_at(plan.trade_id)):
+                continue
+            if self._open_order(plan.trade_id, "CLOSE"):
+                continue
+            step, cost = self._storage.connection.execute(
+                "SELECT price_step, step_cost FROM trades WHERE trade_id=?", (plan.trade_id,)).fetchone()
+            carry = session_guard.carry_decision(
+                plan, state, close=close,
+                price_step=None if step is None else Decimal(step),
+                step_cost=None if cost is None else Decimal(cost),
+                settings=self._intraday,
+            )
+            extra = {
+                "first_fixation": MeasuredValue(carry.first_fixation, "flag"),
+                "break_even": MeasuredValue(carry.break_even, "price"),
+                "confirmed_stop": MeasuredValue(state.confirmed_stop, "price"),
+                "market_close": MeasuredValue(close, "price"),
+                "carry_reason": MeasuredValue(carry.reason, "reason"),
+            }
+            if carry.action == "keep":
+                log.info("manage %s: позиция %s переносится — стоп в безубытке", ticker, plan.trade_id)
+                self._approve_carry(plan.trade_id, now, self._session_trace(
+                    code="intraday-carry", action=None, timeframe=plan.timeframe, now=now,
+                    schedule=holding.schedule, block=holding.block, links=links,
+                    outcome=TraceOutcome.ACCEPTED, extra=extra))
+                continue
+            if carry.action == "move":
+                if state.pending_stop is not None:
+                    continue  # перенос уже ждёт подтверждения; решение повторится на следующем цикле
+                log.info("manage %s: стоп %s переносится в безубыток %s перед концом сессии",
+                         ticker, plan.trade_id, carry.break_even)
+                action = MoveStop(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision,
+                                  reason=session_guard.CARRY_BREAK_EVEN, stop_price=carry.break_even)
+            else:
+                log.info("manage %s: закрытие %s перед концом разрешённой сессии", ticker, plan.trade_id)
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                    state_revision=state.state_revision, reason=session_guard.SESSION_END)
+            trace = self._session_trace(code=action.reason, action=type(action).__name__, timeframe=plan.timeframe,
+                                        now=now, schedule=holding.schedule, block=holding.block, links=links,
+                                        outcome=TraceOutcome.ACCEPTED, extra=extra)
+            if self._submit_session_action(action, plan, trace, close):
+                submitted.append(action)
+        return tuple(submitted)
+
+    def _submit_session_action(self, action: TradeAction, plan: TradePlan, trace, close) -> bool:
+        try:
+            return self.submit_action(action, assignment_id=plan.assignment_id, trace=trace, market_close=close)
+        except (ValueError, TradeManagementException) as exc:
+            log.debug("сессионная защита %s пропустила %s: %s", plan.trade_id, type(action).__name__, type(exc).__name__)
+            return False
 
     def _cancel_stale_entries(self, ticker: str, now: datetime) -> tuple[TradeAction, ...]:
         """Отменить незаполненный вход, чья принятая заявка не исполнилась в срок.

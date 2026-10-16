@@ -30,6 +30,7 @@ from src.bot.run_session import HistoricalRunSession
 from src.events.bus import EventBus
 from src.market_context.models import MarketContext, SRLevel, SRType, TrendResult, TrendDirection
 from src.strategies.contracts import Assignment, Decision, SignalType
+from src.trade_management.intraday_settings import IntradaySettings
 
 D = Decimal
 START = datetime(2026, 1, 1, 10)
@@ -282,6 +283,8 @@ def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_pat
     monkeypatch.setattr(run, "_family_warmup", lambda family: {"1m": 2})
     monkeypatch.setattr(run, "FUTURE_STRATEGIES", bindings)
     monkeypatch.setattr(run, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    # Проверяется переход контрактов без расписания торгов: сессионная защита выключена.
+    monkeypatch.setattr(run, "INTRADAY_SETTINGS", IntradaySettings(enabled=False))
     monkeypatch.setattr(run, "TRADE_MANAGEMENT_PROFILES", {"levels_rr": {
         "target_R": [3, 4], "shares": [.5, .5], "min_stop_atr": 0,
         "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}})

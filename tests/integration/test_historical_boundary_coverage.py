@@ -12,6 +12,7 @@ from src.api.emulator_client import EmulatorClientProvider
 from src.bot import TradingBot
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.history.contract_lifecycle import ConstantContractLifecycle
+from src.trade_management.intraday_settings import IntradaySettings
 
 START = datetime(2025, 1, 24, 20, 48)
 END = datetime(2025, 1, 25, 12)
@@ -95,6 +96,8 @@ def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail
     monkeypatch.setattr(run, "_strategy_map", lambda: {"macd_rsi_stoch": object()})
     monkeypatch.setattr(run, "_warmup_bars", lambda: 2)
     monkeypatch.setattr(run, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    # Проверяется граница прогона, а не сессии: входы 1m вне правила сессионной защиты.
+    monkeypatch.setattr(run, "INTRADAY_SETTINGS", IntradaySettings(enabled=False))
 
     class Strategy:
         def compute(self, frame):

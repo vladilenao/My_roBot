@@ -62,6 +62,7 @@ from src.config import (
     TRADE_MANAGEMENT_PROFILES,
     CONTRACT_EXPIRY_BLOCK_DAYS,
     TRADING_DIRECTIONS,
+    INTRADAY_SETTINGS,
     trading_enabled,
     runtime_dir,
     run_dir_name,
@@ -1124,6 +1125,8 @@ def _build_runtime(
         signal_filter=SignalFilter(),
         clock=clock,
         cluster_gate=cluster_gate,
+        intraday_settings=INTRADAY_SETTINGS,
+        session_calendar=_session_calendar_provider(data_cache),
     )
     if historical:
         trade_manager.initialize_account()
@@ -1317,6 +1320,21 @@ def _build_runtime(
     )
     runtime_ref.append(runtime)
     return runtime
+
+
+def _session_calendar_provider(data_cache):
+    """Расписание режима торгов инструмента для сессионной защиты: только сохранённые дни.
+
+    Live и исторический прогон используют один и тот же ``MarketCalendar``
+    кэша (в истории — расписание снимка прогона); сеть на тике не трогается.
+    """
+    def provider(instrument, now):
+        calendar = getattr(data_cache, "market_calendar", None)
+        uid = data_cache.instrument_uid(instrument)
+        if calendar is None or not uid:
+            return None
+        return calendar.calendar_for(uid, now)
+    return provider
 
 
 def _dispatch_evidence(data_cache, instruments, storage, intent_since):

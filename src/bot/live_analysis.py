@@ -332,6 +332,19 @@ class LiveAnalysis:
             managed.add(management_key)
         self.cursors[key] = stamp
 
+    def _guard_sessions(self, instrument, needs, managed, execution_complete):
+        """Сессионная защита внутридневных сделок на каждом новом 1m-баре.
+
+        Рубеж закрытия (18:35/18:40 МСК) не совпадает с закрытием бара плана,
+        поэтому решения о снятии входа, закрытии и переносе принимаются на
+        служебном 1m, а не только на барах 5m/15m сделки.
+        """
+        needed = getattr(self.bot._trade_manager, "session_guard_needed", None)
+        if not callable(needed) or not needed(needs):
+            return
+        tf = self.bot._protection_timeframe
+        self._manage_unbound(instrument, tf, self.cache.frame_for(instrument, tf), 1, managed, execution_complete)
+
     def publish_status(self, instrument, tf, frame):
         now = self.timeline.now()
         key = self._key(instrument, tf)
@@ -476,6 +489,7 @@ class LiveAnalysis:
             admits_signals = getattr(self.bot._trade_manager, "actions_for_signal", None) is not None
             for instrument in self.bot._instruments:
                 needs = self.bot._management_needs(instrument)
+                self._guard_sessions(instrument, needs, managed, execution_complete)
                 for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)} | set(needs)):
                     bindings = self._bindings(instrument, tf)
                     if not bindings and self._key(instrument, tf) not in self.states:

@@ -23,6 +23,7 @@ from typing import Any, Mapping, Sequence
 
 from src.data.ingestion_settings import SettingError, setting_names, validate_combination, validate_setting
 from src.clusters.settings import ClusterSettings, check_mode
+from src.trade_management.intraday_settings import IntradaySettings
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
@@ -96,6 +97,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "database_file": "database_file",
         "risk_limits": "risk_limits",
         "directions": "directions",
+        "intraday": "intraday",
         "contract_expiry_block_days": "contract_expiry_block_days",
     },
     "trade_management": {
@@ -148,6 +150,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "audit_backup_count": int,
     "risk_limits": dict,
     "directions": dict,
+    "intraday": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
     "historical_rollover": dict,
@@ -594,6 +597,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             continue
         if key == "directions":
             cleaned[key] = _validate_directions(value, path)
+            continue
+        if key == "intraday":
+            try:
+                cleaned[key] = IntradaySettings.from_config(value).as_config()
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}: [trading.intraday] {exc}") from None
             continue
         if key == "historical_rollover":
             cleaned[key] = _validate_rollover(value, path)

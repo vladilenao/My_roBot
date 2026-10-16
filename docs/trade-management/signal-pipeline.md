@@ -91,6 +91,7 @@ sequenceDiagram
     participant RD as ExecutionReducer
 
     TB->>TM: actions_for_signal
+    Note over TM: сессионная защита: внутридневной вход<br/>вне окна сессий → недопуск intraday-*
     Note over TM: «Кластеры»: вердикт и трасса filter.cluster<br/>(clusters = shadow/enforce)
     Note over TM: фильтр привязки (filter.<профиль>)<br/>enforce + запрет → недопуск cluster-climax
     TM->>PF: уровни, стоп, цели
@@ -153,6 +154,31 @@ ClusterSource (Redis Stream `cluster.events`, локальная копия
 сделке и доборы вердикт не получают. Алгоритм и пример расчёта —
 `openspec/changes/add-cluster-filter/design.md` (D5); отчёт по вердиктам —
 `GET /api/v1/clusters/report` в [OpenAPI](../openapi.yaml).
+
+### Сессионная защита внутридневных сделок
+
+Сделка внутридневная, если таймфрейм её плана не больше
+`[trading.intraday] max_timeframe` (по умолчанию `15m`); сделки на `1h` и
+выше правило не трогает. Окна берутся из расписания брокера для режима торгов
+инструмента (`market-data.sqlite3`, в истории — снимок прогона): разрешённые
+типы сессий из `entry_sessions` сливаются в блок, конец блока округляется
+вверх до минуты (у акций — конец непрерывных торгов, без аукциона закрытия).
+
+| Шаг | Где | Что делает |
+|---|---|---|
+| Допуск входа | `actions_for_signal`, до `_plan_entry` | вне блока — `intraday-session-closed`; позже `конец − no_entry_before_close_min` — `intraday-close-near`; без расписания — `session-schedule-unknown` |
+| Ожидающий вход | `manage`, цикл 1m | после рубежа входа — `CancelEntry` с причиной `intraday-session-end` |
+| Позиция | `manage`, цикл 1m | с `конец − flatten_before_close_min` и вне блоков: `CloseTrade` (`intraday-session-end`) либо перенос, если взята первая цель и стоп не хуже безубытка всей сделки (иначе `MoveStop` в безубыток, `intraday-carry-break-even`, когда рынок по правильную сторону) |
+| Добор | `submit_action` | вне окна входа отклоняется тем же кодом |
+
+Для расписания 16.10.2026 рубежи такие: акции — вход до 17:55, закрытие в
+18:35; фьючерсы — вход до 18:00, закрытие в 18:40 (МСК). В live решения о
+закрытии принимаются на каждом новом 1m-баре (`LiveAnalysis._guard_sessions`),
+в истории — на защитном 1m каждого тика. Одобренный перенос хранится в
+состоянии сделки (`intraday_carry_at`) и действует до следующего рубежа
+закрытия. Каждое решение пишется трассой `session.intraday`. Экспирация и
+контрактный переход имеют приоритет. Подробности —
+`openspec/changes/add-intraday-session-guard/design.md`.
 
 ## 3. Фазы сделки и время жизни резерва
 
