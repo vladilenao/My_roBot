@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from src.history.contract_chain import ContractChainError, build_chain
+from src.history.contract_chain import ContractChainError, build_chain, contract_deadline
 from src.instruments.futures import FuturesCard
 
 
@@ -89,3 +89,37 @@ def test_ticker_reuse_is_not_contract_identity_collision():
     chain = build_chain([first, second], "NG", datetime(2026, 7, 1), datetime(2026, 8, 1), 2)
     assert len(chain) == 2
     assert first.instrument.contract_id != second.instrument.contract_id
+
+
+def br_card(month, expiration, last_trade, first_trade):
+    """Карточка BR в том виде, в каком её отдаёт эмулятор по данным Tinkoff."""
+    return FuturesCard.from_row({
+        "instrument_id": f"uid-br-{month}", "ticker": f"BR{month}", "name": f"BR-{month}.25 Нефть Brent",
+        "basic_asset": "Brent", "first_trade_date": first_trade,
+        "expiration_date": expiration, "last_trade_date": last_trade,
+        "min_price_increment": .01, "min_price_increment_amount": 7.82284,
+        "initial_margin_on_buy": 6826.01, "initial_margin_on_sell": 6826.01,
+    })
+
+
+BR_6_25 = br_card(6, "2025-06-02T00:00:00Z", "2025-06-02T16:05:00Z", "2024-05-28T20:59:59Z")
+
+
+def test_midnight_expiration_on_last_trade_day_does_not_cut_last_session():
+    assert contract_deadline(BR_6_25) == (datetime(2025, 6, 2, 16, 5), "last_trade_date")
+
+
+def test_midnight_expiration_after_last_trade_day_keeps_last_trade():
+    c = br_card(5, "2026-05-29T00:00:00Z", "2026-05-28T16:00:00Z", "2025-04-21T07:00:00Z")
+    assert contract_deadline(c) == (datetime(2026, 5, 28, 16), "last_trade_date")
+
+
+def test_midnight_expiration_without_last_trade_is_unchanged():
+    c = replace(BR_6_25, last_trade_date=None)
+    assert contract_deadline(c) == (datetime(2025, 6, 2), "expiration_only")
+
+
+def test_br_6_25_cutoff_is_not_moved_into_weekend_midnight():
+    part, = build_chain([BR_6_25], "BR", datetime(2025, 5, 10), datetime(2025, 5, 20), 2)
+    assert part.deadline == datetime(2025, 6, 2, 16, 5)
+    assert part.cutoff == datetime(2025, 5, 31, 16, 5)
