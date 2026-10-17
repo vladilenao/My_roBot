@@ -28,6 +28,8 @@ class FakeRedis:
     def xreadgroup(self, group, consumer, streams, count=None, block=None):
         if self.fail:
             raise self.fail
+        if group not in self.groups:
+            raise RuntimeError(f"NOGROUP No such key 'cluster.events' or consumer group '{group}'")
         (stream, start), = streams.items()
         if start == "0":
             batch = [entry for entry in self.entries if entry[0] in self.pending][:count]
@@ -164,6 +166,23 @@ class TestConsumer:
 
         with pytest.raises(ConnectionError):
             _consumer(store, redis).step()
+
+    def test_lost_group_is_recreated(self, tmp_path):
+        store = ClusterEventStore(tmp_path / "cluster-events.sqlite3")
+        redis = FakeRedis(_stream(2))
+        consumer = _consumer(store, redis)
+        consumer.step()  # pending пуст
+        consumer.step()  # новые
+        # Redis пересоздан пустым: группы нет, поток наполняется заново.
+        redis.__init__(_stream(3))
+
+        assert consumer.step() == 0
+        assert "robot-v1" in redis.groups
+        consumer.step()  # pending пуст
+        assert consumer.step() == 1  # повторы отсекает event_id
+
+        assert redis.acked == [entry[0] for entry in _stream(3)]
+        assert len(store.signals("BRX6", after=datetime(2026, 10, 15, tzinfo=timezone.utc), until=NOW)) == 3
 
 
 class TestCatchUp:
