@@ -13,6 +13,7 @@ from src.config_loader import (
     validate_triple_screen_hierarchy,
 )
 from src.clusters.settings import ClusterSettings
+from src.trade_management.intraday_settings import IntradaySettings
 from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
@@ -335,6 +336,8 @@ RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
 CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
 TRADING_DIRECTIONS = dict(_CONFIG.get("directions", {}))
+# Сессионная защита внутридневных сделок ([trading.intraday]); без секции — дефолты.
+INTRADAY_SETTINGS = IntradaySettings.from_config(_CONFIG.get("intraday", {}))
 
 
 def trading_enabled() -> bool:
