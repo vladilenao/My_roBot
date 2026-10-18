@@ -12,6 +12,14 @@ release notes and checksums are available from the GitHub Release.
 
 Release contract details live in `openspec/specs/release/spec.md`.
 
+The T-Invest SDK `t-tech-investments` is not on PyPI and its tbank index is
+unreachable from GitHub Actions, so CI installs it from the wheel vendored in
+`vendor/wheels/`. Before every release check that this wheel matches the
+`t-tech-investments==X.Y.Z` pin in `requirements.txt` and the version in
+`.venv`; when the SDK is upgraded, replace the wheel in the same commit (see
+the «Зависимость t-invest» section of the release doc). Never point CI back at
+the tbank index.
+
 ## Secrets — never print them (strict, no exceptions)
 
 Tokens, passwords and secret addresses (`TINKOFF_TOKEN`, `TELEGRAM_BOT_TOKEN`,

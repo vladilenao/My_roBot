@@ -42,6 +42,32 @@ robot-vX.Y.Z-windows-x64/
 5. Ручной запуск workflow обязан получать явный тег или версию. Имя ветки
    никогда не используется как номер версии или часть имени артефакта.
 
+## Зависимость t-invest (подложенный wheel)
+
+T-Invest Python SDK `t-tech-investments` публикуется только на индексе
+`opensource.tbank.ru`, а он недоступен с раннеров GitHub Actions. Поэтому SDK
+подкладывается в репозиторий:
+
+- wheel лежит в `vendor/wheels/t_tech_investments-<версия>-py3-none-any.whl`;
+- в `requirements.txt` SDK закреплён ровно той же версией
+  `t-tech-investments==<версия>`;
+- CI командой `python -m scripts.offline_requirements` убирает из
+  `requirements.txt` внешний индекс, проверяет наличие wheel закреплённой
+  версии и ставит зависимости с `--find-links vendor/wheels`. Остальные
+  зависимости SDK берутся с PyPI.
+
+Если версия в `requirements.txt` и wheel расходятся, CI останавливается до
+установки зависимостей. При обновлении SDK:
+
+1. Установить новую версию локально и прогнать тесты.
+2. Положить её wheel в `vendor/wheels/` и удалить старый. Wheel берётся из
+   индекса tbank (`pip download t-tech-investments==X.Y.Z --no-deps
+   --only-binary=:all: -d vendor/wheels --index-url
+   https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple`) либо,
+   если индекс недоступен, из кэша pip (`~/Library/Caches/pip/http-v2`), после
+   сверки RECORD с установленным пакетом.
+3. Обновить пин в `requirements.txt` и закоммитить всё одним коммитом.
+
 ## Безопасность и состав
 
 - В дистрибутив включаются только binary, документация, `VERSION.txt`,
@@ -58,7 +84,12 @@ robot-vX.Y.Z-windows-x64/
 1. Выбрать SemVer-номер и изменить только `src/__init__.py::__version__`.
 2. В `CHANGELOG.md` переименовать `## Unreleased` в
    `## X.Y.Z — DD.MM.YYYY`, добавить новый пустой `## Unreleased`.
-3. Выполнить проверки:
+3. Убедиться, что wheel `t-tech-investments` в `vendor/wheels/` совпадает с
+   пином в `requirements.txt` и с версией в `.venv`
+   (`.venv/bin/python -m scripts.offline_requirements --output /dev/null`
+   завершается без ошибки). Иначе — обновить по разделу
+   «Зависимость t-invest».
+4. Выполнить проверки:
 
    ```bash
    .venv/bin/python -m pytest -q
@@ -67,7 +98,7 @@ robot-vX.Y.Z-windows-x64/
 
    Заранее признанные замечания в `tools/` и `openspec/_check_sync.py`
    фиксируются отдельно; новые замечания недопустимы.
-4. Собрать локальный macOS-дистрибутив нативным PyInstaller и проверить
+5. Собрать локальный macOS-дистрибутив нативным PyInstaller и проверить
    исполняемый файл. Из корня репозитория:
 
    ```bash
@@ -77,13 +108,13 @@ robot-vX.Y.Z-windows-x64/
 
    Минимальные smoke-проверки: запуск `--version`, загрузка bundled
    `default.toml` и `--telegram-chart-smoke`.
-5. Создать коммит релиза, тег `vX.Y.Z` и отправить ветку с тегом.
-6. CI обязан нативно собрать и проверить macOS arm64 и Windows x64. Windows
+6. Создать коммит релиза, тег `vX.Y.Z` и отправить ветку с тегом.
+7. CI обязан нативно собрать и проверить macOS arm64 и Windows x64. Windows
    binary получает GitHub Actions на `windows-latest`; собирать его на macOS
    вручную не требуется.
-7. Для каждой платформы CI формирует ZIP требуемой структуры, вычисляет
+8. Для каждой платформы CI формирует ZIP требуемой структуры, вычисляет
    SHA-256 и прикрепляет ZIP и `checksums.txt` к GitHub Release тега.
-8. Релиз завершён только после проверки содержимого GitHub Release: оба
+9. Релиз завершён только после проверки содержимого GitHub Release: оба
    архива, notes и checksums доступны для скачивания.
 
 ## Получение Windows-сборки
@@ -105,6 +136,8 @@ CI должен технически проверять, а не только о
 - до упаковки проходят pytest и Ruff;
 - Python, PyInstaller и вспомогательные build tools закреплены
   воспроизводимыми версиями;
+- `t-tech-investments` ставится из `vendor/wheels/` той версии, что закреплена
+  в `requirements.txt`, без обращения к tbank-индексу;
 - binary создан под заявленную ОС и архитектуру;
 - smoke-проверки выполняются для готового binary;
 - ZIP не содержит секретов или пользовательских runtime-файлов;

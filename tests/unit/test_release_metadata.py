@@ -4,7 +4,12 @@ import zipfile
 import pytest
 
 from scripts.build_distribution import package_distribution
-from src.release_metadata import ReleaseMetadataError, release_notes, validate_release
+from src.release_metadata import (
+    ReleaseMetadataError,
+    offline_requirements,
+    release_notes,
+    validate_release,
+)
 
 
 CHANGELOG = """# История\n\n## Unreleased\n\n## 4.2.0 — 08.10.2026\n\n- Новая поставка.\n\n## 4.1.0 — 01.10.2026\n"""
@@ -55,3 +60,43 @@ def test_package_distribution_contains_only_allowlisted_files(tmp_path: Path):
             "robot-v4.2.0-windows-x64/robot.toml.example",
         ]
         assert bundle.read("robot-v4.2.0-windows-x64/VERSION.txt") == b"4.2.0\n"
+
+
+REQUIREMENTS = (
+    "numba==0.67.0\n"
+    "--extra-index-url https://example.invalid/simple\n"
+    "--trusted-host example.invalid\n"
+    "t-tech-investments==1.2.3\n"
+    "requests\n"
+)
+
+
+def test_offline_requirements_drops_external_index_when_wheel_is_vendored(tmp_path: Path):
+    (tmp_path / "t_tech_investments-1.2.3-py3-none-any.whl").write_bytes(b"wheel")
+
+    assert offline_requirements(REQUIREMENTS, tmp_path) == (
+        "numba==0.67.0\nt-tech-investments==1.2.3\nrequests\n"
+    )
+
+
+def test_offline_requirements_rejects_wheel_of_other_version(tmp_path: Path):
+    (tmp_path / "t_tech_investments-1.2.2-py3-none-any.whl").write_bytes(b"wheel")
+
+    with pytest.raises(ReleaseMetadataError, match="1.2.3"):
+        offline_requirements(REQUIREMENTS, tmp_path)
+
+
+def test_offline_requirements_requires_exact_pin(tmp_path: Path):
+    (tmp_path / "t_tech_investments-1.2.3-py3-none-any.whl").write_bytes(b"wheel")
+
+    with pytest.raises(ReleaseMetadataError, match="закреплён"):
+        offline_requirements("t-tech-investments\n", tmp_path)
+
+
+def test_repository_vendors_pinned_broker_sdk():
+    root = Path(__file__).resolve().parents[2]
+    text = offline_requirements(
+        (root / "requirements.txt").read_text(encoding="utf-8"), root / "vendor" / "wheels"
+    )
+
+    assert "index-url" not in text
