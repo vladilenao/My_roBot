@@ -517,6 +517,9 @@ class TradingBot:
             candidate.context,
             timeframe=candidate.timeframe,
         )
+        stats = getattr(self._run, "admission_stats", None)
+        if stats is not None:
+            stats.record(candidate.assignment, candidate.timeframe, candidate.decision, admission)
         diagnostics = dict(admission.diagnostics)
         if admission.rejections and not diagnostics:
             provider = getattr(self._trade_manager, "portfolio_diagnostics", None)

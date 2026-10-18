@@ -61,6 +61,11 @@ class SourceInfo:
         }
 
 
+def _require_broker(provenance: str) -> None:
+    if provenance != "broker":
+        raise ValueError(f"Расписание происхождения {provenance!r} не сохраняется в рыночной базе")
+
+
 @dataclass(frozen=True)
 class StoredScheduleDay:
     source: str
@@ -72,6 +77,10 @@ class StoredScheduleDay:
     observed_at: str
     last_confirmed_at: str
     schedule_change_id: int
+    # Происхождение дня: ``broker`` — наблюдён у брокера; ``reconstructed`` —
+    # восстановлен историческим источником и живёт только в снимке прогона.
+    provenance: str = "broker"
+    rules_version: str | None = None
 
 
 class MarketDataStore:
@@ -719,12 +728,17 @@ class MarketDataStore:
                 (source, instrument_uid, kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), _utc_text(observed_at)),
             )
 
-    def record_schedule_day(self, *, source: str, exchange: str, day: object, observed_at: object | None = None) -> bool:
+    def record_schedule_day(
+        self, *, source: str, exchange: str, day: object, observed_at: object | None = None,
+        provenance: str = "broker", rules_version: str | None = None,
+    ) -> bool:
         """Сохраняет новую версию сырого дня либо подтверждает прежнюю.
 
         Возвращает ``True`` только если содержание дня изменилось и получило
-        новый отдельный курсор ленты расписаний.
+        новый отдельный курсор ленты расписаний. Восстановленный день сюда не
+        попадает: он не наблюдён у брокера и не должен уйти в ленту экспорта.
         """
+        _require_broker(provenance)
         exchange = normalize_exchange(exchange)
         raw_json = canonical_day_json(day)
         version = day_version(day)
@@ -785,9 +799,11 @@ class MarketDataStore:
         )
 
     def record_schedule_binding(
-        self, *, source: str, instrument_uid: str, exchange: str, observed_at: object | None = None
+        self, *, source: str, instrument_uid: str, exchange: str, observed_at: object | None = None,
+        provenance: str = "broker",
     ) -> bool:
         """Фиксирует смену режима торгов UID без дублирования прежней связи."""
+        _require_broker(provenance)
         exchange = normalize_exchange(exchange)
         when = _utc_text(observed_at)
         with self._lock, self._connect() as conn:

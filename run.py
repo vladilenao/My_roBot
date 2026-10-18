@@ -68,6 +68,7 @@ from src.config import (
     run_dir_name,
     HIST_DIR,
     HISTORICAL_LOGGING,
+    HISTORICAL_SCHEDULE,
     HISTORICAL_ROLLOVER,
     TIMEFRAMES,
     CLUSTER_SETTINGS,
@@ -495,6 +496,7 @@ def _launch(
             snapshot_store,
             EmulatorScheduleSource(snapshot_store, provider),
             schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+            allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
         )
         calendar_expectation = _historical_calendar_expectation(market_calendar)
     else:
@@ -531,6 +533,7 @@ def _launch(
         if report.notes:
             print(report.message())
         session.set_boundary_checks(report.boundaries)
+        _preload_history_schedule(market_calendar, selection, instruments, session)
 
     channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
@@ -919,6 +922,20 @@ def _family_warmup(family):
                               TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
 
 
+def _preload_history_schedule(market_calendar, selection, instruments, session) -> None:
+    """Расписание прогона до первого тика; пропуски для внутридневных стратегий — предупреждением."""
+    from src.history.schedule_notice import preload_history_schedule, report_notice, schedule_ranges
+
+    try:
+        ranges = schedule_ranges(selection, instruments, session.start, session.end,
+                                 INTRADAY_SETTINGS, SHARE_STRATEGIES, FUTURE_STRATEGIES)
+        report_notice(preload_history_schedule(market_calendar, ranges, session.start, INTRADAY_SETTINGS))
+    except Exception as exc:  # предзагрузка не должна останавливать прогон
+        if getattr(exc, "code", None) == "SNAPSHOT_MISMATCH":
+            raise
+        log.warning("Предзагрузка расписания прогона не выполнена: %s", type(exc).__name__)
+
+
 def _calendar_schedule(data_cache) -> CalendarScheduleMetadata | None:
     """Расписание, которым пользовался прогон; None — календаря у прогона нет."""
     calendar = getattr(data_cache, "market_calendar", None)
@@ -930,6 +947,20 @@ def _calendar_schedule(data_cache) -> CalendarScheduleMetadata | None:
     except Exception as exc:  # отчёт не должен падать из-за диагностики
         log.warning("Сводка расписания для отчёта не собрана: %s", exc)
         return None
+
+
+def _strategy_admissions(session, storage) -> tuple:
+    """Сигналы и недопуски по привязкам для отчёта; сбой диагностики отчёт не роняет."""
+    stats = getattr(session, "admission_stats", None)
+    if stats is None:
+        return ()
+    try:
+        from src.history.admission_stats import trades_by_assignment
+
+        return stats.rows(trades_by_assignment(storage.connection))
+    except Exception as exc:
+        log.warning("Недопуски по стратегиям для отчёта не собраны: %s", type(exc).__name__)
+        return ()
 
 
 def _finish_history(
@@ -971,6 +1002,7 @@ def _finish_history(
         rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
         calendar_schedule=_calendar_schedule(data_cache),
         log_rotation=log_rotation(),
+        strategy_admissions=_strategy_admissions(session, storage),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -1347,7 +1379,9 @@ def _session_calendar_provider(data_cache):
         uid = data_cache.instrument_uid(instrument)
         if calendar is None or not uid:
             return None
-        return calendar.calendar_for(uid, now)
+        # Восстановленные дни прогона — только для сессионной защиты; календарь
+        # отдаёт их, лишь если прогон их разрешил ([historical.schedule]).
+        return calendar.calendar_for(uid, now, include_reconstructed=True)
     return provider
 
 

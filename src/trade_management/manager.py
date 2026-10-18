@@ -1410,6 +1410,8 @@ class TradeManager:
             "market_time": MeasuredValue(session_guard.naive_utc(now).isoformat(), "utc"),
             "trading_date": MeasuredValue(schedule.trading_date.isoformat(), "date"),
             "schedule_version": MeasuredValue(schedule.version, "schedule-day-version"),
+            "schedule_provenance": MeasuredValue(schedule.provenance, "schedule-provenance"),
+            "schedule_rules_version": MeasuredValue(schedule.rules_version, "schedule-rules-version"),
             "entry_sessions": MeasuredValue(list(settings.entry_sessions), "sessions"),
             "blocks": MeasuredValue([[b.start.isoformat(), b.end.isoformat()] for b in schedule.blocks], "utc-intervals"),
             "entry_cutoff": MeasuredValue(block.entry_cutoff(settings).isoformat() if block else None, "utc"),

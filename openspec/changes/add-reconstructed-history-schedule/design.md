@@ -65,7 +65,7 @@
 `MarketCalendar.calendar_for(uid, now, *, include_reconstructed=False)` и `calendar(exchange, now, *, include_reconstructed=False)`:
 
 - **по умолчанию** — только `broker`-дни. Ожидание свечей, `MarketReconciler` (`scheduled_closed`, `interval_state`, `stored_calendars`), проверка правых границ и представление графиков получают ровно то же, что сейчас;
-- **`include_reconstructed=True`** — `broker`-день, а если его нет, `reconstructed`-день той же даты. Использует только `_session_calendar_provider` в `run.py`, и только когда `[historical.schedule].use_reconstructed = true`.
+- **`include_reconstructed=True`** — `broker`-день, а если его нет, `reconstructed`-день той же даты. Запрашивает только `_session_calendar_provider` в `run.py`. Сам календарь отдаёт восстановленные дни, лишь если создан с `allow_reconstructed=True`: исторический прогон передаёт туда `[historical.schedule].use_reconstructed`, live-календарь создаётся без флага.
 
 Почему восстановление включается явно, а не исключается из доказательств: потребителей-доказательств много (ожидание, сверка, графики, границы), а сессионная защита одна. Новый потребитель по умолчанию получит безопасный вид. Кроме того, восстановленный день построен по тем же барам, которые он проверял бы, — доказательство было бы круговым.
 

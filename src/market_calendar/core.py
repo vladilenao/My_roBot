@@ -51,6 +51,8 @@ class CalendarDay:
     windows: tuple[SessionWindow, ...]
     version: str
     observed_at: datetime
+    provenance: str = "broker"
+    rules_version: str | None = None
 
     def __post_init__(self) -> None:
         windows = tuple(

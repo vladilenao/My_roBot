@@ -71,6 +71,9 @@ class HistoricalRunSession(RunSession):
         self.terminal_gap = None
         self._source_failed = False
         self._drivers_complete = True
+        # Сигналы и недопуски по привязкам — для отчёта прогона.
+        from src.history.admission_stats import SignalAdmissionStats
+        self.admission_stats = SignalAdmissionStats()
 
     def update_data_status(self, *, source_failed, drivers_complete):
         self._source_failed = source_failed

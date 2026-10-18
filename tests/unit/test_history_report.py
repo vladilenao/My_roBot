@@ -159,9 +159,12 @@ class TestWriteReport:
             snapshot_generation=42,
             snapshot_pinned=True,
             exchanges=("MOEX",),
-            day_versions=(("MOEX", "2026-10-13", "version-1"),),
+            day_versions=(("MOEX", "2026-10-13", "version-1", "broker"),),
             missing_dates=("2026-10-14",),
             unavailable_reason="часть дат отсутствует в снимке",
+            provenance_counts={"broker": 1},
+            binding_provenance={"MOEX": ("broker",)},
+            use_reconstructed=True,
         )
 
         txt, js = write_report(
@@ -176,17 +179,51 @@ class TestWriteReport:
             "snapshot_pinned": True,
             "exchanges": ["MOEX"],
             "day_versions": [
-                {"exchange": "MOEX", "date": "2026-10-13", "version": "version-1"}
+                {"exchange": "MOEX", "date": "2026-10-13", "version": "version-1", "provenance": "broker"}
             ],
             "missing_dates": ["2026-10-14"],
             "unavailable_reason": "часть дат отсутствует в снимке",
+            "provenance_counts": {"broker": 1},
+            "rules_versions": [],
+            "binding_provenance": {"MOEX": ["broker"]},
+            "use_reconstructed": True,
         }
         assert "Источник: emulator" in text
         assert "Снимок: закреплён (42)" in text
         assert "Режимы торгов: MOEX" in text
-        assert "MOEX 2026-10-13: version-1" in text
+        assert "MOEX 2026-10-13: version-1 (подтверждено брокером)" in text
+        assert "Дни расписания: подтверждено брокером — 1" in text
         assert "Даты без расписания: 2026-10-14" in text
         assert "Причина недоступности расписания: часть дат отсутствует в снимке" in text
+
+    def test_mixed_schedule_shows_provenance_and_date_ranges(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        versions = tuple(
+            ("forts_futures_weekend", f"2025-04-{day:02d}", f"v{day}", "reconstructed") for day in range(1, 26)
+        )
+        schedule = CalendarScheduleMetadata(
+            source="emulator",
+            exchanges=("forts_futures_weekend",),
+            day_versions=versions,
+            missing_dates=("2025-03-10", "2025-03-11", "2025-03-12", "2025-03-14", "2025-03-17"),
+            provenance_counts={"broker": 6, "reconstructed": 25},
+            rules_versions=("forts_futures_weekend/1",),
+            binding_provenance={"forts_futures_weekend": ("reconstructed",)},
+            use_reconstructed=True,
+        )
+
+        txt, js = write_report(tmp_path, _metrics(calendar_schedule=schedule), collect_result(storage))
+        text = txt.read_text(encoding="utf-8")
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Восстановленное расписание: используется" in text
+        assert "Дни расписания: подтверждено брокером — 6, восстановлено — 25" in text
+        assert "Версии правил восстановления: forts_futures_weekend/1" in text
+        assert "Привязки режимов: forts_futures_weekend (восстановлено)" in text
+        assert "Версии дней: 25 (полный список — в report.json)" in text
+        assert "Даты без расписания: 2025-03-10 — 2025-03-12, 2025-03-14, 2025-03-17" in text
+        assert len(payload["calendar_schedule"]["day_versions"]) == 25
+        assert payload["calendar_schedule"]["missing_dates"][0] == "2025-03-10"
 
     def test_calendar_schedule_is_omitted_when_absent(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
