@@ -15,13 +15,13 @@ class HistorySelection:
     catalog: tuple[FuturesCard, ...] = ()
     chains: tuple[tuple, ...] = ()
 
-    def planned(self, start, end, settings, floor):
+    def planned(self, start, end, settings, floor, cutoff_for=None):
         for instrument in self.fixed:
             if instrument.instrument_type == "future" and family_for(instrument.ticker, instrument.short_name or "") in self.families:
                 raise ValueError("Семейство нельзя выбирать одновременно автоматически и фиксированным контрактом")
         overrides = settings.get("families", {})
         chains = tuple(build_chain(self.catalog, family, start, end,
-                                  overrides.get(family, {}).get("lead_days", floor))
+                                  overrides.get(family, {}).get("lead_days", floor), cutoff_for)
                        for family in self.families)
         return replace(self, chains=chains)
 

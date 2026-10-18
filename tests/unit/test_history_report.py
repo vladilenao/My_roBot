@@ -480,3 +480,14 @@ class TestConsoleLines:
 
         assert line == "Прогон аварийно остановлен на 2023-06-01 14:35"
         assert "\n" not in line
+
+
+def test_segment_line_explains_cutoff_shift_and_unknown_schedule():
+    from src.history.report import _cutoff_note
+    shifted = {"cutoff_source": "session-end", "calendar_cutoff": "2025-06-29T16:05:00Z",
+               "cutoff": "2025-06-27T20:30:00Z", "session_end": "2025-06-27T20:50:00Z"}
+    assert _cutoff_note(shifted) == ("; рубеж 2025-06-29T16:05:00Z в перерыве — сдвинут на 2025-06-27T20:30:00Z"
+                                     " (конец сессии 2025-06-27T20:50:00Z)")
+    assert _cutoff_note({"cutoff_source": "schedule-unknown"}) == "; расписание у рубежа неизвестно — рубеж календарный"
+    assert _cutoff_note({"cutoff_source": "calendar"}) == ""
+    assert _cutoff_note({}) == ""

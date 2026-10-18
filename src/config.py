@@ -117,6 +117,7 @@ _DEFAULTS = {
     # Горизонт блокировки входов и принудительного закрытия фьючерсов:
     # календарные сутки до момента экспирации контракта.
     "contract_expiry_block_days": 2,
+    "contract_expiry_close_before_end_min": 20,
     "historical_rollover": {"policy": "calendar", "families": {}},
     # Лог исторического прогона (секция [historical.logging]).
     "historical_logging": dict(HISTORY_LOGGING_DEFAULTS),
@@ -343,6 +344,7 @@ AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
 CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
+CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN = _CONFIG["contract_expiry_close_before_end_min"]
 TRADING_DIRECTIONS = dict(_CONFIG.get("directions", {}))
 # Сессионная защита внутридневных сделок ([trading.intraday]); без секции — дефолты.
 INTRADAY_SETTINGS = IntradaySettings.from_config(_CONFIG.get("intraday", {}))
