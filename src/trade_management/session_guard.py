@@ -19,7 +19,8 @@ from src.trade_management.models import TradePlan, TradeState
 from src.trade_management.profiles.rules import whole_trade_break_even
 
 ALGORITHM = "session.intraday"
-ALGORITHM_VERSION = "1"
+# 2 — во входах трассы происхождение дня расписания и версия правил восстановления.
+ALGORITHM_VERSION = "2"
 SESSION_CLOSED = "intraday-session-closed"
 CLOSE_NEAR = "intraday-close-near"
 SCHEDULE_UNKNOWN = "session-schedule-unknown"
@@ -66,14 +67,21 @@ class DaySchedule:
     known: bool
     blocks: tuple[SessionBlock, ...] = ()
     version: str | None = None
+    # broker | reconstructed; None — дня нет.
+    provenance: str | None = None
+    rules_version: str | None = None
 
 
 def day_schedule(calendar, trading_date: date, settings: IntradaySettings) -> DaySchedule:
     day = None if calendar is None else calendar.day(trading_date)
-    if day is None or not day.is_trading_day:
-        return DaySchedule(trading_date, known=False, version=None if day is None else day.version)
+    if day is None:
+        return DaySchedule(trading_date, known=False)
+    origin = {"version": day.version, "provenance": getattr(day, "provenance", "broker"),
+              "rules_version": getattr(day, "rules_version", None)}
+    if not day.is_trading_day:
+        return DaySchedule(trading_date, known=False, **origin)
     if not any(window.raw_type in _KNOWN_SESSION_TYPES for window in day.windows):
-        return DaySchedule(trading_date, known=False, version=day.version)
+        return DaySchedule(trading_date, known=False, **origin)
     allowed = settings.raw_types
     windows = sorted((w for w in day.windows if w.raw_type in allowed), key=lambda w: w.start)
     blocks: list[SessionBlock] = []
@@ -85,7 +93,7 @@ def day_schedule(calendar, trading_date: date, settings: IntradaySettings) -> Da
                                       last.raw_types + (window.raw_type,))
         else:
             blocks.append(SessionBlock(trading_date, window.start, end, (window.raw_type,)))
-    return DaySchedule(trading_date, known=True, blocks=tuple(blocks), version=day.version)
+    return DaySchedule(trading_date, known=True, blocks=tuple(blocks), **origin)
 
 
 @dataclass(frozen=True)

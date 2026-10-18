@@ -334,7 +334,7 @@ def test_13_snapshot_schedule_is_applied_and_reported(tmp_path):
     report = run._calendar_schedule(SimpleNamespace(market_calendar=calendar))
     assert report.snapshot_pinned and report.snapshot_generation == 42
     assert report.exchanges == (FUTURES,)
-    assert report.day_versions == ((FUTURES, "2026-10-13", day_version(day)),)
+    assert report.day_versions == ((FUTURES, "2026-10-13", day_version(day), "broker"),)
     # 21:00 UTC — уже 14-е по МСК: его в снимке нет, как и объявленного 12-го.
     assert report.missing_dates == ("2026-10-12", "2026-10-14")
 

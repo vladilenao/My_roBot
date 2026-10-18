@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from src.config import DATABASE_FILE
+from src.history.admission_stats import SCHEDULE_UNKNOWN, StrategyAdmission
 from src.data.timeutil import to_naive
 from src.logging_setup import LogRotation, get_logger
+from src.trade_management.models import rejection_message
 
 log = get_logger(__name__)
 
@@ -44,9 +47,16 @@ class CalendarScheduleMetadata:
     snapshot_generation: int | None = None
     snapshot_pinned: bool = False
     exchanges: tuple[str, ...] = ()
-    day_versions: tuple[tuple[str, str, str], ...] = ()
+    # (режим, дата, версия, происхождение: broker | reconstructed)
+    day_versions: tuple[tuple[str, str, str, str], ...] = ()
     missing_dates: tuple[str, ...] = ()
     unavailable_reason: str | None = None
+    # Запрошенные прогоном даты по происхождению применённого дня;
+    # reconstructed_unused — восстановленный день есть, но выключен.
+    provenance_counts: Mapping[str, int] = field(default_factory=dict)
+    rules_versions: tuple[str, ...] = ()
+    binding_provenance: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    use_reconstructed: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -55,12 +65,41 @@ class CalendarScheduleMetadata:
             "snapshot_pinned": self.snapshot_pinned,
             "exchanges": list(self.exchanges),
             "day_versions": [
-                {"exchange": exchange, "date": day, "version": version}
-                for exchange, day, version in self.day_versions
+                {"exchange": exchange, "date": day, "version": version, "provenance": provenance}
+                for exchange, day, version, provenance in self.day_versions
             ],
             "missing_dates": list(self.missing_dates),
             "unavailable_reason": self.unavailable_reason,
+            "provenance_counts": dict(self.provenance_counts),
+            "rules_versions": list(self.rules_versions),
+            "binding_provenance": {key: list(value) for key, value in self.binding_provenance.items()},
+            "use_reconstructed": self.use_reconstructed,
         }
+
+
+_PROVENANCE_TITLES = {
+    "broker": "подтверждено брокером",
+    "reconstructed": "восстановлено",
+    "reconstructed_unused": "восстановлено, не использовалось",
+}
+_MAX_LISTED_DAY_VERSIONS = 20
+
+
+def date_ranges(dates) -> str:
+    """Даты ``YYYY-MM-DD`` диапазонами подряд идущих дней: «A — B, C»."""
+    days = sorted({date.fromisoformat(value) for value in dates})
+    parts: list[str] = []
+    start = previous = None
+    for day in days:
+        if previous is not None and day == previous + timedelta(days=1):
+            previous = day
+            continue
+        if start is not None:
+            parts.append(start.isoformat() if start == previous else f"{start} — {previous}")
+        start = previous = day
+    if start is not None:
+        parts.append(start.isoformat() if start == previous else f"{start} — {previous}")
+    return ", ".join(parts)
 
 
 def _stamp(moment) -> str:
@@ -119,6 +158,8 @@ class RunMetrics:
     terminal_gap: bool = False
     #: Ротация debug-лога; ``None`` — лог не настраивался (тесты, сбой до запуска).
     log_rotation: LogRotation | None = None
+    #: Сигналы, сделки и недопуски по привязкам стратегий.
+    strategy_admissions: tuple[StrategyAdmission, ...] = ()
 
 
 @dataclass
@@ -216,14 +257,32 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
             f"Снимок: {snapshot}",
             "Режимы торгов: " + (", ".join(schedule.exchanges) or "нет"),
         ])
-        if schedule.day_versions:
+        head.append(
+            "Восстановленное расписание: "
+            + ("используется" if schedule.use_reconstructed else "выключено")
+        )
+        if schedule.provenance_counts:
+            head.append("Дни расписания: " + ", ".join(
+                f"{_PROVENANCE_TITLES.get(key, key)} — {count}"
+                for key, count in schedule.provenance_counts.items()
+            ))
+        if schedule.rules_versions:
+            head.append("Версии правил восстановления: " + ", ".join(schedule.rules_versions))
+        if schedule.binding_provenance:
+            head.append("Привязки режимов: " + ", ".join(
+                f"{exchange} ({', '.join(_PROVENANCE_TITLES.get(item, item) for item in items)})"
+                for exchange, items in schedule.binding_provenance.items()
+            ))
+        if schedule.day_versions and len(schedule.day_versions) <= _MAX_LISTED_DAY_VERSIONS:
             head.append("Версии дней:")
             head.extend(
-                f"  {exchange} {day}: {version}"
-                for exchange, day, version in schedule.day_versions
+                f"  {exchange} {day}: {version} ({_PROVENANCE_TITLES.get(provenance, provenance)})"
+                for exchange, day, version, provenance in schedule.day_versions
             )
+        elif schedule.day_versions:
+            head.append(f"Версии дней: {len(schedule.day_versions)} (полный список — в report.json)")
         if schedule.missing_dates:
-            head.append("Даты без расписания: " + ", ".join(schedule.missing_dates))
+            head.append("Даты без расписания: " + date_ranges(schedule.missing_dates))
         if schedule.unavailable_reason:
             head.append(f"Причина недоступности расписания: {schedule.unavailable_reason}")
     if metrics.horizon_start is not None and metrics.horizon_end is not None:
@@ -278,12 +337,28 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
         f"Итог (P&L - комиссии): {_money(result.net_pnl)}",
         f"Баланс:           {_money(result.balance)}",
         f"Капитал:          {_money(result.equity)}",
-    ] + (
+    ] + _admission_lines(metrics.strategy_admissions) + (
         ["", "Открытые позиции на момент остановки:"]
         + [f"  • {position}" for position in result.open_positions]
         if result.open_positions
         else ["", "Открытых позиций нет."]
     ) + ["", f"База журнала: {source}"]
+
+
+def _admission_lines(rows) -> list[str]:
+    if not rows:
+        return []
+    lines = ["", "Сигналы и недопуски по стратегиям:"]
+    for row in rows:
+        if row.blocked_by_schedule:
+            lines.append(
+                f"⚠ {row.assignment_id}: 0 сделок — {row.schedule_unknown} из {row.signals} "
+                f"сигналов отклонены: {rejection_message(SCHEDULE_UNKNOWN)}"
+            )
+    for row in rows:
+        lines.append(f"  {row.assignment_id} ({row.timeframe}): сигналов {row.signals}, сделок {row.trades}")
+        lines.extend(f"    {code} — {count}: {rejection_message(code)}" for code, count in row.rejections)
+    return lines
 
 
 def _log_line(rotation: LogRotation) -> str:
@@ -352,6 +427,8 @@ def write_report(
     }
     if metrics.calendar_schedule is not None:
         payload["calendar_schedule"] = metrics.calendar_schedule.to_json()
+    if metrics.strategy_admissions:
+        payload["strategy_admissions"] = [row.to_json() for row in metrics.strategy_admissions]
     txt_path.write_text(
         "\n".join(_lines(metrics, result, origin)) + "\n", encoding="utf-8"
     )

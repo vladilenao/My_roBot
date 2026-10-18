@@ -65,7 +65,11 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
     },
-    "historical": {"rollover": "historical_rollover", "logging": "historical_logging"},
+    "historical": {
+        "rollover": "historical_rollover",
+        "logging": "historical_logging",
+        "schedule": "historical_schedule",
+    },
     "notifier": {
         "channels": "notifier_channels",
         "channel": "notifier",
@@ -156,6 +160,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contract_expiry_block_days": int,
     "historical_rollover": dict,
     "historical_logging": dict,
+    "historical_schedule": dict,
 }
 
 _INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
@@ -612,6 +617,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "historical_logging":
             cleaned[key] = validate_history_logging(value, path)
             continue
+        if key == "historical_schedule":
+            cleaned[key] = validate_history_schedule(value, path)
+            continue
         if key == "initial_deposit":
             if isinstance(value, bool):
                 raise ConfigError(
@@ -678,6 +686,26 @@ def _validate_rollover(value: dict, path: Path) -> dict:
             raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
         normalized[canonical] = dict(settings)
     return {"policy": "calendar", "families": normalized}
+
+
+HISTORY_SCHEDULE_DEFAULTS = {"use_reconstructed": True}
+
+
+def validate_history_schedule(value: dict, path: Path | str) -> dict:
+    """Секция ``[historical.schedule]``: восстановленное расписание эмулятора."""
+    where = f"{path}: [historical.schedule]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} должна быть таблицей")
+    unknown = set(value) - set(HISTORY_SCHEDULE_DEFAULTS)
+    if unknown:
+        raise ConfigError(f"{where} незнакомые ключи {sorted(unknown)}")
+    merged = {**HISTORY_SCHEDULE_DEFAULTS, **value}
+    if type(merged["use_reconstructed"]) is not bool:
+        raise ConfigError(
+            f"{where} historical.schedule.use_reconstructed должен быть логическим значением, "
+            f"получено {merged['use_reconstructed']!r}"
+        )
+    return merged
 
 
 HISTORY_LOGGING_DEFAULTS = {
