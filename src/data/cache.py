@@ -15,7 +15,6 @@ from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
 from src.data.coverage_states import RESOLVED_INTERVAL_STATES
-from src.data.request_budget import RequestDeferred
 from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)

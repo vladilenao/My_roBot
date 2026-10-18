@@ -1,6 +1,6 @@
 """Stream-полоса: подтверждённые подписки, здоровье, reconnect, буфер, fallback."""
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from queue import Empty, Queue
 from types import SimpleNamespace

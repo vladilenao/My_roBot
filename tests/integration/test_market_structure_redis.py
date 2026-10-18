@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 import redis

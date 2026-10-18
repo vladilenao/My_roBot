@@ -10,7 +10,7 @@ from src.data.ingestion import IngestionWorker, RecoveryRange, chunk_windows
 from src.data.ingestion_settings import MarketDataSettings
 from src.data.market_store import MarketDataStore
 from src.data.reconciliation import MarketDataReconciler, SessionCalendar
-from src.data.request_budget import RequestBudget, RequestDeferred
+from src.data.request_budget import RequestBudget
 from src.instruments import Instrument
 from src.scheduler.timing import CandleScheduler, MultiTimeframeScheduler
 
@@ -38,7 +38,8 @@ class Exchange:
 
     def loader(self, **kwargs):
         budget = kwargs.get("request_budget")
-        serve = lambda: self._serve(kwargs)
+        def serve():
+            return self._serve(kwargs)
         if budget is None:
             return serve()
         # Как реальный загрузчик: каждая страница идёт через общий бюджет.
@@ -192,8 +193,9 @@ def test_empty_responses_park_range_without_fast_cycle_and_survive_restart(tmp_p
     assert cache.pair_status(ITEM, "1m")["state"] == "GAP_HOLD"
     # Окна recovery начинаются с пропуска; плановая сверка последних баров —
     # отдельный недорогой ритм и интенсивным раундом не является.
-    recovery = lambda: [call for call in exchange.calls
-                        if call[2] is not None and call[1] >= pd.Timestamp("2026-10-12 12:01")]
+    def recovery():
+        return [call for call in exchange.calls
+                            if call[2] is not None and call[1] >= pd.Timestamp("2026-10-12 12:01")]
     calls = len(recovery())
     for _ in range(5):
         clock[0] += timedelta(seconds=40)

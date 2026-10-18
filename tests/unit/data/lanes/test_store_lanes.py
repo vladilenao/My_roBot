@@ -57,8 +57,9 @@ def test_source_absent_is_exported_as_unresolved_and_resolves_prefix(tmp_path):
 
 def test_roster_keeps_obligations_and_retires_unselected_pairs(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
-    pair = lambda uid, origin: {"instrument_uid": uid, "interval": "1h", "ticker": uid.upper(),
-                                "instrument_type": "share", "origin": origin}
+    def pair(uid, origin):
+        return {"instrument_uid": uid, "interval": "1h", "ticker": uid.upper(),
+                                    "instrument_type": "share", "origin": origin}
     store.save_roster(source=SOURCE, entries=[pair("sber", "selected"), pair("phor", "selected"), pair("ng", "obligation")])
     store.save_roster(source=SOURCE, entries=[pair("sber", "selected")])
     current = {row["instrument_uid"]: row["origin"] for row in store.roster(source=SOURCE)}

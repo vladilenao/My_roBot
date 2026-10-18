@@ -185,7 +185,7 @@ class TestIterationRetry:
 
         with patch("src.api.client.Client"), \
              patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
-             patch("src.data.loader.time.sleep") as mock_sleep, \
+             patch("src.data.loader.time.sleep"), \
              patch("src.data.loader.api_call_with_retry") as mock_retry:
 
             streams = {"n": 0}

@@ -63,9 +63,10 @@ def owner(tmp_path):
 
 def test_saved_roster_is_registered_and_unselected_pairs_are_retired(tmp_path):
     cache, store = owner(tmp_path)
-    entry = lambda uid, ticker, tf, origin: {"instrument_uid": uid, "interval": tf, "ticker": ticker,
-                                             "instrument_type": "share", "short_name": ticker, "origin": origin,
-                                             "requirements": {"min_bars": 60}}
+    def entry(uid, ticker, tf, origin):
+        return {"instrument_uid": uid, "interval": tf, "ticker": ticker,
+                                                 "instrument_type": "share", "short_name": ticker, "origin": origin,
+                                                 "requirements": {"min_bars": 60}}
     store.save_roster(source=SOURCE, entries=[entry("u-sber", "SBER", "1h", "selected"),
                                               entry("u-phor", "PHOR", "1h", "selected"),
                                               entry("u-ng", "NGZ6", "1m", "obligation")])
@@ -118,9 +119,10 @@ def started_owner(tmp_path, clock):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **_: (pd.DataFrame(), None), timeline, market_store=store,
                             request_budget=RequestBudget(lambda: clock[0], 0))
-    entry = lambda uid, ticker: {"instrument_uid": uid, "interval": "1m", "ticker": ticker,
-                                 "instrument_type": "share", "short_name": ticker, "origin": "selected",
-                                 "requirements": {"min_bars": 1}}
+    def entry(uid, ticker):
+        return {"instrument_uid": uid, "interval": "1m", "ticker": ticker,
+                                     "instrument_type": "share", "short_name": ticker, "origin": "selected",
+                                     "requirements": {"min_bars": 1}}
     store.save_roster(source=SOURCE, entries=[entry(PHOR_UID, "PHOR"), entry("0-sber", "SBER")])
     run._register_saved_roster(cache, store)                  # полосы стартуют до выбора
     for uid in (PHOR_UID, "0-sber"):
@@ -200,7 +202,8 @@ def test_execution_lower_applies_whatever_registration_order(tmp_path, selected_
 def test_market_obligations_map_journal_ids_to_pair_uids(tmp_path):
     clock = [pd.Timestamp("2026-10-14 04:22:30")]
     cache, *_ = started_owner(tmp_path, clock)
-    at = lambda hour: (datetime(2026, 10, 13, hour, tzinfo=timezone.utc), True)
+    def at(hour):
+        return (datetime(2026, 10, 13, hour, tzinfo=timezone.utc), True)
     journal = {"PHOR": at(12), PHOR_UID: at(11),               # одна пара под двумя адресами
                "SBER": at(13),                                  # не выбран, пара сохранённого состава есть
                "EDZ6": at(14)}                                  # пары ещё нет — переведёт следующий тик

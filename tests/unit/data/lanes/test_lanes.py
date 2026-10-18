@@ -5,7 +5,6 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pandas as pd
-import pytest
 from t_tech.invest.schemas import TradeSourceType
 
 from src.data.cache import MarketDataCache
@@ -301,8 +300,9 @@ def test_restart_with_unfinished_trade_resumes_check_schedule(tmp_path):
     before.clock[0] += timedelta(hours=1, seconds=1)
     before.completeness.wake()
     run(before.completeness)
-    checks = lambda env: env.store.window_snapshot(source=SOURCE, instrument_uid="uid", interval="1m",
-                                                   lower=missing, upper=missing)["checks"][missing]
+    def checks(env):
+        return env.store.window_snapshot(source=SOURCE, instrument_uid="uid", interval="1m",
+                                                       lower=missing, upper=missing)["checks"][missing]
     assert checks(before)["checks"] == 2
 
     # Перезапуск: полосы стартуют до выбора, обязательств ещё нет — окно от границы запуска.

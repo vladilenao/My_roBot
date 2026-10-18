@@ -33,9 +33,12 @@ def test_waiting_live_lane_keeps_freed_slot_from_borrowers():
     clock = [T0]
     budget = arbiter(clock)
     call(budget, "completeness", key=1)                 # гарантия
-    clock[0] = T0 + timedelta(seconds=1); call(budget, "completeness", key=2)  # взаймы
-    clock[0] = T0 + timedelta(seconds=2); call(budget, "evidence", key=3)
-    clock[0] = T0 + timedelta(seconds=3); call(budget, "live", key=4)          # окно заполнено
+    clock[0] = T0 + timedelta(seconds=1)
+    call(budget, "completeness", key=2)  # взаймы
+    clock[0] = T0 + timedelta(seconds=2)
+    call(budget, "evidence", key=3)
+    clock[0] = T0 + timedelta(seconds=3)
+    call(budget, "live", key=4)          # окно заполнено
     clock[0] = T0 + timedelta(seconds=59.5)
     with pytest.raises(RequestDeferred):
         call(budget, "live", key=5)                      # живая ждёт квоты
@@ -82,7 +85,8 @@ def test_lane_comes_from_thread_context():
     seen = []
     worker = threading.Thread(target=lambda: seen.append(budget.current_lane()))
     with budget.lane("completeness"):
-        worker.start(); worker.join()
+        worker.start()
+        worker.join()
         budget.call(lambda: None, key="in-completeness")
     assert seen == ["live"]  # контекст полосы не утекает в другой поток
     assert budget.calls_by_lane == {("quotes", "evidence"): 1, ("quotes", "completeness"): 1}
@@ -136,4 +140,5 @@ def test_calls_without_key_are_not_deduplicated_across_threads():
     worker.start()
     assert entered.wait(2)
     assert budget.call(lambda: "fast") == "fast"           # второй вызов без ключа не откладывается
-    release.set(); worker.join(2)
+    release.set()
+    worker.join(2)

@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 
-import pytest
 
 from src.market_structure.worker import PatternTask, PatternWorker
 
