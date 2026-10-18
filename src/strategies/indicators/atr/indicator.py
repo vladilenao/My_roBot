@@ -34,14 +34,17 @@ class AtrWilderIndicator:
             axis=1,
         ).max(axis=1)
 
-        atr = pd.Series(np.nan, index=data.index, dtype=float)
+        values = np.full(len(data), np.nan)
         if len(data) >= self.period:
-            atr.iloc[self.period - 1] = data["true_range"].iloc[: self.period].mean()
-            for index in range(self.period, len(data)):
-                atr.iloc[index] = (
-                    (self.period - 1) * atr.iloc[index - 1]
-                    + data["true_range"].iloc[index]
-                ) / self.period
+            true_range = data["true_range"].to_numpy(dtype=float)
+            previous = float(data["true_range"].iloc[: self.period].mean())
+            values[self.period - 1] = previous
+            # Рекурсия Уайлдера на обычных float: те же операции в том же
+            # порядке, что и поэлементный pandas, без накладных расходов iloc.
+            for index, value in enumerate(true_range[self.period:].tolist(), start=self.period):
+                previous = ((self.period - 1) * previous + value) / self.period
+                values[index] = previous
+        atr = pd.Series(values, index=data.index, dtype=float)
         data["atr_wilder"] = atr
         data["atr_available"] = atr.notna()
         return data

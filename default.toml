@@ -47,6 +47,18 @@ fallback_ticker = "NGU6"
 policy = "calendar"
 # Пример: [historical.rollover.families.BR] lead_days = 3
 
+# Лог исторического прогона (bot_debug.log в папке прогона HIST/...). Боевой режим
+# использует [logging]. По умолчанию INFO и без ротации: лог прогона целиком.
+[historical.logging]
+level = "INFO"            # порог лога прогона: DEBUG/INFO/WARNING/ERROR
+max_bytes = 0             # размер файла до ротации; 0 — без ротации (лог не теряется)
+backup_count = 0          # ротационных копий при max_bytes > 0
+# Окно отладки по рыночному времени: внутри него пишется и DEBUG.
+# Формат ГГГГ-ММ-ДД ЧЧ:ММ; без зоны — UTC (как границы прогона), «+03:00» — МСК.
+# Пример: debug_from = "2025-08-07 14:00+03:00" и debug_to = "2025-08-07 18:00+03:00"
+debug_from = ""
+debug_to = ""
+
 [notifier]
 # Каналы доставки уведомлений в порядке подписки: "console" | "telegram".
 # Старый ключ channel = "telegram" поддерживается как channels = ["telegram"].

@@ -30,8 +30,10 @@ class MarketContextCache:
         self._sr_calculator = sr_calculator
         self._cache: dict[tuple, tuple[pd.Timestamp, MarketContext]] = {}
 
-    def get_context(self, instrument, timeframe: str) -> MarketContext:
-        df = self._data_cache.frame_for(instrument, timeframe)
+    def get_context(self, instrument, timeframe: str, frame: pd.DataFrame | None = None) -> MarketContext:
+        """Контекст пары; ``frame`` — кадр тика, если он уже получен (ленивый расчёт
+        позже в тике не должен видеть свечи, пришедшие после анализа стратегий)."""
+        df = self._data_cache.frame_for(instrument, timeframe) if frame is None else frame
         key = self._key(instrument, timeframe)
         last_dt = self._last_datetime(df)
         cached = self._cache.get(key)

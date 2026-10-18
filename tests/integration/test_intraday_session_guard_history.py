@@ -45,7 +45,7 @@ class _BuyEveryBar:
 
 
 class _Context:
-    def get_context(self, instrument, timeframe):
+    def get_context(self, instrument, timeframe, frame=None):
         return MarketContext(TrendResult(TrendDirection.UP, .8), [SRLevel(6, SRType.SUPPORT, 3, "support")], 10)
 
 

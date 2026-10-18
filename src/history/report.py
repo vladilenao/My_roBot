@@ -16,7 +16,7 @@ from pathlib import Path
 
 from src.config import DATABASE_FILE
 from src.data.timeutil import to_naive
-from src.logging_setup import get_logger
+from src.logging_setup import LogRotation, get_logger
 
 log = get_logger(__name__)
 
@@ -117,6 +117,8 @@ class RunMetrics:
     boundary_checks: tuple = ()
     last_processed_bar: datetime | None = None
     terminal_gap: bool = False
+    #: Ротация debug-лога; ``None`` — лог не настраивался (тесты, сбой до запуска).
+    log_rotation: LogRotation | None = None
 
 
 @dataclass
@@ -259,6 +261,8 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
                         f"активация={event['activation_at'] or 'не состоялась'}; "
                         f"комиссии закрытия={event.get('exit_fees', '0')}; "
                         f"отклонение исполнения, ₽={event.get('exit_slippage_amount') if event.get('exit_slippage_amount') is not None else 'не определено'}")
+    if metrics.log_rotation is not None:
+        head.append(_log_line(metrics.log_rotation))
     return head + [
         f"Обработано тиков: {metrics.ticks}",
         f"Пропущено баров: {metrics.missed_bars}",
@@ -280,6 +284,27 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
         if result.open_positions
         else ["", "Открытых позиций нет."]
     ) + ["", f"База журнала: {source}"]
+
+
+def _log_line(rotation: LogRotation) -> str:
+    if rotation.complete:
+        return f"Лог прогона: полный (ротаций: {rotation.rollovers})"
+    return (
+        f"Лог прогона: НЕПОЛНЫЙ — ротация удалила начало ({rotation.rollovers} ротаций при "
+        f"backup_count={rotation.backup_count}); сохранён с рыночного момента "
+        f"{_stamp(rotation.retained_from)}. Для полного лога задайте [historical.logging] max_bytes = 0"
+    )
+
+
+def _log_payload(rotation: LogRotation | None) -> dict | None:
+    if rotation is None:
+        return None
+    return {
+        "complete": rotation.complete,
+        "rollovers": rotation.rollovers,
+        "backup_count": rotation.backup_count,
+        "retained_from": _stamp(rotation.retained_from) or None,
+    }
 
 
 def write_report(
@@ -323,6 +348,7 @@ def write_report(
         "boundary_checks": [item.payload() for item in metrics.boundary_checks],
         "last_processed_bar": _stamp(metrics.last_processed_bar),
         "terminal_gap": metrics.terminal_gap,
+        "log": _log_payload(metrics.log_rotation),
     }
     if metrics.calendar_schedule is not None:
         payload["calendar_schedule"] = metrics.calendar_schedule.to_json()

@@ -16,6 +16,7 @@ from src.events.event import Event
 from src.events.visual import CANDLE_LIMIT
 from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
+from src.market_context.lazy import LazyMarketContext
 from src.notifier.errors import is_rate_limit
 from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
@@ -311,6 +312,14 @@ class TradingBot:
             self._bus.publish(Event.tick_finished(tick_id=tick_id, completed=completed))
             correlation_id_var.set(None)
 
+    def _lazy_context(self, instrument: Instrument, tf: str, frame) -> LazyMarketContext:
+        """Контекст ТФ считается, только если его прочтут фильтр или сопровождение."""
+        name = self._display_name(instrument)
+        return LazyMarketContext(
+            lambda: self._context_cache.get_context(instrument, tf, frame),
+            on_load=lambda context: log.debug("%s %s | контекст: %s", name, tf, context),
+        )
+
     def _take_data_gap(self):
         """Забирает найденный кэшем разрыв в данных (одноразово, ``None`` — разрыва нет)."""
         take = getattr(self._data_cache, "take_pending_gap", None)
@@ -351,7 +360,7 @@ class TradingBot:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
             self._submit_pattern_bar(instrument, tf, frame)
-            context = self._context_cache.get_context(instrument, tf) if self._context_cache else None
+            context = self._lazy_context(instrument, tf, frame) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
             log.debug(
                 "%s %s | получено свечей=%d, последний бар O=%.4f H=%.4f L=%.4f C=%.4f",
@@ -359,8 +368,6 @@ class TradingBot:
                 frame["open"].iloc[-1], frame["high"].iloc[-1],
                 frame["low"].iloc[-1], frame["close"].iloc[-1],
             )
-            if context is not None:
-                log.debug("%s %s | контекст: %s", self._display_name(instrument), tf, context)
             if tf_assignments or tf in management_needs:
                 self._remember_market(instrument, tf, frame)
             self._manage(instrument, tf_assignments, frame, context, tf)

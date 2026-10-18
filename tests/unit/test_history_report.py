@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 from src.broker import ExecutionEvent, ExecutionStatus
+from src.logging_setup import LogRotation
 from src.history.report import (
     CalendarScheduleMetadata,
     MarketDataSync,
@@ -195,6 +196,38 @@ class TestWriteReport:
 
         assert "calendar_schedule" not in payload
         assert "Расписание торгов:" not in txt.read_text(encoding="utf-8")
+
+    def test_complete_log_is_reported(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        rotation = LogRotation(rollovers=0, backup_count=0, retained_from=None)
+
+        txt, js = write_report(tmp_path, _metrics(log_rotation=rotation), collect_result(storage))
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Лог прогона: полный (ротаций: 0)" in txt.read_text(encoding="utf-8")
+        assert payload["log"] == {"complete": True, "rollovers": 0, "backup_count": 0, "retained_from": None}
+
+    def test_truncated_log_warns_with_market_moment(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        rotation = LogRotation(rollovers=9, backup_count=5, retained_from=datetime(2023, 6, 1, 11, 30))
+
+        txt, js = write_report(tmp_path, _metrics(log_rotation=rotation), collect_result(storage))
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+        text = txt.read_text(encoding="utf-8")
+
+        assert "Лог прогона: НЕПОЛНЫЙ" in text
+        assert "9 ротаций при backup_count=5" in text
+        assert "сохранён с рыночного момента 2023-06-01 11:30" in text
+        assert payload["log"] == {"complete": False, "rollovers": 9, "backup_count": 5,
+                                  "retained_from": "2023-06-01 11:30"}
+
+    def test_log_block_is_omitted_without_logging(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, js = write_report(tmp_path, _metrics(), collect_result(storage))
+
+        assert "Лог прогона" not in txt.read_text(encoding="utf-8")
+        assert __import__("json").loads(js.read_text(encoding="utf-8"))["log"] is None
 
     def test_sync_snapshot_is_written_to_both_reports(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)

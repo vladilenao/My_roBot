@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tomllib
+from datetime import datetime, timezone
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
@@ -64,7 +65,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
     },
-    "historical": {"rollover": "historical_rollover"},
+    "historical": {"rollover": "historical_rollover", "logging": "historical_logging"},
     "notifier": {
         "channels": "notifier_channels",
         "channel": "notifier",
@@ -154,6 +155,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
     "historical_rollover": dict,
+    "historical_logging": dict,
 }
 
 _INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
@@ -607,6 +609,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "historical_rollover":
             cleaned[key] = _validate_rollover(value, path)
             continue
+        if key == "historical_logging":
+            cleaned[key] = validate_history_logging(value, path)
+            continue
         if key == "initial_deposit":
             if isinstance(value, bool):
                 raise ConfigError(
@@ -673,6 +678,63 @@ def _validate_rollover(value: dict, path: Path) -> dict:
             raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
         normalized[canonical] = dict(settings)
     return {"policy": "calendar", "families": normalized}
+
+
+HISTORY_LOGGING_DEFAULTS = {
+    "level": "INFO",
+    "max_bytes": 0,
+    "backup_count": 0,
+    "debug_from": None,
+    "debug_to": None,
+}
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+def validate_history_logging(value: dict, path: Path | str) -> dict:
+    """Секция ``[historical.logging]``: лог прогона и окно DEBUG по рыночному времени.
+
+    ``debug_from``/``debug_to`` — моменты в формате ГГГГ-ММ-ДД ЧЧ:ММ; без зоны
+    это UTC (как границы прогона), с зоной (``+03:00``) — приводятся к UTC.
+    """
+    where = f"{path}: [historical.logging]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} должна быть таблицей")
+    unknown = set(value) - set(HISTORY_LOGGING_DEFAULTS)
+    if unknown:
+        raise ConfigError(f"{where} незнакомые ключи {sorted(unknown)}")
+    merged = {**HISTORY_LOGGING_DEFAULTS, **value}
+    level = merged["level"]
+    if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
+        raise ConfigError(f"{where} level должен быть одним из {sorted(_LOG_LEVELS)}")
+    merged["level"] = level.upper()
+    for key in ("max_bytes", "backup_count"):
+        if type(merged[key]) is not int or merged[key] < 0:
+            raise ConfigError(f"{where} {key} должен быть целым числом >= 0")
+    for key in ("debug_from", "debug_to"):
+        merged[key] = _history_moment(merged[key], f"{where} {key}")
+    bounds = merged["debug_from"], merged["debug_to"]
+    if (bounds[0] is None) != (bounds[1] is None):
+        raise ConfigError(f"{where} debug_from и debug_to задаются вместе")
+    if bounds[0] is not None and bounds[0] >= bounds[1]:
+        raise ConfigError(f"{where} debug_to должен быть позже debug_from")
+    return merged
+
+
+def _history_moment(value: Any, where: str) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value.strip())
+        except ValueError:
+            raise ConfigError(f"{where}: ожидается ГГГГ-ММ-ДД ЧЧ:ММ, получено {value!r}") from None
+    else:
+        raise ConfigError(f"{where}: ожидается строка ГГГГ-ММ-ДД ЧЧ:ММ, получено {value!r}")
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
 
 
 _CLEARING_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")

@@ -757,3 +757,30 @@ def test_live_loop_does_not_swallow_unsafe_execution_state():
         TradingBot._loop_live(bot)
 
     bot._report_error.assert_not_called()
+
+
+class TestHistoryLogSettings:
+    def test_live_uses_logging_section(self):
+        settings = run._log_settings(False, None)
+
+        assert settings == {"level": run.LOGGING_LEVEL, "max_bytes": run.LOGGING_MAX_BYTES,
+                            "backup_count": run.LOGGING_BACKUP_COUNT}
+
+    def test_history_uses_historical_logging_and_market_clock(self, monkeypatch):
+        window = (datetime(2025, 8, 7, 11), datetime(2025, 8, 7, 15))
+        monkeypatch.setitem(run.HISTORICAL_LOGGING, "debug_from", window[0])
+        monkeypatch.setitem(run.HISTORICAL_LOGGING, "debug_to", window[1])
+        clock = HistoricalClock(datetime(2025, 8, 7), datetime(2025, 8, 8), timedelta(minutes=1), 0)
+
+        settings = run._log_settings(True, clock)
+
+        assert settings["level"] == run.HISTORICAL_LOGGING["level"]
+        assert settings["max_bytes"] == run.HISTORICAL_LOGGING["max_bytes"]
+        assert settings["debug_window"] == window
+        assert settings["clock"]() == datetime(2025, 8, 7)
+
+    def test_history_without_window(self, monkeypatch):
+        monkeypatch.setitem(run.HISTORICAL_LOGGING, "debug_from", None)
+        monkeypatch.setitem(run.HISTORICAL_LOGGING, "debug_to", None)
+
+        assert run._log_settings(True, None)["debug_window"] is None

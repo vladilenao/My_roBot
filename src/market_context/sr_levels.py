@@ -62,50 +62,71 @@ class SRLevelsCalculator:
     def _find_pivots(self, df: pd.DataFrame) -> list[dict]:
         high = df["high"].to_numpy(dtype=float)
         low = df["low"].to_numpy(dtype=float)
-        n = len(high)
         w = self._fractal_side
+        size = 2 * w + 1
+        if len(high) < size:
+            return []
+        # Окна [i-w, i+w] для каждого центра i; NaN не даёт разворота, как и раньше.
+        high_windows = np.lib.stride_tricks.sliding_window_view(high, size)
+        low_windows = np.lib.stride_tricks.sliding_window_view(low, size)
+        high_center = high[w : len(high) - w]
+        low_center = low[w : len(low) - w]
+        resistance = (high_center == high_windows.max(axis=1)) & (
+            (high_windows == high_center[:, None]).sum(axis=1) == 1
+        )
+        support = (low_center == low_windows.min(axis=1)) & (
+            (low_windows == low_center[:, None]).sum(axis=1) == 1
+        )
         pivots: list[dict] = []
-        for i in range(w, n - w):
-            h_window = high[i - w : i + w + 1]
-            l_window = low[i - w : i + w + 1]
-            if high[i] == h_window.max() and np.sum(h_window == high[i]) == 1:
-                pivots.append({"price": high[i], "kind": SRType.RESISTANCE})
-            if low[i] == l_window.min() and np.sum(l_window == low[i]) == 1:
-                pivots.append({"price": low[i], "kind": SRType.SUPPORT})
+        for offset in np.flatnonzero(resistance | support):
+            if resistance[offset]:
+                pivots.append({"price": high_center[offset], "kind": SRType.RESISTANCE})
+            if support[offset]:
+                pivots.append({"price": low_center[offset], "kind": SRType.SUPPORT})
         return pivots
 
     def _cluster(self, pivots: list[dict]) -> list[dict]:
         clusters: list[dict] = []
+        # Опорная цена кластера не меняется до конца прохода, а новые кластеры
+        # добавляются в конец, поэтому первый подходящий кластер для цены
+        # однажды найден навсегда. Цены фьючерсов лежат на сетке шага, так что
+        # повторы частые и полный перебор кластеров идёт только для новых цен.
+        first_match: dict[float, int] = {}
         for p in pivots:
-            merged = False
-            for c in clusters:
-                if self._bucket_close(c["price"], p["price"]):
-                    c["prices"].append(p["price"])
-                    c["touches"] += 1
-                    c["kinds"].append(p["kind"])
-                    self._update_cluster_kind(c)
-                    merged = True
-                    break
-            if not merged:
+            price = p["price"]
+            index = first_match.get(price)
+            if index is None:
+                index = next(
+                    (i for i, c in enumerate(clusters) if self._bucket_close(c["price"], price)),
+                    len(clusters),
+                )
+                first_match[price] = index
+            if index == len(clusters):
                 clusters.append(
                     {
-                        "prices": [p["price"]],
-                        "price": p["price"],
+                        "prices": [price],
+                        "price": price,
                         "touches": 1,
-                        "kinds": [p["kind"]],
+                        "support": 0,
+                        "resistance": 0,
                         "kind": p["kind"],
                     }
                 )
+                self._count_kind(clusters[index], p["kind"])
+                continue
+            c = clusters[index]
+            c["prices"].append(price)
+            c["touches"] += 1
+            self._count_kind(c, p["kind"])
+            # При равенстве побеждает поддержка — порядок прежнего max() по словарю.
+            c["kind"] = SRType.SUPPORT if c["support"] >= c["resistance"] else SRType.RESISTANCE
         for c in clusters:
             c["price"] = float(np.mean(c["prices"]))
         return clusters
 
-    def _update_cluster_kind(self, cluster: dict) -> None:
-        kind_counts = {
-            SRType.SUPPORT: cluster["kinds"].count(SRType.SUPPORT),
-            SRType.RESISTANCE: cluster["kinds"].count(SRType.RESISTANCE),
-        }
-        cluster["kind"] = max(kind_counts, key=kind_counts.get)
+    @staticmethod
+    def _count_kind(cluster: dict, kind: SRType) -> None:
+        cluster["support" if kind is SRType.SUPPORT else "resistance"] += 1
 
     def _bucket_close(self, a: float, b: float) -> bool:
         span = max(abs(a), abs(b))
