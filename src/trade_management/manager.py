@@ -24,6 +24,7 @@ from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
     action_from_payload, action_payload,
 )
+from src.instruments.futures import family_for, family_key
 from src.instruments.model import instrument_key
 from src.trade_management.errors import (
     InvalidStopBoundaryError,
@@ -136,6 +137,21 @@ def _is_opposite(side: str, signal_type: SignalType) -> bool:
     return (side == SignalType.BUY.value and signal_type is SignalType.SELL) or (
         side == SignalType.SELL.value and signal_type is SignalType.BUY
     )
+
+
+def _exposure_key(instrument_id: str, ticker: str | None = None, short_name: str | None = None,
+                  family: str | None = None) -> str:
+    """Ключ общей позиции счёта: семейство фьючерса, для прочих инструментов — сам контракт.
+
+    Семейство берётся из карточки, иначе распознаётся по тикеру и короткому
+    имени (``NGV6``, ``BR-6.25``); нераспознанный или неоднозначный инструмент
+    сравнивается только по своему адресу.
+    """
+    try:
+        found = family_key(family) if family else family_for(ticker or instrument_id, name=short_name or "")
+    except ValueError:
+        found = None
+    return f"family:{found}" if found else instrument_id
 
 
 def _expires_within(meta, now: datetime, block_days: int) -> bool:
@@ -1155,6 +1171,9 @@ class TradeManager:
             session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
             if session_rejection is not None:
                 return SignalAdmission(rejections=(session_rejection,))
+            opposite_rejection = self._opposite_exposure_rejection(assignment, decision, instrument)
+            if opposite_rejection is not None:
+                return SignalAdmission(rejections=(opposite_rejection,))
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except sqlite3.IntegrityError as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -1450,6 +1469,48 @@ class TradeManager:
             links=TraceLinks(assignment_id=assignment_id, trade_id=action.trade_id, signal_id=signal_id),
         ))
         return False
+
+    def _opposite_exposure_rejection(self, assignment, decision, instrument):
+        """Недопуск входа против незавершённой сделки другой привязки (trade-management: «Отказ во встречном входе»).
+
+        Счёт один, позиция по контракту у брокера общая, поэтому встречной
+        считается любая незавершённая сделка другого направления — с ожидающим
+        входом или с ненулевым объёмом — по тому же контракту или по другому
+        контракту того же семейства фьючерсов (переход BR-6.25 → BR-7.25).
+        Существующая сделка не закрывается.
+        """
+        side = decision.signal_type.value
+        names = self._storage.instrument_names()
+        own_id = instrument_key(instrument)
+        key = _exposure_key(own_id, getattr(instrument, "ticker", None),
+                            getattr(instrument, "short_name", None), getattr(instrument, "family", None))
+        rows = self._storage.connection.execute(
+            "SELECT t.trade_id, t.instrument_id, t.side FROM trades t LEFT JOIN positions p USING(trade_id) "
+            f"WHERE t.side<>? AND (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) ORDER BY t.created_at",
+            (side,),
+        ).fetchall()
+        blocking = [(trade_id, instrument_id, other_side) for trade_id, instrument_id, other_side in rows
+                    if instrument_id == own_id
+                    or _exposure_key(instrument_id, instrument_id, names.get(instrument_id)) == key]
+        if not blocking:
+            return None
+        _, instrument_id, other_side = blocking[0]
+        contract = names.get(instrument_id)
+        message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
+                   f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+        log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, message)
+        self._traces.record(calculation_trace(
+            "portfolio.opposite-exposure",
+            inputs={"signal": MeasuredValue(side, "side"),
+                    "exposure_key": MeasuredValue(key, "exposure-key"),
+                    "blocking_trades": MeasuredValue([row[0] for row in blocking], "trade-ids")},
+            result=MeasuredValue(False, "allowed"),
+            reason="opposite-exposure",
+            formula="new entry side != side of an unfinished trade on the same contract or futures family -> reject",
+            links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
+        return rejection_reason("opposite-exposure", message=message)
 
     def _open_order(self, trade_id: str, action_type: str, *, reason: str | None = None) -> bool:
         """Есть ли незавершённая заявка типа ``action_type`` (при ``reason`` — с этой причиной)."""
