@@ -350,6 +350,7 @@ class TestRuntimeComposition:
             max_entry_deviation_r=run.RISK_LIMITS.get("max_entry_deviation_r", 0.25),
             live_market_provider=None,
             contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
+            contract_expiry_close_before_end_min=run.CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN,
             direction_limits=run.TRADING_DIRECTIONS,
             clock=None,
             signal_filter=ANY,

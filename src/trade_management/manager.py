@@ -13,6 +13,7 @@ from contextlib import contextmanager
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
 from src.logging_setup import get_logger
+from src.market_calendar.expiry import expiry_cutoff
 from src.portfolio.risk import PortfolioRiskManager, RiskLimits, RiskTrade
 from src.scheduler.clock import Clock, as_aware, as_clock
 from src.scheduler.timing import tf_period_minutes
@@ -154,17 +155,21 @@ def _exposure_key(instrument_id: str, ticker: str | None = None, short_name: str
     return f"family:{found}" if found else instrument_id
 
 
-def _expires_within(meta, now: datetime, block_days: int) -> bool:
-    """Близость экспирации контракта к моменту ``now`` (оба в naive UTC).
+def _expires_within(
+    meta, now: datetime, block_days: int, calendar=None, close_before_end: timedelta = timedelta(0),
+) -> bool:
+    """Наступил ли к ``now`` (naive UTC) рубеж близкой экспирации контракта.
 
     ``expiration_date`` у акций отсутствует (``None``) — такие контракты всегда
-    считаются неистекшими. Порог трактуется как календарные сутки: частичные
-    сутки попадают в него.
+    считаются неистекшими. Календарный рубеж — ``block_days`` суток по 24 часа
+    до экспирации; попавший в перерыв по расписанию ``calendar`` рубеж
+    сдвигается на конец последней сессии минус ``close_before_end``.
     """
     expiration_date = getattr(meta, "expiration_date", None)
-    if expiration_date is None:
+    if expiration_date is None or expiration_date != expiration_date:  # None или NaT — даты нет
         return False
-    return (expiration_date - now).total_seconds() <= block_days * 86400
+    cutoff = expiry_cutoff(calendar, expiration_date - timedelta(days=block_days), close_before_end)
+    return now >= cutoff.at
 
 
 def plan_reference_entry(plan_json: str) -> Decimal:
@@ -251,6 +256,7 @@ class TradeManager:
         slippage_tolerance: Decimal | float | str | None = None,
         signal_filter: object | None = None,
         contract_expiry_block_days: int = 2,
+        contract_expiry_close_before_end_min: int = 20,
         direction_limits: Mapping[str, Sequence[str]] | None = None,
         min_trade_risk_pct: Decimal | float | str | None = None,
         portfolio_pct: Decimal | float | str | None = None,
@@ -291,6 +297,7 @@ class TradeManager:
         self._traces = CalculationTraceRepository(storage)
         self._unknown_timeframe_reported: set[str] = set()
         self._contract_expiry_block_days = contract_expiry_block_days
+        self._contract_expiry_close_before_end = timedelta(minutes=contract_expiry_close_before_end_min)
         self._direction_limits = {
             instrument_type: frozenset(str(direction).lower() for direction in directions)
             for instrument_type, directions in (direction_limits or {}).items()
@@ -1153,7 +1160,7 @@ class TradeManager:
             return SignalAdmission(
                 rejections=(rejection_reason("no-contract-metadata"),),
             )
-        if _expires_within(meta, self._clock.now(), self._contract_expiry_block_days):
+        if self._contract_expiring(instrument, meta, self._clock.now()):
             log.info("actions_for_signal %s: вход отклонён — близкая экспирация", instrument.ticker)
             return SignalAdmission(
                 rejections=(rejection_reason("contract-expiring"),),
@@ -1234,7 +1241,7 @@ class TradeManager:
         if meta is None:
             return ()
         automatic_contract = self.contract_lifecycle is not None and self.contract_lifecycle.contains(instrument_key(instrument))
-        if not automatic_contract and _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
+        if not automatic_contract and self._contract_expiring(instrument, meta, now.replace(tzinfo=None)):
             return self._close_expiring(instrument_key(instrument))
         results: list[TradeAction] = []
         results.extend(self._cancel_stale_entries(instrument_key(instrument), now))
@@ -1389,6 +1396,12 @@ class TradeManager:
     def session_guard_needed(self, timeframes) -> bool:
         """Есть ли у инструмента незавершённые внутридневные сделки (по таймфреймам их планов)."""
         return self._session_guard_active() and any(self._intraday.is_intraday(tf) for tf in timeframes)
+
+    def _contract_expiring(self, instrument, meta, now: datetime) -> bool:
+        """Рубеж близкой экспирации по расписанию инструмента; без расписания — календарный."""
+        calendar = self._calendar_for(instrument, now) if self._session_calendar is not None else None
+        return _expires_within(meta, now, self._contract_expiry_block_days, calendar,
+                               self._contract_expiry_close_before_end)
 
     def _calendar_for(self, instrument, now: datetime):
         """Сохранённое расписание режима торгов инструмента; сбой провайдера — как неизвестное."""

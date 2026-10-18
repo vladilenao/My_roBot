@@ -123,3 +123,36 @@ def test_br_6_25_cutoff_is_not_moved_into_weekend_midnight():
     part, = build_chain([BR_6_25], "BR", datetime(2025, 5, 10), datetime(2025, 5, 20), 2)
     assert part.deadline == datetime(2025, 6, 2, 16, 5)
     assert part.cutoff == datetime(2025, 5, 31, 16, 5)
+
+
+def test_effective_cutoff_moves_segment_boundary_and_is_recorded():
+    from src.market_calendar.expiry import CUTOFF_SESSION_END, ExpiryCutoff
+    calendar_cutoff = datetime(2026, 7, 23, 12)
+    shifted = datetime(2026, 7, 22, 20, 30)
+
+    def cutoff_for(c, at):
+        if c.short_name == "NG-7.26":
+            return ExpiryCutoff(shifted, at, CUTOFF_SESSION_END, datetime(2026, 7, 22, 20, 50))
+        return ExpiryCutoff(at, at, "calendar")
+
+    first, second = build_chain([card(7), card(8)], "NG", datetime(2026, 7, 1), datetime(2026, 8, 1), 2, cutoff_for)
+    assert (first.end, first.cutoff, first.calendar_cutoff, first.cutoff_source) == (
+        shifted, shifted, calendar_cutoff, CUTOFF_SESSION_END)
+    assert second.start == shifted
+    payload = first.payload()
+    assert (payload["cutoff"], payload["calendar_cutoff"], payload["cutoff_source"], payload["session_end"]) == (
+        "2026-07-22T20:30:00Z", "2026-07-23T12:00:00Z", "session-end", "2026-07-22T20:50:00Z")
+    assert second.payload()["session_end"] is None
+
+
+def test_chain_without_schedule_keeps_calendar_cutoff_as_unknown():
+    part, = build_chain([card(7)], "NG", datetime(2026, 7, 1), datetime(2026, 7, 2), 2)
+    assert (part.cutoff, part.calendar_cutoff, part.cutoff_source) == (
+        datetime(2026, 7, 23, 12), datetime(2026, 7, 23, 12), "schedule-unknown")
+
+
+def test_effective_cutoff_later_than_calendar_is_rejected():
+    from src.market_calendar.expiry import ExpiryCutoff
+    with pytest.raises(ContractChainError, match="позже календарного"):
+        build_chain([card(7)], "NG", datetime(2026, 7, 1), datetime(2026, 7, 2), 2,
+                    lambda c, at: ExpiryCutoff(at + timedelta(hours=1), at, "session-end"))

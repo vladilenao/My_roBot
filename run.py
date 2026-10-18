@@ -61,6 +61,7 @@ from src.config import (
     AUDIT_BACKUP_COUNT,
     TRADE_MANAGEMENT_PROFILES,
     CONTRACT_EXPIRY_BLOCK_DAYS,
+    CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN,
     TRADING_DIRECTIONS,
     INTRADAY_SETTINGS,
     trading_enabled,
@@ -482,8 +483,6 @@ def _launch(
         except ValueError as exc:
             print(f"Прогон невозможен — контрактная цепочка: {exc}")
             return 2, None, selection
-        selection.save(state_dir)
-        session.contract_selection = selection
         instruments = selection.instruments
 
     provider = client_provider if history or client_provider is not None else default_client_provider()
@@ -499,8 +498,21 @@ def _launch(
             allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
         )
         calendar_expectation = _historical_calendar_expectation(market_calendar)
+        if selection is not None:
+            # Рубежи экспирации уточняются по расписанию цепочки до сохранения и предпроверки.
+            _preload_history_schedule(market_calendar, selection, instruments, session)
+            try:
+                selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS,
+                                              cutoff_for=_history_expiry_cutoff(market_calendar))
+            except ValueError as exc:
+                print(f"Прогон невозможен — контрактная цепочка: {exc}")
+                return 2, None, selection
+            instruments = selection.instruments
     else:
         calendar_expectation = None
+    if selection is not None:
+        selection.save(state_dir)
+        session.contract_selection = selection
 
     if history:
         if selection is not None and selection.families:
@@ -533,7 +545,8 @@ def _launch(
         if report.notes:
             print(report.message())
         session.set_boundary_checks(report.boundaries)
-        _preload_history_schedule(market_calendar, selection, instruments, session)
+        if selection is None:
+            _preload_history_schedule(market_calendar, selection, instruments, session)
 
     channels = build_channels(channel_names, state_dir=state_dir)
     bus = EventBus()
@@ -922,6 +935,21 @@ def _family_warmup(family):
                               TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
 
 
+def _history_expiry_cutoff(market_calendar):
+    """Эффективный рубеж экспирации контракта цепочки по загруженному расписанию прогона."""
+    from src.market_calendar.expiry import expiry_cutoff
+
+    margin = timedelta(minutes=CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN)
+
+    def cutoff_for(card, calendar_cutoff):
+        exchange = market_calendar.exchange_for(card.uid)
+        # Восстановленные дни календарь отдаёт, только если прогон их разрешил.
+        calendar = None if exchange is None else market_calendar.calendar(
+            exchange, calendar_cutoff, include_reconstructed=True)
+        return expiry_cutoff(calendar, calendar_cutoff, margin)
+    return cutoff_for
+
+
 def _preload_history_schedule(market_calendar, selection, instruments, session) -> None:
     """Расписание прогона до первого тика; пропуски для внутридневных стратегий — предупреждением."""
     from src.history.schedule_notice import preload_history_schedule, report_notice, schedule_ranges
@@ -1167,6 +1195,7 @@ def _build_runtime(
         max_entry_deviation_r=RISK_LIMITS.get("max_entry_deviation_r", 0.25),
         live_market_provider=None if historical else data_cache.entry_market if getattr(data_cache, "live_session_enabled", False) is True else None,
         contract_expiry_block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
+        contract_expiry_close_before_end_min=CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN,
         direction_limits=TRADING_DIRECTIONS,
         signal_filter=SignalFilter(),
         clock=clock,

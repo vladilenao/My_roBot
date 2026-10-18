@@ -638,6 +638,24 @@ class TestContractExpiryBlockDays:
             load_config(_defaults(), config_file=cfg)
 
 
+class TestContractExpiryCloseBeforeEnd:
+    def test_default_is_twenty_minutes(self):
+        from src.config import _DEFAULTS
+        assert _DEFAULTS["contract_expiry_close_before_end_min"] == 20
+
+    def test_key_overrides_default(self, tmp_path):
+        cfg = load_config(
+            _defaults(), config_file=_write(tmp_path, "[trading]\ncontract_expiry_close_before_end_min = 45\n")
+        )
+        assert cfg["contract_expiry_close_before_end_min"] == 45
+
+    @pytest.mark.parametrize("value", ["-1", "1.5", "true", "\"20\""])
+    def test_invalid_value_rejected(self, tmp_path, value):
+        cfg = _write(tmp_path, f"[trading]\ncontract_expiry_close_before_end_min = {value}\n")
+        with pytest.raises(ConfigError, match="contract_expiry_close_before_end_min"):
+            load_config(_defaults(), config_file=cfg)
+
+
 def _write(tmp_path, body: str):
     tmp_path.mkdir(parents=True, exist_ok=True)
     cfg = tmp_path / "robot.toml"

@@ -102,6 +102,17 @@ def date_ranges(dates) -> str:
     return ", ".join(parts)
 
 
+def _cutoff_note(segment) -> str:
+    """Происхождение рубежа экспирации сегмента: сдвиг из перерыва или неизвестное расписание."""
+    source = segment.get("cutoff_source")
+    if source == "session-end":
+        return (f"; рубеж {segment['calendar_cutoff']} в перерыве — сдвинут на {segment['cutoff']}"
+                f" (конец сессии {segment['session_end']})")
+    if source == "schedule-unknown":
+        return "; расписание у рубежа неизвестно — рубеж календарный"
+    return ""
+
+
 def _stamp(moment) -> str:
     if moment is None:
         return ""
@@ -311,7 +322,7 @@ def _lines(metrics: RunMetrics, result: RunResult, source: str) -> list[str]:
                      "Экономические метаданные: статичная карточка источника."])
         for segment in plan["segments"]:
             head.append(f"  {segment['contract']}: {segment['start']} — {segment['end']}; "
-                        f"N={segment['lead_days']}; граница={segment['deadline_source']}")
+                        f"N={segment['lead_days']}; граница={segment['deadline_source']}{_cutoff_note(segment)}")
         for event in plan.get("transitions", []):
             status = {"active": "активирован", "draining": "закрытие старого", "waiting_data": "ожидание данных",
                       "skipped": "участок не активирован", "incomplete": "не завершён"}.get(event["status"], event["status"])

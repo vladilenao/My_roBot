@@ -104,6 +104,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "directions": "directions",
         "intraday": "intraday",
         "contract_expiry_block_days": "contract_expiry_block_days",
+        "contract_expiry_close_before_end_min": "contract_expiry_close_before_end_min",
     },
     "trade_management": {
         "profiles": "trade_management_profiles",
@@ -158,6 +159,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "intraday": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
+    "contract_expiry_close_before_end_min": int,
     "historical_rollover": dict,
     "historical_logging": dict,
     "historical_schedule": dict,
@@ -655,6 +657,10 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "contract_expiry_block_days" and (isinstance(value, bool) or value < 0):
             raise ConfigError(
                 f"{path}: [trading] contract_expiry_block_days должен быть неотрицательным целым числом"
+            )
+        if key == "contract_expiry_close_before_end_min" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [trading] contract_expiry_close_before_end_min должен быть неотрицательным целым числом"
             )
         if expected is dict:
             value = _validate_strategies(value, key, path)
