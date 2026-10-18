@@ -89,10 +89,22 @@ class ClusterEventsConsumer:
         if not self._group_ready:
             self._ensure_group()
         start = ">" if self._pending_done else "0"
-        response = self._redis.xreadgroup(
-            self._group, self._consumer, {self._stream: start}, count=BATCH,
-            block=None if start == "0" else BLOCK_MS,
-        )
+        try:
+            response = self._redis.xreadgroup(
+                self._group, self._consumer, {self._stream: start}, count=BATCH,
+                block=None if start == "0" else BLOCK_MS,
+            )
+        except Exception as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            # Redis потерял группу (пересоздан пустым, удалён поток): создаём
+            # её заново с начала потока; повторы отсекает event_id хранилища.
+            log.warning("Кластеры: группа %s потока %s пропала в Redis, создаю заново",
+                        self._group, self._stream)
+            self._group_ready = False
+            self._pending_done = False
+            self._ensure_group()
+            return 0
         entries = _entries(response)
         now = self._clock()
         self._last_read_at = now
