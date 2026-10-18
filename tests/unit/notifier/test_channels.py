@@ -3,6 +3,7 @@
 import io
 import os
 import time
+from functools import partial
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -191,6 +192,9 @@ class TestConsoleChannel:
                 return True
 
         monkeypatch.delenv("NO_COLOR", raising=False)
+        # На Windows ANSI допустим только в настоящей консоли; здесь проверяется POSIX-терминал.
+        monkeypatch.setattr("src.notifier.console._supports_color",
+                            partial(_supports_color, platform_name="posix"))
         monkeypatch.setenv("TERM", "xterm-256color")
         def now() -> datetime:
             return datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc)
@@ -209,6 +213,9 @@ class TestConsoleChannel:
                 return True
 
         monkeypatch.delenv("NO_COLOR", raising=False)
+        # На Windows ANSI допустим только в настоящей консоли; здесь проверяется POSIX-терминал.
+        monkeypatch.setattr("src.notifier.console._supports_color",
+                            partial(_supports_color, platform_name="posix"))
         monkeypatch.setenv("TERM", "xterm")
         stream = Terminal()
         channel = ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 8, 7, 15, tzinfo=timezone.utc))
