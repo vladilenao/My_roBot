@@ -429,4 +429,4 @@ def test_carry_stop_reason_in_csv(storage, tmp_path):
     env.now = msk(16, 18, 40)
     env.manage(close=105.0)
     events, _ = _csv(storage, tmp_path)
-    assert "безубыток для переноса через перерыв" in {row["Причина"] for row in events}
+    assert "безубыток для переноса через перерыв: 96 → 103" in {row["Причина"] for row in events}

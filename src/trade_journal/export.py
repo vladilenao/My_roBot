@@ -110,7 +110,11 @@ _ACTION_LABELS = {
     "REDUCE": "частичное закрытие",
     "CLOSE": "закрытие позиции",
     "STOP": "стоп",
+    "MOVESTOP": "перенос стопа",
 }
+_ENTRY_ACTIONS = frozenset({"OPEN", "ADD"})
+_DEFERRED_ACK_REASONS = frozenset({"next-bar"})
+_NEXT_BAR_EXECUTION = "исполнение по следующему бару"
 
 
 class CsvExporter:
@@ -180,11 +184,12 @@ class CsvExporter:
                        events.payload_json, trades.trade_id, trades.instrument_id, trades.side,
                        orders.action_type, orders.quantity AS order_quantity,
                        orders.requested_price AS order_price, fills.quantity AS fill_quantity,
-                       fills.price AS fill_price
+                       fills.price AS fill_price, outbox.payload_json AS command_json
                 FROM events
                 LEFT JOIN trades ON trades.trade_id = events.trade_id
                 LEFT JOIN orders ON orders.order_id = events.order_id
                 LEFT JOIN fills ON fills.execution_id = events.event_id
+                LEFT JOIN outbox ON outbox.command_id = events.command_id
                 ORDER BY events.event_seq
                 """
             ):
@@ -207,20 +212,34 @@ class CsvExporter:
                     index = self._connection.execute("SELECT target_index FROM targets WHERE trade_id=? AND target_id=?",
                                                      (trade_id, display_action.partition(":")[2])).fetchone()
                     display_action = f"TARGET:TP{index[0]+1}" if index else "TARGET:"
+                event = self._describe_event(str(row.get("event_type") or ""), display_action)
+                reason = reason_label(payload.get("reason"))
+                action = display_action.partition(":")[0]
+                if str(row.get("event_type") or "").upper() == "ACK" and action not in _ENTRY_ACTIONS:
+                    # Эмулятор подтверждает любую команду кодом next-bar; для выхода
+                    # и переноса стопа причиной служит причина самой команды.
+                    command_reason = self._payload(row.get("command_json")).get("reason")
+                    if payload.get("reason") in _DEFERRED_ACK_REASONS:
+                        reason = reason_label(command_reason) if command_reason else _NEXT_BAR_EXECUTION
+                if action == "MOVESTOP":
+                    quantity = ""  # перенос стопа действует на весь остаток, объём заявки условный
+                    confirmed = payload.get("confirmed_stop")
+                    if isinstance(confirmed, dict) and confirmed.get("new") is not None:
+                        event, price = "Стоп перенесён", confirmed["new"]
+                        if confirmed.get("old") is not None:
+                            reason = f"{reason}: {confirmed['old']} → {confirmed['new']}"
                 journal_rows.append({
                     "occurred_at": self._msk(row.get("occurred_at")),
                     "contract": self._display_contract(str(row.get("instrument_id") or "")),
                     "side": _SIDE_LABELS.get(str(row.get("side") or "").upper(), ""),
-                    "event": self._describe_event(
-                        str(row.get("event_type") or ""), display_action
-                    ),
+                    "event": event,
                     "quantity": quantity,
                     "price": price,
                     "position_qty_before": before_qty if before_qty else "",
                     "position_qty_after": after_qty if after_qty else "",
                     "avg_price_before": self._money(before_avg) if before_avg is not None else "",
                     "avg_price_after": self._money(after_avg) if after_avg is not None else "",
-                    "reason": reason_label(payload.get("reason")),
+                    "reason": reason,
                 })
             cards: list[tuple[datetime, str, dict[str, object]]] = []
             for row in self._rows(
