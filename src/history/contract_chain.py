@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from src.instruments.futures import FuturesCard, family_key, family_for
 from src.data.timeutil import to_naive
@@ -36,6 +36,13 @@ def contract_deadline(card: FuturesCard) -> tuple[datetime, str]:
         raise ContractChainError(f"{card.short_name or 'контракт не указан'}: отсутствует expiration_date")
     boundaries = [(card.expiration_date, "expiration_only")]
     if card.last_trade_date is not None:
+        # Tinkoff отдаёт expiration_date полуночью дня экспирации — это метка дня,
+        # а не момент окончания торгов. Если в тот же день есть last_trade_date,
+        # полночь отсекла бы последнюю сессию: при экспирации в понедельник
+        # (BR-6.25, 2025-06-02) окно выхода целиком попадало на выходные.
+        expiration = card.expiration_date
+        if expiration.time() == time(0) and card.last_trade_date.date() == expiration.date():
+            boundaries = []
         boundaries.append((card.last_trade_date, "last_trade_date"))
     if card.first_notice_date is not None:
         boundaries.append((card.first_notice_date, "first_notice_date"))

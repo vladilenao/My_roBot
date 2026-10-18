@@ -122,3 +122,38 @@ def test_missing_tail_is_not_full_coverage():
         return frame, uid
 
     assert any("конец участка" in problem for problem in check(source).problems)
+
+
+def test_br_6_25_monday_expiration_after_weekend_passes():
+    """BR-6.25 истекает в понедельник 2025-06-02; торгов в выходные нет.
+
+    Полночь expiration_date раньше ставила срок на 2025-06-02 00:00, и окно
+    поиска бара-продолжения и бара выхода целиком попадало на выходные.
+    """
+    rows = [
+        ("BRK5", "5", "2024-04-26T20:59:59Z", "2025-05-02"),
+        ("BRM5", "6", "2024-05-28T20:59:59Z", "2025-06-02"),
+        ("BRN5", "7", "2024-06-25T20:59:59Z", "2025-07-01"),
+    ]
+    cards = tuple(FuturesCard.from_row({
+        "instrument_id": f"uid-{ticker}", "ticker": ticker, "name": f"BR-{month}.25 Нефть Brent",
+        "basic_asset": "Brent", "first_trade_date": first,
+        "expiration_date": f"{day}T00:00:00Z", "last_trade_date": f"{day}T16:05:00Z",
+        "min_price_increment": .01, "min_price_increment_amount": 7.82284,
+        "initial_margin_on_buy": 6826.01, "initial_margin_on_sell": 6826.01,
+    }) for ticker, month, first, day in rows)
+    start, end = datetime(2025, 5, 20), datetime(2025, 6, 20)
+    chosen = HistorySelection(families=("BR",), catalog=cards,
+        chains=(build_chain(cards, "BR", start, end, 2),))
+
+    def weekdays(**kw):
+        frame, uid = loader(**kw)
+        stamps = frame["datetime"]
+        open_ = (stamps.dt.weekday < 5) & (stamps.dt.hour >= 6) & (
+            (stamps.dt.hour < 20) | ((stamps.dt.hour == 20) & (stamps.dt.minute < 50)))
+        return frame.loc[open_].reset_index(drop=True), uid
+
+    result = run_chain_preflight(chosen, requirements=lambda family: {"1m": 2},
+        start=start, end=end, load_candles=weekdays)
+    assert result.ok, result.problems
+    assert any("BR-6.25" in line for line in result.detail)
