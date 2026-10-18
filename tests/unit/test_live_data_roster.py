@@ -13,7 +13,7 @@ from src.history.warmup import live_data_requirements
 from src.strategies.contracts import Assignment
 
 
-def test_shipped_all_selected_roster_has_81_unique_pairs(monkeypatch):
+def test_shipped_all_selected_roster_has_111_unique_pairs(monkeypatch):
     # Это конфигурационный fixture, не исторические/торговые данные и не
     # текущий выбор интерактивного меню. Каждый ticker/family здесь один UID.
     with (Path(__file__).resolve().parents[2] / "default.toml").open("rb") as source:
@@ -37,14 +37,14 @@ def test_shipped_all_selected_roster_has_81_unique_pairs(monkeypatch):
             work_pairs.update((uid, binding.timeframe) for binding in bindings)
     assert len(instruments) == 23
     assert len(work_pairs) == 46
-    assert len(roster) == 81
+    assert len(roster) == 111
     assert Counter(tf for _, tf in roster) == {
-        "1m": 23, "5m": 2, "15m": 22, "30m": 1, "1h": 22, "4h": 2, "1d": 5, "1w": 4,
+        "1m": 23, "5m": 2, "15m": 7, "30m": 1, "1h": 22, "4h": 17, "1d": 20, "1w": 19,
     }
     assert {tf for uid, tf in roster if uid == "future:SI"} == {"1m", "5m", "30m", "4h"}
     # Арифметика ниже явно условна: один RPC/пара каждые 300 с и один
     # однодневный 1m чанк без overlap/retries, не реальная доступная квота.
-    assert len(roster) * 60 / 300 == pytest.approx(16.2)
+    assert len(roster) * 60 / 300 == pytest.approx(22.2)
     assert len(instruments) * 30 == 690
 
 
