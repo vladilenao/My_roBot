@@ -215,6 +215,7 @@ def test_hold_with_unknown_schedule_stays_a_data_hold() -> None:
     )
 
 
+@pytest.mark.skipif(not hasattr(__import__("time"), "tzset"), reason="time.tzset нет на Windows")
 def test_console_time_ignores_computer_timezone(monkeypatch) -> None:
     import time
     decision = Event.decision("SBER", outcome="signal_buy", side="BUY", price=300,

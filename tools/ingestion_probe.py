@@ -21,13 +21,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
 import sys
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # Windows: модуля resource нет, пик памяти не замеряется
+    resource = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -289,6 +293,8 @@ def probe_cold_start(instrument, *, days):
     from src.data.request_budget import RequestBudget
 
     def rss_mb():
+        if resource is None:
+            return None
         value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return round(value / (1024 * 1024) if sys.platform == "darwin" else value / 1024, 1)
 
