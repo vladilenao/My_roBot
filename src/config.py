@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.data.ingestion_settings import MarketDataSettings
 from src.config_loader import (
+    HISTORY_LOGGING_DEFAULTS,
     ConfigError,
     app_dir,
     load_config,
@@ -116,10 +117,13 @@ _DEFAULTS = {
     # календарные сутки до момента экспирации контракта.
     "contract_expiry_block_days": 2,
     "historical_rollover": {"policy": "calendar", "families": {}},
+    # Лог исторического прогона (секция [historical.logging]).
+    "historical_logging": dict(HISTORY_LOGGING_DEFAULTS),
 }
 
 _CONFIG = load_config(_DEFAULTS)
 HISTORICAL_ROLLOVER = _CONFIG["historical_rollover"]
+HISTORICAL_LOGGING = _CONFIG["historical_logging"]
 
 TIMEFRAME = _CONFIG["timeframe"]
 if TIMEFRAME not in TIMEFRAMES:

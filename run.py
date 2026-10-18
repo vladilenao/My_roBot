@@ -67,6 +67,7 @@ from src.config import (
     runtime_dir,
     run_dir_name,
     HIST_DIR,
+    HISTORICAL_LOGGING,
     HISTORICAL_ROLLOVER,
     TIMEFRAMES,
     CLUSTER_SETTINGS,
@@ -110,7 +111,7 @@ from src.events.types import EventType
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
 from src.instruments.selector import select_instruments
-from src.logging_setup import get_logger, setup_logging
+from src.logging_setup import get_logger, log_rotation, setup_logging
 from src.notifier import build_channels, close_channels
 from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
 from src.scheduler.timing import MultiTimeframeScheduler
@@ -410,6 +411,20 @@ def _historical_calendar_expectation(market_calendar):
     return expectation
 
 
+def _log_settings(history: bool, clock) -> dict:
+    """Порог и ротация лога: у исторического прогона своя секция [historical.logging]."""
+    if not history:
+        return {"level": LOGGING_LEVEL, "max_bytes": LOGGING_MAX_BYTES, "backup_count": LOGGING_BACKUP_COUNT}
+    window = HISTORICAL_LOGGING["debug_from"], HISTORICAL_LOGGING["debug_to"]
+    return {
+        "level": HISTORICAL_LOGGING["level"],
+        "max_bytes": HISTORICAL_LOGGING["max_bytes"],
+        "backup_count": HISTORICAL_LOGGING["backup_count"],
+        "clock": None if clock is None else clock.now,  # HistoricalClock: naive UTC
+        "debug_window": None if window[0] is None else window,
+    }
+
+
 def _launch(
     *,
     state_dir,
@@ -437,11 +452,9 @@ def _launch(
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
         log_file=str(state_dir / LOGGING_FILE),
-        level=LOGGING_LEVEL,
-        max_bytes=LOGGING_MAX_BYTES,
-        backup_count=LOGGING_BACKUP_COUNT,
         secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
                  MARKET_DATA_EXPORT_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
+        **_log_settings(history, clock),
     )
     log.info("Робот v%s запущен", __version__)
     # Независимые полосы: данные собираются с момента запуска процесса, пока
@@ -957,6 +970,7 @@ def _finish_history(
         terminal_gap=bool(getattr(session, "terminal_gap", None)),
         rollover=collect_rollover(storage, lifecycle.selection) if isinstance(lifecycle, RolloverLifecycle) else None,
         calendar_schedule=_calendar_schedule(data_cache),
+        log_rotation=log_rotation(),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)

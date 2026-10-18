@@ -303,7 +303,7 @@ def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_pat
                             bar_time=frame["datetime"].iloc[-1])
 
     class Context:
-        def get_context(self, instrument, timeframe):
+        def get_context(self, instrument, timeframe, frame=None):
             base = 100+(int(instrument.uid[-1])-1)*50
             return MarketContext(TrendResult(TrendDirection.UP, .8),
                                  [SRLevel(base-4, SRType.SUPPORT, 3, "support")], base)
