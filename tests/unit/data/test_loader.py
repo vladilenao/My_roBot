@@ -183,7 +183,7 @@ class TestIterationRetry:
         # повторно открытый поток продолжает с последней собранной свечи.
         made = [make_candle(0), make_candle(1), make_candle(2)]
 
-        with patch("src.data.loader.Client"), \
+        with patch("src.api.client.Client"), \
              patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
              patch("src.data.loader.time.sleep") as mock_sleep, \
              patch("src.data.loader.api_call_with_retry") as mock_retry:
@@ -214,7 +214,7 @@ class TestIterationRetry:
         assert len(df) >= 3
 
     def test_iteration_rate_limit_pauses_before_retry(self):
-        with patch("src.data.loader.Client"), \
+        with patch("src.api.client.Client"), \
              patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
              patch("src.data.loader.time.sleep") as mock_sleep, \
              patch("src.data.loader.api_call_with_retry") as mock_retry:
@@ -237,7 +237,7 @@ class TestIterationRetry:
         assert slept <= 7  # пауза ограничена ratelimit_reset
 
     def test_iteration_rate_limit_rethrown_after_max_retries(self):
-        with patch("src.data.loader.Client"), \
+        with patch("src.api.client.Client"), \
              patch("src.data.loader.find_working_instrument", return_value="uid-123"), \
              patch("src.data.loader.time.sleep") as mock_sleep, \
              patch("src.data.loader.api_call_with_retry") as mock_retry:

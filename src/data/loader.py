@@ -2,7 +2,6 @@ import time
 
 import pandas as pd
 from datetime import datetime, timedelta
-from t_tech.invest import Client  # noqa: F401  (цель patch в тестах)
 from t_tech.invest.utils import now
 from src.config import TIMEFRAMES
 from src.api.client import ClientProvider, LIVE_CANDLE_SOURCE, client_context
