@@ -65,9 +65,22 @@ jobs:
         shell: bash
         run: python -m scripts.validate_release --tag "$RELEASE_TAG"
 
+      # Логи Actions без входа не видны, поэтому итог падения pytest
+      # дублируется в публичную аннотацию.
       - name: Run tests
         shell: bash
-        run: python -m pytest -q
+        run: |
+          set +e
+          python -m pytest -q -rfE --tb=short 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E '^(ERROR|FAILED|E  )|Error|error' "$RUNNER_TEMP/pytest.log" | head -40 | cut -c1-300)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=pytest (exit $status)::${summary}"
+          fi
+          exit "$status"
 
       - name: Run Ruff
         shell: bash
