@@ -180,8 +180,8 @@ strategies = [
 
 [strategies.share.PHOR]
 strategies = [
-    { id = "share-phor-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
-    { id = "share-phor-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-phor-macd-15m-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "15m", priority = 10, clusters = "shadow" },
+    { id = "share-phor-macd-15m-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "15m", priority = 10, clusters = "shadow" },
     { id = "share-phor-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-phor-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
