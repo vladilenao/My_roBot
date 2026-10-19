@@ -24,7 +24,9 @@ from src.market_calendar.intervals import normalize_exchange, trading_date
 
 SCHEMA_VERSION = 4
 SOURCE_TBANK = "tbank_exchange"
-from src.data.coverage_states import EXPORTED_STATE, INTERVAL_STATES, RESOLVED_INTERVAL_STATES  # noqa: E402,F401
+from src.data.coverage_states import (  # noqa: E402,F401
+    EXPORTED_STATE, FINAL_EVIDENCE_STATES, INTERVAL_STATES, RESOLVED_INTERVAL_STATES, WAITING_INTERVAL_STATES,
+)
 ROSTER_ORIGINS = frozenset({"selected", "obligation", "previous"})
 
 
@@ -38,6 +40,11 @@ def _utc_text(value: object | None = None) -> str:
     else:
         stamp = stamp.tz_convert("UTC")
     return stamp.isoformat().replace("+00:00", "Z")
+
+
+def _downgrades_final(current: str, state: str) -> bool:
+    """Ожидание поверх итога по данным источника — понижение, его не пишем."""
+    return current in FINAL_EVIDENCE_STATES and state in WAITING_INTERVAL_STATES
 
 
 def _price_text(value: object) -> str:
@@ -624,7 +631,8 @@ class MarketDataStore:
         """Сохраняет доказанное состояние интервала и отдаёт его в экспорт.
 
         ``pending`` и ``unresolved`` намеренно не позволяют кэшу продвигать
-        симуляцию; статус записывается отдельно от временной свечи.
+        симуляцию; статус записывается отдельно от временной свечи. Итог по
+        данным источника они не понижают: тогда возвращается ``None``.
         """
         if state not in INTERVAL_STATES:
             raise ValueError(f"Неизвестное состояние интервала: {state}")
@@ -633,6 +641,9 @@ class MarketDataStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._keeps_final_state(conn, source, instrument_uid, interval, stamp, state):
+                    conn.commit()
+                    return None
                 change_id = self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True)
                 pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
                 cursor = conn.execute(
@@ -655,8 +666,9 @@ class MarketDataStore:
                             rows: Iterable[tuple[object, str, str]], observed_at: object | None = None) -> int:
         """Пакет состояний одного ряда в одной транзакции и с одним пересчётом префикса.
 
-        Полученный интервал (``received``) не понижается. Возвращает число
-        изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
+        Полученный интервал (``received``) не понижается, итог по данным
+        источника (``confirmed_no_trade``, ``source_absent``) не возвращается в
+        ``pending``/``unresolved``. Возвращает число изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
         это тысячи минут, по транзакции на каждую слишком дорого.
         """
         prepared = []
@@ -677,6 +689,8 @@ class MarketDataStore:
                         (source, instrument_uid, interval, stamp)).fetchone()
                     if current is not None and current["state"] == "received":
                         continue
+                    if current is not None and _downgrades_final(current["state"], state):
+                        continue
                     if self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True):
                         changed += 1
                 pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
@@ -694,6 +708,16 @@ class MarketDataStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    @staticmethod
+    def _keeps_final_state(conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
+                           stamp: str, state: str) -> bool:
+        if state not in WAITING_INTERVAL_STATES:
+            return False
+        current = conn.execute(
+            "SELECT state FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+            (source, instrument_uid, interval, stamp)).fetchone()
+        return current is not None and _downgrades_final(current["state"], state)
 
     def _upsert_coverage(self, conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str, stamp: str, state: str, evidence: str, observed_at: str, *, emit: bool) -> int | None:
         old = conn.execute("SELECT state,evidence FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?", (source, instrument_uid, interval, stamp)).fetchone()

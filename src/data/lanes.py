@@ -397,7 +397,7 @@ class CompletenessLane:
             self._store.set_interval_states(source=self._source, instrument_uid=uid, interval=timeframe,
                                             rows=rows, observed_at=now)
             log.info("Нет у источника: %s %s, интервалов %d после %d проверок",
-                     uid, timeframe, len(final), len(self._rechecks) + 1)
+                     uid, timeframe, len(final), max(done for _, done, _ in final))
 
 
 class CalendarLane:

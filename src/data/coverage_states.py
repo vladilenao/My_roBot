@@ -9,6 +9,12 @@ add-independent-market-data-lanes).
 
 INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "source_absent", "pending", "unresolved"})
 RESOLVED_INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "source_absent"})
+# Итог по данным источника (GetLastTrades без сделок, исчерпанное расписание
+# проверок). Повторная сверка с расписанием или пустой ответ не возвращают его
+# в ожидание: доказательство не повторить вне окна, переигровка замерла бы
+# навсегда (fix-pending-overwrites-resolved). Сменить его может только свеча.
+FINAL_EVIDENCE_STATES = frozenset({"confirmed_no_trade", "source_absent"})
+WAITING_INTERVAL_STATES = frozenset({"pending", "unresolved"})
 # В ленту /changes «у источника нет» уходит как прежнее unresolved с
 # доказательством source_absent:…, чтобы не ломать прежних потребителей.
 EXPORTED_STATE = {"source_absent": "unresolved"}
