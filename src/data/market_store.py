@@ -1182,6 +1182,13 @@ class MarketDataStore:
                 conn.rollback()
                 raise
 
+    def mark_roster_previous(self, *, source: str, pairs: Iterable[tuple[str, str]]) -> None:
+        """Пары, снятые запуском как ненужные, становятся прошлыми, даже обязательства."""
+        with self._lock, self._connect() as conn:
+            conn.executemany("""UPDATE market_data_roster SET origin='previous'
+                WHERE source=? AND instrument_uid=? AND interval=?""",
+                [(source, uid, interval) for uid, interval in pairs])
+
     def set_roster_window(self, *, source: str, instrument_uid: str, interval: str, window_lower: object) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("""UPDATE market_data_roster SET window_lower_utc=?

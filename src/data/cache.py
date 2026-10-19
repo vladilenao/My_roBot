@@ -206,6 +206,9 @@ class MarketDataCache:
         self._live_generation = 0
         self._data_changed = threading.Condition(self._lock)
         self._pending_live_history = {}
+        # Все потребности этого запуска (адрес, тикер, тип, ТФ): по ним пары
+        # сохранённого состава, которые никто не запросил, снимаются.
+        self._requested_live = set()
 
     @property
     def history_source_failed(self):
@@ -425,6 +428,29 @@ class MarketDataCache:
             self._live_generation += 1
             self._data_changed.notify_all()
             return True
+
+    def retire_unrequested_live_pairs(self):
+        """Снимает пары, ТФ которых этот запуск не запросил (retire-unrequired-roster-pairs).
+
+        Пара сохранённого состава регистрируется до выбора без потребности
+        прогрева. Если после регистрации потребностей стратегий, фильтров и
+        сопровождения сделок её ТФ не нужен никому, прогрев не начнётся
+        никогда, и старт ждал бы её вечно. Запрос узнаётся по UID или адресу
+        пары либо по тикеру и типу: live-выбор строит инструменты без UID.
+        Возвращает снятые пары как (UID, ТФ, тикер).
+        """
+        with self._lock:
+            stale = []
+            for (uid, timeframe), member in sorted(self._live_members.items()):
+                instrument = member["instrument"]
+                addresses = {uid} | {key[0] for key in member["keys"]}
+                if not any(tf == timeframe and (address in addresses or (
+                        ticker == instrument.ticker and kind == instrument.instrument_type))
+                        for address, ticker, kind, tf in self._requested_live):
+                    stale.append((uid, timeframe, instrument.ticker))
+            for uid, timeframe, _ in stale:
+                self.unregister_live_pair(uid, timeframe)
+        return stale
 
     def set_live_execution_lower(self, uid, timeframe, open_time):
         """Main-thread boundary сохранённых обязательств, не high-water receipt."""
@@ -710,6 +736,7 @@ class MarketDataCache:
         """Недостающая потребность передаётся worker без синхронной сети."""
         with self._lock:
             key = self._key(instrument, timeframe)
+            self._requested_live.add((key[0], instrument.ticker, instrument.instrument_type, timeframe))
             self._instruments.setdefault(key, instrument)
             uid = self._uids.get(key)
             member = self._live_members.get((uid, timeframe)) if uid else None

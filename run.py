@@ -582,7 +582,7 @@ def _launch(
         live_waiter = None
         if not history:
             market_poller = _start_live_ingestion(data_cache, runtime, instruments, provider, early=early)
-            live_waiter = market_poller.wait_startup
+            live_waiter = _live_startup_waiter(market_poller, timeout=MARKET_DATA_SETTINGS.startup_wait_timeout_secs)
         pattern_worker = None
         if not history and MARKET_STRUCTURE_PATTERNS_ENABLED:
             import redis
@@ -886,6 +886,26 @@ def _retire_unselected_pairs(data_cache, instruments, worker):
         if data_cache.unregister_live_pair(pair["uid"], pair["timeframe"]):
             log.info("Пара %s %s прошлого запуска не выбрана — снята с обслуживания",
                      instrument.ticker, pair["timeframe"])
+
+
+def _live_startup_waiter(poller, *, timeout):
+    """Ожидание прогрева перед стартовым обзором (retire-unrequired-roster-pairs).
+
+    LiveAnalysis вызывает его сразу после регистрации потребностей стратегий,
+    фильтров и сопровождения. Пары сохранённого состава, которые никто не
+    запросил, сначала снимаются: их прогрев не начнётся никогда. Ожидание
+    ограничено ``timeout``: неготовые пары выходят в обзор с причиной.
+    """
+    def wait():
+        for ticker, timeframe in poller.retire_unrequested_pairs():
+            log.info("Пара %s %s сохранённого состава не нужна ни стратегиям, ни сделкам — снята с обслуживания",
+                     ticker, timeframe)
+        if poller.wait_startup(timeout):
+            return True
+        log.warning("Прогрев не завершился за %d с, стартовый обзор выходит без него. Ждали: %s",
+                    timeout, "; ".join(poller.startup_pending()) or "нет данных")
+        return False
+    return wait
 
 
 def _canonical_execution_boundaries(boundaries, aliases):
