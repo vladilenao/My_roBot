@@ -9,6 +9,11 @@ from pathlib import Path
 
 SCHEMA_VERSION = 3
 FILE_RETENTION = timedelta(days=7)
+# Фоновая досылка запросов, которые гарантированно не ушли: паузы между
+# попытками (последняя повторяется) и окно от первого отказа.
+AUTO_RETRY_DELAYS = (10.0, 30.0, 120.0, 300.0, 600.0)
+AUTO_RETRY_WINDOW = timedelta(hours=1)
+AUTO_RETRY_EXPIRED = "auto-retry-expired"
 
 
 class _Row(tuple):
@@ -89,6 +94,11 @@ class DeliveryRepository:
                 operation_id INTEGER PRIMARY KEY REFERENCES operations(operation_id),
                 data_json TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS telegram_files_expiry ON telegram_files(namespace,created_at);
+            -- Добавочная таблица без смены user_version: v7.0.0 открывает базу при откате.
+            CREATE TABLE IF NOT EXISTS telegram_auto_retry(
+                operation_id INTEGER PRIMARY KEY REFERENCES operations(operation_id),
+                namespace TEXT NOT NULL, first_failed_at TEXT NOT NULL,
+                next_attempt_at TEXT NOT NULL, retries INTEGER NOT NULL DEFAULT 0);
         """)
         with self.connection:
             if version < 2:
@@ -196,13 +206,73 @@ class DeliveryRepository:
     def finish_operation(self, operation_id, response):
         message_id = response.result.get("message_id") if isinstance(response.result, dict) and response.ok else None
         status = "confirmed" if response.ok else "uncertain" if response.uncertain else "failed"
+        self._finish(operation_id, status, message_id, getattr(response, "detail", "") or None)
+        return message_id
+
+    def _finish(self, operation_id, status, message_id=None, detail=None, *, attempted=True):
         now = _utc_now()
         with self.connection:
             self.connection.execute("UPDATE operations SET status=?,message_id=?,updated_at=? WHERE namespace=? AND operation_id=?", (status, message_id, now, self.namespace, operation_id))
             key = self.connection.execute("SELECT operation_key FROM operations WHERE namespace=? AND operation_id=?", (self.namespace, operation_id)).fetchone()[0]
             self.connection.execute("UPDATE attempts SET status=?,message_id=? WHERE namespace=? AND operation_key=?", (status, message_id, self.namespace, key))
-            self.connection.execute("UPDATE attempt_history SET status=?,finished_at=? WHERE attempt_id=(SELECT max(attempt_id) FROM attempt_history WHERE namespace=? AND operation_id=?)", (status, now, self.namespace, operation_id))
-        return message_id
+            if attempted:
+                self.connection.execute("UPDATE attempt_history SET status=?,finished_at=?,detail=? WHERE attempt_id=(SELECT max(attempt_id) FROM attempt_history WHERE namespace=? AND operation_id=?)", (status, now, detail, self.namespace, operation_id))
+            elif detail:
+                # Решение без HTTP (окно досылки истекло) тоже видно в истории.
+                self.connection.execute("INSERT INTO attempt_history(namespace,operation_id,source,started_at,finished_at,status,detail) VALUES (?,?,?,?,?,?,?)",
+                                        (self.namespace, operation_id, "automatic", now, now, status, detail))
+            if status != "deferred":
+                self.connection.execute("DELETE FROM telegram_auto_retry WHERE namespace=? AND operation_id=?", (self.namespace, operation_id))
+
+    def abandon_operation(self, operation_id, detail):
+        """Известный отказ без HTTP: досылка невозможна (например, материалы утрачены)."""
+        self._finish(operation_id, "failed", None, detail, attempted=False)
+
+    def defer_operation(self, operation_id, detail="", *, attempted=True, now=None):
+        """Запрос не ушёл: назначить фоновую попытку или закрыть окно досылки.
+
+        Возвращает время следующей попытки (UTC) или None, если окно истекло и
+        операция стала failed — известный отказ, доступный ручной досылке.
+        """
+        now = now or datetime.now(timezone.utc)
+        row = self.connection.execute("SELECT first_failed_at,retries FROM telegram_auto_retry WHERE namespace=? AND operation_id=?",
+                                      (self.namespace, operation_id)).fetchone()
+        first, retries = (datetime.fromisoformat(row[0]), row[1]) if row else (now, 0)
+        due = now + timedelta(seconds=AUTO_RETRY_DELAYS[min(retries, len(AUTO_RETRY_DELAYS) - 1)])
+        if due - first > AUTO_RETRY_WINDOW:
+            self._finish(operation_id, "failed", None, AUTO_RETRY_EXPIRED if not attempted else f"{detail}; {AUTO_RETRY_EXPIRED}",
+                         attempted=attempted)
+            return None
+        if attempted:
+            self._finish(operation_id, "deferred", None, detail or None)
+        else:
+            with self.connection:
+                self.connection.execute("UPDATE operations SET status='deferred',updated_at=? WHERE namespace=? AND operation_id=?",
+                                        (_utc_now(), self.namespace, operation_id))
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO telegram_auto_retry VALUES (?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET "
+                "next_attempt_at=excluded.next_attempt_at,retries=excluded.retries",
+                (operation_id, self.namespace, first.isoformat(), due.isoformat(), retries + 1))
+        return due
+
+    def deferred_operations(self, now=None):
+        """Отложенные операции для подхвата при старте; истёкшие окна закрываются как failed."""
+        now = now or datetime.now(timezone.utc)
+        rows = self.connection.execute("""
+            SELECT o.operation_id,o.operation_key,o.trade_id,o.event_key,r.first_failed_at,r.next_attempt_at
+            FROM operations o LEFT JOIN telegram_auto_retry r USING(operation_id)
+            WHERE o.namespace=? AND o.status='deferred' ORDER BY o.operation_id
+        """, (self.namespace,)).fetchall()
+        result = []
+        for row in rows:
+            if row["first_failed_at"] is None or now - datetime.fromisoformat(row["first_failed_at"]) > AUTO_RETRY_WINDOW:
+                self._finish(row["operation_id"], "failed", None, AUTO_RETRY_EXPIRED, attempted=False)
+                continue
+            result.append({"operation_id": row["operation_id"], "operation_key": row["operation_key"],
+                           "trade_id": row["trade_id"], "event_key": row["event_key"],
+                           "due": datetime.fromisoformat(row["next_attempt_at"])})
+        return result
 
     # Compatibility with the original receipt API.
     def begin_attempt(self, key):
