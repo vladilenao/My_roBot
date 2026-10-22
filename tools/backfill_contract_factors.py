@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from run import _token_client_context  # noqa: E402
+from src.assembly.contour import _token_client_context  # noqa: E402
 from src.config import DATABASE_FILE  # noqa: E402
 from src.instruments.selector import select_instruments  # noqa: E402
 

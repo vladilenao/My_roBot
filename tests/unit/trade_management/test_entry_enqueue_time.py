@@ -1,6 +1,6 @@
 """Момент создания входа при проверке актуальности (fix-entry-command-enqueue-time).
 
-Настоящие ``Storage``, ``TradeManager`` и ``run._dispatch_evidence``. У входа
+Настоящие ``Storage``, ``TradeManager`` и ``contour._dispatch_evidence``. У входа
 ``outbox.created_at`` — время открытия свечи сигнала, а начало шага ``intent_since`` —
 рыночные часы: до исправления любой живой вход считался созданным раньше шага.
 """
@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
-import run
+from src.assembly import contour
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.instruments import Instrument
 from src.portfolio.models import ContractMeta
@@ -58,7 +58,7 @@ class Live:
         cache = SimpleNamespace(pair_status=lambda instrument, timeframe: {"state": self.state})
         manager = TradeManager(self.storage, self.broker, initial_balance=Decimal(100000), clock=lambda: self.now)
         manager.configure_dispatch_eligibility(
-            run._dispatch_evidence(cache, [ITEM], self.storage, self.step), nullcontext)
+            contour._dispatch_evidence(cache, [ITEM], self.storage, self.step), nullcontext)
         return manager
 
     def begin_step(self, start):

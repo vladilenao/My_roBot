@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-import run
+from src.assembly import contour
 from src.bot import TradingBot
 from src.broker.events import BrokerEvent
 from src.broker.port import ExecutionEvent, ExecutionStatus
@@ -286,7 +286,8 @@ class TestNoStateChangingSubscribers:
         assert "risk_manager" not in parameters
 
     def test_execution_outcome_is_applied_by_a_direct_call(self):
-        source = (ROOT / "run.py").read_text(encoding="utf-8")
+        # Сборка торговой части переехала из run.py в торговый контур (refactor-core-contour-split).
+        source = (ROOT / "src" / "assembly" / "contour.py").read_text(encoding="utf-8")
 
         assert "trade_manager.consume(event)" in source
 
@@ -342,7 +343,7 @@ class TestOneFactOneEvent:
 
 class TestTradeIdStaysInternal:
     def _closed(self) -> object:
-        return run._broker_event(
+        return contour._broker_event(
             BrokerEvent(
                 type=EventType.TRADE_CLOSED,
                 ts=BAR0,
@@ -373,7 +374,7 @@ class TestTradeIdStaysInternal:
         bus = EventBus()
         bus.subscribe(recorder)
         bus.publish(
-            run._broker_event(
+            contour._broker_event(
                 BrokerEvent(
                     type=EventType.CLEARING_DONE,
                     ts=BAR0,

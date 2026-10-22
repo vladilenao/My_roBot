@@ -16,6 +16,7 @@ from src.trade_journal.storage import Storage
 from src.trade_management.audit import CalculationTraceRepository
 from tests.unit.clusters.helpers import T
 from tests.unit.clusters.test_gate_admission import BR, _assignment, _decision, _gate, _store
+from src.assembly import core
 
 SPEC = yaml.safe_load((Path(__file__).resolve().parents[3] / "docs" / "openapi.yaml").read_text(encoding="utf-8"))
 SIGNAL_ID = "future-br-macd:BRX6:5m:SELL"
@@ -180,10 +181,9 @@ def test_rest_route(tmp_path):
 
 
 def test_local_api_without_token_does_not_start(tmp_path, monkeypatch, capsys):
-    import run
 
-    monkeypatch.setattr(run, "MARKET_DATA_EXPORT_TOKEN", None)
-    monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", None)
+    monkeypatch.setattr(core, "MARKET_DATA_EXPORT_TOKEN", None)
+    monkeypatch.setattr(core, "ROBOT_CONTROL_TOKEN", None)
 
-    assert run._start_local_api(MarketDataStore(tmp_path / "market-data.sqlite3"), tmp_path) is None
+    assert core._start_local_api(MarketDataStore(tmp_path / "market-data.sqlite3"), tmp_path) is None
     assert "MARKET_DATA_EXPORT_TOKEN" in capsys.readouterr().out

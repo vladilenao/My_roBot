@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-import run
+from src.assembly import core
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
 from src.data.ingestion_settings import MarketDataSettings, SettingError, validate_setting
@@ -41,7 +41,7 @@ def owner(tmp_path, entries):
     cache = MarketDataCache(lambda **_: (pd.DataFrame(), None), timeline, market_store=store,
                             request_budget=RequestBudget(timeline.now, 0))
     store.save_roster(source=SOURCE, entries=entries)
-    run._register_saved_roster(cache, store)
+    core._register_saved_roster(cache, store)
     worker = IngestionWorker(cache, settings=MarketDataSettings(independent_lanes=True))
     return cache, store, worker
 
@@ -93,7 +93,7 @@ def test_obligation_keeps_only_timeframes_its_management_requests(tmp_path):
 
     roster = {row["interval"]: row["origin"] for row in store.roster(source=SOURCE, origins=ALL_ORIGINS)}
     assert roster == {"1m": "obligation", "1h": "obligation", "15m": "previous"}
-    run._register_saved_roster(cache, store)        # следующий запуск её уже не регистрирует
+    core._register_saved_roster(cache, store)        # следующий запуск её уже не регистрирует
     assert (PHOR_UID, "15m") not in pairs(cache)
 
 
@@ -147,7 +147,7 @@ def test_startup_waiter_retires_first_then_waits_with_timeout(caplog):
         retire_unrequested_pairs=lambda: calls.append("retire") or [("PHOR", "15m")],
         wait_startup=lambda timeout: calls.append(("wait", timeout)) or False,
         startup_pending=lambda: ["PHOR 1h: поток: acknowledged"])
-    wait = run._live_startup_waiter(poller, timeout=600)
+    wait = core._live_startup_waiter(poller, timeout=600)
 
     with caplog.at_level(logging.INFO):
         assert wait() is False

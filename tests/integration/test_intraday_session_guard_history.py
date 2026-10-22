@@ -9,7 +9,7 @@ from datetime import timedelta
 import pandas as pd
 import pytest
 
-import run
+from src.assembly import contour
 from src.bot import TradingBot
 from src.bot.run_session import HistoricalRunSession
 from src.data.cache import MarketDataCache
@@ -56,18 +56,18 @@ def _history(tmp_path, monkeypatch, start, end):
     session = HistoricalRunSession(clock)
     selection = HistorySelection((STOCK,), (), ()).planned(start, end, {}, 2)
     session.contract_selection = selection
-    monkeypatch.setattr(run, "SHARE_STRATEGIES", BINDINGS)
-    monkeypatch.setattr(run, "FUTURE_STRATEGIES", {})
-    monkeypatch.setattr(run, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
-    monkeypatch.setattr(run, "TRADE_MANAGEMENT_PROFILES", {"levels_rr": {
+    monkeypatch.setattr(contour, "SHARE_STRATEGIES", BINDINGS)
+    monkeypatch.setattr(contour, "FUTURE_STRATEGIES", {})
+    monkeypatch.setattr(contour, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    monkeypatch.setattr(contour, "TRADE_MANAGEMENT_PROFILES", {"levels_rr": {
         "target_R": [3, 4], "shares": [.5, .5], "min_stop_atr": 0,
         "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}})
-    monkeypatch.setattr(run, "trading_enabled", lambda: False)
-    monkeypatch.setattr(run, "_token_client_context", lambda: pytest.fail("История обратилась к боевому API"))
-    monkeypatch.setattr(run, "_load_contracts_metadata",
+    monkeypatch.setattr(contour, "trading_enabled", lambda: False)
+    monkeypatch.setattr(contour, "_token_client_context", lambda: pytest.fail("История обратилась к боевому API"))
+    monkeypatch.setattr(contour, "_load_contracts_metadata",
                         lambda *args, **kwargs: {"share": ContractMeta("share", 1, 1, 0, 0)})
-    monkeypatch.setattr(run, "_session_calendar_provider", lambda data_cache: lambda instrument, now: SHARES)
-    runtime = run._build_runtime(selection.instruments, cache, EventBus(), tmp_path, clock=clock, session=session)
+    monkeypatch.setattr(contour, "_session_calendar_provider", lambda data_cache: lambda instrument, now: SHARES)
+    runtime = contour._build_runtime(selection.instruments, cache, EventBus(), tmp_path, clock=clock, session=session)
     bot = TradingBot(selection.instruments, runtime.bus if hasattr(runtime, "bus") else EventBus(),
                      {"macd_rsi_stoch": object()}, cache, timeline,
                      strategy_factory=lambda *args, **kwargs: _BuyEveryBar(), share_strategies=BINDINGS,

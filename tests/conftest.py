@@ -23,7 +23,19 @@ class _OfflineRedis:
 @pytest.fixture(autouse=True)
 def _offline_cluster_redis(monkeypatch):
     """Кластерный фильтр в тестах прогона не читает локальный Redis разработчика."""
-    monkeypatch.setattr("run._cluster_redis", lambda: _OfflineRedis())
+    monkeypatch.setattr("src.assembly.core._cluster_redis", lambda: _OfflineRedis())
+
+
+@pytest.fixture(autouse=True)
+def _no_real_local_api_keys(monkeypatch):
+    """Ключи локального API из .env разработчика в тестах не используются.
+
+    Тест, которому нужен ключ, подставляет заведомо поддельное значение сам;
+    так настоящий ключ не попадёт в сравнение и в вывод упавшего теста.
+    """
+    for target in ("run.ROBOT_CONTROL_TOKEN", "src.assembly.core.ROBOT_CONTROL_TOKEN",
+                   "src.assembly.core.MARKET_DATA_EXPORT_TOKEN"):
+        monkeypatch.setattr(target, None)
 
 
 def pytest_configure(config):

@@ -62,15 +62,16 @@ class MarketServices(Protocol):
     market_calendar: MarketCalendar | None
     request_budget: RequestBudget | None
     pattern_sink: PatternWorker | None          # только эмуляция
+    tracks_obligations: bool                    # ведёт ли владелец входа обязательства
 
     def cluster_gate(self, state_dir) -> ClusterGate | None: ...
     def serve(self, demand: ContourDemand) -> Callable[[], bool] | None: ...
-    def update(self, demand: ContourDemand) -> None: ...
+    def update_obligations(self, obligations) -> None: ...
     def close(self) -> None: ...
 ```
 
 - `serve` — регистрация потребностей контура и запуск приёма. В эмуляции: снятие невыбранных пар сохранённого состава, запрос истории для обязательств, нижние границы исполнения, поток, старт поллера. Возвращает ожидание прогрева (`_live_startup_waiter`). В истории ничего не запускает и возвращает `None`.
-- `update` — то, что сейчас делает `post_tick`: новые обязательства после тика.
+- `update_obligations` — то, что сейчас делает `post_tick`: новые обязательства после тика. Контур вызывает его, только если `tracks_obligations` истинно (эмуляция с финансовой базой), поэтому в истории обязательства после тика не считаются, как и раньше.
 - `cluster_gate` — вердикт кластерного фильтра для контура. В эмуляции служба отдаёт вердикт поверх своего хранилища и потребителя Redis, в истории — поверх копии хранилища в каталоге прогона, как сейчас.
 - `timeline` и `data_cache` остаются общими объектами внутри процесса. В П3 контур получит свою реализацию `MarketServices`, которая строит собственные кэш и планировщик из ленты ядра; контур при этом не изменится.
 
@@ -111,7 +112,7 @@ class ContourSettings:
 
 - `build()` — каналы и шина, регистрация `triple_screen` с поставщиком старших ТФ по `services.data_cache`, кластерный вердикт из `services.cluster_gate`, торговая часть (`_build_runtime` переезжает сюда как есть).
 - `demand()` — `ContourDemand` по описанным выше правилам.
-- `run(waiter)` — `TradingBot` (бывший `_run_bot`), `post_tick` вызывает `services.update(self.demand())`, обработчик паттернов — `services.pattern_sink`.
+- `run(waiter)` — `TradingBot` (бывший `_run_bot`), `post_tick` считает обязательства из финансовой базы контура и передаёт их `services.update_obligations`, обработчик паттернов — `services.pattern_sink`.
 - `finish()` — отчёт истории (бывший `_finish_history`).
 - `close()` — каналы.
 
@@ -121,9 +122,10 @@ class ContourSettings:
 
 `LiveCore(state_dir, client_provider, control)`:
 
-- `start()` — бывший `_start_early_market_data`: рыночная база, арбитр, календарь, сверка, кэш, владелец входа, полосы по сохранённому составу.
+- `start_early()` — бывший `_start_early_market_data`: рыночная база, арбитр, календарь, сверка, кэш, владелец входа, полосы по сохранённому составу.
+- `ensure_market_data()` — без независимых полос данные собираются после выбора инструментов, как раньше.
 - `start_api()` — бывший вызов `_start_local_api` с `LaunchControl`.
-- `cluster_gate()`, `serve()`, `update()` — по порту.
+- `cluster_gate()`, `serve()`, `update_obligations()` — по порту.
 - `pattern_sink` — `PatternWorker`, если `patterns_enabled`; стартует в `serve`, как сейчас после сборки торговой части.
 - `close()` — паттерны, поллер или ранние полосы, кластерный поток, API — в прежнем порядке.
 
@@ -131,16 +133,16 @@ class ContourSettings:
 
 ### Историческая служба
 
-`HistoricalMarketServices(state_dir, clock, client_provider, market_calendar)` — бывшая ветка `history` в `_launch`: `_build_market_data(history=True)`, границы предпроверки (`set_boundary_checks`), кластерный вердикт по копии хранилища. `serve` и `update` ничего не делают, `pattern_sink` — `None`.
+`HistoricalMarketServices(state_dir, clock, client_provider, market_calendar, boundary_checks)` — бывшая ветка `history` в `_launch`: `_build_market_data(history=True)`, границы предпроверки (`set_boundary_checks`), кластерный вердикт по копии хранилища. `serve` и `update_obligations` ничего не делают, `pattern_sink` — `None`.
 
 ### Новый `_launch`
 
 ```text
 lock + журнал
-если эмуляция: core = LiveCore(...).start(); core.start_api()
+если эмуляция: core = LiveCore(...); core.start_early(); core.start_api()
 instruments = _choose_instruments(...)            # без изменений
 если история: план цепочки, расписание, предпроверка (без изменений); services = HistoricalMarketServices(...)
-иначе: services = core
+иначе: services = core.ensure_market_data(); services.start_api()
 contour = TradingContour(ContourSettings(...), services).build()
 waiter = services.serve(contour.demand())
 try: contour.run(waiter)

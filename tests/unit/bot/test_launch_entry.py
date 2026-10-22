@@ -6,8 +6,9 @@ from unittest.mock import patch
 import pytest
 
 import run
+from src.assembly import core
 from src.bot.launch import (
-    ALL, MODE_EMULATION, SOURCE_CLI, SOURCE_MENU, Chosen, LaunchRequest, Rejection, Resolution,
+    MODE_EMULATION, SOURCE_CLI, SOURCE_MENU, Chosen, LaunchRequest, Rejection, Resolution,
 )
 from src.bot.launch_control import LaunchControl, parse_command
 from src.data.market_store import MarketDataStore
@@ -122,15 +123,18 @@ class TestChooseInstruments:
 
 
 def test_local_api_starts_with_control_key_only(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(run, "MARKET_DATA_EXPORT_TOKEN", None)
-    monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", "control-test-key")
-    monkeypatch.setattr(run, "MARKET_DATA_EXPORT_PORT", 0)
+    monkeypatch.setattr(core, "MARKET_DATA_EXPORT_TOKEN", None)
+    monkeypatch.setattr(core, "ROBOT_CONTROL_TOKEN", "control-test-key")
+    monkeypatch.setattr(core, "MARKET_DATA_EXPORT_PORT", 0)
     try:
-        server = run._start_local_api(MarketDataStore(tmp_path / "market.sqlite3"), tmp_path, control=LaunchControl())
+        server = core._start_local_api(MarketDataStore(tmp_path / "market.sqlite3"), tmp_path, control=LaunchControl())
     except PermissionError:
         pytest.skip("Песочница не разрешает открыть loopback-сокет")
     try:
-        assert server is not None and server.control_token == "control-test-key" and server.token is None
+        # Сравнение без вывода значения ключа: при сбое pytest не напечатает секрет.
+        key_matches = server is not None and server.control_token == "control-test-key"
+        assert key_matches
+        assert server.token is None
         out = capsys.readouterr().out
         assert "MARKET_DATA_EXPORT_TOKEN" in out and "control-test-key" not in out
     finally:
