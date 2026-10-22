@@ -97,6 +97,31 @@ class LiveMarketDataPoller:
             sleep(0.1)
         return False
 
+    def retire_unrequested_pairs(self):
+        """Снимает пары, не запрошенные запуском; в составе они станут прошлыми.
+
+        Возвращает снятые пары как (тикер, ТФ).
+        """
+        retired = self._cache.retire_unrequested_live_pairs()
+        if retired and self._worker is not None:
+            self._worker.retire_roster_pairs([(uid, timeframe) for uid, timeframe, _ in retired])
+            self.wake()
+        return [(ticker, timeframe) for _, timeframe, ticker in retired]
+
+    def startup_pending(self) -> list[str]:
+        """Пары, которых ждёт ``wait_startup``: «ТИКЕР ТФ: причина»."""
+        pending = {}
+        if self._worker is not None:
+            pending.update(self._worker.startup_pending())
+        if self._stream is not None:
+            pending.update(self._stream.startup_pending())   # поток уточняет причину
+        lines = []
+        for (uid, timeframe), reason in pending.items():
+            pair = self._cache.live_pair(uid, timeframe)
+            name = pair["instrument"].ticker if pair is not None else uid
+            lines.append(f"{name} {timeframe}: {reason}")
+        return sorted(lines)
+
     def close(self) -> None:
         self._stopped.set()
         self._wake.set()

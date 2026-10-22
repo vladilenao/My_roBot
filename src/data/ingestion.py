@@ -144,6 +144,10 @@ class IngestionWorker:
         self.completeness = None
         # Состав пар сохраняется для раннего старта следующего запуска.
         self.roster_dirty = False
+        # Пары, снятые главным потоком как незапрошенные: при пересохранении
+        # они становятся прошлыми, даже если были обязательствами.
+        self._roster_lock = Lock()
+        self._retired_roster = set()
 
     def set_execution_obligations(self, boundaries):
         """Main-thread snapshot of unfinished financial work, never a DB read here.
@@ -161,11 +165,20 @@ class IngestionWorker:
             if self.completeness is not None:
                 self.completeness.wake()
 
+    def retire_roster_pairs(self, pairs):
+        """Снятые запуском пары (UID, ТФ) станут прошлыми при пересохранении состава."""
+        with self._roster_lock:
+            self._retired_roster.update(pairs)
+        self.roster_dirty = True
+
     def persist_roster(self):
         """Текущие пары владельца — сохранённый состав для раннего старта."""
         self.roster_dirty = False
+        with self._roster_lock:
+            retired, self._retired_roster = self._retired_roster, set()
+        live = self._cache.live_pairs()
         entries = []
-        for pair in self._cache.live_pairs():
+        for pair in live:
             instrument = pair["instrument"]
             entries.append({
                 "instrument_uid": pair["uid"], "interval": pair["timeframe"], "ticker": instrument.ticker,
@@ -173,10 +186,16 @@ class IngestionWorker:
                 "origin": "obligation" if self.execution_boundary(pair["uid"]) is not None else "selected",
                 "requirements": {"min_bars": int(pair["min_bars"] or 1)},
             })
+        # Пара, которую снова запросили после снятия, остаётся в составе.
+        retired -= {(pair["uid"], pair["timeframe"]) for pair in live}
         try:
             self._store.save_roster(source=self._source, entries=entries)
+            if retired:
+                self._store.mark_roster_previous(source=self._source, pairs=sorted(retired))
         except Exception as exc:
             self.roster_dirty = True
+            with self._roster_lock:
+                self._retired_roster |= retired
             log.warning("Состав пар не сохранён: %s", exc)
 
     def execution_boundary(self, uid):
@@ -229,6 +248,15 @@ class IngestionWorker:
             return False
         return all(pair["history"] == "done" or (pair["uid"], pair["timeframe"]) in self._attempted
                    for pair in self._cache.live_pairs())
+
+    def startup_pending(self):
+        """Чего ждёт ``startup_complete``: (UID или адрес, ТФ) → причина."""
+        pending = {(key[0], key[2]): "потребность не обслужена"
+                   for key, _, _ in self._cache.live_needs() if key not in self._need_attempts}
+        for pair in self._cache.live_pairs():
+            if pair["history"] != "done" and (pair["uid"], pair["timeframe"]) not in self._attempted:
+                pending[pair["uid"], pair["timeframe"]] = "нет прогрева"
+        return pending
 
     # ── одна единица работы ──
     def step(self, now=None):
