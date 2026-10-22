@@ -34,6 +34,6 @@
 - Новый модуль параметров запуска и разрешения инструментов `src/bot/launch.py`.
 - `src/data/export_api.py`: маршруты `/api/v1/contours`, проверка ключа управления и `Host`.
 - `src/config.py`: `ROBOT_CONTROL_TOKEN`.
-- `src/instruments/selector.py`: меню возвращает токены, проверка переезжает в общее разрешение.
+- `src/instruments/selector.py`: список активных фьючерсов с моментом экспирации; меню сохраняет проверку по ходу выбора, после неё — фильтр привязок.
 - Документация: `docs/openapi.yaml`, `README.txt`, `docs/architecture/core-contours.md`, `CHANGELOG.md`.
 - Торговля, стратегии, журнал и рыночные данные не меняются.

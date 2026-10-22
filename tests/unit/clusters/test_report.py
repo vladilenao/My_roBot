@@ -183,6 +183,7 @@ def test_local_api_without_token_does_not_start(tmp_path, monkeypatch, capsys):
     import run
 
     monkeypatch.setattr(run, "MARKET_DATA_EXPORT_TOKEN", None)
+    monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", None)
 
     assert run._start_local_api(MarketDataStore(tmp_path / "market-data.sqlite3"), tmp_path) is None
     assert "MARKET_DATA_EXPORT_TOKEN" in capsys.readouterr().out

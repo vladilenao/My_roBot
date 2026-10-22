@@ -34,6 +34,15 @@ def _format_futures_display(contract_name, base_name, label):
 
 
 def fetch_active_futures(client, market_now=None):
+    return [entry[:4] for entry in active_futures_with_expiry(client, market_now)]
+
+
+def active_futures_with_expiry(client, market_now=None):
+    """Те же стандартные контракты, что в меню, плюс момент экспирации (UTC, naive).
+
+    Элемент — ``(display, ticker, "future", contract_name, expiry)``; порядок —
+    по базам меню, внутри базы по экспирации.
+    """
     now = market_now if market_now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now + FUTURES_TTL
     resp = api_call_with_retry(
@@ -65,7 +74,8 @@ def fetch_active_futures(client, market_now=None):
         entries.sort(key=lambda x: x[3])
         result.extend(entries)
 
-    return [(display, ticker, inst_type, contract_name) for display, ticker, inst_type, _, contract_name in result]
+    return [(display, ticker, inst_type, contract_name, expiry)
+            for display, ticker, inst_type, expiry, contract_name in result]
 
 
 def _ask_choice(prompt, options):
