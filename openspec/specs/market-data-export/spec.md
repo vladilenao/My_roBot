@@ -15,8 +15,10 @@ HTTP API `/api/v1/market-data`, отдавать OpenAPI 3.0.3 контракт 
 
 Контракт ДОЛЖЕН быть единым для всех HTTP-сервисов робота: файл
 `docs/openapi.yaml`, по одному тегу на сервис (`MarketDataExport`,
-`Clusters`). `GET /openapi.yaml` ДОЛЖЕН отдавать именно этот файл.
+`Clusters`, `Contours`). `GET /openapi.yaml` ДОЛЖЕН отдавать именно этот файл.
 Отдельные файлы контрактов HTTP-сервисов робота НЕ ДОЛЖНЫ создаваться.
+Каждая схема ключа (`ExportToken`, `ControlToken`) ДОЛЖНА быть описана в
+контракте отдельно, а маршрут ДОЛЖЕН ссылаться только на свою схему.
 
 #### Scenario: Потребитель начинает подключение
 - **WHEN** Historical Broker API Emulator запрашивает `GET /source`
@@ -24,7 +26,11 @@ HTTP API `/api/v1/market-data`, отдавать OpenAPI 3.0.3 контракт 
 
 #### Scenario: Один контракт на все сервисы
 - **WHEN** пользователь открывает `GET /docs`
-- **THEN** Swagger UI показывает и экспорт рыночных данных, и отчёт кластерного фильтра из `docs/openapi.yaml`
+- **THEN** Swagger UI показывает экспорт рыночных данных, отчёт кластерного фильтра и управление контурами из `docs/openapi.yaml`
+
+#### Scenario: Ключ управления в Swagger
+- **WHEN** пользователь открывает в Swagger UI маршрут `POST /api/v1/contours`
+- **THEN** маршрут требует схему `ControlToken`, а не `ExportToken`
 
 ### Requirement: Постраничный поток подтверждённых изменений
 Нормативный уровень: MUST. `GET /changes` ДОЛЖЕН возвращать изменения строго

@@ -26,6 +26,7 @@ from src.config import (
     MARKET_DATA_EXPORT_PORT,
     MARKET_DATA_SETTINGS,
     MARKET_DATA_EXPORT_TOKEN,
+    ROBOT_CONTROL_TOKEN,
     MARKET_STRUCTURE_PATTERNS_ENABLED,
     MARKET_STRUCTURE_QUEUE_MAXSIZE,
     MARKET_STRUCTURE_REDIS_DB,
@@ -75,8 +76,28 @@ from src.config import (
     CLUSTER_SETTINGS,
     CLUSTERS_ENABLED,
 )
-from src.api.client import default_client_provider
+from src.api.client import client_context, default_client_provider
 from src.api.emulator_client import EmulatorClientProvider, EmulatorError
+from src.bot.launch import (
+    HISTORY_DEFAULT_PAUSE,
+    MODE_EMULATION,
+    SOURCE_API,
+    SOURCE_MENU,
+    LaunchError,
+    LaunchRequest,
+    Rejection,
+    RunConfigurationError,
+    describe_choice,
+    equivalent_command,
+    parse_launch_args,
+    parse_moment,
+    resolve_emulation,
+    resolve_history,
+    tokens_from_menu,
+    validate_range,
+    without_assignments,
+)
+from src.bot.launch_control import LaunchControl
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_aware_utc, to_naive
 from src.history.preflight import active_pairs, run_preflight, run_chain_preflight, smallest_period
@@ -122,20 +143,15 @@ log = get_logger(__name__)
 
 MODE_LIVE = "live"
 MODE_HISTORY = "history"
-HISTORY_DEFAULT_PAUSE = 1.0
 MOMENT_FORMAT = "%Y-%m-%d %H:%M"
 
 
-class RunConfigurationError(Exception):
-    """Прогон не запускается: ответы оператора не задают рабочий диапазон."""
-
-
 def ask_mode(no_prompt: bool = False) -> str:
-    """Режим прогона. ``--no-prompt`` — боевая торговля без единого вопроса."""
+    """Режим прогона. ``--no-prompt`` — эмуляция без единого вопроса."""
     if no_prompt:
         return MODE_LIVE
     print("=== Режим работы ===")
-    print("  1. Боевая торговля (реальный брокер, текущее время)")
+    print("  1. Эмуляция (живые данные, симулятор исполнения)")
     print("  2. Историческая торговля (локальный эмулятор данных, заданный диапазон)")
     while True:
         answer = input("Выбор режима (1/2): ").strip()
@@ -143,6 +159,18 @@ def ask_mode(no_prompt: bool = False) -> str:
             return MODE_LIVE
         if answer == "2":
             return MODE_HISTORY
+        print("Нужен ответ 1 или 2.")
+
+
+def ask_emulation_source() -> bool:
+    """Меню эмуляции: ``True`` — ждать команду API, ``False`` — выбрать инструменты сейчас."""
+    print("Инструменты: выбрать сейчас — 1, ждать команду API — 2")
+    while True:
+        answer = input("Ваш выбор (1/2): ").strip()
+        if answer in ("1", ""):
+            return False
+        if answer == "2":
+            return True
         print("Нужен ответ 1 или 2.")
 
 
@@ -179,27 +207,6 @@ def _ask_pause() -> float:
         return value
 
 
-def parse_moment(raw: str) -> datetime:
-    """Момент из строки оператора: без зоны — UTC, с зоной — приводим к UTC."""
-    text = raw.strip()
-    if not text:
-        raise ValueError("Пустая дата — введите момент в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        raise ValueError(
-            f"Не разобрана дата «{text}» — нужен формат ГГГГ-ММ-ДД ЧЧ:ММ."
-        ) from None
-    return to_naive(to_aware_utc(moment))
-
-
-def validate_range(start: datetime, end: datetime, pause: float) -> tuple[datetime, datetime, float]:
-    if to_naive(start) >= to_naive(end):
-        raise RunConfigurationError(
-            f"Начало диапазона ({start:%Y-%m-%d %H:%M}) должно быть раньше конца "
-            f"({end:%Y-%m-%d %H:%M}). Прогон не запущен."
-        )
-    return to_naive(start), to_naive(end), float(pause)
 
 
 def describe_scale(start: datetime, end: datetime, pause: float, timeframes=None) -> str:
@@ -235,24 +242,37 @@ def state_dir_for(start: datetime, end: datetime, started_at: datetime | None = 
     )
 
 
-def main(no_prompt: bool = False):
+def main(argv=None, no_prompt: bool = False):
+    """Точка входа: параметры командной строки или меню, затем общий путь запуска."""
+    argv = list(argv or [])
+    if no_prompt and "--no-prompt" not in argv:
+        argv.append("--no-prompt")
     try:
-        mode = ask_mode(no_prompt)
-        if mode == MODE_HISTORY:
-            start, end, pause = ask_history_range()
-            print(describe_scale(start, end, pause))
-        else:
-            start = end = pause = None
-    except (RunConfigurationError, ValueError) as exc:
+        request = parse_launch_args(argv)
+    except LaunchError as exc:
         print(str(exc))
-        return 1
+        return 2
+    if request is None:
+        try:
+            request = _menu_request()
+        except (RunConfigurationError, ValueError) as exc:
+            print(str(exc))
+            return 1
+    if request.mode == MODE_HISTORY:
+        print(describe_scale(request.start, request.end, request.pause))
+        return _run_history(request.start, request.end, request.pause, request)
+    return _run_live(request)
 
-    if mode == MODE_HISTORY:
-        return _run_history(start, end, pause)
-    return _run_live()
+
+def _menu_request() -> LaunchRequest:
+    """Меню собирает те же параметры запуска, что командная строка."""
+    if ask_mode() == MODE_HISTORY:
+        start, end, pause = ask_history_range()
+        return LaunchRequest(MODE_HISTORY, SOURCE_MENU, None, start=start, end=end, pause=pause)
+    return LaunchRequest(MODE_EMULATION, SOURCE_MENU, None, wait_command=ask_emulation_source())
 
 
-def _run_live():
+def _run_live(request: LaunchRequest | None = None):
     try:
         code, _, _ = _launch(
             state_dir=runtime_dir(),
@@ -260,6 +280,7 @@ def _run_live():
             clock=None,
             session=build_run_session(MODE_LIVE),
             channel_names=None,
+            launch=request,
         )
     except RuntimeLockError as exc:
         print(str(exc))
@@ -267,7 +288,7 @@ def _run_live():
     return code
 
 
-def _run_history(start, end, pause):
+def _run_history(start, end, pause, request: LaunchRequest | None = None):
     """Прогон с повтором, если проверка сдвинула начало на первую доступную свечу.
 
     Сдвиг меняет часы и каталог состояния, поэтому прогон собирается заново; уже
@@ -322,6 +343,7 @@ def _run_history(start, end, pause):
             history=True,
             instruments=instruments,
             market_data_sync=market_data_sync,
+            launch=request,
         )
         if shifted is None:
             return code
@@ -437,6 +459,7 @@ def _launch(
     history: bool = False,
     instruments=None,
     market_data_sync: MarketDataSync | None = None,
+    launch: LaunchRequest | None = None,
 ) -> tuple[int, datetime | None, list]:
     """Единая сборка прогона: различаются только источник, часы и каталог.
 
@@ -455,7 +478,7 @@ def _launch(
         service_uid=LOGGING_SERVICE_UID,
         log_file=str(state_dir / LOGGING_FILE),
         secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
-                 MARKET_DATA_EXPORT_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
+                 MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
         **_log_settings(history, clock),
     )
     log.info("Робот v%s запущен", __version__)
@@ -465,14 +488,29 @@ def _launch(
     if not history and MARKET_DATA_SETTINGS.independent_lanes:
         early = _start_early_market_data(
             state_dir, client_provider if client_provider is not None else default_client_provider())
+    # Локальный API — сразу после раннего сбора данных, до выбора инструментов:
+    # команда запуска приходит именно сюда (add-noninteractive-launch).
+    control = LaunchControl() if not history and ROBOT_CONTROL_TOKEN else None
+    if control is not None:
+        if launch is not None and launch.wait_command:
+            control.accept_commands()
+        else:
+            control.mark_starting(SOURCE_MENU if launch is None else launch.source)
+    export_server = None
+    if getattr(early, "market_store", None) is not None and MARKET_DATA_EXPORT_ENABLED:
+        export_server = _start_local_api(early.market_store, state_dir, control=control)
     if instruments is None:
-        instruments = select_instruments(
-            validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
-            client_provider=client_provider,
-            market_now=None if clock is None else clock.now(),
-            historical=history,
-            request_budget=None if early is None else early.request_budget,
-        ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+        try:
+            instruments = _choose_instruments(
+                launch, history=history, client_provider=client_provider, clock=clock, early=early,
+                control=control, export_server=export_server,
+            )
+        except BaseException:
+            _stop_early_services(early, export_server)
+            raise
+        if instruments is None:
+            _stop_early_services(early, export_server)
+            return 2, None, None
         if not isinstance(instruments, HistorySelection):
             instruments = [normalize_instrument(item) for item in instruments]
 
@@ -566,12 +604,11 @@ def _launch(
     )
 
     storage = None
-    export_server = None
     market_poller = None
     cluster_consumer = None
     try:
-        if not history and MARKET_DATA_EXPORT_ENABLED:
-            export_server = _start_local_api(market_store, state_dir)
+        if export_server is None and not history and MARKET_DATA_EXPORT_ENABLED:
+            export_server = _start_local_api(market_store, state_dir, control=control)
         cluster_gate, cluster_consumer = _cluster_gate(history=history, market_store=market_store,
                                                        data_cache=data_cache, state_dir=state_dir)
         runtime = _build_runtime(
@@ -632,19 +669,25 @@ def _configured_cluster_mode() -> str:
     return modes.pop() if len(modes) == 1 else "mixed"
 
 
-def _start_local_api(market_store, state_dir):
-    """Локальный HTTP API: экспорт рыночных данных и отчёт кластерного фильтра.
+def _start_local_api(market_store, state_dir, control=None):
+    """Локальный HTTP API: экспорт, отчёт кластерного фильтра и управление контуром.
 
-    Без токена в окружении API не запускается, а робот работает дальше: ошибка
-    конфигурации доступа не должна останавливать торговлю.
+    Сервер поднимается, если задан хотя бы один ключ; маршруты без своего ключа
+    отвечают 401. Без ключей API не запускается, а робот работает дальше:
+    ошибка конфигурации доступа не должна останавливать торговлю.
     """
     from src.clusters.report import ClusterReport
     from src.data.market_store import SOURCE_TBANK
 
-    if not MARKET_DATA_EXPORT_TOKEN:
-        log.warning("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
-        print("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
+    control_token = ROBOT_CONTROL_TOKEN if control is not None else None
+    if not MARKET_DATA_EXPORT_TOKEN and not control_token:
+        _say("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
+        _say("Управление по API недоступно: в .env не задан ROBOT_CONTROL_TOKEN")
         return None
+    if not MARKET_DATA_EXPORT_TOKEN:
+        _say("Экспорт и отчёт кластеров недоступны: в .env не задан MARKET_DATA_EXPORT_TOKEN")
+    if not control_token:
+        _say("Управление по API недоступно: в .env не задан ROBOT_CONTROL_TOKEN")
     report = ClusterReport(
         state_dir / DATABASE_FILE,
         lambda uid: market_store.current_frame(source=SOURCE_TBANK, instrument_uid=uid, interval="1m"),
@@ -653,9 +696,136 @@ def _start_local_api(market_store, state_dir):
     server = MarketDataExportServer(
         market_store, MARKET_DATA_EXPORT_TOKEN,
         host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT, clusters_report=report,
+        control=control, control_token=control_token,
     )
     server.start()
     return server
+
+
+def _say(message: str) -> None:
+    log.warning(message)
+    print(message)
+
+
+def _stop_early_services(early, export_server) -> None:
+    """Запуск отменён до сборки: остановить API и ранние полосы данных."""
+    if export_server is not None:
+        export_server.close()
+    poller = getattr(early, "poller", None)
+    if poller is not None:
+        poller.close()
+
+
+def _choose_instruments(launch, *, history, client_provider, clock, early, control, export_server):
+    """Инструменты прогона из параметров, команды API или меню.
+
+    ``None`` — запуск отменён: параметры отклонены или ждать команду нельзя.
+    Без ``launch`` (прямой вызов) работает прежнее меню без фильтра и команды.
+    """
+    market_now = None if clock is None else clock.now()
+    budget = None if early is None else early.request_budget
+    if launch is not None and launch.wait_command:
+        if control is None or export_server is None:
+            if control is None:
+                reason = "в .env не задан ROBOT_CONTROL_TOKEN"
+            elif not MARKET_DATA_EXPORT_ENABLED:
+                reason = "локальный API выключен: в robot.toml [market_data] export_enabled = false"
+            elif early is None:
+                reason = "локальный API не поднят до выбора инструментов: в robot.toml [market_data] independent_lanes = false"
+            else:
+                reason = "локальный API не запустился, причина — в строках выше"
+            print(f"Ждать команду запуска нельзя: {reason}.")
+            return None
+        return _await_command(control, export_server, client_provider, budget, market_now)
+    if launch is not None and launch.instruments is not None:
+        resolution = _resolve_request(launch, client_provider, budget, market_now, history)
+        _print_resolution(resolution)
+        if not resolution.ok:
+            print("Торговля не запущена: исправьте --instruments.")
+            return None
+        _announce(launch, resolution.chosen, control, launch.source)
+        return resolution.instruments
+    while True:
+        selected = select_instruments(
+            validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
+            client_provider=client_provider,
+            market_now=market_now,
+            historical=history,
+            request_budget=budget,
+        ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
+        if launch is None:
+            return selected
+        chosen = tokens_from_menu(selected, history=history)
+        missing = without_assignments(chosen, SHARE_STRATEGIES, FUTURE_STRATEGIES)
+        for name in missing:
+            print(f"  ✗ {name}: у инструмента нет привязок в robot.toml")
+        selected, chosen = _drop_unassigned(selected, chosen, missing, history)
+        if chosen:
+            break
+        print("Необходимо выбрать хотя бы один инструмент с привязками.")
+    _announce(launch, chosen, control, SOURCE_MENU)
+    return selected
+
+
+def _drop_unassigned(selected, chosen, missing, history):
+    if not missing:
+        return selected, chosen
+    keep = [item for item in chosen if item.name not in missing]
+    if history:
+        fixed = tuple(item for item in selected.fixed if (item.short_name or "контракт не указан") not in missing)
+        families = tuple(family for family in selected.families if family not in missing)
+        return HistorySelection(fixed, families, selected.catalog), keep
+    return [item for item in selected if (normalize_instrument(item).short_name or "контракт не указан") not in missing], keep
+
+
+def _resolve_request(request, client_provider, budget, market_now, history):
+    context = client_provider.client_context() if client_provider is not None else client_context()
+    with context as raw_client:
+        client = raw_client if budget is None else budget.wrap_client(raw_client, lane="interactive")
+        if history:
+            return resolve_history(request.instruments, client, share_strategies=SHARE_STRATEGIES,
+                                   future_strategies=FUTURE_STRATEGIES, market_now=market_now)
+        return resolve_emulation(request.instruments, client, share_strategies=SHARE_STRATEGIES,
+                                 future_strategies=FUTURE_STRATEGIES, block_days=CONTRACT_EXPIRY_BLOCK_DAYS,
+                                 market_now=market_now)
+
+
+def _print_resolution(resolution) -> None:
+    for item in resolution.chosen:
+        print(f"  ✓ {describe_choice(item)}")
+    for item in resolution.rejections:
+        print(f"  ✗ {item.token}: {item.reason}")
+
+
+def _announce(launch, chosen, control, source, pending=None) -> str:
+    command = equivalent_command(launch, chosen)
+    print(f"Повторить запуск: {command}")
+    log.info("Повторить запуск: %s", command)
+    if control is not None:
+        control.mark_running(source, chosen, command, pending)
+    return command
+
+
+def _await_command(control, export_server, client_provider, budget, market_now):
+    """Главный поток ждёт команду API на месте выбора инструментов в консоли."""
+    control.accept_commands()
+    host, port = export_server.address
+    _say(f"Робот ждёт команду запуска: POST http://{host}:{port}/api/v1/contours")
+    while True:
+        pending = control.next_command()
+        try:
+            resolution = _resolve_request(pending.request, client_provider, budget, market_now, history=False)
+        except Exception as exc:  # сбой разрешения не должен оставлять API без ответа
+            log.warning("Команда запуска не разрешена: %s", type(exc).__name__)
+            control.reject(pending, [Rejection("*", f"Внутренняя ошибка разрешения инструментов ({type(exc).__name__}).")])
+            continue
+        _print_resolution(resolution)
+        if not resolution.ok:
+            control.reject(pending, resolution.rejections or [Rejection("*", "Не выбрано ни одного инструмента.")])
+            print("Команда запуска отклонена, робот ждёт следующую.")
+            continue
+        _announce(pending.request, resolution.chosen, control, SOURCE_API, pending)
+        return resolution.instruments
 
 
 def _cluster_redis():
@@ -1722,4 +1892,4 @@ if __name__ == "__main__":
             code = 2
         sys.exit(code)
     else:
-        sys.exit(main(no_prompt="--no-prompt" in sys.argv[1:]) or 0)
+        sys.exit(main(sys.argv[1:]) or 0)

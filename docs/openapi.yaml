@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.1.0-proposal
+  version: 1.2.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -11,6 +11,25 @@ info:
       версии свечей и состояния покрытия из локального журнала, сохраняет их
       и подтверждает курсор.
     * Clusters — отчёт кластерного фильтра входа (данные ClusterSource).
+    * Contours — запуск торгового контура эмуляции командой и его состояние.
+
+    Когда сервер работает: только в режиме эмуляции (торговля на живых
+    данных с симулятором исполнения), сразу после раннего сбора рыночных
+    данных и до выбора инструментов, если в `.env` задан хотя бы один ключ.
+    Эмуляция запускается параметром `--mode emulation`, флагом `--no-prompt`
+    или пунктом меню «Эмуляция». В историческом режиме (`--mode history`)
+    сервер не запускается. Адрес и порт — `[market_data] export_host` и
+    `export_port`.
+
+    Ключи разные и не заменяют друг друга:
+    * `ExportToken` — значение `MARKET_DATA_EXPORT_TOKEN`, экспорт и отчёт;
+    * `ControlToken` — значение `ROBOT_CONTROL_TOKEN`, управление контуром.
+    Ключ передаётся только в заголовке `Authorization: Bearer`.
+
+    Как запустить торговлю командой: запустите робота с
+    `--mode emulation --wait-command` (или выберите в меню «ждать команду
+    API»), дождитесь строки «Робот ждёт команду запуска» и отправьте
+    `POST /api/v1/contours`.
 servers:
   - url: /
     description: Тот же узел, где опубликован Swagger UI; по умолчанию loopback.
@@ -19,6 +38,11 @@ tags:
     description: Чтение изменений локального рыночного журнала.
   - name: Clusters
     description: Отчёт кластерного фильтра входа.
+  - name: Contours
+    description: |
+      Запуск торгового контура эмуляции командой и его состояние. В этой
+      версии процесс торгует одним набором инструментов: второй запуск,
+      остановка и смена состава через API появятся позже.
 paths:
   /openapi.yaml:
     get:
@@ -342,6 +366,168 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /api/v1/contours:
+    get:
+      tags: [Contours]
+      summary: Состояние торговых контуров процесса
+      description: |
+        В режиме эмуляции список содержит ровно один контур `emulation`:
+        ждёт ли он команды, запускается или торгует, какими контрактами и
+        откуда пришёл запуск. Сделок, баланса и секретов в ответе нет.
+      operationId: listContours
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контуры процесса.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContourList'
+              examples:
+                waiting:
+                  summary: Робот ждёт команду
+                  value:
+                    contours:
+                      - id: emulation
+                        kind: emulation
+                        state: waiting_command
+                        source: null
+                        instruments: []
+                        started_at: null
+                        command: null
+                        rejections: []
+                running:
+                  summary: Торговля запущена командой
+                  value:
+                    contours:
+                      - id: emulation
+                        kind: emulation
+                        state: running
+                        source: api
+                        instruments:
+                          - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                          - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
+                        started_at: '2026-10-22T10:15:00Z'
+                        command: --mode emulation --instruments NG-12.26,SBER
+                        rejections: []
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Contours]
+      summary: Запустить торговлю эмуляции выбранными инструментами
+      description: |
+        Работает, когда робот запущен с `--mode emulation --wait-command` и
+        ещё не торгует. Инструменты разрешаются по тем же правилам, что
+        параметр `--instruments`:
+
+        * `all` или поле не задано — все инструменты с привязками в `robot.toml`;
+        * тикер акции — `SBER`;
+        * код или префикс семейства фьючерсов — `NG`, `RTS`/`RI`, `SBRF`/`SR`:
+          берётся ближайший контракт, до экспирации которого больше
+          `contract_expiry_block_days` суток;
+        * контракт коротким именем `NG-12.26` или биржевым тикером.
+
+        Отказ строгий: если хотя бы один токен отклонён, торговля не
+        начинается ни по одному инструменту (`422`), робот продолжает ждать.
+        Проверка у брокера ограничена 60 секундами; если не уложилась —
+        `202`, итог виден в `GET /api/v1/contours`.
+      operationId: startContour
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContourLaunchRequest'
+            examples:
+              gasAndSber:
+                summary: Газ и Сбер
+                value: {kind: emulation, instruments: [NG, SBER]}
+              explicitContract:
+                summary: Конкретный контракт
+                value: {kind: emulation, instruments: [NG-03.27]}
+              everything:
+                summary: Все инструменты с привязками
+                value: {kind: emulation}
+      responses:
+        '201':
+          description: Инструменты разрешены, торговля запускается.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contour'
+              example:
+                id: emulation
+                kind: emulation
+                state: running
+                source: api
+                instruments:
+                  - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                  - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
+                started_at: '2026-10-22T10:15:00Z'
+                command: --mode emulation --instruments NG-12.26,SBER
+                rejections: []
+        '202':
+          description: Проверка инструментов у брокера ещё идёт; итог — в `GET /api/v1/contours`.
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/contours}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contour'
+              example:
+                id: emulation
+                kind: emulation
+                state: starting
+                source: api
+                instruments: []
+                started_at: null
+                command: null
+                rejections: []
+        '400':
+          description: Тело не JSON, неизвестные поля, `kind` не `emulation` или `instruments` не список строк.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: UNSUPPORTED_KIND
+                message: В этом процессе командой запускается только эмуляция.
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: Торговля уже запущена командой, параметрами или меню.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContourConflict'
+              example:
+                code: ALREADY_RUNNING
+                message: Контур эмуляции уже торгует; набор инструментов не изменён.
+                contour:
+                  id: emulation
+                  kind: emulation
+                  state: running
+                  source: cli
+                  instruments:
+                    - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                  started_at: '2026-10-22T09:00:00Z'
+                  command: --mode emulation --instruments NG-12.26
+                  rejections: []
+        '422':
+          description: Хотя бы один инструмент отклонён; торговля не начата, робот ждёт новую команду.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LaunchRejected'
+              example:
+                code: INSTRUMENTS_REJECTED
+                message: Торговля не запущена.
+                rejections:
+                  - {token: AFLT, reason: У инструмента нет привязок в robot.toml.}
 components:
   securitySchemes:
     ExportToken:
@@ -349,6 +535,13 @@ components:
       scheme: bearer
       bearerFormat: opaque
       description: Отдельный токен чтения и подтверждения экспортного потока.
+    ControlToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Ключ управления контуром — значение `ROBOT_CONTROL_TOKEN` из `.env`.
+        Не даёт доступа к экспорту, а ключ экспорта не даёт управления.
   responses:
     BadRequest:
       description: Неверный параметр или идентификатор вне допустимого диапазона.
@@ -380,6 +573,15 @@ components:
           example:
             code: CURSOR_EXPIRED
             message: Часть журнала изменений недоступна; выполните сверку.
+    ForbiddenHost:
+      description: Заголовок `Host` не loopback-адрес сервера; команда отклонена.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: FORBIDDEN_HOST
+            message: Управление доступно только по адресу 127.0.0.1, localhost или [::1].
     Unavailable:
       description: Локальное рыночное хранилище временно недоступно.
       content:
@@ -618,6 +820,96 @@ components:
           type: integer
           format: int64
           minimum: 0
+    ContourLaunchRequest:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [emulation]
+          description: Вид контура. В этой версии командой запускается только эмуляция.
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Токены инструментов; без поля — `all`.
+    ContourInstrument:
+      type: object
+      additionalProperties: false
+      required: [token, name, instrument_type, days_to_expiry]
+      properties:
+        token: {type: string, description: Токен из команды.}
+        name: {type: string, description: Короткое имя контракта или тикер акции.}
+        instrument_type: {type: string, enum: [share, future]}
+        days_to_expiry:
+          type: integer
+          nullable: true
+          description: Суток до экспирации контракта; у акции — null.
+    LaunchRejection:
+      type: object
+      additionalProperties: false
+      required: [token, reason]
+      properties:
+        token: {type: string}
+        reason: {type: string}
+    Contour:
+      type: object
+      additionalProperties: false
+      required: [id, kind, state, source, instruments, started_at, command, rejections]
+      properties:
+        id: {type: string, example: emulation}
+        kind: {type: string, enum: [emulation]}
+        state:
+          type: string
+          enum: [waiting_command, starting, running]
+        source:
+          type: string
+          nullable: true
+          enum: [cli, menu, api, null]
+          description: Откуда пришёл запуск; null, пока робот ждёт команду.
+        instruments:
+          type: array
+          items: {$ref: '#/components/schemas/ContourInstrument'}
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        command:
+          type: string
+          nullable: true
+          description: Эквивалентная команда запуска; контракты коротким именем.
+        rejections:
+          type: array
+          description: Отказы последней отклонённой команды.
+          items: {$ref: '#/components/schemas/LaunchRejection'}
+    ContourList:
+      type: object
+      additionalProperties: false
+      required: [contours]
+      properties:
+        contours:
+          type: array
+          items: {$ref: '#/components/schemas/Contour'}
+    ContourConflict:
+      type: object
+      additionalProperties: false
+      required: [code, message, contour]
+      properties:
+        code: {type: string, example: ALREADY_RUNNING}
+        message: {type: string}
+        contour: {$ref: '#/components/schemas/Contour'}
+    LaunchRejected:
+      type: object
+      additionalProperties: false
+      required: [code, message, rejections]
+      properties:
+        code: {type: string, example: INSTRUMENTS_REJECTED}
+        message: {type: string}
+        rejections:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/LaunchRejection'}
     ApiError:
       type: object
       additionalProperties: false
