@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import run
+from src.assembly import contour, core
 from src.bot import TradingBot
 from src.bot.live_analysis import LiveAnalysis
 from src.data.cache import MarketDataCache
@@ -63,8 +64,9 @@ def test_draining_obligation_keeps_old_uid_and_new_warmup_does_not_move_executio
     plan = SimpleNamespace(instrument_id="old", timeframe="15m", profile=SimpleNamespace(parameters={}))
     storage = SimpleNamespace(load_trades=lambda: (SimpleNamespace(plan=plan),),
         execution_bar_boundaries=lambda: {"old": (datetime(2026, 10, 12, 11, 0, tzinfo=timezone.utc), False)})
-    monkeypatch.setattr(run.LiveMarketDataPoller, "start", lambda self: None)
-    run._start_live_ingestion(cache, SimpleNamespace(storage=storage, contract_lifecycle=lifecycle), [new], None)
+    monkeypatch.setattr(core.LiveMarketDataPoller, "start", lambda self: None)
+    runtime = SimpleNamespace(storage=storage, contract_lifecycle=lifecycle)
+    core._start_live_ingestion(cache, contour.build_demand(runtime, [new], cache), None)
     needs = {(key[0], key[2]) for key, _, _ in cache.live_needs()}
     assert needs == {("old", "15m"), ("old", "1m")}  # старая 1m остаётся до terminal obligations
     assert set(cache._pending_execution_lower) == {"old"}  # новый UID не получает исполнения
@@ -110,11 +112,11 @@ def test_history_launch_never_starts_live_ingestion(tmp_path):
         patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
         patch.object(run, "_warmup_bars", return_value=41),
         patch.object(run, "run_preflight", return_value=report),
-        patch.object(run, "build_channels", return_value=[]),
-        patch.object(run, "_build_runtime", return_value=run._Runtime()),
-        patch.object(run, "_run_bot") as bot,
-        patch.object(run, "_finish_history"),
-        patch.object(run, "_start_live_ingestion", side_effect=AssertionError("live-ingestion в истории")),
+        patch.object(contour, "build_channels", return_value=[]),
+        patch.object(contour, "_build_runtime", return_value=contour._Runtime()),
+        patch.object(contour, "_run_bot") as bot,
+        patch.object(contour, "_finish_history"),
+        patch.object(core, "_start_live_ingestion", side_effect=AssertionError("live-ingestion в истории")),
     ):
         code, _, _ = run._launch(state_dir=tmp_path / "state", client_provider=MagicMock(), clock=MagicMock(),
                                  session=MagicMock(start=start, end=end), channel_names=[], history=True)
@@ -125,10 +127,10 @@ def test_history_launch_never_starts_live_ingestion(tmp_path):
 def test_notify_only_live_uses_same_ingestion_and_stream_without_factory_falls_back(tmp_path, monkeypatch, caplog):
     cache = live_cache(tmp_path)
     started = []
-    monkeypatch.setattr(run.LiveMarketDataPoller, "start", lambda self: started.append(self))
-    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", MarketDataSettings(live_transport="stream"))
-    poller = run._start_live_ingestion(cache, run._Runtime(), [Instrument("SBER", "SBER", "share", "SBER", "u")],
-                                       SimpleNamespace(client_context=lambda token=None: None))
+    monkeypatch.setattr(core.LiveMarketDataPoller, "start", lambda self: started.append(self))
+    monkeypatch.setattr(core, "MARKET_DATA_SETTINGS", MarketDataSettings(live_transport="stream"))
+    demand = contour.build_demand(contour._Runtime(), [Instrument("SBER", "SBER", "share", "SBER", "u")], cache)
+    poller, _ = core._start_live_ingestion(cache, demand, SimpleNamespace(client_context=lambda token=None: None))
     assert started == [poller]
     assert poller._stream is None and poller._worker is not None
     assert "используется polling" in caplog.text

@@ -9,7 +9,7 @@ import sqlite3
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.api.market_data_stream import StreamCandle
 from src.data.cache import MarketDataCache
 from src.data.live_state import StreamClosureEvidence
@@ -50,7 +50,7 @@ def trades_storage(timeframe="15m"):
 def test_dispatch_evidence_reflects_owner_readiness_and_intent_age(tmp_path):
     cache, _, _ = live_cache(tmp_path, "1m", "15m")
     since = [datetime(2026, 10, 12, 12, 3, tzinfo=timezone.utc)]
-    inspect = run._dispatch_evidence(cache, [ITEM], trades_storage(), since)
+    inspect = contour._dispatch_evidence(cache, [ITEM], trades_storage(), since)
     fresh = SimpleNamespace(trade_id="t", created_at=datetime(2026, 10, 12, 12, 3, 10, tzinfo=timezone.utc))
     held = SimpleNamespace(trade_id="t", created_at=datetime(2026, 10, 12, 11, 0, tzinfo=timezone.utc))
     evidence = inspect(UID, None, fresh)
@@ -68,12 +68,12 @@ def runtime_for(cache, tmp_path):
     storage = MagicMock()
     storage.load_trades.return_value = ()
     storage.execution_bar_boundaries.side_effect = lambda: {UID: (datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc), True)}
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([ITEM], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([ITEM], cache, MagicMock(), tmp_path)
     return runtime, broker
 
 
@@ -292,12 +292,12 @@ def runtime_with_manager(cache, tmp_path):
     storage = MagicMock()
     storage.load_trades.return_value = ()
     storage.execution_bar_boundaries.return_value = {}
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=manager
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([ITEM], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([ITEM], cache, MagicMock(), tmp_path)
     return runtime, manager
 
 

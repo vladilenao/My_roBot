@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import run
+from src.assembly import contour, services
 from src.bot.run_session import HistoricalRunSession
 from src.data.cache import DataExhaustion
 from src.history.preflight import PreflightReport
@@ -77,8 +78,8 @@ class TestLoadContractsMetadata:
         with patch("src.api.client.client_context", return_value=fake_client) as ctx, patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"NGV6": ContractMeta("NGV6", 0.001, 8.4, 100, 100)},
-        ) as loader, patch("run.TINKOFF_TOKEN", "t"):
-            contracts = run._load_contracts_metadata([fake_instrument])
+        ) as loader, patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+            contracts = contour._load_contracts_metadata([fake_instrument])
 
         ctx.assert_called_once_with()
         loader.assert_called_once_with(fake_client, tickers={"NGV6"})
@@ -86,26 +87,26 @@ class TestLoadContractsMetadata:
 
     def test_selector_tuples_use_real_ticker(self):
         """`(display, ticker, type[, name])` из селектора → в запрос идёт реальный тикер (индекс 1)."""
-        assert run._instrument_ticker(SELECTOR_NG) == "NGV6"
-        assert run._instrument_ticker(("RTS", "RIU6", "future")) == "RIU6"
-        assert run._instrument_ticker(SELECTOR_NG[:1]) == "NG (Природный газ) — NG-10.26"
-        assert run._instrument_ticker(None) is None
+        assert contour._instrument_ticker(SELECTOR_NG) == "NGV6"
+        assert contour._instrument_ticker(("RTS", "RIU6", "future")) == "RIU6"
+        assert contour._instrument_ticker(SELECTOR_NG[:1]) == "NG (Природный газ) — NG-10.26"
+        assert contour._instrument_ticker(None) is None
 
     def test_empty_without_token(self, fake_instrument):
-        with patch("run.TINKOFF_TOKEN", ""), patch("run.log") as log:
-            assert run._load_contracts_metadata([fake_instrument]) == {}
+        with patch("src.assembly.contour.TINKOFF_TOKEN", ""), patch("src.assembly.contour.log") as log:
+            assert contour._load_contracts_metadata([fake_instrument]) == {}
         log.warning.assert_called_once()
 
     def test_no_instruments_skips_source_entirely(self):
-        with patch("run.TINKOFF_TOKEN", ""), patch("run.log") as log:
-            assert run._load_contracts_metadata([]) == {}
+        with patch("src.assembly.contour.TINKOFF_TOKEN", ""), patch("src.assembly.contour.log") as log:
+            assert contour._load_contracts_metadata([]) == {}
         log.warning.assert_not_called()
 
     def test_exception_falls_back_to_empty(self, fake_instrument):
         with patch("src.api.client.client_context", side_effect=RuntimeError("boom")), patch(
-            "run.TINKOFF_TOKEN", "t"
+            "src.assembly.contour.TINKOFF_TOKEN", "t"
         ):
-            assert run._load_contracts_metadata([fake_instrument]) == {}
+            assert contour._load_contracts_metadata([fake_instrument]) == {}
 
 
     def test_share_and_future_metadata_are_merged(self):
@@ -116,8 +117,8 @@ class TestLoadContractsMetadata:
         ) as futures, patch(
             "src.api.instruments.load_share_contracts",
             return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
-        ) as shares, patch("run.TINKOFF_TOKEN", "t"):
-            contracts = run._load_contracts_metadata(
+        ) as shares, patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+            contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
             )
 
@@ -133,9 +134,9 @@ class TestLoadContractsMetadata:
         with patch("src.api.client.client_context", return_value=fake_client), patch(
             "src.api.instruments.load_futures_contracts", return_value={}
         ), patch("src.api.instruments.load_share_contracts", return_value={}), patch(
-            "run.TINKOFF_TOKEN", "t"
+            "src.assembly.contour.TINKOFF_TOKEN", "t"
         ):
-            contracts = run._load_contracts_metadata(
+            contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
             )
 
@@ -151,8 +152,8 @@ class TestLoadContractsMetadata:
         ), patch(
             "src.api.instruments.load_share_contracts",
             side_effect=RuntimeError("каталог акций недоступен"),
-        ), patch("run.TINKOFF_TOKEN", "t"):
-            contracts = run._load_contracts_metadata(
+        ), patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+            contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
             )
 
@@ -163,7 +164,7 @@ class TestLoadContractsMetadata:
         provider = MagicMock()
         provider.client_context.return_value = fake_client
         with patch("src.api.instruments.load_share_contracts", return_value={}) as shares:
-            run._load_contracts_metadata(
+            contour._load_contracts_metadata(
                 [("Сбербанк", "SBER", "share", "SBER")], client_provider=provider
             )
 
@@ -181,17 +182,17 @@ class TestHistoryMetadataWithoutToken:
     def test_futures_and_shares_load_with_no_token(self):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("run.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
         ) as futures, patch(
             "src.api.instruments.load_share_contracts",
             return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
         ) as shares, patch(
-            "run._token_client_context",
+            "src.assembly.contour._token_client_context",
             side_effect=AssertionError("токен не должен быть нужен"),
         ):
-            contracts = run._load_contracts_metadata(
+            contracts = contour._load_contracts_metadata(
                 [("Фьючерс", "SiH5", "future", "Si-6.25"),
                  ("Сбербанк", "SBER", "share", "SBER")],
                 client_provider=provider,
@@ -205,14 +206,14 @@ class TestHistoryMetadataWithoutToken:
     def test_entries_not_rejected_for_missing_metadata(self, caplog):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("run.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
         ), patch(
             "src.api.instruments.load_share_contracts",
             return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
         ):
-            contracts = run._load_contracts_metadata(
+            contracts = contour._load_contracts_metadata(
                 [("Фьючерс", "SiH5", "future", "Si-6.25"),
                  ("Сбербанк", "SBER", "share", "SBER")],
                 client_provider=provider,
@@ -225,10 +226,10 @@ class TestHistoryMetadataWithoutToken:
     def test_no_token_warning_absent_when_provider_available(self, caplog):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("run.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts", return_value={}
         ), patch("src.api.instruments.load_share_contracts", return_value={}):
-            run._load_contracts_metadata(
+            contour._load_contracts_metadata(
                 [("Фьючерс", "SiH5", "future", "Si-6.25")], client_provider=provider
             )
 
@@ -248,14 +249,14 @@ class TestRuntimeComposition:
         storage.execution_bar_boundaries.return_value = {}
         cache = MagicMock()
         cache.frame_for.return_value = _frame_with_candle()
-        with patch("run.trading_enabled", return_value=True), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
         ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
             "src.trade_management.manager.TradeManager", return_value=manager
-        ), patch("run._load_contracts_metadata", return_value={}), patch(
-            "run.print_contract_metadata"
-        ), patch("run._risk_limits"):
-            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+        ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch(
+            "src.assembly.contour.print_contract_metadata"
+        ), patch("src.assembly.contour._risk_limits"):
+            runtime = contour._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
 
         assert runtime.post_tick({"1m"}) is False
         assert runtime.post_tick({"1m"}) is True
@@ -273,25 +274,25 @@ class TestRuntimeComposition:
         storage.execution_bar_boundaries.return_value = {}
         cache = MagicMock()
         cache.frame_for.return_value = _frame_with_candle()
-        with patch("run.trading_enabled", return_value=True), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
         ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
             "src.trade_management.manager.TradeManager", return_value=MagicMock()
-        ), patch("run._load_contracts_metadata", return_value={}), patch(
-            "run.print_contract_metadata"
-        ), patch("run._risk_limits"):
-            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+        ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch(
+            "src.assembly.contour.print_contract_metadata"
+        ), patch("src.assembly.contour._risk_limits"):
+            runtime = contour._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
 
-        with pytest.raises(run._UnsafeExecutionState):
+        with pytest.raises(contour._UnsafeExecutionState):
             runtime.post_tick(("1m",))
         cache.mark_processed.assert_not_called()
         broker.drain_addressed_events.assert_not_called()
 
     def test_notify_only_never_initializes_storage_or_broker(self):
-        with patch("run.trading_enabled", return_value=False), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=False), patch(
             "src.trade_journal.storage.Storage"
         ) as storage, patch("src.broker.create_addressable_journal_broker") as broker:
-            runtime = run._build_runtime([], MagicMock(), MagicMock(), run.runtime_dir())
+            runtime = contour._build_runtime([], MagicMock(), MagicMock(), run.runtime_dir())
 
         assert runtime.trade_manager is None
         assert runtime.post_tick is None
@@ -306,56 +307,56 @@ class TestRuntimeComposition:
         storage = MagicMock()
         bus = MagicMock()
         storage.load_trades.return_value = ()
-        with patch("run.trading_enabled", return_value=True), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
         ) as storage_cls, patch(
             "src.broker.create_addressable_journal_broker", return_value=broker
         ) as broker_factory, patch(
             "src.trade_management.manager.TradeManager", return_value=manager
-        ) as manager_cls, patch("run._load_contracts_metadata", return_value={}), patch(
-            "run.print_contract_metadata"
-        ), patch("run._risk_limits") as limits:
-            runtime = run._build_runtime([], MagicMock(), bus, run.runtime_dir())
+        ) as manager_cls, patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch(
+            "src.assembly.contour.print_contract_metadata"
+        ), patch("src.assembly.contour._risk_limits") as limits:
+            runtime = contour._build_runtime([], MagicMock(), bus, run.runtime_dir())
 
         storage_cls.assert_called_once_with(
-            run.runtime_dir() / run.DATABASE_FILE,
-            journal_path=run.runtime_dir() / run.JOURNAL_FILE,
-            positions_path=run.runtime_dir() / run.POSITIONS_FILE,
-            audit_path=run.runtime_dir() / run.AUDIT_FILE,
-            audit_max_bytes=run.AUDIT_MAX_BYTES,
-            audit_backup_count=run.AUDIT_BACKUP_COUNT,
-            initial_deposit=str(run.INITIAL_DEPOSIT),
+            run.runtime_dir() / contour.DATABASE_FILE,
+            journal_path=run.runtime_dir() / contour.JOURNAL_FILE,
+            positions_path=run.runtime_dir() / contour.POSITIONS_FILE,
+            audit_path=run.runtime_dir() / contour.AUDIT_FILE,
+            audit_max_bytes=contour.AUDIT_MAX_BYTES,
+            audit_backup_count=contour.AUDIT_BACKUP_COUNT,
+            initial_deposit=str(contour.INITIAL_DEPOSIT),
             clock=None,
         )
         broker_factory.assert_called_once_with(
-            run.INITIAL_DEPOSIT, run.CLEARING_TIMES, contract_names={}
+            contour.INITIAL_DEPOSIT, contour.CLEARING_TIMES, contract_names={}
         )
         manager_cls.assert_called_once_with(
             storage,
             broker,
-            initial_balance=run.Decimal(str(run.INITIAL_DEPOSIT)),
+            initial_balance=contour.Decimal(str(contour.INITIAL_DEPOSIT)),
             budget_observer=ANY,
             execution_observer=ANY,
-            profiles_config=run.TRADE_MANAGEMENT_PROFILES,
+            profiles_config=contour.TRADE_MANAGEMENT_PROFILES,
             risk_limits=limits.return_value,
-            max_qty=run.RISK_LIMITS.get("max_qty"),
-            commission=run.RISK_LIMITS.get("commission"),
-            slippage=run.RISK_LIMITS.get("slippage"),
-            slippage_tolerance=run.RISK_LIMITS.get("slippage_tolerance"),
-            min_trade_risk_pct=run.RISK_LIMITS.get("min_trade_risk_pct"),
-            portfolio_pct=run.RISK_LIMITS.get("portfolio_pct", 2),
-            min_risk_cost_ratio=run.RISK_LIMITS.get("min_risk_cost_ratio", 2),
-            min_net_payoff=run.RISK_LIMITS.get("min_net_payoff", 1.5),
-            max_slippage_r=run.RISK_LIMITS.get("max_slippage_r", 0.25),
-            max_entry_deviation_r=run.RISK_LIMITS.get("max_entry_deviation_r", 0.25),
+            max_qty=contour.RISK_LIMITS.get("max_qty"),
+            commission=contour.RISK_LIMITS.get("commission"),
+            slippage=contour.RISK_LIMITS.get("slippage"),
+            slippage_tolerance=contour.RISK_LIMITS.get("slippage_tolerance"),
+            min_trade_risk_pct=contour.RISK_LIMITS.get("min_trade_risk_pct"),
+            portfolio_pct=contour.RISK_LIMITS.get("portfolio_pct", 2),
+            min_risk_cost_ratio=contour.RISK_LIMITS.get("min_risk_cost_ratio", 2),
+            min_net_payoff=contour.RISK_LIMITS.get("min_net_payoff", 1.5),
+            max_slippage_r=contour.RISK_LIMITS.get("max_slippage_r", 0.25),
+            max_entry_deviation_r=contour.RISK_LIMITS.get("max_entry_deviation_r", 0.25),
             live_market_provider=None,
             contract_expiry_block_days=run.CONTRACT_EXPIRY_BLOCK_DAYS,
             contract_expiry_close_before_end_min=run.CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN,
-            direction_limits=run.TRADING_DIRECTIONS,
+            direction_limits=contour.TRADING_DIRECTIONS,
             clock=None,
             signal_filter=ANY,
             cluster_gate=None,
-            intraday_settings=run.INTRADAY_SETTINGS,
+            intraday_settings=contour.INTRADAY_SETTINGS,
             session_calendar=ANY,
         )
         manager.restore.assert_called_once_with()
@@ -367,14 +368,14 @@ class TestRuntimeComposition:
         callbacks = manager_cls.call_args.kwargs
         callbacks["budget_observer"]({"risk_state": "unknown", "unknown_reason": "нет подтверждённого стопа"})
         alert = bus.publish.call_args.args[0]
-        assert alert.type is run.EventType.RISK_LIMIT_HIT and alert.get("risk_scope") == "portfolio"
+        assert alert.type is contour.EventType.RISK_LIMIT_HIT and alert.get("risk_scope") == "portfolio"
         assert "trade_id" not in alert.payload
         callbacks["execution_observer"](SimpleNamespace(trade_id="trade", timestamp=datetime(2026, 1, 1), filled_quantity=2,
-            price=run.Decimal(100), fee=run.Decimal(0), fee_source="broker", reason="entry", execution_id="exec", status="fill"),
-            {"action_type": "OPEN", "instrument_id": "SBER", "side": "BUY", "gross_pnl": run.Decimal(0), "net_pnl": run.Decimal(0),
-             "fees_total": run.Decimal(0), "fees_known": True, "pnl_units": "RUB", "quantity_remaining": 2})
+            price=contour.Decimal(100), fee=contour.Decimal(0), fee_source="broker", reason="entry", execution_id="exec", status="fill"),
+            {"action_type": "OPEN", "instrument_id": "SBER", "side": "BUY", "gross_pnl": contour.Decimal(0), "net_pnl": contour.Decimal(0),
+             "fees_total": contour.Decimal(0), "fees_known": True, "pnl_units": "RUB", "quantity_remaining": 2})
         fact = bus.publish.call_args.args[0]
-        assert fact.type is run.EventType.TRADE_OPENED and fact.get("fee_source") == "broker"
+        assert fact.type is contour.EventType.TRADE_OPENED and fact.get("fee_source") == "broker"
         assert fact.get("fee") == 0 and fact.get("quantity_remaining") == 2
         assert fact.get("side") == "BUY"
 
@@ -388,16 +389,16 @@ class TestRuntimeComposition:
         storage.execution_bar_boundaries.return_value = {}
         cache = MagicMock()
         cache.frame_for.return_value = _frame_with_candle()
-        with patch("run.trading_enabled", return_value=True), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
         ), patch(
             "src.broker.create_addressable_journal_broker", return_value=broker
         ), patch(
             "src.trade_management.manager.TradeManager", return_value=manager
-        ), patch("run._load_contracts_metadata", return_value={}), patch(
-            "run.print_contract_metadata"
-        ), patch("run._risk_limits"):
-            runtime = run._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
+        ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch(
+            "src.assembly.contour.print_contract_metadata"
+        ), patch("src.assembly.contour._risk_limits"):
+            runtime = contour._build_runtime([SELECTOR_NG], cache, MagicMock(), run.runtime_dir())
 
         storage.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
         broker.set_names.assert_called_once_with({"NGV6": "NG-10.26"})
@@ -426,16 +427,16 @@ class TestRuntimeComposition:
         cache = MagicMock()
         cache.frame_for.return_value = pd.DataFrame()
         bus = MagicMock()
-        with patch("run.trading_enabled", return_value=True), patch(
+        with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
             "src.trade_journal.storage.Storage", return_value=storage
         ), patch(
             "src.broker.create_addressable_journal_broker", return_value=broker
         ), patch(
             "src.trade_management.manager.TradeManager", return_value=manager
-        ), patch("run._load_contracts_metadata", return_value={}), patch(
-            "run.print_contract_metadata"
-        ), patch("run._risk_limits"), patch("run._broker_event", side_effect=lambda event: event):
-            runtime = run._build_runtime([SELECTOR_NG], cache, bus, run.runtime_dir())
+        ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch(
+            "src.assembly.contour.print_contract_metadata"
+        ), patch("src.assembly.contour._risk_limits"), patch("src.assembly.contour._broker_event", side_effect=lambda event: event):
+            runtime = contour._build_runtime([SELECTOR_NG], cache, bus, run.runtime_dir())
             assert runtime.post_tick(("1m",)) is True
 
         broker.track_bar.assert_not_called()
@@ -444,7 +445,7 @@ class TestRuntimeComposition:
 
 class TestInstrumentNames:
     def test_share_named_by_ticker(self):
-        names = run._instrument_names(
+        names = contour._instrument_names(
             [normalize_instrument(("SBER", "SBER", "share")), normalize_instrument(("GAZP", "GAZP", "share"))]
         )
 
@@ -456,7 +457,7 @@ class TestInstrumentNames:
             normalize_instrument(("NG (Природный газ) — NG-10.26", "NGV7", "future")),
         ]
 
-        assert run._instrument_names(instruments) == {"NGV6": "NG-9.26"}
+        assert contour._instrument_names(instruments) == {"NGV6": "NG-9.26"}
 
 
 SHIFTED_START = datetime(2024, 1, 3, 4, 2)
@@ -488,7 +489,7 @@ class TestHistoryStartShift:
             patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
             patch.object(run, "_warmup_bars", return_value=41),
             patch.object(run, "run_preflight", return_value=report),
-            patch.object(run, "build_channels") as channels,
+            patch.object(contour, "build_channels") as channels,
         ):
             code, shifted, instruments = run._launch(
                 state_dir=tmp_path / "state",
@@ -521,7 +522,7 @@ class TestHistoryStartShift:
                 run, "run_preflight",
                 return_value=_preflight_report(start=self.START, ok=False),
             ),
-            patch.object(run, "build_channels") as channels,
+            patch.object(contour, "build_channels") as channels,
         ):
             code, shifted, instruments = run._launch(
                 state_dir=tmp_path / "state",
@@ -571,7 +572,7 @@ class TestRunHistoryRetry:
         with (
             patch.object(run, "HistoricalClock"),
             patch.object(run, "build_run_session"),
-            patch.object(run, "_timeframes", return_value={"1m"}),
+            patch.object(services, "_timeframes", return_value={"1m"}),
             patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
             patch.object(run, "EmulatorClientProvider", return_value=provider),
             patch.object(run, "state_dir_for", side_effect=lambda s, e: tmp_path / f"{s:%m%d%H%M}"),
@@ -627,7 +628,7 @@ class TestRunHistoryRetry:
         with (
             patch.object(run, "HistoricalClock"),
             patch.object(run, "build_run_session"),
-            patch.object(run, "_timeframes", return_value={"1m"}),
+            patch.object(services, "_timeframes", return_value={"1m"}),
             patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
             patch.object(run, "EmulatorClientProvider", side_effect=[first, second]),
             patch.object(run, "state_dir_for", return_value=tmp_path / "run"),
@@ -680,7 +681,7 @@ class TestFinishHistoryReportsCheckedHorizon:
         timeline.now.return_value = pd.Timestamp("2026-09-25 12:05")
         state_dir = tmp_path / "run-1"
 
-        run._finish_history(
+        contour._finish_history(
             Storage(tmp_path / "trades.sqlite3", initial_deposit="100000"),
             session,
             cache,
@@ -737,7 +738,7 @@ def test_execution_boundaries_translate_legacy_ticker_to_live_uid():
     boundary = datetime(2026, 10, 8, 11, 20)
     aliases = {"EDZ6": "uid-ed", "uid-ed": "uid-ed"}
 
-    assert run._canonical_execution_boundaries(
+    assert contour._canonical_execution_boundaries(
         {"EDZ6": (boundary, True)}, aliases) == {"uid-ed": (boundary, True)}
 
 
@@ -752,9 +753,9 @@ def test_live_loop_does_not_swallow_unsafe_execution_state():
         _tick_poll_secs=1,
     )
     live = MagicMock()
-    live.step.side_effect = run._UnsafeExecutionState("unsafe")
+    live.step.side_effect = contour._UnsafeExecutionState("unsafe")
 
-    with patch("src.bot.live_analysis.LiveAnalysis", return_value=live), pytest.raises(run._UnsafeExecutionState):
+    with patch("src.bot.live_analysis.LiveAnalysis", return_value=live), pytest.raises(contour._UnsafeExecutionState):
         TradingBot._loop_live(bot)
 
     bot._report_error.assert_not_called()

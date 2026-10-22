@@ -33,6 +33,7 @@ from src.market_calendar.service import (
     BrokerScheduleSource, EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore,
 )
 from src.scheduler.timing import MultiTimeframeScheduler
+from src.assembly import contour
 
 FIXTURE = Path(__file__).parent / "fixtures" / "trading_schedules_20261013.json"
 SHARES = "moex_mrng_evng_e_wknd_dlr"
@@ -318,7 +319,6 @@ class EmulatorProvider:
 
 def test_13_snapshot_schedule_is_applied_and_reported(tmp_path):
     from src.market_calendar.serialization import canonical_day_json, day_version
-    import run
 
     day = sdk_day(FUTURES, "2026-10-13")
     payload = {"instrument_id": "uid", "snapshot_generation": 42, "missing_dates": ["2026-10-12"],
@@ -331,7 +331,7 @@ def test_13_snapshot_schedule_is_applied_and_reported(tmp_path):
     assert calendar.service(now)
     assert calendar.expectation("uid", CANDLE_RULES["1m"], now, TIMEOUT).phase is MarketPhase.BREAK
 
-    report = run._calendar_schedule(SimpleNamespace(market_calendar=calendar))
+    report = contour._calendar_schedule(SimpleNamespace(market_calendar=calendar))
     assert report.snapshot_pinned and report.snapshot_generation == 42
     assert report.exchanges == (FUTURES,)
     assert report.day_versions == ((FUTURES, "2026-10-13", day_version(day), "broker"),)

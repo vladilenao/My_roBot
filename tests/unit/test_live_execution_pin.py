@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.data.cache import MarketDataCache
 from src.data.market_store import MarketDataStore
 from src.data.request_budget import RequestBudget
@@ -39,12 +39,12 @@ def setup(tmp_path, boundaries=None):
     storage.load_trades.return_value = ()
     # Открытая позиция: 12:00 ещё не применена симуляцией.
     storage.execution_bar_boundaries.side_effect = lambda: dict(OPEN_POSITION if boundaries is None else boundaries)
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([instrument], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([instrument], cache, MagicMock(), tmp_path)
     return cache, store, broker, runtime, instrument
 
 

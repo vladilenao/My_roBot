@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 import run
+from src.assembly import contour, core
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
 from src.data.ingestion_settings import MarketDataSettings
@@ -24,7 +25,7 @@ def test_live_launch_starts_market_data_before_instrument_selection(monkeypatch,
     order = []
     budget = object()
     monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=True))
-    monkeypatch.setattr(run, "_start_early_market_data",
+    monkeypatch.setattr(core, "_start_early_market_data",
                         lambda state_dir, provider: order.append("early") or SimpleNamespace(request_budget=budget))
 
     def select(**kwargs):
@@ -41,7 +42,7 @@ def test_live_launch_starts_market_data_before_instrument_selection(monkeypatch,
 
 def test_history_launch_does_not_start_lanes(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=True))
-    monkeypatch.setattr(run, "_start_early_market_data", lambda *a: pytest.fail("ранний старт в истории"))
+    monkeypatch.setattr(core, "_start_early_market_data", lambda *a: pytest.fail("ранний старт в истории"))
 
     def select(**kwargs):
         assert kwargs["request_budget"] is None
@@ -70,13 +71,13 @@ def test_saved_roster_is_registered_and_unselected_pairs_are_retired(tmp_path):
     store.save_roster(source=SOURCE, entries=[entry("u-sber", "SBER", "1h", "selected"),
                                               entry("u-phor", "PHOR", "1h", "selected"),
                                               entry("u-ng", "NGZ6", "1m", "obligation")])
-    assert run._register_saved_roster(cache, store) == 3
+    assert core._register_saved_roster(cache, store) == 3
     assert {(p["uid"], p["timeframe"], p["min_bars"]) for p in cache.live_pairs()} == {
         ("u-sber", "1h", 60), ("u-phor", "1h", 60), ("u-ng", "1m", 60)}
 
     worker = IngestionWorker(cache, settings=MarketDataSettings(independent_lanes=True))
     worker.set_execution_obligations({"u-ng": (pd.Timestamp("2026-10-13 09:00"), True)})
-    run._retire_unselected_pairs(cache, [Instrument("SBER", "SBER", "share", "SBER", "u-sber")], worker)
+    core._retire_unselected_pairs(cache, [Instrument("SBER", "SBER", "share", "SBER", "u-sber")], worker)
     assert {p["uid"] for p in cache.live_pairs()} == {"u-sber", "u-ng"}   # PHOR не выбран — снят
     worker.persist_roster()
     assert {row["instrument_uid"]: row["origin"] for row in store.roster(source=SOURCE)} == {
@@ -124,7 +125,7 @@ def started_owner(tmp_path, clock):
                                      "instrument_type": "share", "short_name": ticker, "origin": "selected",
                                      "requirements": {"min_bars": 1}}
     store.save_roster(source=SOURCE, entries=[entry(PHOR_UID, "PHOR"), entry("0-sber", "SBER")])
-    run._register_saved_roster(cache, store)                  # полосы стартуют до выбора
+    core._register_saved_roster(cache, store)                  # полосы стартуют до выбора
     for uid in (PHOR_UID, "0-sber"):
         cache.mark_live_history(uid, "1m", done=True)
     worker = IngestionWorker(cache, settings=MarketDataSettings(independent_lanes=True))
@@ -138,7 +139,7 @@ def journal_obligations(cache, selected):
     """Обязательства так, как их собирает запуск: журнал хранит вход PHOR под тикером."""
     journal = {"PHOR": (datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc), True)}
     aliases = {alias: instrument_key(item) for item in selected for alias in (instrument_key(item), item.ticker)}
-    return run._market_obligations(journal, aliases, selected, cache)
+    return contour._market_obligations(journal, aliases, selected, cache)
 
 
 def test_obligation_under_ticker_reaches_pair_registered_under_uid(tmp_path):
@@ -152,7 +153,7 @@ def test_obligation_under_ticker_reaches_pair_registered_under_uid(tmp_path):
 
     assert completeness.window_lower(pair, clock[0]) <= pd.Timestamp("2026-10-13 12:00")
     assert completeness._level(pair) == 0                       # первая очередь полноты
-    run._retire_unselected_pairs(cache, [normalize_instrument(("SBER", "SBER", "share"))], worker)
+    core._retire_unselected_pairs(cache, [normalize_instrument(("SBER", "SBER", "share"))], worker)
     assert cache.live_pair(PHOR_UID, "1m") is not None           # с обязательством не снимается
     worker.persist_roster()
     assert {row["instrument_uid"]: row["origin"] for row in store.roster(source=SOURCE)}[PHOR_UID] == "obligation"
@@ -210,6 +211,6 @@ def test_market_obligations_map_journal_ids_to_pair_uids(tmp_path):
     phor = normalize_instrument(("PHOR", "PHOR", "share"))
     aliases = {"PHOR": "PHOR"}
 
-    result = run._market_obligations(journal, aliases, [phor], cache)
+    result = contour._market_obligations(journal, aliases, [phor], cache)
 
     assert result == {PHOR_UID: at(11), "0-sber": at(13), "EDZ6": at(14)}

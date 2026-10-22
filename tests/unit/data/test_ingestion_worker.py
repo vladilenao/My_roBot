@@ -13,6 +13,7 @@ from src.data.reconciliation import MarketDataReconciler, SessionCalendar
 from src.data.request_budget import RequestBudget
 from src.instruments import Instrument
 from src.scheduler.timing import CandleScheduler, MultiTimeframeScheduler
+from src.assembly import contour, core
 
 # Прежняя общая очередь — откат при independent_lanes = false.
 LEGACY_QUEUE = MarketDataSettings(independent_lanes=False)
@@ -281,7 +282,6 @@ def test_history_error_keeps_pair_not_ready_and_is_visible(tmp_path):
 
 
 def test_saved_obligations_register_management_timeframe_and_execution_lower(tmp_path, monkeypatch):
-    import run
     from types import SimpleNamespace
     from datetime import timezone
     clock = [pd.Timestamp("2026-10-12 12:05")]
@@ -293,8 +293,8 @@ def test_saved_obligations_register_management_timeframe_and_execution_lower(tmp
     storage = SimpleNamespace(load_trades=lambda: (SimpleNamespace(plan=plan),),
         execution_bar_boundaries=lambda: {UID: (datetime(2026, 10, 12, 11, 0, tzinfo=timezone.utc), False)})
     started = []
-    monkeypatch.setattr(run.LiveMarketDataPoller, "start", lambda self: started.append(self))
-    run._start_live_ingestion(cache, SimpleNamespace(storage=storage), [ITEM], None)
+    monkeypatch.setattr(core.LiveMarketDataPoller, "start", lambda self: started.append(self))
+    core._start_live_ingestion(cache, contour.build_demand(SimpleNamespace(storage=storage), [ITEM], cache), None)
     needs = {key[2]: count for key, _, count in cache.live_needs()}
     assert needs == {"1h": 21, "1m": 1}  # сопровождение не зависит от удалённой привязки
     assert cache._pending_execution_lower[UID] == pd.Timestamp("2026-10-12 11:00")

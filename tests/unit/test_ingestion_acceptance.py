@@ -34,7 +34,7 @@ import threading
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.api.market_data_stream import CandleSubscriptionAck, StreamCandle, StreamResponse
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
@@ -78,12 +78,12 @@ def test_critical_gap_of_one_uid_does_not_stop_healthy_uid(tmp_path):
     storage.load_trades.return_value = ()
     start = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
     storage.execution_bar_boundaries.side_effect = lambda: {"aaa": (start, True), "bbb": (start, True)}
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([a, b], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([a, b], cache, MagicMock(), tmp_path)
     assert runtime.post_tick({"1m"}) is True
     executed = {}
     for call in broker.track_bar.call_args_list:
