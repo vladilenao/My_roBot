@@ -28,6 +28,10 @@ from src.data.coverage_states import (  # noqa: E402,F401
     EXPORTED_STATE, FINAL_EVIDENCE_STATES, INTERVAL_STATES, RESOLVED_INTERVAL_STATES, WAITING_INTERVAL_STATES,
 )
 ROSTER_ORIGINS = frozenset({"selected", "obligation", "previous"})
+# Подтверждения ленты расписаний живут в общей таблице под этим префиксом.
+SCHEDULE_CHECKPOINT_PREFIX = "trading-schedules:"
+# Порция очистки ленты /changes — одна короткая транзакция записи.
+PRUNE_BATCH = 5000
 
 
 def _utc_text(value: object | None = None) -> str:
@@ -66,6 +70,22 @@ class SourceInfo:
             "min_after_id": self.min_after_id,
             "max_change_id": self.max_change_id,
         }
+
+
+@dataclass(frozen=True)
+class ChangesPrune:
+    """Итог одной порции очистки ленты ``/changes``.
+
+    ``more`` — в начале ленты остались строки, которые можно удалить
+    следующей порцией; ``holder`` — потребитель, чьё подтверждение
+    остановило порцию, ``holder_lag`` — сколько записей он не дочитал.
+    """
+
+    deleted: int
+    min_after_id: int
+    more: bool
+    holder: str | None = None
+    holder_lag: int = 0
 
 
 def _require_broker(provenance: str) -> None:
@@ -306,7 +326,9 @@ class MarketDataStore:
         with self._lock, self._connect() as conn:
             values = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
             maximum = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM changes").fetchone()[0]
-        return SourceInfo(values["producer_id"], int(values["schema_version"]), int(values["min_after_id"]), maximum)
+        minimum = int(values["min_after_id"])
+        # Очищенная целиком лента не опускает максимум ниже удержанного края.
+        return SourceInfo(values["producer_id"], int(values["schema_version"]), minimum, max(maximum, minimum))
 
     @property
     def producer_id(self) -> str:
@@ -1107,7 +1129,7 @@ class MarketDataStore:
             maximum = int(row[0]) if row is not None else 0
             if change_id < 0 or change_id > maximum:
                 raise ValueError("change_id вне доступного диапазона расписаний")
-            key, now = f"trading-schedules:{consumer_id}", _utc_text()
+            key, now = f"{SCHEDULE_CHECKPOINT_PREFIX}{consumer_id}", _utc_text()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 old = conn.execute("SELECT acknowledged_through FROM consumer_checkpoints WHERE consumer_id=?", (key,)).fetchone()
@@ -1140,6 +1162,55 @@ class MarketDataStore:
                 producer_id=excluded.producer_id,acknowledged_through=MAX(consumer_checkpoints.acknowledged_through,excluded.acknowledged_through),acknowledged_at=excluded.acknowledged_at""", (consumer_id, producer_id, acknowledged, now))
             conn.commit()
         return {"producer_id": info.producer_id, "consumer_id": consumer_id, "acknowledged_through": acknowledged}
+
+    def prune_changes(self, older_than: object, *, limit: int = PRUNE_BATCH) -> ChangesPrune:
+        """Удаляет порцию начала ленты ``/changes`` старше ``older_than``.
+
+        Удаляется только префикс ленты и не дальше наименьшего подтверждения
+        потребителей ``/changes`` текущего производителя: неподтверждённое не
+        удаляется. Подтверждения ленты расписаний очистку не удерживают.
+        ``min_after_id`` поднимается в той же транзакции (add-changes-retention).
+        """
+        cutoff = _utc_text(older_than)
+        limit = max(1, int(limit))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                values = dict(conn.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('producer_id', 'min_after_id')").fetchall())
+                floor = int(values["min_after_id"])
+                held = conn.execute(
+                    "SELECT consumer_id, acknowledged_through FROM consumer_checkpoints "
+                    "WHERE producer_id=? AND consumer_id NOT LIKE ? "
+                    "ORDER BY acknowledged_through, consumer_id LIMIT 1",
+                    (values["producer_id"], SCHEDULE_CHECKPOINT_PREFIX + "%"),
+                ).fetchone()
+                bound = None if held is None else int(held["acknowledged_through"])
+                rows = conn.execute(
+                    "SELECT change_id, recorded_at FROM changes ORDER BY change_id LIMIT ?", (limit,)).fetchall()
+                last, blocked = None, False
+                for row in rows:
+                    if row["recorded_at"] >= cutoff:
+                        break
+                    if bound is not None and row["change_id"] > bound:
+                        blocked = True
+                        break
+                    last = int(row["change_id"])
+                deleted = 0
+                if last is not None:
+                    deleted = conn.execute("DELETE FROM changes WHERE change_id<=?", (last,)).rowcount
+                    floor = max(floor, last)
+                    conn.execute("UPDATE metadata SET value=? WHERE key='min_after_id'", (str(floor),))
+                lag = 0
+                if blocked:
+                    newest = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM changes").fetchone()[0]
+                    lag = max(int(newest) - bound, 0)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        more = last is not None and len(rows) == limit and last == int(rows[-1]["change_id"])
+        return ChangesPrune(deleted, floor, more, held["consumer_id"] if blocked else None, lag)
 
     # ── состав пар и проверки полноты (add-independent-market-data-lanes) ──
     def save_roster(self, *, source: str, entries: Iterable[dict], observed_at: object | None = None) -> None:

@@ -47,6 +47,7 @@ _LIMITS: dict[str, tuple[str, float | None, float | None, bool]] = {
     "completeness_rescan_interval_secs": ("number", 0, None, False),
     "lane_status_log_interval_secs": ("number", 0, None, False),
     "startup_wait_timeout_secs": ("number", 0, None, False),
+    "changes_retention_days": ("int", 0, None, True),
 }
 
 # Полосы и сервисы источника (add-independent-market-data-lanes, design 2).
@@ -107,6 +108,9 @@ class MarketDataSettings:
     # Предел ожидания прогрева перед стартовым обзором: неготовые пары
     # выходят в обзор с причиной и догружаются в фоне.
     startup_wait_timeout_secs: float = 600
+    # Срок хранения ленты /changes рыночной базы в сутках; 0 — не очищать.
+    # Неподтверждённое потребителями не удаляется независимо от срока.
+    changes_retention_days: int = 7
 
     def __post_init__(self):
         for name in setting_names():

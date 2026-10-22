@@ -8,7 +8,9 @@
 - ``CompletenessLane`` — дыры старше окна доказательства в окне полноты:
   догрузка диапазонами, конечное расписание проверок, затем
   ``source_absent``;
-- ``CalendarLane`` — привязки и расписание на сервисе инструментов.
+- ``CalendarLane`` — привязки и расписание на сервисе инструментов;
+- ``ChangesRetentionLane`` — хранение ленты ``/changes`` рыночной базы,
+  без запросов к брокеру.
 
 Живая полоса — ``IngestionWorker.step()`` (прогрев, handoff, свежий опрос).
 Все наблюдения идут через владельца входа (``MarketDataCache._load``).
@@ -16,7 +18,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -413,6 +415,48 @@ class CalendarLane:
         if self._reconciler is None:
             return False
         return bool(self._reconciler.service_calendar(_naive(now or self._timeline.now())))
+
+
+class ChangesRetentionLane:
+    """Хранение ленты ``/changes`` (add-changes-retention).
+
+    Проход раз в ``interval``: порция за шаг, пока в начале ленты есть строки
+    старше срока, не удержанные подтверждением потребителя. Шаг всегда
+    возвращает «не работал», чтобы между порциями полоса выдерживала обычную
+    паузу и не занимала базу подряд.
+    """
+
+    name = "retention"
+    INTERVAL = timedelta(hours=1)
+
+    def __init__(self, store, retention_days, *, clock=None, interval=INTERVAL):
+        self._store = store
+        self._days = retention_days
+        self._retention = timedelta(days=retention_days)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._interval = interval
+        self._next = None      # начало следующего прохода; None — сразу
+        self._deleted = None   # удалено за текущий проход; None — прохода нет
+
+    def step(self, now=None):
+        now = now or self._clock()
+        if self._deleted is None:
+            if self._next is not None and now < self._next:
+                return False
+            self._deleted = 0
+        result = self._store.prune_changes(now - self._retention)
+        self._deleted += result.deleted
+        if result.more:
+            return False
+        if self._deleted:
+            log.info("Лента изменений рыночной базы: удалено %d записей старше %s сут, минимальный курсор %d",
+                     self._deleted, self._days, result.min_after_id)
+        if result.holder is not None:
+            log.info("Лента изменений рыночной базы: очистку удерживает потребитель %s, не дочитано %d записей",
+                     result.holder, result.holder_lag)
+        self._deleted = None
+        self._next = now + self._interval
+        return False
 
 
 def _text(value):

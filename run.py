@@ -103,7 +103,7 @@ from src.data.export_api import MarketDataExportServer
 from src.data.reconciliation import MarketDataReconciler
 from src.data.poller import LiveMarketDataPoller
 from src.data.ingestion import IngestionWorker
-from src.data.lanes import CalendarLane, CompletenessLane, EvidenceLane
+from src.data.lanes import CalendarLane, ChangesRetentionLane, CompletenessLane, EvidenceLane
 from src.data.stream_ingestion import StreamSupervisor
 from src.decision.filters import PROFILES
 from src.decision.filters.triple_screen import TripleScreenFilter
@@ -783,6 +783,8 @@ def _start_early_market_data(state_dir, provider):
     worker.evidence = evidence
     worker.completeness = completeness
     lanes = [CalendarLane(market_reconciler, timeline), evidence, completeness]
+    if settings.changes_retention_days:
+        lanes.append(ChangesRetentionLane(market_store, settings.changes_retention_days))
     registered = _register_saved_roster(data_cache, market_store)
     poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, lanes=lanes,
                                   status_interval=settings.lane_status_log_interval_secs)

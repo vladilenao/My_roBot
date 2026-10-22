@@ -403,7 +403,11 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Наименьший курсор, с которого доступна полная выдача.
+          description: >-
+            Наименьший курсор, с которого доступна полная выдача. Растёт по
+            правилу хранения ленты ([market_data] changes_retention_days), но
+            не дальше наименьшего подтверждённого курсора потребителей;
+            курсор меньше него получает 410.
         max_change_id:
           type: integer
           format: int64
