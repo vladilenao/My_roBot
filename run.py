@@ -1,4 +1,5 @@
 
+import src.grpc_fork  # noqa: F401  — первым, до загрузки gRPC
 from src import __version__
 from datetime import datetime, timedelta
 from pathlib import Path

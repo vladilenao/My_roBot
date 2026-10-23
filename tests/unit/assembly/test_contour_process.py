@@ -1,10 +1,15 @@
 """Процесс контура: файл запуска, переезд журнала, надзор через stdin (add-contour-process, D2, D5, D6)."""
 
+import ast
 import io
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import time
+from pathlib import Path
+
 import pytest
 
 from src.assembly import process
@@ -168,3 +173,49 @@ def test_command_uses_same_entry(monkeypatch):
     command = process.contour_command("emulation")
     assert command[1].endswith("run.py") and command[2:] == ["--contour", "emulation"]
 
+
+
+# Ядро запускает контур, пока его потоки держат вызовы gRPC брокера.
+_GRPC_PROBE = """
+import sys, threading, time
+if sys.argv[1] == "fixed":
+    import src.grpc_fork
+import grpc
+from src.assembly.process import ContourProcess
+call = grpc.insecure_channel("127.0.0.1:1").unary_unary("/probe.Probe/Call")
+def busy():
+    while True:
+        try:
+            call(b"", timeout=0.05, wait_for_ready=True)
+        except grpc.RpcError:
+            pass
+for _ in range(4):
+    threading.Thread(target=busy, daemon=True).start()
+time.sleep(0.5)
+for _ in range(3):
+    contour = ContourProcess("emulation", command=[sys.executable, "-c", "import sys; sys.stdin.read()"])
+    contour.start()
+    contour.stop()
+"""
+ROOT = Path(__file__).resolve().parents[3]
+
+
+class TestGrpcForkHandlers:
+    @staticmethod
+    def _stderr(mode):
+        env = {key: value for key, value in os.environ.items() if key != "GRPC_ENABLE_FORK_SUPPORT"}
+        result = subprocess.run([sys.executable, "-c", _GRPC_PROBE, mode], cwd=ROOT, env=env,
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr[-500:]
+        return result.stderr
+
+    def test_contour_start_does_not_flood_core_console(self):
+        if "fork_posix" not in self._stderr("plain"):
+            pytest.skip("gRPC этой платформы не печатает обработчики fork()")
+        output = self._stderr("fixed")
+        assert "fork_posix" not in output and "ev_poll_posix" not in output
+
+    def test_run_imports_module_before_grpc(self):
+        tree = ast.parse((ROOT / "run.py").read_text(encoding="utf-8"))
+        first = next(node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom)))
+        assert isinstance(first, ast.Import) and first.names[0].name == "src.grpc_fork"
