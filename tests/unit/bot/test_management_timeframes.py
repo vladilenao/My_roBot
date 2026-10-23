@@ -36,6 +36,7 @@ def _live(manager, *, now=datetime(2026, 10, 12, 10, 1)):
     cache = MarketDataCache(lambda **kw: (data[kw["ticker"], kw["timeframe"]], kw["ticker"]), timeline,
                             request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=datetime(2026, 10, 12, 6, 0))
+    cache.contour_id = "emulation"
     worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     events = []
     bus = EventBus()

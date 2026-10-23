@@ -14,7 +14,6 @@ class HistoricalMarketServices:
     поток, локальный API и обработчик паттернов не запускаются.
     """
 
-    pattern_sink = None
     tracks_obligations = False
 
     def __init__(self, state_dir, clock, client_provider, market_calendar=None, boundary_checks=()) -> None:
@@ -42,6 +41,9 @@ class HistoricalMarketServices:
         return None
 
     def update_obligations(self, obligations) -> None:
+        return None
+
+    def acknowledge_tick(self) -> None:
         return None
 
     def close(self) -> None:

@@ -64,6 +64,17 @@ class _EntryCandidate:
         )
 
 
+def assignments_for(instrument: Instrument, share_strategies, future_strategies) -> list[Assignment]:
+    """Привязки инструмента: акция — по тикеру, фьючерс — по семейству."""
+    if instrument.instrument_type == "future":
+        if isinstance(instrument.family, str):
+            from src.instruments.futures import FAMILIES
+            return future_strategies.get(instrument.family,
+                future_strategies.get(FAMILIES[instrument.family][0], []))
+        return future_strategies.get(instrument.ticker[:2].upper(), [])
+    return share_strategies.get(instrument.ticker, [])
+
+
 class TradingBot:
     """Оркестратор-сценарий: каждый этап работы робота — отдельный метод.
 
@@ -96,7 +107,6 @@ class TradingBot:
         contract_lifecycle=None,
         market_data_settings=None,
         live_data_waiter=None,
-        pattern_worker=None,
     ) -> None:
         self._bus = bus
         self._strategy_map = strategy_map
@@ -114,9 +124,6 @@ class TradingBot:
         self._market_data_settings = market_data_settings or MarketDataSettings()
         # Ограниченное ожидание первичного прогрева фоновой ingestion-полосой.
         self._await_live_data = live_data_waiter
-        self._pattern_worker = pattern_worker
-        # Пары, о пропуске которых без UID уже предупредили (до появления UID).
-        self._pattern_uid_missing: set[tuple[str, str]] = set()
         self._context_cache = context_cache
         self._signal_filter = signal_filter
         self._post_tick = post_tick
@@ -359,7 +366,6 @@ class TradingBot:
             if frame.empty:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
-            self._submit_pattern_bar(instrument, tf, frame)
             context = self._lazy_context(instrument, tf, frame) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
             log.debug(
@@ -373,35 +379,6 @@ class TradingBot:
             self._manage(instrument, tf_assignments, frame, context, tf)
             if tf_assignments:
                 self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
-
-    def _submit_pattern_bar(self, instrument: Instrument, timeframe: str, frame) -> None:
-        """Единственная точка передачи уже закрытого бара фоновому анализу."""
-        worker = self._pattern_worker
-        if worker is None:
-            return
-        uid = self._pattern_uid(instrument, timeframe)
-        missing = (instrument_key(instrument), timeframe)
-        if not uid:
-            if missing not in self._pattern_uid_missing:
-                self._pattern_uid_missing.add(missing)
-                log.warning("Паттерны: UID пары %s %s неизвестен — закрытые бары не анализируются",
-                            self._display_name(instrument), timeframe)
-            return
-        self._pattern_uid_missing.discard(missing)
-        close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
-        worker.submit(ticker=instrument.ticker, instrument_uid=uid, timeframe=timeframe, close_time=close)
-
-    def _pattern_uid(self, instrument: Instrument, timeframe: str):
-        """UID пары у рыночного слоя: карточка live-инструмента его не содержит."""
-        resolve = getattr(self._data_cache, "pair_uid", None)
-        return resolve(instrument, timeframe) if callable(resolve) else getattr(instrument, "uid", None)
-
-    def _prime_pattern_bar(self, instrument: Instrument, timeframe: str, frame) -> None:
-        worker = self._pattern_worker
-        uid = self._pattern_uid(instrument, timeframe) if worker is not None else None
-        if worker is not None and uid and not frame.empty:
-            close = self._timeline.grid(timeframe).bar_close(frame["datetime"].iloc[-1])
-            worker.prime(instrument_uid=uid, timeframe=timeframe, close_time=close)
 
     # ── ПУНКТ 4.2: анализ по каждой привязке «стратегия × профиль» одного ТФ ──
     def _analyze(
@@ -788,13 +765,7 @@ class TradingBot:
 
     # ── диспетчеризация привязок по типу инструмента ──
     def _strategies_for(self, instrument: Instrument) -> list[Assignment]:
-        if instrument.instrument_type == "future":
-            if isinstance(instrument.family, str):
-                from src.instruments.futures import FAMILIES
-                return self._future_strategies.get(instrument.family,
-                    self._future_strategies.get(FAMILIES[instrument.family][0], []))
-            return self._future_strategies.get(instrument.ticker[:2].upper(), [])
-        return self._share_strategies.get(instrument.ticker, [])
+        return assignments_for(instrument, self._share_strategies, self._future_strategies)
 
     # ── ТФ и прогрев сопровождения незавершённых сделок инструмента ──
     def _management_needs(self, instrument: Instrument) -> dict[str, int]:
@@ -871,10 +842,12 @@ class TradingBot:
         self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
+        lag = getattr(self._data_cache, "feed_lag", None)
         self._bus.publish(
             Event.heartbeat(
                 tick_count=self._tick_count,
                 error_count=self._errors_in_period,
+                feed_lag=lag() if callable(lag) else None,
             )
         )
         self._errors_in_period = 0

@@ -30,6 +30,11 @@ from src.data.coverage_states import (  # noqa: E402,F401
 ROSTER_ORIGINS = frozenset({"selected", "obligation", "previous"})
 # Подтверждения ленты расписаний живут в общей таблице под этим префиксом.
 SCHEDULE_CHECKPOINT_PREFIX = "trading-schedules:"
+# Курсоры ленты торговых контуров: внешним потребителям этот префикс закрыт.
+CONTOUR_CONSUMER_PREFIX = "contour-"
+# Отметки исполнения, записанные до add-contour-market-feed, принадлежат
+# единственному тогда исполнителю в живой базе — эмуляции.
+LEGACY_CONTOUR = "emulation"
 # Порция очистки ленты /changes — одна короткая транзакция записи.
 PRUNE_BATCH = 5000
 
@@ -86,6 +91,12 @@ class ChangesPrune:
     more: bool
     holder: str | None = None
     holder_lag: int = 0
+
+
+def _require_contour(contour: str | None) -> None:
+    """Отметку исполнения пишет только торговый контур под своим ключом."""
+    if not contour or not isinstance(contour, str):
+        raise ValueError("Отметка исполнения требует идентификатор торгового контура")
 
 
 def _require_broker(provenance: str) -> None:
@@ -212,10 +223,18 @@ class MarketDataStore:
                     attempted_at TEXT NOT NULL, next_attempt_at TEXT NOT NULL,
                     PRIMARY KEY(source,instrument_uid,interval,open_time_utc)
                 );
-                CREATE TABLE IF NOT EXISTS analysis_cursors (
+                CREATE TABLE IF NOT EXISTS contour_cursors (
+                    contour_id TEXT NOT NULL,
                     source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
-                    assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
-                    PRIMARY KEY(source,instrument_uid,interval,assignment_id)
+                    processed_through TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,source,instrument_uid,interval)
+                );
+                CREATE TABLE IF NOT EXISTS pair_readiness (
+                    source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                    status_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(source,instrument_uid,interval)
                 );
                 CREATE TABLE IF NOT EXISTS trading_schedule_days (
                     source TEXT NOT NULL,
@@ -304,17 +323,66 @@ class MarketDataStore:
                     DROP TABLE interval_coverage_v1;
                     """
                 )
+            self._migrate_contour_marks(conn)
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
             self._set_default(conn, "schedule_max_change_id", "0")
 
-    def _backup_before_migration(self, conn: sqlite3.Connection, table: str) -> None:
+    def _migrate_contour_marks(self, conn: sqlite3.Connection) -> None:
+        """Отметки исполнения переходят под ключ контура (add-contour-market-feed).
+
+        Курсоры анализа получают ``contour_id`` (пересоздание таблицы),
+        граница обработки уходит из ``market_cursors`` в ``contour_cursors``,
+        закрепление входа — в ``input_references``. Всё прежнее принадлежит
+        эмуляции. Версия схемы экспорта не меняется: контракт ``/changes`` тот же.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(analysis_cursors)").fetchall()}
+        migrated = conn.execute("SELECT 1 FROM metadata WHERE key='contour_marks'").fetchone() is not None
+        if "contour_id" in columns and migrated:
+            return
+        legacy = bool(columns) and "contour_id" not in columns
+        if legacy or conn.execute("SELECT 1 FROM market_cursors WHERE processed_through IS NOT NULL LIMIT 1").fetchone():
+            self._backup_before_migration(conn, "market_cursors", label="pre-contour-feed")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if legacy:
+                conn.execute("ALTER TABLE analysis_cursors RENAME TO analysis_cursors_v1")
+            conn.execute("""CREATE TABLE IF NOT EXISTS analysis_cursors (
+                contour_id TEXT NOT NULL,
+                source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
+                PRIMARY KEY(contour_id,source,instrument_uid,interval,assignment_id))""")
+            if legacy:
+                conn.execute("""INSERT INTO analysis_cursors SELECT ?,source,instrument_uid,interval,assignment_id,open_time_utc
+                    FROM analysis_cursors_v1""", (LEGACY_CONTOUR,))
+                conn.execute("DROP TABLE analysis_cursors_v1")
+            now = _utc_text()
+            conn.execute("""INSERT OR IGNORE INTO contour_cursors(contour_id,source,instrument_uid,interval,processed_through,updated_at)
+                SELECT ?,source,instrument_uid,interval,processed_through,? FROM market_cursors WHERE processed_through IS NOT NULL""",
+                (LEGACY_CONTOUR, now))
+            conn.execute("UPDATE market_cursors SET processed_through=NULL WHERE processed_through IS NOT NULL")
+            rows = conn.execute("""SELECT key,value FROM metadata WHERE key LIKE 'live:candle:%'
+                AND value LIKE '%"input_reference"%'""").fetchall()
+            for key, value in rows:
+                facts = json.loads(value)
+                reference = facts.pop("input_reference", None)
+                if reference is not None:
+                    facts.setdefault("input_references", {})[LEGACY_CONTOUR] = reference
+                    self._write_live(conn, key, facts)
+            conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('contour_marks','1')")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _backup_before_migration(self, conn: sqlite3.Connection, table: str, *, label: str | None = None) -> None:
         """Согласованная копия файла базы перед пересозданием таблицы с данными."""
         if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
             return
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = self.path.with_name(f"{self.path.name}.before-schema-{SCHEMA_VERSION}-{stamp}.bak")
+        label = label or f"before-schema-{SCHEMA_VERSION}"
+        target = self.path.with_name(f"{self.path.name}.{label}-{stamp}.bak")
         with sqlite3.connect(target) as backup:
             conn.backup(backup)
 
@@ -324,7 +392,9 @@ class MarketDataStore:
 
     def source_info(self) -> SourceInfo:
         with self._lock, self._connect() as conn:
-            values = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+            # Только ключи источника: в metadata лежат и факты каждой свечи.
+            values = dict(conn.execute("SELECT key, value FROM metadata WHERE key IN "
+                                       "('producer_id', 'schema_version', 'min_after_id')").fetchall())
             maximum = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM changes").fetchone()[0]
         minimum = int(values["min_after_id"])
         # Очищенная целиком лента не опускает максимум ниже удержанного края.
@@ -469,25 +539,31 @@ class MarketDataStore:
         if old is not None and old["is_complete"] and not fence_matches:
             facts["conflict"] = {"candidate_revision": revision, "received_at": candle["received_at"],
                                  "reason": "source_conflict" if source_conflict else "values_conflict"}
-            cursor = conn.execute("SELECT processed_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
-                                  (source, uid, interval)).fetchone()
-            pin = facts.get("input_reference")
-            consumed = (pin is not None and pin.get("state") == "consumed"
-                        or cursor and cursor[0] is not None and stamp <= cursor[0])
-            if interval == "1m" and consumed:
+            pins = facts.get("input_references") or {}
+            consumer, pin = next(((contour, ref) for contour, ref in sorted(pins.items())
+                                  if ref.get("state") == "consumed"), (None, None))
+            if consumer is None:
+                passed = conn.execute("""SELECT contour_id FROM contour_cursors WHERE source=? AND instrument_uid=?
+                    AND interval=? AND processed_through>=? ORDER BY contour_id LIMIT 1""",
+                    (source, uid, interval, stamp)).fetchone()
+                consumer = None if passed is None else passed[0]
+            started = next(((contour, ref) for contour, ref in sorted(pins.items())
+                            if ref.get("state") == "started"), None)
+            if interval == "1m" and consumer is not None:
                 held = self._read_live(conn, uid_key)
                 held.update(integrity_hold=True, incident={"open_time": stamp, "candidate_revision": revision,
                     "consumed_revision": None if pin is None else pin["revision"],
                     "reason": "consumed_input_changed" if pin else "legacy_input_unconfirmed",
-                    "received_at": candle["received_at"]})
+                    "contour_id": consumer, "received_at": candle["received_at"]})
                 self._write_live(conn, uid_key, held)
-            elif interval == "1m" and pin is not None:
+            elif interval == "1m" and started is not None:
                 # Начатый пакет ещё не подтверждён финансовым owner.
                 # Замораживаем зависимые новые действия, но не выдаём
                 # сам факт pin за уже исполненную минуту.
                 held = self._read_live(conn, uid_key)
                 pending = held.setdefault("pending_input_conflicts", {})
-                pending[stamp] = {"revision": pin["revision"], "candidate_revision": revision}
+                pending[stamp] = {"revision": started[1]["revision"], "candidate_revision": revision,
+                                  "contour_id": started[0]}
                 self._write_live(conn, uid_key, held)
             self._write_live(conn, facts_key, facts)
             return {"state": "conflict", "revision": revision, "changed": False}
@@ -512,14 +588,15 @@ class MarketDataStore:
         return {"state": "accepted", "revision": revision, "changed": True,
                 "previous_coverage": None if previous is None else previous["state"]}
 
-    def pin_input(self, *, source, instrument_uid, interval, open_time):
-        """Закрепляет выбранную revision до внешней финансовой обработки."""
+    def pin_input(self, *, source, instrument_uid, interval, open_time, contour=None):
+        """Закрепляет выбранную revision до финансовой обработки контура ``contour``."""
+        _require_contour(contour)
         key = self._live_key("candle", source, instrument_uid, interval, open_time)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 facts = self._read_live(conn, key)
-                reference = facts.get("input_reference")
+                reference = (facts.get("input_references") or {}).get(contour)
                 if reference is None:
                     held = self._read_live(conn, self._live_key("uid", source, instrument_uid))
                     # Коррекция начатого, но не подтверждённого пакета
@@ -532,7 +609,7 @@ class MarketDataStore:
                         raise ValueError("Нет завершённой версии рыночного входа")
                     reference = dict(source=source, instrument_uid=instrument_uid, interval=interval,
                                      open_time_utc=_utc_text(open_time), revision=row["revision"], state="started")
-                    facts["input_reference"] = reference
+                    facts.setdefault("input_references", {})[contour] = reference
                     self._write_live(conn, key, facts)
                 conn.commit()
                 return dict(reference)
@@ -949,18 +1026,21 @@ class MarketDataStore:
                 (source, instrument_uid, kind, limit)).fetchall()
         return [(json.loads(row[0]), pd.Timestamp(row[1]).tz_localize(None)) for row in rows]
 
-    def analysis_cursor(self, *, source, instrument_uid, interval, assignment_id):
+    def analysis_cursor(self, *, source, instrument_uid, interval, assignment_id, contour=None):
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT open_time_utc FROM analysis_cursors WHERE source=? AND instrument_uid=? AND interval=? AND assignment_id=?",
-                (source, instrument_uid, interval, assignment_id)).fetchone()
+            row = conn.execute("""SELECT open_time_utc FROM analysis_cursors WHERE contour_id=? AND source=?
+                AND instrument_uid=? AND interval=? AND assignment_id=?""",
+                (contour, source, instrument_uid, interval, assignment_id)).fetchone()
         return pd.Timestamp(row[0]).tz_localize(None) if row else None
 
-    def mark_analyzed(self, *, source, instrument_uid, interval, assignment_id, open_time):
+    def mark_analyzed(self, *, source, instrument_uid, interval, assignment_id, open_time, contour=None):
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
-            conn.execute("""INSERT INTO analysis_cursors VALUES(?,?,?,?,?)
-                ON CONFLICT(source,instrument_uid,interval,assignment_id) DO UPDATE SET
+            conn.execute("""INSERT INTO analysis_cursors VALUES(?,?,?,?,?,?)
+                ON CONFLICT(contour_id,source,instrument_uid,interval,assignment_id) DO UPDATE SET
                 open_time_utc=MAX(analysis_cursors.open_time_utc,excluded.open_time_utc)""",
-                (source, instrument_uid, interval, assignment_id, _utc_text(open_time)))
+                (contour, source, instrument_uid, interval, assignment_id, _utc_text(open_time)))
 
     def unresolved_between(self, *, source, instrument_uid, interval, start, end, limit=1000):
         with self._lock, self._connect() as conn:
@@ -970,28 +1050,34 @@ class MarketDataStore:
                 (source, instrument_uid, interval, _utc_text(start), _utc_text(end), limit)).fetchall()
         return [pd.Timestamp(row[0]).tz_localize(None) for row in rows]
 
-    def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object) -> None:
-        """Продвигает границу симуляции после внешнего durable commit."""
+    def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object,
+                       contour: str | None = None) -> None:
+        """Продвигает границу обработки контура после его durable commit."""
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 stamp = _utc_text(open_time)
                 key = self._live_key("candle", source, instrument_uid, interval, stamp)
                 facts = self._read_live(conn, key)
-                reference = facts.get("input_reference")
+                reference = (facts.get("input_references") or {}).get(contour)
                 if reference is not None:
                     reference["state"] = "consumed"
                     self._write_live(conn, key, facts)
                 uid_key = self._live_key("uid", source, instrument_uid)
                 held = self._read_live(conn, uid_key)
                 pending = held.get("pending_input_conflicts", {})
-                conflict = pending.pop(stamp, None)
-                if conflict is not None:
+                conflict = pending.get(stamp)
+                if conflict is not None and conflict.get("contour_id", contour) == contour:
+                    pending.pop(stamp)
                     held.update(integrity_hold=True, incident={"open_time": stamp,
                         "consumed_revision": conflict["revision"], "candidate_revision": conflict["candidate_revision"],
-                        "reason": "consumed_input_changed", "received_at": _utc_text()})
+                        "reason": "consumed_input_changed", "contour_id": contour, "received_at": _utc_text()})
                     self._write_live(conn, uid_key, held)
-                self._advance_cursor(conn, source, instrument_uid, interval, processed=stamp)
+                conn.execute("""INSERT INTO contour_cursors(contour_id,source,instrument_uid,interval,processed_through,updated_at)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(contour_id,source,instrument_uid,interval) DO UPDATE SET
+                    processed_through=MAX(contour_cursors.processed_through,excluded.processed_through),
+                    updated_at=excluded.updated_at""", (contour, source, instrument_uid, interval, stamp, _utc_text()))
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -1046,13 +1132,69 @@ class MarketDataStore:
             MarketDataStore._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
         return resolved
 
-    def cursors(self, *, source: str, instrument_uid: str, interval: str) -> dict[str, str | None]:
+    def publish_pair_readiness(self, *, source: str, instrument_uid: str, interval: str, status: dict) -> None:
+        """Текущая готовность живой пары от ядра; не событие и не строка ``/changes``."""
+        payload = json.dumps(status, separators=(",", ":"), ensure_ascii=False, sort_keys=True, default=str)
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO pair_readiness(source,instrument_uid,interval,status_json,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(source,instrument_uid,interval) DO UPDATE SET
+                status_json=excluded.status_json, updated_at=excluded.updated_at
+                WHERE pair_readiness.status_json<>excluded.status_json""",
+                (source, instrument_uid, interval, payload, _utc_text()))
+
+    def drop_pair_readiness(self, *, source: str, instrument_uid: str | None = None,
+                            interval: str | None = None) -> None:
+        """Снимает готовность пары; без UID — всех пар источника (старт ядра)."""
+        with self._lock, self._connect() as conn:
+            if instrument_uid is None:
+                conn.execute("DELETE FROM pair_readiness WHERE source=?", (source,))
+            else:
+                conn.execute("DELETE FROM pair_readiness WHERE source=? AND instrument_uid=? AND interval=?",
+                             (source, instrument_uid, interval))
+
+    def pair_readiness(self, *, source: str, instrument_uid: str, interval: str) -> dict | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("""SELECT status_json,updated_at FROM pair_readiness
+                WHERE source=? AND instrument_uid=? AND interval=?""", (source, instrument_uid, interval)).fetchone()
+        return None if row is None else {**json.loads(row[0]), "updated_at": row[1]}
+
+    def pair_readiness_all(self, *, source: str) -> list[dict]:
+        """Готовность всех живых пар источника одной короткой транзакцией чтения."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT instrument_uid,interval,status_json,updated_at FROM pair_readiness
+                WHERE source=? ORDER BY instrument_uid,interval""", (source,)).fetchall()
+        return [{**json.loads(row["status_json"]), "instrument_uid": row["instrument_uid"],
+                 "interval": row["interval"], "updated_at": row["updated_at"]} for row in rows]
+
+    def checkpoint(self, consumer_id: str) -> dict | None:
+        """Подтверждённый курсор ленты ``/changes`` потребителя либо ``None``."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT producer_id,acknowledged_through FROM consumer_checkpoints WHERE consumer_id=?",
+                               (consumer_id,)).fetchone()
+        return None if row is None else {"producer_id": row[0], "acknowledged_through": int(row[1])}
+
+    def source_absent_opens(self, *, source: str, instrument_uid: str, interval: str) -> list[pd.Timestamp]:
+        """Интервалы, разрешённые как «у источника нет»: поздняя свеча по ним — отдельная отметка."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT open_time_utc FROM interval_coverage WHERE source=? AND instrument_uid=?
+                AND interval=? AND state='source_absent' ORDER BY open_time_utc""",
+                (source, instrument_uid, interval)).fetchall()
+        return [pd.Timestamp(row[0]).tz_convert("UTC").tz_localize(None) for row in rows]
+
+    def cursors(self, *, source: str, instrument_uid: str, interval: str, contour: str | None = None) -> dict[str, str | None]:
+        """Границы пары; ``processed_through`` — контура ``contour`` либо наибольшая по контурам."""
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT received_through,resolved_through,processed_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                "SELECT received_through,resolved_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
                 (source, instrument_uid, interval),
             ).fetchone()
-        return dict(row) if row is not None else {"received_through": None, "resolved_through": None, "processed_through": None}
+            processed = conn.execute(
+                "SELECT MAX(processed_through) FROM contour_cursors WHERE source=? AND instrument_uid=? AND interval=?"
+                + ("" if contour is None else " AND contour_id=?"),
+                (source, instrument_uid, interval) + (() if contour is None else (contour,)),
+            ).fetchone()[0]
+        result = dict(row) if row is not None else {"received_through": None, "resolved_through": None}
+        return {**result, "processed_through": processed}
 
     @staticmethod
     def _advance_cursor(

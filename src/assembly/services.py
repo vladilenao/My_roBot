@@ -27,6 +27,8 @@ class ContourDemand:
 
     ``obligations`` — обязательства незавершённых сделок для владельца входа;
     ``None`` — у контура нет финансовой базы (NotifyOnly), обязательств нет.
+    ``pattern_pairs`` — пары (инструмент, ТФ привязки), чьи закрытые бары ядро
+    ставит воркеру паттернов (add-contour-market-feed).
     """
 
     instruments: tuple[Instrument, ...]
@@ -34,6 +36,7 @@ class ContourDemand:
     obligations: object = None
     history_requests: tuple[tuple[Instrument, str, int], ...] = ()
     execution_lower: tuple[tuple[Instrument, datetime], ...] = ()
+    pattern_pairs: tuple[tuple[Instrument, str], ...] = ()
 
 
 class MarketServices(Protocol):
@@ -44,12 +47,13 @@ class MarketServices(Protocol):
     market_store: object
     market_calendar: object
     request_budget: object
-    pattern_sink: object
 
     def cluster_gate(self, state_dir): ...
 
     def serve(self, demand: ContourDemand) -> Callable[[], bool] | None: ...
 
     def update_obligations(self, obligations) -> None: ...
+
+    def acknowledge_tick(self) -> None: ...
 
     def close(self) -> None: ...

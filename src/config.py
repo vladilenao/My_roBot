@@ -87,6 +87,10 @@ _DEFAULTS = {
     "market_structure_redis_db": 0,
     "market_structure_queue_maxsize": 1024,
     "market_structure_retention_days": 90,
+    # Контур эмуляции читает свечи из ленты ядра (add-contour-market-feed);
+    # false — откат на прямое чтение памяти ядра на время П3.1.
+    "contours_market_feed": True,
+    "contours_feed_poll_secs": 1,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -158,6 +162,8 @@ DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
 DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
 MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
+CONTOURS_MARKET_FEED = _CONFIG["contours_market_feed"]
+CONTOURS_FEED_POLL_SECS = _CONFIG["contours_feed_poll_secs"]
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
 MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]

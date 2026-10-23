@@ -34,6 +34,7 @@ def live_cache(tmp_path, *timeframes):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), UID), timeline,
                             request_budget=RequestBudget(lambda: clock[0], 0), market_store=store)
+    cache.contour_id = "emulation"
     for tf in timeframes or ("1m",):
         cache.register_live_pair(ITEM, UID, tf)
         cache.mark_live_history(UID, tf, done=True)

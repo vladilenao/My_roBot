@@ -32,11 +32,12 @@ from src.config import (
 from src.api.client import default_client_provider
 from src.data.cache import MarketDataCache
 from src.data.loader import load_candles
-from src.data.market_store import MarketDataStore
+from src.data.market_store import SOURCE_TBANK, MarketDataStore
 from src.data.export_api import MarketDataExportServer
 from src.data.reconciliation import MarketDataReconciler
 from src.data.poller import LiveMarketDataPoller
 from src.data.ingestion import IngestionWorker
+from src.market_structure.trigger import PatternTrigger
 from src.data.lanes import CalendarLane, ChangesRetentionLane, CompletenessLane, EvidenceLane
 from src.data.stream_ingestion import StreamSupervisor
 from src.instruments import Instrument
@@ -64,7 +65,6 @@ def _start_local_api(market_store, state_dir, control=None):
     ошибка конфигурации доступа не должна останавливать торговлю.
     """
     from src.clusters.report import ClusterReport
-    from src.data.market_store import SOURCE_TBANK
 
     control_token = ROBOT_CONTROL_TOKEN if control is not None else None
     if not MARKET_DATA_EXPORT_TOKEN and not control_token:
@@ -114,7 +114,6 @@ def _live_cluster_gate(*, market_store, data_cache, state_dir):
     from src.clusters.consumer import ClusterEventsConsumer
     from src.clusters.gate import ClusterGate, store_candles
     from src.clusters.store import FILE_NAME, ClusterEventStore
-    from src.data.market_store import SOURCE_TBANK
 
     store = ClusterEventStore(state_dir / FILE_NAME)
     consumer = ClusterEventsConsumer(store, _cluster_redis(), stream=CLUSTER_SETTINGS.stream,
@@ -137,6 +136,9 @@ def _build_market_data(*, state_dir, clock, provider, history, market_calendar=N
         clock=clock,
     )
     market_store = None if history else MarketDataStore(state_dir / MARKET_DATA_DATABASE_FILE)
+    if market_store is not None:
+        # Готовность прошлого запуска не действует: пары заново проходят прогрев.
+        market_store.drop_pair_readiness(source=SOURCE_TBANK)
     from src.data.request_budget import RequestBudget
     # Полосы: без глобального окна темпа (свежий опрос ограничен для пары),
     # раздельные сервисы и доли полос (design 2).
@@ -335,6 +337,7 @@ class LiveCore:
         self.timeline = self.market_store = self.request_budget = None
         self.market_calendar = self.market_reconciler = self.data_cache = None
         self.pattern_sink = None
+        self._pattern_trigger = None
         self._poller = None
         self._worker = None
         self._cluster_consumer = None
@@ -370,7 +373,7 @@ class LiveCore:
         return gate
 
     def serve(self, demand: ContourDemand):
-        """Потребности контура → приём, поток, ожидание прогрева и обработчик паттернов."""
+        """Потребности контура → приём, поток, ожидание прогрева, обработчик паттернов и его сторож."""
         self._poller, self._worker = _start_live_ingestion(
             self.data_cache, demand, self.client_provider, early=self.early)
         self._tracks = demand.obligations is not None
@@ -394,6 +397,10 @@ class LiveCore:
                 retention_days=MARKET_STRUCTURE_RETENTION_DAYS,
             )
             self.pattern_sink.start()
+            # Закрытые бары пар привязок ставит ядро, не тик контура.
+            self._pattern_trigger = PatternTrigger(self.data_cache, self.timeline, self.pattern_sink,
+                                                   demand.pattern_pairs)
+            self._pattern_trigger.start()
         return waiter
 
     @property
@@ -405,7 +412,14 @@ class LiveCore:
         if self._worker is not None and obligations is not None:
             self._worker.set_execution_obligations(obligations)
 
+    def acknowledge_tick(self) -> None:
+        """Контур на памяти ядра курсора ленты не держит."""
+        return None
+
     def stop_patterns(self) -> None:
+        if self._pattern_trigger is not None:
+            self._pattern_trigger.stop()
+            self._pattern_trigger = None
         if self.pattern_sink is not None:
             self.pattern_sink.stop()
             self.pattern_sink = None

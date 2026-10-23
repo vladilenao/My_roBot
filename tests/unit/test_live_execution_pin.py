@@ -29,6 +29,7 @@ def setup(tmp_path, boundaries=None):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), UID), timeline,
                             request_budget=RequestBudget(lambda: NOW, 0), market_store=store)
+    cache.contour_id = "emulation"
     instrument = Instrument("SBER", "SBER", "share", "SBER", UID)
     cache.register_live_pair(instrument, UID, "1m")
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100), ("2026-10-12 12:01", 101)), received_at=NOW)
@@ -60,7 +61,7 @@ def test_simulator_receives_pinned_revision_and_marker_consumes_it(tmp_path):
     assert store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")["processed_through"].endswith("12:01:00Z")
     facts = store.live_state(kind="candle", source=SOURCE, instrument_uid=UID, interval="1m",
                              open_time=pd.Timestamp("2026-10-12 12:01"))
-    assert facts["input_reference"]["state"] == "consumed"
+    assert facts["input_references"]["emulation"]["state"] == "consumed"
 
 
 def test_conflicting_minute_holds_execution_without_skipping(tmp_path):

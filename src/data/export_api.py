@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from src.data.market_store import CursorExpired, MarketDataStore, ProducerMismatch
+from src.data.market_store import CONTOUR_CONSUMER_PREFIX, CursorExpired, MarketDataStore, ProducerMismatch
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -165,7 +165,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
         consumer_id = (schedule_match or match).group(1)
-        if not _CONSUMER_ID.fullmatch(consumer_id):
+        if not _CONSUMER_ID.fullmatch(consumer_id) or consumer_id.startswith(CONTOUR_CONSUMER_PREFIX):
+            # Префикс contour- занят курсорами торговых контуров робота.
             self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Некорректный consumer_id.")
             return
         try:

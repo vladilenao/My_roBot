@@ -22,6 +22,7 @@ def setup_owner(tmp_path):
         pytest.fail("Сеть из чтения торгового входа")
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(forbidden, timeline, market_store=store)
+    cache.contour_id = "emulation"
     instrument = Instrument("SBER", "SBER", "share", "SBER", "u")
     cache.register_live_pair(instrument, "u", "1m")
     cache._live_evidence["u", "1m"] = StreamClosureEvidence("u", "1m", 1, 1, 1, True)

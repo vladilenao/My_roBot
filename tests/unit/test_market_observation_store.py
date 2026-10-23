@@ -87,15 +87,15 @@ def test_pinned_input_and_integrity_hold_survive_restart_and_reconciliation(tmp_
     path = tmp_path / "market.sqlite3"
     store = MarketDataStore(path)
     store.accept_observation(observation(100))
-    reference = store.pin_input(open_time=OPEN, **IDENTITY)
-    store.mark_processed(open_time=OPEN, **IDENTITY)
+    reference = store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")
+    store.mark_processed(open_time=OPEN, **IDENTITY, contour="emulation")
     reference["state"] = "consumed"
     store.accept_observation(observation(101, transport="stream"))
     reopened = MarketDataStore(path)
     assert reopened.pinned_frame(reference)["close"] == 100
     assert reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")["integrity_hold"]
     # Повтор начатого пакета получает исходную revision, новый ключ — hold.
-    assert reopened.pin_input(open_time=OPEN, **IDENTITY) == reference
+    assert reopened.pin_input(open_time=OPEN, **IDENTITY, contour="emulation") == reference
     reopened.accept_observation(observation(101), reconcile_sequence=state(reopened)["observed_sequence"])
     assert reopened.pinned_frame(reference)["close"] == 100
     assert reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")["integrity_hold"]
@@ -113,18 +113,18 @@ def test_market_operational_state_preserves_producer_and_export_schema(tmp_path)
     assert reopened.source_info().schema_version == SCHEMA_VERSION
     assert reopened.live_state(kind="pair", **IDENTITY)["epoch"] == 3
     export = reopened.changes_after(producer, 0)["changes"][0]["candle"]
-    assert "epoch" not in export and "input_reference" not in export
+    assert "epoch" not in export and "input_reference" not in export and "input_references" not in export
 
 
 def test_inflight_pin_is_not_itself_financial_execution(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     store.accept_observation(observation(100))
-    store.pin_input(open_time=OPEN, **IDENTITY)
+    store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")
     store.accept_observation(observation(101, transport="stream"))
     held = store.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")
     assert not held.get("integrity_hold")
     assert held["pending_input_conflicts"]
-    store.mark_processed(open_time=OPEN, **IDENTITY)
+    store.mark_processed(open_time=OPEN, **IDENTITY, contour="emulation")
     held = store.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")
     assert held["integrity_hold"]
     assert not held["pending_input_conflicts"]
@@ -138,7 +138,7 @@ def test_receipt_resolved_and_processed_are_independent(tmp_path):
     assert store.cursors(**IDENTITY)["processed_through"] is None
     store.mark_resolved(open_time=OPEN, **IDENTITY)
     assert store.cursors(**IDENTITY)["processed_through"] is None
-    store.mark_processed(open_time=OPEN, **IDENTITY)
+    store.mark_processed(open_time=OPEN, **IDENTITY, contour="emulation")
     assert store.cursors(**IDENTITY)["processed_through"] == store.cursors(**IDENTITY)["resolved_through"]
 
 
@@ -159,8 +159,8 @@ def test_contiguous_resolution_uses_meaningful_lower_not_received_high_water(tmp
 def test_analysis_cursor_does_not_advance_external_processed_frontier(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     store.accept_observation(observation())
-    store.mark_analyzed(assignment_id="a", open_time=OPEN, **IDENTITY)
-    assert store.analysis_cursor(assignment_id="a", **IDENTITY) == OPEN
+    store.mark_analyzed(assignment_id="a", open_time=OPEN, **IDENTITY, contour="emulation")
+    assert store.analysis_cursor(assignment_id="a", **IDENTITY, contour="emulation") == OPEN
     assert store.cursors(**IDENTITY)["processed_through"] is None
 
 
@@ -178,8 +178,8 @@ def test_calendar_resolution_recomputes_persisted_meaningful_prefix(tmp_path):
 def test_unknown_missing_or_conflicting_input_cannot_be_pinned(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     with pytest.raises(ValueError, match="завершённой"):
-        store.pin_input(open_time=OPEN, **IDENTITY)
+        store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")
     store.accept_observation(observation())
     store.accept_observation(observation(101, transport="stream"))
     with pytest.raises(ValueError, match="неподтверждённый"):
-        store.pin_input(open_time=OPEN, **IDENTITY)
+        store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")

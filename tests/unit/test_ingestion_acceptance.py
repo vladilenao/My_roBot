@@ -59,6 +59,7 @@ def test_critical_gap_of_one_uid_does_not_stop_healthy_uid(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), kw["instrument_id"]), timeline,
                             request_budget=RequestBudget(lambda: now, 0), market_store=store)
+    cache.contour_id = "emulation"
     a, b = (Instrument(name, name, "share", name, name.lower()) for name in ("AAA", "BBB"))
     for item in (a, b):
         # Сохранённые обязательства передаются до приёма данных, как в run.py:
@@ -143,6 +144,7 @@ def test_end_to_end_stream_startup_overlap_internal_and_trailing_gap(tmp_path):
     # Робот работает с 11:30: внутренняя дыра — пропуск во время работы.
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=datetime(2026, 10, 12, 11, 30))
+    cache.contour_id = "emulation"
     item = Instrument("SBER", "SBER", "share", "SBER", "u")
     cache.prepare_live_history(item, "1m", 30)
     settings = MarketDataSettings(independent_lanes=False, live_transport="stream", candle_publication_timeout_secs=30,
