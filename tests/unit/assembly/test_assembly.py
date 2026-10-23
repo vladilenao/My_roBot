@@ -35,15 +35,30 @@ def test_services_do_not_import_contour(module):
     assert not any("contour" in name for name in imported), sorted(imported)
 
 
+def test_feed_services_do_not_import_core_or_history():
+    imported = _imports(ROOT / "src" / "assembly" / "feed.py")
+    assert not {"src.assembly.core", "src.assembly.history", "src.assembly.contour"} & imported, sorted(imported)
+
+
 def test_contour_reaches_data_only_through_services_port():
     imported = _imports(ROOT / "src" / "assembly" / "contour.py")
     assert "src.assembly.core" not in imported and "src.assembly.history" not in imported
 
 
 class TestBuildDemand:
-    def test_notify_only_has_no_obligations(self):
+    def test_notify_only_has_no_obligations(self, monkeypatch):
+        monkeypatch.setattr(contour, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="1h")]})
         demand = contour.build_demand(contour._Runtime(), [SBER], data_cache=None)
-        assert demand == ContourDemand((SBER,))
+        assert demand == ContourDemand((SBER,), pattern_pairs=((SBER, "1h"),))
+
+    def test_pattern_pairs_are_assignment_timeframes_of_selected_instruments(self, monkeypatch):
+        monkeypatch.setattr(contour, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="4h"),
+                                                                   SimpleNamespace(timeframe="1h"),
+                                                                   SimpleNamespace(timeframe="1h")]})
+        monkeypatch.setattr(contour, "FUTURE_STRATEGIES", {"NG": [SimpleNamespace(timeframe="15m")]})
+        demand = contour.build_demand(contour._Runtime(), [SBER, NG, ("GAZP", "GAZP", "share")], data_cache=None)
+        assert [(item.ticker, tf) for item, tf in demand.pattern_pairs] == [("SBER", "1h"), ("SBER", "4h"),
+                                                                           ("NGZ6", "15m")]
 
     def test_obligations_requests_and_lower_come_from_contour_storage(self):
         plan = SimpleNamespace(instrument_id="uid-ng", timeframe="1h", profile=SimpleNamespace(parameters={"atr_period": 20}))
@@ -77,7 +92,7 @@ def test_historical_services_start_no_live_parts(monkeypatch, tmp_path):
         monkeypatch.setattr(core, name, lambda *a, **k: pytest.fail("история запустила живую часть"))
     services = HistoricalMarketServices(tmp_path, clock=object(), client_provider=object())
     assert services.serve(ContourDemand(())) is None
-    assert services.pattern_sink is None and not services.tracks_obligations
+    assert not hasattr(services, "pattern_sink") and not services.tracks_obligations
     services.update_obligations(object())
     services.close()
 
@@ -85,26 +100,28 @@ def test_historical_services_start_no_live_parts(monkeypatch, tmp_path):
 def test_live_core_closes_in_previous_order():
     order = []
     live = core.LiveCore.__new__(core.LiveCore)
+    live._pattern_trigger = SimpleNamespace(stop=lambda: order.append("trigger"))
     live.pattern_sink = SimpleNamespace(stop=lambda: order.append("patterns"))
     live._poller = SimpleNamespace(close=lambda: order.append("poller"))
     live.early = None
     live._cluster_consumer = SimpleNamespace(stop=lambda: order.append("clusters"))
     live.export_server = SimpleNamespace(close=lambda: order.append("api"))
     live.close()
-    assert order == ["patterns", "poller", "clusters", "api"]
+    assert order == ["trigger", "patterns", "poller", "clusters", "api"]
 
 
 def test_live_core_without_serve_closes_early_lanes():
     order = []
     live = core.LiveCore.__new__(core.LiveCore)
-    live.pattern_sink = live._poller = live._cluster_consumer = None
+    live.pattern_sink = live._pattern_trigger = live._poller = live._cluster_consumer = None
     live.early = SimpleNamespace(poller=SimpleNamespace(close=lambda: order.append("early")))
     live.export_server = SimpleNamespace(close=lambda: order.append("api"))
     live.close()
     assert order == ["early", "api"]
 
 
-def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path):
+@pytest.mark.parametrize("market_feed", [False, True])
+def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path, market_feed):
     order = []
 
     class FakeCore:
@@ -129,9 +146,24 @@ def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path):
         def close(self):
             order.append("core.close")
 
+    class FakeFeed:
+        def __init__(self, core, *, contour_id, poll_seconds):
+            assert isinstance(core, FakeCore) and contour_id == "emulation"
+            order.append("feed")
+            self.core = core
+
+        def serve(self, demand):
+            return self.core.serve(demand)
+
+        def close(self):
+            order.append("feed.close")
+            self.core.close()
+
+    services_class = FakeFeed if market_feed else FakeCore
+
     class FakeContour:
         def __init__(self, settings, services):
-            assert settings.kind == "emulation" and services.__class__ is FakeCore
+            assert settings.kind == "emulation" and services.__class__ is services_class
 
         def build(self):
             order.append("build")
@@ -150,6 +182,8 @@ def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path):
             order.append("contour.close")
 
     monkeypatch.setattr(run, "LiveCore", FakeCore)
+    monkeypatch.setattr(run, "FeedMarketServices", FakeFeed)
+    monkeypatch.setattr(run, "CONTOURS_MARKET_FEED", market_feed)
     monkeypatch.setattr(run, "TradingContour", FakeContour)
     monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
     monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
@@ -158,5 +192,24 @@ def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path):
     code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None, session=SimpleNamespace(),
                              channel_names=[])
     assert code == 0
-    assert order == ["early", "api", "choose", "data", "api", "build", "demand", "serve", "run:waiter",
-                     "core.close", "contour.close"]
+    feed = ["feed"] if market_feed else []
+    closing = ["feed.close", "core.close"] if market_feed else ["core.close"]
+    assert order == ["early", "api", "choose", "data", "api", *feed, "build", "demand", "serve", "run:waiter",
+                     *closing, "contour.close"]
+
+
+@pytest.mark.parametrize("result, acknowledged", [(True, 1), (None, 1), (False, 0)])
+def test_feed_cursor_is_acknowledged_only_after_committed_tick(monkeypatch, result, acknowledged):
+    captured, acks = {}, []
+
+    class Bot:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            captured["result"] = captured["post_tick"]({"1m"})
+
+    monkeypatch.setattr(contour, "TradingBot", Bot)
+    runtime = contour._Runtime(post_tick=lambda ready: result)
+    contour._run_bot([], None, runtime, data_cache=None, timeline=None, after_tick=lambda: acks.append(1))
+    assert captured["result"] is result and len(acks) == acknowledged

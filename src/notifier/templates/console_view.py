@@ -369,8 +369,10 @@ def _system(event: Event, stamp: str) -> Block | None:
         errors = event.get("error_count", 0)
         def ending(n: int, forms: tuple[str, str, str]) -> str:
             return forms[2] if 11 <= n % 100 <= 14 else forms[0] if n % 10 == 1 else forms[1] if 2 <= n % 10 <= 4 else forms[2]
+        lag = event.get("feed_lag") or 0
+        behind = f" · лента ядра отстаёт на {lag} {ending(lag, ('изменение', 'изменения', 'изменений'))}" if lag > 0 else ""
         return Block(stamp, "СИСТЕМА", f"{ticks} {ending(ticks, ('такт', 'такта', 'тактов'))} работы · "
-                     f"{errors} {ending(errors, ('ошибка', 'ошибки', 'ошибок'))}", role="muted")
+                     f"{errors} {ending(errors, ('ошибка', 'ошибки', 'ошибок'))}{behind}", role="muted")
     if event.type is EventType.ERROR:
         return Block(stamp, "СБОЙ", event.get("operation") or "выполнение операции",
                      ("Подробности в bot_debug.log рядом с роботом",), "error")

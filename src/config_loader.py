@@ -61,6 +61,10 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "queue_maxsize": "market_structure_queue_maxsize",
         "retention_days": "market_structure_retention_days",
     },
+    "contours": {
+        "market_feed": "contours_market_feed",
+        "feed_poll_secs": "contours_feed_poll_secs",
+    },
     "instruments": {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
@@ -128,6 +132,8 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_redis_db": int,
     "market_structure_queue_maxsize": int,
     "market_structure_retention_days": int,
+    "contours_market_feed": bool,
+    "contours_feed_poll_secs": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -581,6 +587,8 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [market_structure] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
+        if key == "contours_feed_poll_secs" and (isinstance(value, bool) or value < 1):
+            raise ConfigError(f"{path}: [contours] feed_poll_secs должен быть целым числом > 0, получено {value!r}")
         if key == "market_structure_redis_port" and value > 65535:
             raise ConfigError(f"{path}: [market_structure] redis_port не может быть больше 65535")
         if key == "market_structure_redis_db" and (isinstance(value, bool) or value < 0):

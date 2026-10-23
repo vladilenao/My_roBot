@@ -53,6 +53,7 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
     store = MarketDataStore(Path(tempfile.mkdtemp()) / "market.sqlite3")
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=cutover)
+    cache.contour_id = "emulation"
     worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     events = []
     class Channel:
@@ -265,6 +266,7 @@ def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path
         return frame("2026-10-09 19:00", count=3), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0),
                             market_store=MarketDataStore(tmp_path / "market.sqlite3"))
+    cache.contour_id = "emulation"
     instrument = Instrument("SBER", "SBER", "share", "SBER", "uid")
     assert cache.prepare_live_history(instrument, "1h", 100).empty  # торговое чтение без сети
     assert calls == []
@@ -302,6 +304,7 @@ def test_entry_market_uses_calendar_phase_and_publication_deadline():
     timeline = MultiTimeframeScheduler(["1m"], clock=lambda: now)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
     cache = MarketDataCache(lambda **kwargs: (frame("2026-10-12 10:00", "1m", 1), "uid"), timeline)
+    cache.contour_id = "emulation"
     cache.calendar_expectation = lambda *args, **kwargs: SimpleNamespace(
         phase=SimpleNamespace(value="break"), last_due=None,
     )
@@ -364,6 +367,7 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
         return source[keep].reset_index(drop=True), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
                            market_reconciler=rec, recovery_retry_seconds=65)
+    cache.contour_id = "emulation"
     worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     store.set_interval_state(source="tbank_exchange", instrument_uid="uid", interval="1m",
         open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
@@ -441,7 +445,7 @@ def test_old_market_store_migration_preserves_candles_coverage_cursors_and_analy
     source, uid, interval = "tbank_exchange", "uid", "1m"
     store.record_candles(source=source, instrument_uid=uid, interval=interval,
         candles=frame("2026-10-09 19:59", interval, 3))
-    store.mark_processed(source=source, instrument_uid=uid, interval=interval, open_time="2026-10-09 19:59")
+    store.mark_processed(source=source, instrument_uid=uid, interval=interval, open_time="2026-10-09 19:59", contour="emulation")
     before = store.source_info()
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE recovery_attempts")
@@ -450,9 +454,9 @@ def test_old_market_store_migration_preserves_candles_coverage_cursors_and_analy
     assert reopened.source_info() == before
     assert len(reopened.current_frame(source=source, instrument_uid=uid, interval=interval)) == 3
     assert reopened.cursors(source=source, instrument_uid=uid, interval=interval)["processed_through"] == "2026-10-09T19:59:00Z"
-    reopened.mark_analyzed(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", open_time="2026-10-09 19:00")
+    reopened.mark_analyzed(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", open_time="2026-10-09 19:00", contour="emulation")
     again = MarketDataStore(path)
-    assert again.analysis_cursor(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy") == pd.Timestamp("2026-10-09 19:00")
+    assert again.analysis_cursor(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", contour="emulation") == pd.Timestamp("2026-10-09 19:00")
 
 
 def test_holds_are_structured_utc_moments_without_phrases():

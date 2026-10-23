@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.2.0-proposal
+  version: 1.3.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -167,11 +167,17 @@ paths:
       description: |
         Потребитель вызывает после commit своей БД. Повтор и меньший
         change_id не откатывают ранее подтверждённый курсор.
+
+        Имена с префиксом `contour-` заняты курсорами торговых контуров
+        робота: контур читает ленту напрямую из базы, и его курсор так же
+        удерживает очистку ленты. Такое имя в запросе отклоняется с `400`.
       parameters:
         - name: consumer_id
           in: path
           required: true
-          description: Стабильное имя потребителя, например historical-emulator.
+          description: |
+            Стабильное имя потребителя, например historical-emulator.
+            Префикс `contour-` зарезервирован за торговыми контурами робота (400).
           schema:
             type: string
             pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
@@ -240,6 +246,7 @@ paths:
         - name: consumer_id
           in: path
           required: true
+          description: Имя потребителя; префикс `contour-` зарезервирован за торговыми контурами робота (400).
           schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
       requestBody:
         required: true

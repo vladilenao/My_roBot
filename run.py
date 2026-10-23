@@ -7,6 +7,8 @@ import sys
 
 from src.config import (
     ACTIVE_TIMEFRAMES,
+    CONTOURS_FEED_POLL_SECS,
+    CONTOURS_MARKET_FEED,
     DATA_REFRESH_MIN_INTERVAL,
     MARKET_DATA_EXPORT_ENABLED,
     MARKET_DATA_SETTINGS,
@@ -58,6 +60,7 @@ from src.bot.launch import (
 )
 from src.assembly.contour import ContourSettings, TradingContour, _family_warmup, _strategy_map
 from src.assembly.core import LiveCore, _say
+from src.assembly.feed import FeedMarketServices
 from src.assembly.history import HistoricalMarketServices
 from src.assembly.services import _timeframes
 from src.bot.launch_control import LaunchControl
@@ -523,6 +526,9 @@ def _launch(
     else:
         services = core.ensure_market_data()
         services.start_api(control)
+        if CONTOURS_MARKET_FEED:
+            # Контур эмуляции читает свечи из ленты ядра (add-contour-market-feed).
+            services = FeedMarketServices(core, contour_id=MODE_EMULATION, poll_seconds=CONTOURS_FEED_POLL_SECS)
     contour = TradingContour(ContourSettings(
         kind=MODE_HISTORY if history else MODE_EMULATION, state_dir=state_dir, channel_names=channel_names,
         clock=clock, session=session, client_provider=provider, instruments=instruments,

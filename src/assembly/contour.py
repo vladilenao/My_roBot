@@ -14,6 +14,7 @@ import json
 
 from src.decision import SignalFilter
 from src.bot import TradingBot
+from src.bot.trading_bot import assignments_for
 from src.config import (
     MARKET_DATA_SETTINGS,
     FUTURE_STRATEGIES,
@@ -198,14 +199,18 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
-             pattern_worker=None, update_obligations=None) -> None:
+             update_obligations=None, after_tick=None) -> None:
     def post_tick(ready_tfs):
         # Обязательства после тика контур считает сам и передаёт службам.
         if update_obligations is not None and runtime.storage is not None:
             update_obligations(_market_obligations(
                 runtime.storage.execution_bar_boundaries(), runtime.execution_aliases,
                 runtime.execution_instruments, data_cache))
-        return runtime.post_tick(ready_tfs)
+        result = runtime.post_tick(ready_tfs)
+        # Курсор ленты подтверждается только после commit тика.
+        if after_tick is not None and result is not False:
+            after_tick()
+        return result
 
     TradingBot(
         instruments=instruments,
@@ -220,7 +225,6 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         tick_timeout_secs=TICK_TIMEOUT_SECS,
         market_data_settings=MARKET_DATA_SETTINGS,
         live_data_waiter=live_waiter,
-        pattern_worker=pattern_worker,
         context_cache=MarketContextCache(
             data_cache=data_cache,
             trend_analyzer=TrendAnalyzer(),
@@ -787,9 +791,10 @@ def build_demand(runtime, instruments, data_cache) -> ContourDemand:
         for instrument in (extra() if callable(extra) else ()):
             if instrument_key(instrument) not in {instrument_key(item) for item in roster}:
                 roster.append(instrument)
+    patterns = _pattern_pairs(instruments)
     storage = getattr(runtime, "storage", None)
     if storage is None:
-        return ContourDemand(tuple(roster))
+        return ContourDemand(tuple(roster), pattern_pairs=patterns)
     trades = storage.load_trades()
     aliases = {alias: instrument_key(instrument)
                for instrument in roster
@@ -807,7 +812,18 @@ def build_demand(runtime, instruments, data_cache) -> ContourDemand:
         if key in boundaries:
             lowers.append((instrument, boundaries[key][0]))
     return ContourDemand(tuple(roster), aliases, _market_obligations(journal, aliases, roster, data_cache),
-                         tuple(requests), tuple(lowers))
+                         tuple(requests), tuple(lowers), patterns)
+
+
+def _pattern_pairs(instruments) -> tuple:
+    """ТФ привязок выбранных инструментов: их закрытые бары ядро ставит воркеру паттернов."""
+    pairs = []
+    for item in instruments:
+        instrument = item if isinstance(item, Instrument) else normalize_instrument(item)
+        timeframes = {assignment.timeframe for assignment in
+                      assignments_for(instrument, SHARE_STRATEGIES, FUTURE_STRATEGIES)}
+        pairs.extend((instrument, timeframe) for timeframe in sorted(timeframes))
+    return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -840,6 +856,9 @@ class TradingContour:
 
     def build(self) -> "TradingContour":
         settings, services = self.settings, self.services
+        # Отметки исполнения в рыночной базе пишутся под ключом контура.
+        if hasattr(services.data_cache, "contour_id"):
+            services.data_cache.contour_id = settings.kind
         self.channels = build_channels(settings.channel_names, state_dir=settings.state_dir)
         self.bus = EventBus()
         self.bus.subscribe_all(self.channels)
@@ -858,8 +877,9 @@ class TradingContour:
     def run(self, live_waiter=None) -> None:
         services = self.services
         _run_bot(self.settings.instruments, self.bus, self.runtime, services.data_cache, services.timeline,
-                 session=self.settings.session, live_waiter=live_waiter, pattern_worker=services.pattern_sink,
-                 update_obligations=services.update_obligations if services.tracks_obligations else None)
+                 session=self.settings.session, live_waiter=live_waiter,
+                 update_obligations=services.update_obligations if services.tracks_obligations else None,
+                 after_tick=services.acknowledge_tick)
 
     def finish(self) -> None:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""

@@ -61,7 +61,7 @@ flowchart LR
 | Часть | Что делает |
 | --- | --- |
 | `timeline`, `market_calendar` | общие с ядром: только чтение расписаний из базы |
-| `market_store` | открыт с `contour_id`; пишет только отметки контура |
+| `market_store` | общая база; контур пишет только отметки под `contour=` |
 | `data_cache` | `MarketDataCache` в режиме ведомого (`follower`) |
 | `FeedReader` | фоновый поток: снимок, затем `changes_after` с курсора |
 | `request_budget` | `None`: контур не вызывает свечные методы T-Invest |
@@ -118,14 +118,18 @@ sequenceDiagram
 ```sql
 CREATE TABLE pair_readiness (
   source TEXT, instrument_uid TEXT, interval TEXT,
-  state TEXT,           -- BOOTSTRAPPING / READY / DEGRADED / ...
-  transport TEXT, epoch TEXT,
-  history TEXT, history_error TEXT, gap_json TEXT,
-  live_floor TEXT,      -- граница запуска (вариант «б»)
-  lanes_json TEXT, updated_at TEXT,
+  status_json TEXT,     -- тикер, тип, state, transport, epoch, history,
+                        -- history_error, gap, cutover, live_floor, lanes
+  updated_at TEXT,
   PRIMARY KEY (source, instrument_uid, interval)
 );
 ```
+
+Тикер и тип в статусе нужны контуру, чтобы найти UID пары инструмента без
+UID в карточке (live-выбор), как это делает `pair_uid` ядра. Сводка полос
+меняется на каждой проверке, поэтому без смены состояния пишется не чаще
+раза в 30 с. При старте ядро очищает таблицу: готовность прошлого запуска не
+действует.
 
 Таблица хранит текущее состояние, а не события. Поэтому её нет в ленте
 `changes`, и внешний контракт `/changes` не меняется. Ведомый кэш читает её
@@ -162,8 +166,9 @@ CREATE TABLE pair_readiness (
 Почему `emulation`: до П3.1 отметки в живую базу писала только эмуляция.
 История работает на копии базы.
 
-**Запись.** `MarketStore` получает `contour_id`. Методы отметок без него
-недоступны (`ValueError`), поэтому ядро не может случайно записать отметку.
+**Запись.** Методы отметок `MarketDataStore` принимают `contour=` и без него
+отклоняются (`ValueError`), поэтому ядро не может случайно записать отметку.
+Кэш несёт `contour_id`; его задаёт сборка контура.
 
 ### 5. Сверка интервалов только для чтения
 
@@ -176,14 +181,18 @@ CREATE TABLE pair_readiness (
 ### 6. Паттерны в ядре
 
 Сейчас `TradingBot` ставит закрытый бар в очередь `PatternWorker` на своём
-тике. В П3.1 ставит ядро. При записи свечи с `is_complete` для пары
-обслуживаемого спроса и активного ТФ ядро вызывает `submit` после commit.
-При `serve` ядро вызывает `prime` с последним закрытым баром пары. Повторы и
-бары до стартовой отметки отсекает сам воркер, как сейчас.
+тике. В П3.1 ставит ядро: сторож `PatternTrigger` (поток ядра) просыпается на
+изменении данных кэша ядра и проходит пары `ContourDemand.pattern_pairs` (ТФ
+привязок выбранных инструментов, как у тика). Когда пара впервые прогрета,
+сторож вызывает `prime` с её последним закрытым баром — бары догружаемой
+истории в очередь не попадают. Дальше каждый новый последний закрытый бар
+уходит в `submit`. Повторы отсекает сам воркер, как сейчас.
 
 ```mermaid
 flowchart LR
-    A[record_candles ядра] -->|закрытый бар пары спроса| Q[PatternWorker.submit]
+    A[кэш ядра: новые данные] --> T[PatternTrigger]
+    T -->|пара прогрета впервые| P[prime]
+    T -->|новый закрытый бар| Q[PatternWorker.submit]
     Q --> R[(Redis market.events)]
 ```
 
@@ -197,7 +206,7 @@ flowchart LR
 - `serve(demand)` передаёт спрос ядру (`LiveCore.serve`) и подписывает
   `FeedReader` на пары спроса. Он возвращает ожидание старта: пары спроса
   готовы по `pair_readiness`, и кэш контура догнал ленту до `max_change_id`,
-  который был на момент вызова.
+  который был на момент окончания прогрева ядром.
 - `update_obligations` передаётся ядру без изменений.
 - `prepare_live_history`, а также `frame_for` неизвестной пары в ведомом кэше
   не идут в сеть. Они ставят запрос ядру (`core.request_history(instrument,

@@ -324,12 +324,12 @@ class Event:
         )
 
     @classmethod
-    def heartbeat(cls, *, tick_count: int, error_count: int) -> "Event":
-        """Пульс робота по окончании тика."""
-        return cls._make(
-            EventType.HEARTBEAT,
-            payload={"tick_count": tick_count, "error_count": error_count},
-        )
+    def heartbeat(cls, *, tick_count: int, error_count: int, feed_lag: int | None = None) -> "Event":
+        """Пульс робота по окончании тика; ``feed_lag`` — неприменённые изменения ленты ядра."""
+        payload = {"tick_count": tick_count, "error_count": error_count}
+        if feed_lag is not None:
+            payload["feed_lag"] = feed_lag
+        return cls._make(EventType.HEARTBEAT, payload=payload)
 
     @classmethod
     def tick_started(cls, *, tick_id: str) -> "Event":

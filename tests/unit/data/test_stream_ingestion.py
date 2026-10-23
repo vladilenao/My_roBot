@@ -85,6 +85,7 @@ def setup(tmp_path, *, settings=None, clock=None):
         calls.append(kwargs["timeframe"])
         return history, UID
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: NOW, 0), market_store=store)
+    cache.contour_id = "emulation"
     for tf in ("1m", "15m"):
         cache.register_live_pair(ITEM, UID, tf)
         cache.mark_live_history(UID, tf, done=True)
@@ -303,7 +304,7 @@ def test_restart_with_cached_frame_is_not_ready_without_ack_and_handoff(tmp_path
 def test_over_capacity_pairs_fall_back_without_resetting_cursors(tmp_path):
     settings = MarketDataSettings(stream_subscription_soft_limit=1)
     cache, store, worker, supervisor, _, _, _ = setup(tmp_path, settings=settings)
-    store.mark_processed(source="tbank_exchange", instrument_uid=UID, interval="1m", open_time="2026-10-12 12:00")
+    store.mark_processed(source="tbank_exchange", instrument_uid=UID, interval="1m", open_time="2026-10-12 12:00", contour="emulation")
     session = FakeSession()
     supervisor.set_roster({(UID, "1m"), (UID, "15m")})
     supervisor.epoch = 1

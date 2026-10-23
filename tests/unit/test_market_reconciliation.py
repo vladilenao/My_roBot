@@ -85,6 +85,7 @@ def test_cache_does_not_send_later_bar_to_simulator_before_gap_resolved(tmp_path
     store, reconciler = _setup(tmp_path)
     instrument = Instrument("SBER", "SBER", "share")
     cache = MarketDataCache(loader=lambda **_: (pd.DataFrame(), UID), timeline=_Timeline(), market_store=store, market_reconciler=reconciler)
+    cache.contour_id = "emulation"
     cache._uids[cache._key(instrument, "1m")] = UID
     store.set_interval_state(
         source=SOURCE, instrument_uid=UID, interval="1m", open_time="2026-10-10 12:01",
@@ -113,6 +114,7 @@ def test_oldest_gap_is_recovered_outside_regular_backfill_window(tmp_path):
         loader=loader, timeline=_Timeline(), market_store=store,
         market_reconciler=reconciler, data_backfill_window_seconds=60,
     )
+    cache.contour_id = "emulation"
     key = cache._key(instrument, "1m")
     cache._uids[key] = UID
     cache._instruments[key] = instrument
@@ -136,6 +138,7 @@ def test_empty_recovery_response_keeps_interval_unresolved(tmp_path):
         loader=lambda **_: (pd.DataFrame(), UID), timeline=_Timeline(),
         market_store=store, market_reconciler=reconciler,
     )
+    cache.contour_id = "emulation"
     key = cache._key(instrument, "1m")
     cache._uids[key], cache._instruments[key] = UID, instrument
     store.set_interval_state(source=SOURCE, instrument_uid=UID, interval="1m", open_time="2026-10-10 12:01", state="pending", evidence="open_session_missing_candle")
@@ -153,6 +156,7 @@ def test_rate_limit_keeps_recovery_candidate_for_retry(tmp_path):
         loader=lambda **_: (_ for _ in ()).throw(RuntimeError("resource_exhausted: ratelimit_reset=3")),
         timeline=_Timeline(), market_store=store, market_reconciler=reconciler,
     )
+    cache.contour_id = "emulation"
     key = cache._key(instrument, "1m")
     cache._uids[key], cache._instruments[key] = UID, instrument
     store.set_interval_state(source=SOURCE, instrument_uid=UID, interval="1m", open_time="2026-10-10 12:01", state="pending", evidence="open_session_missing_candle")
@@ -169,7 +173,7 @@ def test_processed_cursor_advances_only_after_commit_marker(tmp_path):
     store, _ = _setup(tmp_path)
     store.record_candles(source=SOURCE, instrument_uid=UID, interval="1m", candles=_frame("2026-10-10 12:01"))
     before = store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")
-    store.mark_processed(source=SOURCE, instrument_uid=UID, interval="1m", open_time="2026-10-10 12:01")
+    store.mark_processed(source=SOURCE, instrument_uid=UID, interval="1m", open_time="2026-10-10 12:01", contour="emulation")
     after = store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")
 
     assert before["processed_through"] is None
