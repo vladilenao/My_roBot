@@ -80,12 +80,12 @@
 - Код: `run.py` (вход `--contour`, запуск процесса из ядра), `src/assembly/`
   (новый `process.py` — запуск и надзор, `feed.py` — служба ленты без ядра в
   памяти, правки `core.py`, `contour.py`), `src/data/market_store.py`
-  (таблицы `contour_demand`, `contour_obligations`, версия схемы),
+  (таблицы `contour_demand`, `contour_obligations`),
   `src/data/ingestion.py` (обязательства всех контуров), `src/bot/launch_control.py`
   (состояние процесса), `src/clusters/store.py` (чтение без записи),
   `src/config*.py`, `src/notifier/factory.py` (канал контура).
 - Данные: новая папка `data/contours/emulation/`; копия журнала эмуляции;
-  версия схемы `market-data.sqlite3` растёт на одну.
+  две новые таблицы `market-data.sqlite3`, версия схемы экспорта не меняется.
 - Сборка: `run.spec` без изменений — процесс контура запускается тем же
   исполняемым файлом.
 - Документы: `docs/architecture/core-contours.md` (файл запуска, канал stdin,

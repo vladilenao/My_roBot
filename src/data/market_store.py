@@ -230,6 +230,22 @@ class MarketDataStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(contour_id,source,instrument_uid,interval)
                 );
+                CREATE TABLE IF NOT EXISTS contour_demand (
+                    contour_id TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL, interval TEXT NOT NULL,
+                    min_bars INTEGER NOT NULL,
+                    instrument_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,instrument_key,interval)
+                );
+                CREATE TABLE IF NOT EXISTS contour_obligations (
+                    contour_id TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL,
+                    lower_open_time TEXT NOT NULL,
+                    inclusive INTEGER NOT NULL CHECK(inclusive IN (0, 1)),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,instrument_key)
+                );
                 CREATE TABLE IF NOT EXISTS pair_readiness (
                     source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
                     status_json TEXT NOT NULL,
@@ -1141,6 +1157,67 @@ class MarketDataStore:
                 status_json=excluded.status_json, updated_at=excluded.updated_at
                 WHERE pair_readiness.status_json<>excluded.status_json""",
                 (source, instrument_uid, interval, payload, _utc_text()))
+
+    # ── Потребности торговых контуров (add-contour-process) ──
+    # Пишет только контур своего contour_id, читает ядро: так процесс контура
+    # передаёт спрос пар и обязательства сделок без вызова в память ядра.
+
+    def record_contour_demand(self, contour_id: str, demands) -> None:
+        """Спрос пар ``(ключ инструмента, ТФ, глубина, карточка инструмента)``; глубина не уменьшается."""
+        rows = [(contour_id, key, interval, int(min_bars), json.dumps(instrument, ensure_ascii=False, sort_keys=True),
+                 _utc_text()) for key, interval, min_bars, instrument in demands]
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO contour_demand(contour_id,instrument_key,interval,min_bars,instrument_json,updated_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT(contour_id,instrument_key,interval) DO UPDATE SET
+                min_bars=MAX(contour_demand.min_bars,excluded.min_bars),instrument_json=excluded.instrument_json,
+                updated_at=excluded.updated_at
+                WHERE excluded.min_bars>contour_demand.min_bars OR excluded.instrument_json<>contour_demand.instrument_json""",
+                rows)
+
+    def contour_demands(self) -> list[dict]:
+        """Спрос всех контуров: ``contour_id``, ``instrument_key``, ``interval``, ``min_bars``, ``instrument``."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT contour_id,instrument_key,interval,min_bars,instrument_json FROM contour_demand
+                ORDER BY contour_id,instrument_key,interval""").fetchall()
+        return [{"contour_id": row[0], "instrument_key": row[1], "interval": row[2], "min_bars": int(row[3]),
+                 "instrument": json.loads(row[4])} for row in rows]
+
+    def replace_contour_obligations(self, contour_id: str, obligations) -> None:
+        """Снимок обязательств контура ``{ключ: (граница, включительно)}`` одной транзакцией."""
+        now = _utc_text()
+        rows = [(contour_id, key, _utc_text(stamp), 1 if inclusive else 0, now)
+                for key, (stamp, inclusive) in sorted(obligations.items()) if stamp is not None]
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM contour_obligations WHERE contour_id=?", (contour_id,))
+                conn.executemany("""INSERT INTO contour_obligations(contour_id,instrument_key,lower_open_time,inclusive,updated_at)
+                    VALUES (?,?,?,?,?)""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def contour_obligations(self) -> dict[str, dict[str, tuple[datetime, bool]]]:
+        """Обязательства по контурам: ``{contour_id: {ключ: (граница naive UTC, включительно)}}``."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT contour_id,instrument_key,lower_open_time,inclusive FROM contour_obligations
+                ORDER BY contour_id,instrument_key""").fetchall()
+        result: dict[str, dict[str, tuple[datetime, bool]]] = {}
+        for contour_id, key, lower, inclusive in rows:
+            stamp = pd.Timestamp(lower).tz_convert("UTC").tz_localize(None).to_pydatetime()
+            result.setdefault(contour_id, {})[key] = (stamp, bool(inclusive))
+        return result
+
+    def consumer_checkpoint(self, consumer_id: str) -> dict | None:
+        """Подтверждённый курсор потребителя ленты: ``acknowledged_through`` и ``acknowledged_at``."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT acknowledged_through, acknowledged_at FROM consumer_checkpoints WHERE consumer_id=?",
+                               (consumer_id,)).fetchone()
+        return None if row is None else {"acknowledged_through": int(row[0]), "acknowledged_at": row[1]}
 
     def drop_pair_readiness(self, *, source: str, instrument_uid: str | None = None,
                             interval: str | None = None) -> None:

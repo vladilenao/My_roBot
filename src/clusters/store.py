@@ -59,12 +59,34 @@ def keep(fields: Mapping[str, str]) -> bool:
     return category in {"signal", "data_quality"} or fields.get("event_type") == "signal_revoked"
 
 
+class _Missing(Exception):
+    """Хранилища ещё нет: процесс контура читает его до первой записи ядром."""
+
+
+def _or_empty(default):
+    """Чтение без файла (только чтение, ядро ещё не создало хранилище) — пустой ответ."""
+
+    def wrap(method):
+        def read(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except _Missing:
+                return default() if callable(default) else default
+        read.__name__, read.__doc__ = method.__name__, method.__doc__
+        return read
+    return wrap
+
+
 class ClusterEventStore:
     """SQLite с событиями потока; соединение на вызов, WAL, общий lock записи."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        # Процесс контура только читает хранилище ядра (add-contour-process, D7).
+        self.read_only = read_only
+        if read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -99,6 +121,12 @@ class ClusterEventStore:
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            if not self.path.exists():
+                raise _Missing()
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=30)
+            conn.row_factory = sqlite3.Row
+            return conn
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
@@ -152,12 +180,14 @@ class ClusterEventStore:
                 (key, value),
             )
 
+    @_or_empty(None)
     def state(self, key: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute("SELECT value FROM consumer_state WHERE key=?", (key,)).fetchone()
         return None if row is None else str(row["value"])
 
     # ── чтение ──
+    @_or_empty(list)
     def signals(self, secid: str, *, after: datetime, until: datetime) -> list[StoredEvent]:
         """Сигналы инструмента с ``after < published_at ≤ until`` по возрастанию времени."""
         with self._connect() as conn:
@@ -168,6 +198,7 @@ class ClusterEventStore:
             ).fetchall()
         return [_event(row) for row in rows]
 
+    @_or_empty(set)
     def revoked(self, signal_ids: Iterable[str], *, until: datetime) -> set[str]:
         """Какие из ``signal_ids`` отозваны с ``published_at ≤ until``."""
         ids = sorted(set(signal_ids))
@@ -182,6 +213,7 @@ class ClusterEventStore:
             ).fetchall()
         return {str(row["signal_id"]) for row in rows}
 
+    @_or_empty(None)
     def last_quality(self, secid: str, *, until: datetime) -> str | None:
         """Тип последнего события качества данных инструмента до ``until``."""
         with self._connect() as conn:
@@ -192,6 +224,7 @@ class ClusterEventStore:
             ).fetchone()
         return None if row is None else str(row["event_type"])
 
+    @_or_empty(False)
     def has_events(self, secid: str, *, until: datetime) -> bool:
         with self._connect() as conn:
             row = conn.execute(
@@ -200,6 +233,7 @@ class ClusterEventStore:
             ).fetchone()
         return row is not None
 
+    @_or_empty(set)
     def secids(self, *, after: datetime, until: datetime) -> set[str]:
         """Инструменты, по которым были события в окне — для поиска другого контракта семейства."""
         with self._connect() as conn:
@@ -209,6 +243,7 @@ class ClusterEventStore:
             ).fetchall()
         return {str(row["secid"]) for row in rows}
 
+    @_or_empty(None)
     def event(self, event_id: str) -> StoredEvent | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM cluster_events WHERE event_id=?", (event_id,)).fetchone()

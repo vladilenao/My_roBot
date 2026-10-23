@@ -78,7 +78,7 @@ class TestLoadContractsMetadata:
         with patch("src.api.client.client_context", return_value=fake_client) as ctx, patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"NGV6": ContractMeta("NGV6", 0.001, 8.4, 100, 100)},
-        ) as loader, patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+        ) as loader, patch("src.assembly.contracts.TINKOFF_TOKEN", "t"):
             contracts = contour._load_contracts_metadata([fake_instrument])
 
         ctx.assert_called_once_with()
@@ -93,18 +93,18 @@ class TestLoadContractsMetadata:
         assert contour._instrument_ticker(None) is None
 
     def test_empty_without_token(self, fake_instrument):
-        with patch("src.assembly.contour.TINKOFF_TOKEN", ""), patch("src.assembly.contour.log") as log:
+        with patch("src.assembly.contracts.TINKOFF_TOKEN", ""), patch("src.assembly.contracts.log") as log:
             assert contour._load_contracts_metadata([fake_instrument]) == {}
         log.warning.assert_called_once()
 
     def test_no_instruments_skips_source_entirely(self):
-        with patch("src.assembly.contour.TINKOFF_TOKEN", ""), patch("src.assembly.contour.log") as log:
+        with patch("src.assembly.contracts.TINKOFF_TOKEN", ""), patch("src.assembly.contracts.log") as log:
             assert contour._load_contracts_metadata([]) == {}
         log.warning.assert_not_called()
 
     def test_exception_falls_back_to_empty(self, fake_instrument):
         with patch("src.api.client.client_context", side_effect=RuntimeError("boom")), patch(
-            "src.assembly.contour.TINKOFF_TOKEN", "t"
+            "src.assembly.contracts.TINKOFF_TOKEN", "t"
         ):
             assert contour._load_contracts_metadata([fake_instrument]) == {}
 
@@ -117,7 +117,7 @@ class TestLoadContractsMetadata:
         ) as futures, patch(
             "src.api.instruments.load_share_contracts",
             return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
-        ) as shares, patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+        ) as shares, patch("src.assembly.contracts.TINKOFF_TOKEN", "t"):
             contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
             )
@@ -134,7 +134,7 @@ class TestLoadContractsMetadata:
         with patch("src.api.client.client_context", return_value=fake_client), patch(
             "src.api.instruments.load_futures_contracts", return_value={}
         ), patch("src.api.instruments.load_share_contracts", return_value={}), patch(
-            "src.assembly.contour.TINKOFF_TOKEN", "t"
+            "src.assembly.contracts.TINKOFF_TOKEN", "t"
         ):
             contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
@@ -152,7 +152,7 @@ class TestLoadContractsMetadata:
         ), patch(
             "src.api.instruments.load_share_contracts",
             side_effect=RuntimeError("каталог акций недоступен"),
-        ), patch("src.assembly.contour.TINKOFF_TOKEN", "t"):
+        ), patch("src.assembly.contracts.TINKOFF_TOKEN", "t"):
             contracts = contour._load_contracts_metadata(
                 [SELECTOR_NG, ("Сбербанк", "SBER", "share", "SBER")]
             )
@@ -182,14 +182,14 @@ class TestHistoryMetadataWithoutToken:
     def test_futures_and_shares_load_with_no_token(self):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contracts.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
         ) as futures, patch(
             "src.api.instruments.load_share_contracts",
             return_value={"SBER": ContractMeta("SBER", 0.01, 1.0, 0.0, 0.0)},
         ) as shares, patch(
-            "src.assembly.contour._token_client_context",
+            "src.assembly.contracts._token_client_context",
             side_effect=AssertionError("токен не должен быть нужен"),
         ):
             contracts = contour._load_contracts_metadata(
@@ -206,7 +206,7 @@ class TestHistoryMetadataWithoutToken:
     def test_entries_not_rejected_for_missing_metadata(self, caplog):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contracts.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts",
             return_value={"SiH5": ContractMeta("SiH5", 1.0, 1.0, 12345.67, 12345.67)},
         ), patch(
@@ -226,7 +226,7 @@ class TestHistoryMetadataWithoutToken:
     def test_no_token_warning_absent_when_provider_available(self, caplog):
         fake_client = _fake_client()
         provider = self._provider(fake_client)
-        with patch("src.assembly.contour.TINKOFF_TOKEN", None), patch(
+        with patch("src.assembly.contracts.TINKOFF_TOKEN", None), patch(
             "src.api.instruments.load_futures_contracts", return_value={}
         ), patch("src.api.instruments.load_share_contracts", return_value={}):
             contour._load_contracts_metadata(

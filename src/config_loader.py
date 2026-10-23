@@ -62,7 +62,6 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "retention_days": "market_structure_retention_days",
     },
     "contours": {
-        "market_feed": "contours_market_feed",
         "feed_poll_secs": "contours_feed_poll_secs",
     },
     "instruments": {
@@ -132,7 +131,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_redis_db": int,
     "market_structure_queue_maxsize": int,
     "market_structure_retention_days": int,
-    "contours_market_feed": bool,
+    "contours_emulation_telegram_channel_env": str,
     "contours_feed_poll_secs": int,
     "instrument_type": str,
     "ticker": str,
@@ -587,6 +586,11 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [market_structure] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
+        if key == "contours_emulation_telegram_channel_env" and not _ENV_NAME.fullmatch(value):
+            raise ConfigError(
+                f"{path}: [contours.emulation] telegram_channel_env — имя переменной окружения "
+                f"(заглавные латинские буквы, цифры и _), получено {value!r}"
+            )
         if key == "contours_feed_poll_secs" and (isinstance(value, bool) or value < 1):
             raise ConfigError(f"{path}: [contours] feed_poll_secs должен быть целым числом > 0, получено {value!r}")
         if key == "market_structure_redis_port" and value > 65535:
@@ -927,6 +931,16 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
         if section == "clusters":
             flat["clusters_params"] = dict(mapping)
             continue
+        if section == "contours":
+            mapping = dict(mapping)
+            if "market_feed" in mapping:
+                raise ConfigError(
+                    f"{path}: [contours] market_feed удалён — контур эмуляции всегда читает ленту ядра "
+                    f"отдельным процессом (add-contour-process); удалите эту строку"
+                )
+            emulation = mapping.pop("emulation", None)
+            if emulation is not None:
+                flat.update(_parse_contour_section("emulation", emulation, path))
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):
@@ -988,6 +1002,22 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
         for key in ("journal_file", "positions_file", "audit_file"):
             if config.get(key) is not None and Path(config[key]).resolve() == Path(database_file).resolve():
                 raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
+
+
+_CONTOUR_KEYS = {"telegram_channel_env"}
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
+    """Секция ``[contours.<вид>]``: строгие ключи, плоские имена ``contours_<вид>_<ключ>``."""
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path}: [contours.{kind}] должна быть таблицей")
+    unknown = set(value) - _CONTOUR_KEYS
+    if unknown:
+        raise ConfigError(
+            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(_CONTOUR_KEYS)}"
+        )
+    return {f"contours_{kind}_{key}": item for key, item in value.items()}
 
 
 def _parse_triple_screen_section(value: Any, path: Path) -> dict[str, Any]:

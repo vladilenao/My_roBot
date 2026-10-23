@@ -56,6 +56,20 @@ class LiveRunSession(RunSession):
         return False
 
 
+class StoppableRunSession(LiveRunSession):
+    """Процесс контура (add-contour-process): цикл до флага остановки, проверяемого на границе тика."""
+
+    def __init__(self, stop_event, clock=None) -> None:
+        super().__init__(clock)
+        self._stop_event = stop_event
+
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def stop_reason(self) -> str:
+        return "остановка контура" if self._stop_event.is_set() else ""
+
+
 class HistoricalRunSession(RunSession):
     """Исторический прогон: рыночное время виртуальное, у прогона есть конец."""
 

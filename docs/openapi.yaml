@@ -892,7 +892,7 @@ components:
     Contour:
       type: object
       additionalProperties: false
-      required: [id, kind, state, source, instruments, started_at, command, rejections]
+      required: [id, kind, state, source, instruments, started_at, command, rejections, pid, exit_code]
       properties:
         id: {type: string, example: emulation}
         kind: {type: string, enum: [emulation]}

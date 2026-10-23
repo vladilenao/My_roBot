@@ -36,10 +36,16 @@ def build_channels(names=None, *, state_dir=None) -> list[Channel]:
             )
         elif name == "telegram":
             events = config.NOTIFIER_TELEGRAM_EVENTS
+            if not config.telegram_channel_id():
+                # Имя переменной — не секрет; значение id в вывод не попадает.
+                message = (f"Telegram контура выключен: в .env не задан "
+                           f"{config.CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV}")
+                log.warning(message)
+                print(message)
             channels.append(
                 TelegramChannel(
                     bot_token=config.TELEGRAM_BOT_TOKEN,
-                    channel_id=config.TELEGRAM_CHANNEL_ID,
+                    channel_id=config.telegram_channel_id(),
                     cloudflare_url=config.CLOUDFLARE_URL,
                     tz_offset_hours=config.BAR_TIME_TZ_OFFSET_HOURS,
                     supported_types=parse_event_types(events),

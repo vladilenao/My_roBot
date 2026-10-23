@@ -393,8 +393,9 @@ class LiveAnalysis:
                 # пометка о неизвестном расписании остаётся в reason.
                 state = replace(state, hold=self._hold(instrument, tf, ingestion, close))
         state = replace(state, ingestion=ingestion)
-        budget = self.cache._request_budget
-        if budget.retry_after is not None and now < budget.retry_after:
+        # У процесса контура арбитра квот нет (add-contour-process): лимиты тратит только ядро.
+        budget = getattr(self.cache, "_request_budget", None)
+        if budget is not None and budget.retry_after is not None and now < budget.retry_after:
             state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API", hold=None)
         self.states[key] = state
         if self.cadence.due(state, now):

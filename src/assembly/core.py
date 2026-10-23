@@ -1,5 +1,7 @@
 """Ядро эмуляции: рыночная база, арбитр, календарь, полосы, приём свечей, локальный API, кластерный поток."""
 
+import os
+
 
 
 from src.config import (
@@ -28,6 +30,9 @@ from src.config import (
     DATABASE_FILE,
     CLUSTER_SETTINGS,
     CLUSTERS_ENABLED,
+    CONTOURS_FEED_POLL_SECS,
+    CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV,
+    trading_enabled,
 )
 from src.api.client import default_client_provider
 from src.data.cache import MarketDataCache
@@ -46,6 +51,7 @@ from src.scheduler.timing import MultiTimeframeScheduler
 
 
 from src.assembly.services import ContourDemand, _timeframes
+from src.assembly.contracts import _load_contracts_metadata, _pattern_pairs, contracts_payload, instrument_payload
 
 log = get_logger(__name__)
 
@@ -75,8 +81,11 @@ def _start_local_api(market_store, state_dir, control=None):
         _say("Экспорт и отчёт кластеров недоступны: в .env не задан MARKET_DATA_EXPORT_TOKEN")
     if not control_token:
         _say("Управление по API недоступно: в .env не задан ROBOT_CONTROL_TOKEN")
+    from src.assembly.process import contour_dir
+
+    # Журнал эмуляции живёт в папке контура (add-contour-process, D7).
     report = ClusterReport(
-        state_dir / DATABASE_FILE,
+        contour_dir(state_dir, "emulation") / DATABASE_FILE,
         lambda uid: market_store.current_frame(source=SOURCE_TBANK, instrument_uid=uid, interval="1m"),
         configured_mode=_configured_cluster_mode(),
     )
@@ -87,6 +96,15 @@ def _start_local_api(market_store, state_dir, control=None):
     )
     server.start()
     return server
+
+
+def _after(stamp: str, moment) -> bool:
+    """Подтверждение курсора сделано после ``moment`` (UTC)."""
+    import pandas as pd
+
+    value = pd.Timestamp(stamp)
+    value = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+    return value.to_pydatetime() >= moment
 
 
 def _say(message: str) -> None:
@@ -366,6 +384,76 @@ class LiveCore:
     def _adopt(self, early) -> None:
         for name in ("timeline", "market_store", "request_budget", "market_calendar", "market_reconciler", "data_cache"):
             setattr(self, name, getattr(early, name, None))
+
+    def start_clusters(self) -> None:
+        """Читатель Redis кластеров — у ядра; контур только читает хранилище (D7)."""
+        if self._cluster_consumer is None:
+            _, self._cluster_consumer = _live_cluster_gate(
+                market_store=self.market_store, data_cache=self.data_cache, state_dir=self.state_dir)
+
+    def run_contour(self, instruments, *, kind: str, control=None, source: str = "", command: str = "",
+                    process_factory=None, poll_secs: float = 1.0) -> int:
+        """Контур отдельным процессом (add-contour-process): переезд журнала, прогрев, launch.json, надзор.
+
+        Главный поток ядра ждёт Ctrl+C, даже если контур упал: приём данных и
+        API продолжают работать, контур сам не перезапускается (D5).
+        """
+        import time
+        from datetime import datetime, timezone
+
+        from src import __version__
+        from src.assembly.demand import ContourDemandPoller
+        from src.assembly.process import ContourProcess, contour_dir, migrate_journal, write_launch
+        from src.data.market_store import CONTOUR_CONSUMER_PREFIX
+
+        directory = contour_dir(self.state_dir, kind)
+        migrate_journal(self.state_dir, directory, version=__version__)
+        contracts = _load_contracts_metadata(instruments, client_provider=self.client_provider,
+                                             request_budget=self.request_budget)
+        tracks = trading_enabled()
+        poller = ContourDemandPoller(self.market_store, self.data_cache, instruments=instruments,
+                                     tracks_obligations=tracks, poll_seconds=CONTOURS_FEED_POLL_SECS)
+        # Строки обязательств прошлого запуска действуют сразу: целостность до старта контура.
+        demand = ContourDemand(tuple(instruments), obligations=poller.obligations() if tracks else None,
+                               pattern_pairs=_pattern_pairs(instruments))
+        waiter = self.serve(demand)
+        poller._worker = self._worker
+        poller.start()
+        self.start_clusters()
+        if waiter is not None:
+            waiter()
+        write_launch(directory, {
+            "contour_id": kind, "kind": kind, "core_pid": os.getpid(), "core_version": __version__,
+            "source": source, "command": command,
+            "telegram_channel_env": CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV,
+            "instruments": [instrument_payload(item) for item in instruments],
+            "contracts": contracts_payload(contracts),
+        })
+
+        def exited(code, stopping):
+            if control is not None:
+                control.mark_exited(code, stopping=stopping)
+
+        factory = process_factory or ContourProcess
+        process = factory(kind, on_exit=exited)
+        pid = process.start()
+        if control is not None:
+            control.mark_process(pid)
+        started = datetime.now(timezone.utc)
+        consumer = CONTOUR_CONSUMER_PREFIX + kind
+        try:
+            while True:
+                if control is not None and process.running:
+                    saved = self.market_store.consumer_checkpoint(consumer)
+                    if saved is not None and _after(saved["acknowledged_at"], started):
+                        control.mark_contour_running()
+                time.sleep(poll_secs)
+        except KeyboardInterrupt:
+            log.info("Ядро останавливается: контур %s получает stop", kind)
+        finally:
+            process.stop()
+            poller.stop()
+        return 0 if process.exit_code in (0, None) else 1
 
     def cluster_gate(self, state_dir):
         gate, self._cluster_consumer = _live_cluster_gate(

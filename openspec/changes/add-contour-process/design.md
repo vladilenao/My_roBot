@@ -119,17 +119,25 @@ flowchart LR
 
 ### D3. Потребности строками в рыночной базе
 
-Новые таблицы `market-data.sqlite3` (версия схемы +1). Пишет только контур
-своего `contour_id`, читает ядро.
+Новые таблицы `market-data.sqlite3` создаются при открытии базы, как
+таблицы П3.1; версия схемы экспорта (`schema_version` в `/source`) не
+меняется — контракт `/changes` тот же. Пишет только контур своего
+`contour_id`, читает ядро.
 
 ```sql
-contour_demand(contour_id TEXT, instrument_uid TEXT, timeframe TEXT, min_bars INTEGER,
-               ticker TEXT, instrument_type TEXT, updated_at TEXT,
-               PRIMARY KEY (contour_id, instrument_uid, timeframe))
-contour_obligations(contour_id TEXT, instrument_uid TEXT, lower_open_time TEXT,
+contour_demand(contour_id TEXT, instrument_key TEXT, interval TEXT, min_bars INTEGER,
+               instrument_json TEXT, updated_at TEXT,
+               PRIMARY KEY (contour_id, instrument_key, interval))
+contour_obligations(contour_id TEXT, instrument_key TEXT, lower_open_time TEXT,
                     inclusive INTEGER, updated_at TEXT,
-                    PRIMARY KEY (contour_id, instrument_uid))
+                    PRIMARY KEY (contour_id, instrument_key))
 ```
+
+`instrument_key` — UID, если он есть у инструмента, иначе биржевой тикер:
+инструменты live-выбора строятся без UID. `instrument_json` — карточка
+инструмента (метка, тикер, тип, короткое имя, UID, семейство), по которой
+ядро регистрирует пару. Ключ обязательства — UID рыночной пары, как прежде
+передавал `_market_obligations`.
 
 - `contour_demand` заменяет `_CoreLink.request_history` и `touch`: строка
   появляется при первом запросе кадра и при росте глубины; глубина не

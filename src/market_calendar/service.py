@@ -206,6 +206,25 @@ class BrokerScheduleSource:
         return self._budget.call(fn, *args, key=key, service="instruments", pace=False, **kwargs)
 
 
+class StoredScheduleSource:
+    """Источник процесса контура: расписание пишет ядро, контур только читает (add-contour-process).
+
+    Запросов в сеть нет: ``request`` и ``service`` ничего не делают, свежесть
+    расписания отвечает за ядро.
+    """
+
+    source = BrokerScheduleSource.source
+
+    def request(self, instrument_uid: str, now: datetime, *, force: bool = False) -> None:
+        return None
+
+    def service(self, now: datetime) -> bool:
+        return False
+
+    def stale(self, exchange: str, now: datetime) -> bool:
+        return False
+
+
 class EmulatorScheduleSource:
     """Расписание исторического снимка без обращения к T-Bank."""
 
