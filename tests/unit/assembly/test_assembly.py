@@ -141,7 +141,7 @@ def test_emulation_launch_runs_contour_process_after_core(monkeypatch, tmp_path)
             return self
 
         def run_contour(self, instruments, *, kind, control=None, source="", command="", core_state=None,
-                        next_launch=None):
+                        next_launch=None, resolve=None):
             assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
             # Желаемое ядра ведётся и без ключа управления; без API следующей команды нет.
             assert core_state is not None and core_state.path == tmp_path / "core.sqlite3"
@@ -227,7 +227,7 @@ def test_control_hooks_wrap_execution_in_tick(monkeypatch):
             self.post_tick({"1m"})
 
     class Control:
-        def start(self, manager):
+        def start(self, manager, roster=None):
             order.append(f"start:{manager}")
 
         def before_tick(self):
@@ -256,8 +256,44 @@ def test_control_hook_runs_without_financial_part(monkeypatch):
         def run(self):
             seen["result"] = seen["post_tick"]({"1m"})
 
-    control = SimpleNamespace(start=lambda manager: None, before_tick=lambda: None, after_tick=lambda: None,
+    control = SimpleNamespace(start=lambda manager, roster=None: None, before_tick=lambda: None, after_tick=lambda: None,
                               close=lambda: None)
     monkeypatch.setattr(contour, "TradingBot", Bot)
     contour._run_bot([], None, contour._Runtime(), data_cache=None, timeline=None, control=control)
     assert seen["result"] is True
+
+
+def test_roster_admits_and_retires_instrument_everywhere():
+    from src.history.contract_lifecycle import ConstantContractLifecycle
+
+    calls, cards = [], []
+    live = SimpleNamespace(register_needs_for=lambda item: calls.append(("needs", item.ticker)),
+                           bootstrap_instrument=lambda item: calls.append(("overview", item.ticker)),
+                           forget_instrument=lambda item: calls.append(("forget", item.ticker)))
+    bot = SimpleNamespace(_instruments=[SBER], _live_analysis=live, _protection_timeframe="1m",
+                          _strategies_for=lambda item: [SimpleNamespace(timeframe="1h")])
+    lifecycle = ConstantContractLifecycle([SBER])
+    runtime = contour._Runtime(storage=object(), contract_lifecycle=lifecycle)
+    runtime.instruments = [SBER]
+    runtime.execution_instruments = [SBER]
+    runtime.on_contracts = cards.append
+    statuses = {("NGZ6", "1m"): "READY", ("NGZ6", "1h"): "BOOTSTRAPPING"}
+    cache = SimpleNamespace(pair_status=lambda item, tf: {"state": statuses[item.ticker, tf]})
+    forgotten = []
+    roster = contour._Roster(bot, runtime, cache, forget=lambda item: forgotten.append(item.ticker))
+
+    assert roster.warm(NG) and not roster.ready(NG)
+    statuses["NGZ6", "1h"] = "READY"
+    assert roster.ready(NG)
+    roster.admit(NG, {"uid-ng": "card"})
+    assert calls == [("needs", "NGZ6"), ("overview", "NGZ6")] and cards == [{"uid-ng": "card"}]
+    assert [item.ticker for item in bot._instruments] == ["SBER", "NGZ6"]
+    assert [item.ticker for item in lifecycle.instruments] == ["SBER", "NGZ6"]
+    assert [item.ticker for item in runtime.instruments] == ["SBER", "NGZ6"]
+    assert runtime.execution_aliases == {"uid-ng": "uid-ng", "NGZ6": "uid-ng"}
+    assert roster.keys() == {"uid-sber", "uid-ng"} and roster.instrument("uid-ng") is NG
+
+    roster.retire(NG)
+    assert [item.ticker for item in bot._instruments] == ["SBER"] and lifecycle.instruments == [SBER]
+    assert runtime.execution_instruments == [SBER] and runtime.execution_aliases == {}
+    assert calls[-1] == ("forget", "NGZ6") and forgotten == ["NGZ6"]

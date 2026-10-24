@@ -140,6 +140,8 @@ class TradingBot:
         self._contract_lifecycle = contract_lifecycle or ConstantContractLifecycle(self._instruments)
         self._tick_count = 0
         self._errors_in_period = 0
+        # Живой анализ — для изменения состава контура на ходу (add-contour-membership).
+        self._live_analysis = None
         self._heartbeat_countdown = self._heartbeat_every
 
     # ── ПУНКТ 1: запуск ──
@@ -187,6 +189,7 @@ class TradingBot:
     def _loop_live(self):
         from src.bot.live_analysis import LiveAnalysis
         live = LiveAnalysis(self)
+        self._live_analysis = live
         try:
             live.bootstrap()
             changed = getattr(self._data_cache, "wait_for_data_change", None)

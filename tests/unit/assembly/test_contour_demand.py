@@ -156,6 +156,8 @@ def test_run_contour_writes_launch_without_secrets_and_tracks_state(tmp_path, mo
             raise KeyboardInterrupt
 
     monkeypatch.setattr("time.sleep", fake_sleep)
+    # Надзор ждёт команду состава вместо паузы (add-contour-membership).
+    monkeypatch.setattr(LaunchControl, "next_membership", lambda self, timeout: fake_sleep(timeout))
     FakeProcess.instances.clear()
 
     code = live.run_contour([SBER], kind="emulation", control=control, source="api",
@@ -231,3 +233,94 @@ def test_relaunch_after_stop_starts_new_process_without_second_serve(tmp_path, m
     assert [(row["action"], row["generation"]) for row in reversed(store.commands())] == [("launch", 1), ("launch", 2)]
     assert store.desired("emulation").instruments[0]["ticker"] == "NGZ6"
     assert pairs == [(NG, "1h")]
+
+
+# ── Снятие пар без спроса (add-contour-membership) ──
+
+class ReleasingCache(FakeCache):
+    def __init__(self):
+        super().__init__()
+        self.unregistered = []
+
+    def unregister_live_pair(self, uid, timeframe):
+        self.unregistered.append((uid, timeframe))
+        return True
+
+
+class RosterWorker(FakeWorker):
+    def __init__(self):
+        super().__init__()
+        self.retired = []
+
+    def retire_roster_pairs(self, pairs):
+        self.retired.extend(pairs)
+
+
+def _releasing(tmp_path, *, tracks=True):
+    store = MarketDataStore(tmp_path / "market.sqlite3")
+    cache, worker, clock, released = ReleasingCache(), RosterWorker(), [0.0], []
+    poller = ContourDemandPoller(store, cache, worker=worker, instruments=[NG, SBER], tracks_obligations=tracks,
+                                 release_seconds=900, on_release=lambda item, tf: released.append((item.ticker, tf)),
+                                 clock=lambda: clock[0])
+    return store, cache, worker, poller, clock, released
+
+
+def test_pair_without_demand_is_released_after_grace(tmp_path):
+    store, cache, worker, poller, clock, released = _releasing(tmp_path)
+    store.record_contour_demand("emulation", [("uid-sber", "15m", 120, instrument_payload(SBER))])
+    poller.poll_once()
+    store.remove_contour_demand("emulation", "uid-sber")
+    poller.poll_once()
+    clock[0] = 899
+    poller.poll_once()
+    assert cache.unregistered == []
+    clock[0] = 900
+    poller.poll_once()
+    assert cache.unregistered == [("uid-sber", "15m")] and worker.retired == [("uid-sber", "15m")]
+    assert released == [("SBER", "15m")]
+    poller.poll_once()
+    assert cache.unregistered == [("uid-sber", "15m")]           # однократно
+
+
+def test_returned_demand_cancels_release(tmp_path):
+    store, cache, _, poller, clock, _ = _releasing(tmp_path)
+    row = [("uid-sber", "15m", 120, instrument_payload(SBER))]
+    store.record_contour_demand("emulation", row)
+    poller.poll_once()
+    store.replace_contour_demand("emulation", [])                  # запуск контура стёр спрос
+    poller.poll_once()
+    clock[0] = 60
+    store.record_contour_demand("emulation", row)                  # обзор вернул спрос
+    poller.poll_once()
+    clock[0] = 2000
+    poller.poll_once()
+    assert cache.unregistered == [] and cache.history == [("SBER", "15m", 120)]
+
+
+def test_obligation_keeps_pair(tmp_path):
+    store, cache, _, poller, clock, _ = _releasing(tmp_path)
+    store.record_contour_demand("emulation", [("uid-ng", "1m", 1, instrument_payload(NG))])
+    poller.poll_once()
+    store.remove_contour_demand("emulation", "uid-ng")
+    store.replace_contour_obligations("emulation", {"uid-ng": (T10, True)})
+    poller.poll_once()
+    clock[0] = 5000
+    poller.poll_once()
+    assert cache.unregistered == []
+
+
+def test_replace_demand_drops_previous_launch_rows(tmp_path):
+    from src.assembly.feed import StoreCoreLink
+
+    store = MarketDataStore(tmp_path / "market.sqlite3")
+    store.record_contour_demand("emulation", [("uid-br", "5m", 50, instrument_payload(NG))])
+    store.record_contour_demand("account", [("uid-br", "5m", 50, instrument_payload(NG))])
+    link = StoreCoreLink(store, "emulation")
+    link.replace([(SBER, "1h", 120), (SBER, "1h", 60)])
+    assert [(row["contour_id"], row["instrument_key"], row["min_bars"]) for row in store.contour_demands()] == [
+        ("account", "uid-br", 50), ("emulation", "uid-sber", 120)]
+    link.request_history(SBER, "1h", 100)                          # уже отправлено глубже — без записи
+    link.forget(SBER)
+    assert [row["contour_id"] for row in store.contour_demands()] == ["account"]
+    link.request_history(SBER, "1h", 100)                          # после выхода — снова пишется
+    assert len(store.contour_demands()) == 2

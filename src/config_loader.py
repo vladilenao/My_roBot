@@ -63,6 +63,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
     },
     "contours": {
         "feed_poll_secs": "contours_feed_poll_secs",
+        "demand_release_secs": "contours_demand_release_secs",
     },
     "instruments": {
         "fallback_type": "instrument_type",
@@ -133,6 +134,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_retention_days": int,
     "contours_emulation_telegram_channel_env": str,
     "contours_feed_poll_secs": int,
+    "contours_demand_release_secs": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -591,6 +593,8 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [contours.emulation] telegram_channel_env — имя переменной окружения "
                 f"(заглавные латинские буквы, цифры и _), получено {value!r}"
             )
+        if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
         if key == "contours_feed_poll_secs" and (isinstance(value, bool) or value < 1):
             raise ConfigError(f"{path}: [contours] feed_poll_secs должен быть целым числом > 0, получено {value!r}")
         if key == "market_structure_redis_port" and value > 65535:
