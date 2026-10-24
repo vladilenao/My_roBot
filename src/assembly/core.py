@@ -378,6 +378,8 @@ class LiveCore:
         self._worker = None
         self._cluster_consumer = None
         self._tracks = False
+        # Пульс ядра (add-contour-recovery): ставит run.py, останавливается до ожидания контура.
+        self.pulse = None
 
     def start_early(self):
         """Ранний сбор данных до выбора инструментов (независимые полосы)."""
@@ -389,7 +391,34 @@ class LiveCore:
         """Локальный API, как только есть рыночная база; иначе — после сборки данных."""
         if self.export_server is None and self.market_store is not None and MARKET_DATA_EXPORT_ENABLED:
             self.export_server = _start_local_api(self.market_store, self.state_dir, control=control)
+            if self.export_server is not None:
+                self.export_server.core_state = self.core_snapshot
         return self.export_server
+
+    def core_snapshot(self) -> dict:
+        """``GET /api/v1/core`` (add-contour-recovery): версия, пульс, готовность пар, запросы к брокеру."""
+        from collections import Counter
+
+        from src import __version__
+
+        pulse = getattr(self, "pulse", None)
+        market = None
+        if self.market_store is not None:
+            info = self.market_store.source_info()
+            readiness = self.market_store.pair_readiness_all(source=SOURCE_TBANK)
+            market = {"producer_id": info.producer_id, "max_change_id": info.max_change_id,
+                      "pairs": {"total": len(readiness),
+                                "by_status": dict(Counter(str(item.get("state")) for item in readiness))}}
+        return {
+            "version": __version__, "pid": os.getpid(),
+            "started_at": None if pulse is None else pulse.started_at,
+            "heartbeat": None if pulse is None else pulse.payload(),
+            "market_data": market,
+            "quotas": {} if self.request_budget is None else {
+                service: {**value, "retry_after": None if value.get("retry_after") is None
+                          else value["retry_after"].isoformat().replace("+00:00", "Z")}
+                for service, value in self.request_budget.snapshot().items()},
+        }
 
     def ensure_market_data(self):
         """Без независимых полос данные собираются после выбора инструментов, как раньше."""
@@ -411,7 +440,7 @@ class LiveCore:
 
     def run_contour(self, instruments, *, kind: str, control=None, source: str = "", command: str = "",
                     core_state=None, next_launch=None, resolve=None, process_factory=None,
-                    poll_secs: float = 1.0) -> int:
+                    poll_secs: float = 1.0, recovery=None) -> int:
         """Цикл ядра: прогрев один раз, затем запуск процесса контура и надзор (add-contour-process, add-control-api).
 
         После выхода процесса ``next_launch`` ждёт следующую команду запуска и
@@ -419,6 +448,10 @@ class LiveCore:
         заново без перезапуска приёма данных. Без ``next_launch`` (или если она
         вернула ``None``) ядро, как прежде, ждёт Ctrl+C: приём данных и API
         работают, контур сам не перезапускается.
+
+        ``recovery`` — план старта ядра (add-contour-recovery): первый процесс
+        подхватывается живым (``adopt``) или поднимается по желаемому без
+        нового поколения (``autostart``).
         """
         import time
 
@@ -440,9 +473,16 @@ class LiveCore:
         process = None
         try:
             while True:
-                process = self._start_contour_process(
-                    instruments, kind=kind, control=control, source=source, command=command,
-                    core_state=core_state, process_factory=process_factory)
+                if recovery is not None and recovery.action == "adopt":
+                    process = self._adopt_contour_process(recovery.pid, kind=kind, control=control,
+                                                          poll_secs=poll_secs)
+                else:
+                    autostart = recovery is not None and core_state is not None
+                    process = self._start_contour_process(
+                        instruments, kind=kind, control=control, source=source, command=command,
+                        core_state=core_state, process_factory=process_factory,
+                        desired=core_state.desired(kind) if autostart else None)
+                recovery = None
                 self._supervise(process, kind=kind, control=control, poll_secs=poll_secs,
                                 membership=lambda command: self._membership_command(
                                     command, kind=kind, control=control, core_state=core_state, poller=poller,
@@ -459,6 +499,9 @@ class LiveCore:
         except KeyboardInterrupt:
             log.info("Ядро останавливается: контур %s получает stop", kind)
         finally:
+            # Пульс «остановлено» — раньше ожидания: подхваченный контур узнаёт об остановке только из него.
+            if getattr(self, "pulse", None) is not None:
+                self.pulse.stop()
             if process is not None:
                 process.stop()
             poller.stop()
@@ -469,9 +512,16 @@ class LiveCore:
         if getattr(self, "_pattern_trigger", None) is not None:
             self._pattern_trigger.remove_pairs([(instrument, timeframe)])
 
-    def _start_contour_process(self, instruments, *, kind, control, source, command, core_state, process_factory):
-        """Переезд журнала, карточки контрактов, желаемое «работает», ``launch.json`` и процесс."""
+    def _start_contour_process(self, instruments, *, kind, control, source, command, core_state, process_factory,
+                               desired=None):
+        """Переезд журнала, карточки контрактов, желаемое «работает», ``launch.json`` и процесс.
+
+        С ``desired`` — автоподъём (add-contour-recovery): желаемое не меняется,
+        процесс получает текущее поколение, а карточки, которые брокер не отдал,
+        берутся из сохранённого состава.
+        """
         from src import __version__
+        from src.assembly.contracts import contracts_from_payload
         from src.assembly.process import ContourProcess, contour_dir, migrate_journal, write_launch
 
         directory = contour_dir(self.state_dir, kind)
@@ -480,10 +530,20 @@ class LiveCore:
                                              request_budget=self.request_budget)
         payloads = [instrument_payload(item) for item in instruments]
         chosen = control.chosen_payloads() if control is not None else []
-        # Желаемое — до запуска процесса: контур на старте не должен увидеть прежнюю остановку.
-        generation = None if core_state is None else core_state.record_launch(
-            kind, kind, payloads, source=source, command=command,
-            members=[_member(item, contracts, chosen) for item in instruments])
+        if desired is not None:
+            stored = {}
+            for member in desired.members:
+                try:
+                    stored.update(contracts_from_payload(member.contract or {}))
+                except (KeyError, TypeError, ValueError):
+                    log.warning("Сохранённая карточка контракта %s не читается — без запасной карточки", member.name)
+            contracts = {**stored, **contracts}
+            generation, source, command = desired.generation, desired.source or "", desired.command or ""
+        else:
+            # Желаемое — до запуска процесса: контур на старте не должен увидеть прежнюю остановку.
+            generation = None if core_state is None else core_state.record_launch(
+                kind, kind, payloads, source=source, command=command,
+                members=[_member(item, contracts, chosen) for item in instruments])
         write_launch(directory, {
             "contour_id": kind, "kind": kind, "core_pid": os.getpid(), "core_version": __version__,
             "source": source, "command": command, "generation": generation,
@@ -499,6 +559,35 @@ class LiveCore:
         factory = process_factory or ContourProcess
         process = factory(kind, on_exit=exited)
         pid = process.start()
+        if control is not None:
+            control.mark_process(pid)
+        return process
+
+    def _adopt_contour_process(self, pid, *, kind, control, poll_secs):
+        """Живой контур той же версии: надзор по pid, команды — через ``core.sqlite3`` (add-contour-recovery)."""
+        from datetime import datetime, timezone
+
+        from src.assembly.contour_control import STATUS_FILE, read_status
+        from src.assembly.core_state import parse_time
+        from src.assembly.process import AdoptedProcess, contour_dir
+
+        adopted_at = datetime.now(timezone.utc)
+        status_path = contour_dir(self.state_dir, kind) / STATUS_FILE
+
+        def exited(code, stopping):
+            # Кода выхода у чужого процесса нет: штатный выход контур отмечает в status.json.
+            status = read_status(status_path) or {}
+            try:
+                clean = bool(status.get("exited_at")) and parse_time(status["exited_at"]) >= adopted_at
+            except (TypeError, ValueError):
+                clean = False
+            if not clean:
+                log.error("Подхваченный контур %s завершился без отметки штатного выхода", kind)
+            if control is not None:
+                control.mark_exited(0 if clean else None, stopping=stopping)
+
+        process = AdoptedProcess(kind, pid, on_exit=exited, poll_secs=poll_secs)
+        process.start()
         if control is not None:
             control.mark_process(pid)
         return process
@@ -647,7 +736,9 @@ class LiveCore:
             self.pattern_sink = None
 
     def close(self) -> None:
-        """Прежний порядок: паттерны, поллер (или ранние полосы), кластерный поток, API."""
+        """Прежний порядок: паттерны, поллер (или ранние полосы), кластерный поток, API; пульс — «остановлено»."""
+        if getattr(self, "pulse", None) is not None:
+            self.pulse.stop()
         self.stop_patterns()
         if self._poller is not None:
             self._poller.close()

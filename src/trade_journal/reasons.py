@@ -25,6 +25,7 @@ REASON_LABELS = {
     "contour-stop": "остановка контура командой",
     "instrument-removing": "инструмент убирается из состава",
     "instrument-remove": "инструмент убран из состава",
+    "core-lost": "нет связи с ядром",
     "profile-entry": "вход по профилю",
     "protective": "стоп",
     "tp": "цель по цене",

@@ -21,6 +21,9 @@ class Manager:
         self.calls.append(mode)
         return ()
 
+    def hold_entries(self, held):
+        self.held = held
+
     def contour_remainder(self):
         return self.remainder
 
@@ -304,3 +307,42 @@ def test_process_start_keeps_removed_instrument_with_open_trade(tmp_path):
                              request_stop=lambda reason: None)
     contour.start(manager, roster)
     assert contour.members == {"SBER": "draining"} and manager.instrument_calls == [("SBER", "no_entries")]
+
+
+# ── Связь с ядром и признак жизни (add-contour-recovery) ──
+
+def test_lost_core_link_holds_entries_at_tick_boundary(env):
+    core, control, stops, tmp_path = env
+    manager = Manager()
+    contour = control()
+    contour.start(manager)
+    contour.touch("lost")
+    assert read_status(tmp_path / "status.json")["core_link"] == "lost"
+    contour.before_tick()
+    assert manager.held is True
+    contour.touch("ok")
+    contour.before_tick()
+    contour.after_tick()
+    assert manager.held is False and read_status(tmp_path / "status.json")["core_link"] == "ok"
+
+
+def test_touch_refreshes_alive_at_without_ticks(env):
+    core, control, stops, tmp_path = env
+    contour = control()
+    contour.touch("ok")                       # до старта снимка нет — файл не пишется
+    assert read_status(tmp_path / "status.json") is None
+    contour.start(Manager())
+    first = read_status(tmp_path / "status.json")
+    contour.touch("ok")
+    second = read_status(tmp_path / "status.json")
+    assert second["alive_at"] >= first["alive_at"] and second["last_tick_at"] is None
+    assert second["exited_at"] is None and second["exit_reason"] is None
+
+
+def test_finish_marks_clean_exit(env):
+    core, control, stops, tmp_path = env
+    contour = control()
+    contour.start(Manager())
+    contour.finish("ядро остановлено")
+    status = read_status(tmp_path / "status.json")
+    assert status["exited_at"] and status["exit_reason"] == "ядро остановлено"

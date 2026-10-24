@@ -6,6 +6,10 @@
 ``trades.sqlite3``, а снимок для API ядра — в ``status.json`` своей папки.
 Когда остановка применена и сделок не осталось, контур просит завершить цикл
 после текущего тика. Модуль не импортирует ядро.
+
+Связь с ядром (add-contour-recovery) приходит из потока пульса через
+``touch``: он же обновляет ``alive_at`` в ``status.json`` между тиками, а
+граница тика включает или снимает запрет входов ``core-lost``.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from datetime import datetime, timezone
@@ -21,6 +26,7 @@ from typing import Callable
 
 from src.assembly.contracts import contracts_from_payload, instrument_from_payload
 from src.assembly.core_state import CLOSE_ALL, read_desired
+from src.assembly.pulse import LINK_LOST, LINK_OK
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -82,6 +88,16 @@ class ContourControl:
         self._members: dict[str, dict] = {}
         self._warm_timeout = warm_timeout
         self._clock = clock
+        # Связь с ядром и признак жизни (add-contour-recovery): пишет и поток пульса, поэтому под замком.
+        self._status_lock = threading.Lock()
+        self._snapshot: dict | None = None
+        self._core_link = LINK_OK
+        self._alive_at: str | None = None
+        self._exited: tuple[str, str] | None = None
+
+    @property
+    def core_link(self) -> str:
+        return self._core_link
 
     @property
     def state(self) -> str:
@@ -116,6 +132,8 @@ class ContourControl:
 
     def before_tick(self) -> None:
         """Начало завершения тика: новое поколение применяется, остановка повторяется до пустого остатка."""
+        if self._manager is not None:
+            self._manager.hold_entries(self._core_link == LINK_LOST)
         desired = self._read()
         if desired is not None and desired.generation != self._generation:
             self._apply(desired)
@@ -139,6 +157,21 @@ class ContourControl:
 
     def close(self) -> None:
         self._write_status()
+
+    def touch(self, link: str) -> None:
+        """Поток пульса: связь с ядром и ``alive_at`` — и между тиками, и без ядра."""
+        with self._status_lock:
+            self._core_link = link
+            self._alive_at = _now()
+            snapshot = self._snapshot
+        if snapshot is not None:
+            self._flush()
+
+    def finish(self, reason: str) -> None:
+        """Штатный выход процесса: ``exited_at`` и причина; аварийный выход их не пишет."""
+        with self._status_lock:
+            self._exited = (_now(), reason)
+        self._flush()
 
     def _apply(self, desired) -> None:
         mode = None if desired.running else desired.stop_mode
@@ -256,14 +289,26 @@ class ContourControl:
 
     def _write_status(self) -> None:
         positions, entries = self._remainder
-        try:
-            write_status(self._status_path, {
-                "contour_id": self._contour_id, "state": self._state, "applied_generation": self._generation,
-                "stop_mode": self._mode, "open_positions": positions, "pending_entries": entries,
-                "last_tick_at": self._last_tick_at, "version": self._version, "pid": self._pid,
-                "members": [{"key": key, "name": entry["member"].name, "state": entry["state"]}
-                            for key, entry in self._members.items()],
-                "updated_at": _now(),
-            })
-        except OSError as exc:
-            log.warning("status.json контура не записан (%s)", type(exc).__name__)
+        snapshot = {
+            "contour_id": self._contour_id, "state": self._state, "applied_generation": self._generation,
+            "stop_mode": self._mode, "open_positions": positions, "pending_entries": entries,
+            "last_tick_at": self._last_tick_at, "version": self._version, "pid": self._pid,
+            "members": [{"key": key, "name": entry["member"].name, "state": entry["state"]}
+                        for key, entry in self._members.items()],
+        }
+        with self._status_lock:
+            self._snapshot = snapshot
+        self._flush()
+
+    def _flush(self) -> None:
+        """Снимок главного потока + связь, признак жизни и итог выхода — одной атомарной записью."""
+        with self._status_lock:
+            if self._snapshot is None:
+                return
+            exited_at, reason = self._exited or (None, None)
+            payload = {**self._snapshot, "core_link": self._core_link, "alive_at": self._alive_at or _now(),
+                       "exited_at": exited_at, "exit_reason": reason, "updated_at": _now()}
+            try:
+                write_status(self._status_path, payload)
+            except OSError as exc:
+                log.warning("status.json контура не записан (%s)", type(exc).__name__)

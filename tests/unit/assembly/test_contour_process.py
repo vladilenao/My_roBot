@@ -152,14 +152,15 @@ class TestStdinStop:
 
         assert stop.requested.is_set() and stop.reason == "команда ядра"
 
-    def test_end_of_stream_means_core_is_gone(self):
+    def test_end_of_stream_does_not_stop(self):
+        # Ядро умерло или контур подхвачен без stdin: решает пульс (add-contour-recovery).
         stop = StdinStop(io.StringIO(""))
         stop._read()
 
-        assert stop.requested.is_set() and stop.reason == "ядро завершилось"
+        assert not stop.requested.is_set()
 
     def test_first_reason_wins(self):
-        stop = StdinStop(io.StringIO(""))
+        stop = StdinStop(io.StringIO("stop\n"))
         stop.request("Ctrl+C")
         stop._read()
 
