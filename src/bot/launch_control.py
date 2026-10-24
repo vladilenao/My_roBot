@@ -69,11 +69,46 @@ def parse_command(body) -> LaunchRequest:
     return LaunchRequest(MODE_EMULATION, SOURCE_API, tokens)
 
 
+@dataclass
+class MembershipCommand:
+    """Команда состава контура (add-contour-membership): ровно одно из ``add`` / ``remove``."""
+
+    add: tuple = ()
+    remove: tuple = ()
+    mode: str = "no_entries"
+    done: threading.Event = field(default_factory=threading.Event)
+    status: int = 0
+    payload: dict | None = None
+
+
+def parse_membership(body) -> MembershipCommand:
+    """Тело ``POST /api/v1/contours/{id}/instruments`` → команда или ``BadCommand``."""
+    message = "Тело — {\"add\": [...]} или {\"remove\": [...], \"mode\": \"no_entries\" | \"close_all\"}."
+    if not isinstance(body, dict) or len({"add", "remove"} & set(body)) != 1:
+        raise BadCommand("INVALID_REQUEST", message)
+    allowed = {"add"} if "add" in body else {"remove", "mode"}
+    tokens = body.get("add", body.get("remove"))
+    mode = body.get("mode", "no_entries")
+    if (set(body) - allowed or mode not in STOP_MODES or not isinstance(tokens, list) or not tokens
+            or not all(isinstance(item, str) and item.strip() for item in tokens)):
+        raise BadCommand("INVALID_REQUEST", message)
+    tokens = tuple(dict.fromkeys(item.strip() for item in tokens))
+    return MembershipCommand(add=tokens) if "add" in body else MembershipCommand(remove=tokens, mode=mode)
+
+
 def parse_stop(body) -> str:
     """Тело ``POST /api/v1/contours/{id}/stop`` → режим остановки или ``BadCommand``."""
     if not isinstance(body, dict) or set(body) != {"mode"} or body["mode"] not in STOP_MODES:
         raise BadCommand("INVALID_REQUEST", "Тело остановки — {\"mode\": \"no_entries\"} или {\"mode\": \"close_all\"}.")
     return body["mode"]
+
+
+def _chosen_payload(member) -> dict:
+    """Участник состава в форме ``ContourInstrument``: как его назвали при разрешении."""
+    chosen = member.chosen or {}
+    return {"token": chosen.get("token") or member.instrument.get("ticker") or member.key,
+            "name": member.name, "instrument_type": member.instrument.get("instrument_type"),
+            "days_to_expiry": chosen.get("days_to_expiry")}
 
 
 def tail_lines(path: Path, count: int) -> str:
@@ -110,6 +145,7 @@ class LaunchControl:
         self._contour_dir = None if contour_dir is None else Path(contour_dir)
         self._log_file = log_file
         self._launched = False
+        self._membership: queue.Queue[MembershipCommand] = queue.Queue()
 
     # --- для API ----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -131,8 +167,24 @@ class LaunchControl:
             }
             launched = self._launched
         # Снимок прошлого запуска ядра не выдаётся за фактическое этого.
-        snapshot["actual"] = self._actual() if launched else None
+        status = self._status() if launched else None
+        snapshot["actual"] = None if status is None else {name: status.get(name) for name in (
+            "state", "applied_generation", "open_positions", "pending_entries", "last_tick_at")}
+        members = () if desired is None else desired.members
+        if members:
+            # Текущий желаемый состав (add-contour-membership), а не состав запуска.
+            snapshot["instruments"] = [_chosen_payload(member) for member in members if member.active]
+        actual = {item.get("key"): item.get("state") for item in (status or {}).get("members") or ()}
+        snapshot["members"] = [{"name": member.name, "instrument_type": member.instrument.get("instrument_type"),
+                                "desired": "active" if member.active else "removed",
+                                "remove_mode": member.remove_mode, "actual": actual.get(member.key)}
+                               for member in members]
         return snapshot
+
+    def chosen_payloads(self) -> list[dict]:
+        """Как инструменты последнего запуска названы при разрешении — для участников состава."""
+        with self._lock:
+            return [item.payload() for item in self._chosen]
 
     def contour(self, contour_id: str) -> dict | None:
         return self.snapshot() if contour_id == CONTOUR_ID else None
@@ -140,15 +192,11 @@ class LaunchControl:
     def _desired(self):
         return None if self._core_state is None else self._core_state.desired(CONTOUR_ID)
 
-    def _actual(self) -> dict | None:
+    def _status(self) -> dict | None:
         if self._contour_dir is None:
             return None
         from src.assembly.contour_control import STATUS_FILE, read_status
-        status = read_status(self._contour_dir / STATUS_FILE)
-        if status is None:
-            return None
-        return {name: status.get(name) for name in
-                ("state", "applied_generation", "open_positions", "pending_entries", "last_tick_at")}
+        return read_status(self._contour_dir / STATUS_FILE)
 
     def stop(self, contour_id: str, mode: str) -> tuple[int, dict]:
         """Команда остановки: желаемое «остановлен» новым поколением; применит контур на границе тика."""
@@ -167,6 +215,35 @@ class LaunchControl:
                          "contour": self.snapshot()}
         status = 202 if outcome.outcome == "accepted" else 200
         return status, {"generation": outcome.generation, "contour": self.snapshot()}
+
+    def change_membership(self, contour_id: str, command: MembershipCommand) -> tuple[int, dict]:
+        """Команда состава из HTTP-потока: разбирает главный поток ядра, ответ — не дольше таймаута."""
+        if contour_id != CONTOUR_ID:
+            return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
+        desired = self._desired()
+        with self._lock:
+            alive = self._pid is not None
+        if not alive:
+            return 409, {"code": "NOT_RUNNING", "message": "Контур не работает: состав менять нечему.",
+                         "contour": self.snapshot()}
+        if desired is not None and not desired.running:
+            return 409, {"code": "STOPPING", "message": "Контур останавливается: состав не меняется.",
+                         "contour": self.snapshot()}
+        self._membership.put(command)
+        if command.done.wait(self._reply_timeout):
+            return command.status, command.payload
+        return 202, {"generation": None, "contour": self.snapshot()}
+
+    def next_membership(self, timeout: float):
+        """Главный поток ядра: следующая команда состава или ``None`` за ``timeout``."""
+        try:
+            return self._membership.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def answer_membership(self, command: MembershipCommand, status: int, payload: dict) -> None:
+        command.status, command.payload = status, payload
+        command.done.set()
 
     def log_tail(self, contour_id: str, count: int) -> str | None:
         """Последние строки журнала процесса контура; секреты в нём уже замаскированы."""

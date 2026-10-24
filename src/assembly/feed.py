@@ -46,6 +46,23 @@ class StoreCoreLink:
     def touch(self, instrument, timeframe):
         self.request_history(instrument, timeframe, 1)
 
+    def replace(self, requests) -> None:
+        """Запуск контура: спрос заменяется начальным, строки прошлых запусков стираются."""
+        rows, sent = [], {}
+        for instrument, timeframe, count in requests:
+            key = (instrument_key(instrument), timeframe)
+            if int(count) > sent.get(key, 0):
+                sent[key] = int(count)
+                rows.append((key[0], timeframe, int(count), instrument_payload(instrument)))
+        self._store.replace_contour_demand(self._contour_id, rows)
+        self._sent = sent
+
+    def forget(self, instrument) -> None:
+        """Инструмент вышел из состава: его строки спроса удаляются, ядро снимет пары после выдержки."""
+        key = instrument_key(instrument)
+        self._store.remove_contour_demand(self._contour_id, key)
+        self._sent = {item: count for item, count in self._sent.items() if item[0] != key}
+
 
 class _ClusterReadClock:
     """Момент последнего чтения Redis ядром — из хранилища кластеров (для ``consumer_lag``)."""
@@ -121,9 +138,10 @@ class FeedMarketServices:
 
     def serve(self, demand: ContourDemand):
         """Спрос — строками ядру, обязательства — снимком; ожидание старта — пары и лента."""
+        # Спрос прошлых запусков не должен держать пары у ядра (add-contour-membership).
+        self.link.replace(demand.history_requests)
         for instrument, timeframe, count in demand.history_requests:
             self.data_cache.want(instrument, timeframe, count)
-            self.link.request_history(instrument, timeframe, count)
         if self._tracks and demand.obligations is not None:
             self.update_obligations(demand.obligations)
         self.reader.start()
@@ -152,6 +170,10 @@ class FeedMarketServices:
             return
         self.market_store.replace_contour_obligations(self.contour_id, obligations)
         self._obligations = dict(obligations)
+
+    def forget_instrument(self, instrument) -> None:
+        """Инструмент вышел из состава контура: строки спроса — долой, ядро снимет пары после выдержки."""
+        self.link.forget(instrument)
 
     def acknowledge_tick(self) -> None:
         if self._started:

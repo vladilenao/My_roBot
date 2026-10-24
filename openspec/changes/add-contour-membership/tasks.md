@@ -1,39 +1,39 @@
 ## 1. Желаемый состав в `core.sqlite3`
 
-- [ ] 1.1 `contour_members` в `core_state.py`: запуск заменяет состав; `add` / `remove` одной транзакцией с одним поколением; `ignored` без изменений; `close_all` поверх `no_entries`; обратный переход — `conflict`; заполнение из `instruments_json` для контура, запущенного до этапа
-- [ ] 1.2 Разрешение `remove` по участникам: короткое имя, тикер, код семейства при единственном контракте
-- [ ] 1.3 Тесты: поколения, повторы, переходы режимов, возврат `removed` → `active`, неизвестный токен, переоткрытие базы
+- [x] 1.1 `contour_members` в `core_state.py`: запуск заменяет состав; `add` / `remove` одной транзакцией с одним поколением; `ignored` без изменений; `close_all` поверх `no_entries`; обратный переход — `conflict`; заполнение из `instruments_json` для контура, запущенного до этапа
+- [x] 1.2 Разрешение `remove` по участникам: короткое имя, тикер, код семейства при единственном контракте
+- [x] 1.3 Тесты: поколения, повторы, переходы режимов, возврат `removed` → `active`, неизвестный токен, переоткрытие базы
 
 ## 2. Менеджер сделок
 
-- [ ] 2.1 `stop_instrument(key, mode | None)`: отказ входам и доборам `instrument-removing`, `CancelEntry`/`CloseTrade` с `instrument-remove` только по инструменту, без повторов
-- [ ] 2.2 `contour_remainder(key=None)` по инструменту
-- [ ] 2.3 Тесты: сигнал по убираемому и по соседнему инструменту, закрыть всё одного инструмента, снятие остановки
+- [x] 2.1 `stop_instrument(key, mode | None)`: отказ входам и доборам `instrument-removing`, `CancelEntry`/`CloseTrade` с `instrument-remove` только по инструменту, без повторов
+- [x] 2.2 `contour_remainder(key=None)` по инструменту
+- [x] 2.3 Тесты: сигнал по убираемому и по соседнему инструменту, закрыть всё одного инструмента, снятие остановки
 
 ## 3. Контур
 
-- [ ] 3.1 `LiveAnalysis.bootstrap_instrument` и `register_needs` для одного инструмента (общая часть со стартовым обзором)
-- [ ] 3.2 `TradingBot`, жизненный цикл, алиасы и списки исполнения: добавление и удаление инструмента на границе тика; карточки — в брокер и журнал
-- [ ] 3.3 `ContourControl`: сравнение состава, `warming` до готовности пар или срока, обзор, `trading`; снятие — `draining`/`closing` до пустого остатка, затем выход; возврат; применение всего состава при старте; `members` в `status.json`
-- [ ] 3.4 Тесты: прогрев и обзор без переигрывания, торговля соседей не прерывается, выход после последней сделки, выход без сделок, срок прогрева, возврат, старт процесса с `removed` и открытой сделкой
+- [x] 3.1 `LiveAnalysis.bootstrap_instrument` и `register_needs` для одного инструмента (общая часть со стартовым обзором)
+- [x] 3.2 `TradingBot`, жизненный цикл, алиасы и списки исполнения: добавление и удаление инструмента на границе тика; карточки — в брокер и журнал
+- [x] 3.3 `ContourControl`: сравнение состава, `warming` до готовности пар или срока, обзор, `trading`; снятие — `draining`/`closing` до пустого остатка, затем выход; возврат; применение всего состава при старте; `members` в `status.json`
+- [x] 3.4 Тесты: прогрев и обзор без переигрывания, торговля соседей не прерывается, выход после последней сделки, выход без сделок, срок прогрева, возврат, старт процесса с `removed` и открытой сделкой
 
 ## 4. Спрос контура и пары ядра
 
-- [ ] 4.1 `MarketDataStore.replace_contour_demand` и `remove_contour_demand`; `FeedMarketServices.serve` заменяет спрос, `StoreCoreLink.forget` при выходе инструмента
-- [ ] 4.2 `ContourDemandPoller`: отметка пар без спроса и обязательств, снятие через `demand_release_secs` (`unregister_live_pair`, `retire_roster_pairs`, пары паттернов), отмена отметки при новом спросе
-- [ ] 4.3 `[contours] demand_release_secs` в конфиге и `default.toml`
-- [ ] 4.4 Тесты: замена спроса при запуске, удаление строк при выходе, снятие после выдержки, отказ снимать при обязательстве, отмена при вернувшемся спросе
+- [x] 4.1 `MarketDataStore.replace_contour_demand` и `remove_contour_demand`; `FeedMarketServices.serve` заменяет спрос, `StoreCoreLink.forget` при выходе инструмента
+- [x] 4.2 `ContourDemandPoller`: отметка пар без спроса и обязательств, снятие через `demand_release_secs` (`unregister_live_pair`, `retire_roster_pairs`, пары паттернов), отмена отметки при новом спросе
+- [x] 4.3 `[contours] demand_release_secs` в конфиге и `default.toml`
+- [x] 4.4 Тесты: замена спроса при запуске, удаление строк при выходе, снятие после выдержки, отказ снимать при обязательстве, отмена при вернувшемся спросе
 
 ## 5. Ядро и API
 
-- [ ] 5.1 Очередь команд состава в `LaunchControl`; `_supervise` разбирает её в главном потоке: разрешение токенов, карточки, `contour_members`, паттерны и инструменты обязательств ядра
-- [ ] 5.2 `POST /api/v1/contours/{id}/instruments`: 202/200/400/404/409/422, ожидание 60 с; `instruments` и `members` в состоянии
-- [ ] 5.3 Swagger `docs/openapi.yaml` `1.6.0-proposal`: маршрут, примеры, схемы `ContourMembershipRequest`, `ContourMember`, `ContourMembershipAccepted`; проверка валидатором
-- [ ] 5.4 Тесты API и ядра: добавить с карточкой фьючерса, отклонённое добавление, убрать отсутствующий, `STOPPING`, `NOT_RUNNING`, повтор `200`, схема ответа
+- [x] 5.1 Очередь команд состава в `LaunchControl`; `_supervise` разбирает её в главном потоке: разрешение токенов, карточки, `contour_members`, паттерны и инструменты обязательств ядра
+- [x] 5.2 `POST /api/v1/contours/{id}/instruments`: 202/200/400/404/409/422, ожидание 60 с; `instruments` и `members` в состоянии
+- [x] 5.3 Swagger `docs/openapi.yaml` `1.6.0-proposal`: маршрут, примеры, схемы `ContourMembershipRequest`, `ContourMember`, `ContourMembershipAccepted`; проверка валидатором
+- [x] 5.4 Тесты API и ядра: добавить с карточкой фьючерса, отклонённое добавление, убрать отсутствующий, `STOPPING`, `NOT_RUNNING`, повтор `200`, схема ответа
 
 ## 6. Документы и проверка
 
-- [ ] 6.1 `docs/architecture/core-contours.md` и артефакт документа 1: состав — инструменты (`contour_members`, `/instruments`), П5 ✓
-- [ ] 6.2 `README.txt`, `CHANGELOG.md`
-- [ ] 6.3 Полный `pytest`, `ruff` (F821/F401), `openspec validate add-contour-membership --strict`
-- [ ] 6.4 Живая проверка на 8102: запуск SBER → `add NG` → прогрев и обзор NG → `remove SBER` при открытой позиции → дожитие и выход → `add SBER` → `remove NG close_all`
+- [x] 6.1 `docs/architecture/core-contours.md` и артефакт документа 1: состав — инструменты (`contour_members`, `/instruments`), П5 ✓
+- [x] 6.2 `README.txt`, `CHANGELOG.md`
+- [x] 6.3 Полный `pytest`, `ruff` (F821/F401), `openspec validate add-contour-membership --strict`
+- [x] 6.4 Живая проверка на 8102: запуск SBER → `add NG` → прогрев и обзор NG → `remove SBER` при открытой позиции → дожитие и выход → `add SBER` → `remove NG close_all`

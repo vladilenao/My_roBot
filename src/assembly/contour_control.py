@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from src.assembly.core_state import read_desired
+from src.assembly.contracts import contracts_from_payload, instrument_from_payload
+from src.assembly.core_state import CLOSE_ALL, read_desired
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -27,6 +29,8 @@ STATUS_FILE = "status.json"
 STATUS_SCHEMA_VERSION = 1
 RUNNING = "running"
 STOPPED = "stopped"
+# Состояния участника состава (add-contour-membership).
+WARMING, TRADING, DRAINING, CLOSING = "warming", "trading", "draining", "closing"
 
 
 def _now() -> str:
@@ -57,7 +61,8 @@ class ContourControl:
     """Применение желаемого состояния ядра внутри процесса контура."""
 
     def __init__(self, *, core_db: Path, contour_id: str, journal_db: Path, status_path: Path,
-                 request_stop: Callable[[str], None], version: str = "", pid: int | None = None) -> None:
+                 request_stop: Callable[[str], None], version: str = "", pid: int | None = None,
+                 warm_timeout: float = 600.0, clock: Callable[[], float] = time.monotonic) -> None:
         self._core_db = Path(core_db)
         self._contour_id = contour_id
         self._journal_db = Path(journal_db)
@@ -72,6 +77,11 @@ class ContourControl:
         self._remainder = (0, 0)
         self._last_tick_at: str | None = None
         self._read_failed = False
+        # Состав (add-contour-membership): ключ инструмента → состояние участника.
+        self._roster = None
+        self._members: dict[str, dict] = {}
+        self._warm_timeout = warm_timeout
+        self._clock = clock
 
     @property
     def state(self) -> str:
@@ -81,9 +91,14 @@ class ContourControl:
     def applied_generation(self) -> int:
         return self._generation
 
-    def start(self, manager) -> None:
+    @property
+    def members(self) -> dict[str, str]:
+        return {key: entry["state"] for key, entry in self._members.items()}
+
+    def start(self, manager, roster=None) -> None:
         """Старт процесса: текущее желаемое применяется всегда — блок входов живёт в памяти менеджера."""
         self._manager = manager
+        self._roster = roster
         with closing(self._journal()) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS contour_state (
                 contour_id TEXT PRIMARY KEY, applied_generation INTEGER NOT NULL, state TEXT NOT NULL,
@@ -95,6 +110,7 @@ class ContourControl:
         desired = self._read()
         if desired is not None:
             self._apply(desired)
+            self._apply_members(desired)
         self._remainder = self._count()
         self._write_status()
 
@@ -106,10 +122,13 @@ class ContourControl:
         elif self._mode is not None and self._manager is not None:
             # Вход мог исполниться до снятия, а закрытие — не пройти: повтор идемпотентен.
             self._manager.stop_contour(self._mode)
+        if desired is not None:
+            self._apply_members(desired)
 
     def after_tick(self) -> None:
-        """Конец завершения тика: при пустом остатке остановка завершается, затем снимок."""
+        """Конец завершения тика: убранные без сделок выходят из состава; пустой остаток завершает остановку."""
         self._last_tick_at = _now()
+        self._retire_drained()
         self._remainder = self._count()
         if self._mode is not None and self._state != STOPPED and self._remainder == (0, 0):
             self._state = STOPPED
@@ -132,6 +151,83 @@ class ContourControl:
         self._state = RUNNING if mode is None else f"stopping_{mode}"
         self._generation = desired.generation
         self._save()
+
+    # ── Состав контура (add-contour-membership) ──
+
+    def _apply_members(self, desired) -> None:
+        """Желаемый состав против текущего: прогрев новых, возврат, снятие; только между тиками."""
+        if self._roster is None or not desired.members:
+            return
+        present = self._roster.keys()
+        for member in desired.members:
+            entry = self._members.get(member.key)
+            if entry is None and member.key in present:
+                entry = self._members[member.key] = {"state": TRADING, "member": member}
+            if member.active:
+                self._activate(member, entry)
+            elif entry is not None:
+                self._deactivate(member, entry)
+        self._progress_warming()
+
+    def _activate(self, member, entry) -> None:
+        if entry is None:
+            log.info("Контур %s: %s добавлен — прогрев", self._contour_id, member.name)
+            self._members[member.key] = {"state": WARMING, "member": member, "since": self._clock(), "warmed": False}
+            return
+        entry["member"] = member
+        if entry["state"] in (DRAINING, CLOSING):
+            log.info("Контур %s: %s возвращён в торговлю", self._contour_id, member.name)
+            if self._manager is not None:
+                self._manager.stop_instrument(member.key, None)
+            entry["state"] = TRADING
+
+    def _deactivate(self, member, entry) -> None:
+        if entry["state"] == WARMING:
+            log.info("Контур %s: %s убран до окончания прогрева", self._contour_id, member.name)
+            self._members.pop(member.key)
+            self._roster.retire(instrument_from_payload(member.instrument))
+            return
+        state = CLOSING if member.remove_mode == CLOSE_ALL else DRAINING
+        if entry["state"] != state:
+            log.info("Контур %s: %s убирается (%s)", self._contour_id, member.name, member.remove_mode)
+        entry.update(state=state, member=member)
+        if self._manager is not None:
+            # Повтор каждый тик идемпотентен: вход мог исполниться до снятия, закрытие — не пройти.
+            self._manager.stop_instrument(member.key, member.remove_mode)
+
+    def _progress_warming(self) -> None:
+        now = self._clock()
+        for entry in self._members.values():
+            if entry["state"] != WARMING:
+                continue
+            member = entry["member"]
+            instrument = instrument_from_payload(member.instrument)
+            if not entry["warmed"]:
+                entry["warmed"] = self._roster.warm(instrument)
+                continue
+            expired = now - entry["since"] >= self._warm_timeout
+            if not self._roster.ready(instrument) and not expired:
+                continue
+            if expired:
+                log.warning("Контур %s: %s не прогрет за %.0f с — обзор с тем, что есть",
+                            self._contour_id, member.name, self._warm_timeout)
+            self._roster.admit(instrument, contracts_from_payload(member.contract or {}))
+            entry["state"] = TRADING
+            log.info("Контур %s: %s торгует", self._contour_id, member.name)
+
+    def _retire_drained(self) -> None:
+        for key, entry in list(self._members.items()):
+            if entry["state"] not in (DRAINING, CLOSING):
+                continue
+            remainder = (0, 0) if self._manager is None else self._manager.contour_remainder(key)
+            if remainder != (0, 0):
+                continue
+            instrument = self._roster.instrument(key) or instrument_from_payload(entry["member"].instrument)
+            self._roster.retire(instrument)
+            if self._manager is not None:
+                self._manager.stop_instrument(key, None)
+            self._members.pop(key)
+            log.info("Контур %s: %s вышел из состава — сделок нет", self._contour_id, entry["member"].name)
 
     def _read(self):
         try:
@@ -165,6 +261,8 @@ class ContourControl:
                 "contour_id": self._contour_id, "state": self._state, "applied_generation": self._generation,
                 "stop_mode": self._mode, "open_positions": positions, "pending_entries": entries,
                 "last_tick_at": self._last_tick_at, "version": self._version, "pid": self._pid,
+                "members": [{"key": key, "name": entry["member"].name, "state": entry["state"]}
+                            for key, entry in self._members.items()],
                 "updated_at": _now(),
             })
         except OSError as exc:

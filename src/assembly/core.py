@@ -30,6 +30,7 @@ from src.config import (
     DATABASE_FILE,
     CLUSTER_SETTINGS,
     CLUSTERS_ENABLED,
+    CONTOURS_DEMAND_RELEASE_SECS,
     CONTOURS_FEED_POLL_SECS,
     CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV,
     trading_enabled,
@@ -46,6 +47,7 @@ from src.market_structure.trigger import PatternTrigger
 from src.data.lanes import CalendarLane, ChangesRetentionLane, CompletenessLane, EvidenceLane
 from src.data.stream_ingestion import StreamSupervisor
 from src.instruments import Instrument
+from src.instruments.model import instrument_key
 from src.logging_setup import get_logger
 from src.scheduler.timing import MultiTimeframeScheduler
 
@@ -304,6 +306,22 @@ def _start_live_ingestion(data_cache, demand, client_provider, early=None):
     return poller, worker
 
 
+def _normalized(item):
+    from src.instruments import normalize_instrument
+    return item if isinstance(item, Instrument) else normalize_instrument(item)
+
+
+def _member(instrument, contracts, chosen):
+    """Участник желаемого состава: карточка, как назван при разрешении, карточка контракта."""
+    from src.assembly.core_state import Member
+
+    key = instrument_key(instrument)
+    name = instrument.short_name or instrument.ticker
+    match = next((item for item in chosen or () if item.get("name") == name), None)
+    own = {address: meta for address, meta in contracts.items() if address in (key, instrument.ticker)}
+    return Member(key, instrument_payload(instrument), match, contracts_payload(own) if own else None)
+
+
 def _retire_unselected_pairs(data_cache, instruments, worker):
     """Пары сохранённого состава, не выбранные сейчас и без обязательств, снимаются."""
     tickers = {instrument.ticker for instrument in instruments}
@@ -392,7 +410,8 @@ class LiveCore:
                 market_store=self.market_store, data_cache=self.data_cache, state_dir=self.state_dir)
 
     def run_contour(self, instruments, *, kind: str, control=None, source: str = "", command: str = "",
-                    core_state=None, next_launch=None, process_factory=None, poll_secs: float = 1.0) -> int:
+                    core_state=None, next_launch=None, resolve=None, process_factory=None,
+                    poll_secs: float = 1.0) -> int:
         """Цикл ядра: прогрев один раз, затем запуск процесса контура и надзор (add-contour-process, add-control-api).
 
         После выхода процесса ``next_launch`` ждёт следующую команду запуска и
@@ -407,7 +426,8 @@ class LiveCore:
 
         tracks = trading_enabled()
         poller = ContourDemandPoller(self.market_store, self.data_cache, instruments=instruments,
-                                     tracks_obligations=tracks, poll_seconds=CONTOURS_FEED_POLL_SECS)
+                                     tracks_obligations=tracks, poll_seconds=CONTOURS_FEED_POLL_SECS,
+                                     release_seconds=CONTOURS_DEMAND_RELEASE_SECS, on_release=self._release_patterns)
         # Строки обязательств прошлого запуска действуют сразу: целостность до старта контура.
         demand = ContourDemand(tuple(instruments), obligations=poller.obligations() if tracks else None,
                                pattern_pairs=_pattern_pairs(instruments))
@@ -423,7 +443,10 @@ class LiveCore:
                 process = self._start_contour_process(
                     instruments, kind=kind, control=control, source=source, command=command,
                     core_state=core_state, process_factory=process_factory)
-                self._supervise(process, kind=kind, control=control, poll_secs=poll_secs)
+                self._supervise(process, kind=kind, control=control, poll_secs=poll_secs,
+                                membership=lambda command: self._membership_command(
+                                    command, kind=kind, control=control, core_state=core_state, poller=poller,
+                                    resolve=resolve))
                 launch = None if next_launch is None else next_launch()
                 if launch is None:
                     while True:
@@ -441,6 +464,11 @@ class LiveCore:
             poller.stop()
         return 0 if process is None or process.exit_code in (0, None) else 1
 
+    def _release_patterns(self, instrument, timeframe) -> None:
+        """Пара снята за отсутствием спроса — её закрытые бары больше не ставятся воркеру паттернов."""
+        if getattr(self, "_pattern_trigger", None) is not None:
+            self._pattern_trigger.remove_pairs([(instrument, timeframe)])
+
     def _start_contour_process(self, instruments, *, kind, control, source, command, core_state, process_factory):
         """Переезд журнала, карточки контрактов, желаемое «работает», ``launch.json`` и процесс."""
         from src import __version__
@@ -451,9 +479,11 @@ class LiveCore:
         contracts = _load_contracts_metadata(instruments, client_provider=self.client_provider,
                                              request_budget=self.request_budget)
         payloads = [instrument_payload(item) for item in instruments]
+        chosen = control.chosen_payloads() if control is not None else []
         # Желаемое — до запуска процесса: контур на старте не должен увидеть прежнюю остановку.
         generation = None if core_state is None else core_state.record_launch(
-            kind, kind, payloads, source=source, command=command)
+            kind, kind, payloads, source=source, command=command,
+            members=[_member(item, contracts, chosen) for item in instruments])
         write_launch(directory, {
             "contour_id": kind, "kind": kind, "core_pid": os.getpid(), "core_version": __version__,
             "source": source, "command": command, "generation": generation,
@@ -473,8 +503,69 @@ class LiveCore:
             control.mark_process(pid)
         return process
 
-    def _supervise(self, process, *, kind, control, poll_secs) -> None:
-        """Пока процесс жив: первое подтверждение курсора ленты переводит контур в ``running``."""
+    def _membership_command(self, command, *, kind, control, core_state, poller, resolve) -> None:
+        """Команда состава в главном потоке: разрешение, карточки, желаемое, потребности ядра."""
+        from src.assembly.core_state import ACCEPTED, IGNORED, match_members
+
+        if core_state is None:
+            control.answer_membership(command, 409, {"code": "NOT_RUNNING", "message": "Нет базы ядра.",
+                                                     "contour": control.snapshot()})
+            return
+        payload = {"add": list(command.add)} if command.add else {"remove": list(command.remove), "mode": command.mode}
+        added: list = []
+        if command.add:
+            try:
+                resolution = resolve(list(command.add))
+            except Exception as exc:  # сбой разрешения не должен оставлять API без ответа
+                log.warning("Команда состава не разрешена: %s", type(exc).__name__)
+                resolution = None
+            if resolution is None or not resolution.ok:
+                rejections = ([(item.token, item.reason) for item in resolution.rejections] if resolution
+                              else [("*", "Внутренняя ошибка разрешения инструментов.")])
+                self._reject_membership(command, control, core_state, kind, payload, rejections or [
+                    ("*", "Не выбрано ни одного инструмента.")])
+                return
+            added = [_normalized(item) for item in resolution.instruments]
+            contracts = _load_contracts_metadata(added, client_provider=self.client_provider,
+                                                 request_budget=self.request_budget)
+            chosen = [item.payload() for item in resolution.chosen]
+            outcome = core_state.record_membership(kind, add=[_member(item, contracts, chosen) for item in added],
+                                                   payload=payload)
+        else:
+            desired = core_state.desired(kind)
+            keys, rejections = match_members(() if desired is None else desired.members, command.remove)
+            if rejections:
+                self._reject_membership(command, control, core_state, kind, payload, rejections)
+                return
+            outcome = core_state.record_membership(kind, remove=keys, mode=command.mode, payload=payload)
+        if outcome.outcome == ACCEPTED and added:
+            # Ядро сразу ведёт сопровождение и паттерны нового инструмента; пары греет спрос контура.
+            poller.add_instruments(added)
+            if self._pattern_trigger is not None:
+                self._pattern_trigger.add_pairs(_pattern_pairs(added))
+        if outcome.outcome in (ACCEPTED, IGNORED):
+            log.info("Состав контура %s: %s — поколение %d", kind, payload, outcome.generation)
+            control.answer_membership(command, 202 if outcome.outcome == ACCEPTED else 200,
+                                      {"generation": outcome.generation, "contour": control.snapshot()})
+        else:
+            code = "STOPPING" if "останавливается" in outcome.reason else "MODE_CONFLICT"
+            control.answer_membership(command, 409, {"code": code, "message": f"Состав не изменён: {outcome.reason}.",
+                                                     "contour": control.snapshot()})
+
+    @staticmethod
+    def _reject_membership(command, control, core_state, kind, payload, rejections) -> None:
+        core_state.record_command(kind, "add" if command.add else "remove", payload, "rejected",
+                                  "; ".join(f"{token}: {reason}" for token, reason in rejections))
+        control.answer_membership(command, 422, {
+            "code": "INSTRUMENTS_REJECTED", "message": "Состав не изменён.",
+            "rejections": [{"token": token, "reason": reason} for token, reason in rejections]})
+
+    def _supervise(self, process, *, kind, control, poll_secs, membership=None) -> None:
+        """Пока процесс жив: первое подтверждение курсора ленты переводит контур в ``running``.
+
+        Вместо паузы главный поток ждёт команду состава и разбирает её здесь
+        (add-contour-membership).
+        """
         import time
         from datetime import datetime, timezone
 
@@ -487,7 +578,16 @@ class LiveCore:
                 saved = self.market_store.consumer_checkpoint(consumer)
                 if saved is not None and _after(saved["acknowledged_at"], started):
                     control.mark_contour_running()
-            time.sleep(poll_secs)
+            command = control.next_membership(poll_secs) if control is not None else None
+            if command is None:
+                if control is None:
+                    time.sleep(poll_secs)
+                continue
+            try:
+                membership(command)
+            except Exception as exc:
+                log.exception("Команда состава не выполнена")
+                control.answer_membership(command, 500, {"code": "INTERNAL", "message": type(exc).__name__})
 
     def cluster_gate(self, state_dir):
         gate, self._cluster_consumer = _live_cluster_gate(

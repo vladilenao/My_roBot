@@ -1177,6 +1177,27 @@ class MarketDataStore:
                 WHERE excluded.min_bars>contour_demand.min_bars OR excluded.instrument_json<>contour_demand.instrument_json""",
                 rows)
 
+    def replace_contour_demand(self, contour_id: str, demands) -> None:
+        """Спрос контура целиком — при его запуске: строки прошлых запусков удаляются (add-contour-membership)."""
+        rows = [(contour_id, key, interval, int(min_bars), json.dumps(instrument, ensure_ascii=False, sort_keys=True),
+                 _utc_text()) for key, interval, min_bars, instrument in demands]
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM contour_demand WHERE contour_id=?", (contour_id,))
+                conn.executemany("""INSERT INTO contour_demand(contour_id,instrument_key,interval,min_bars,instrument_json,
+                    updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(contour_id,instrument_key,interval) DO UPDATE SET
+                    min_bars=MAX(contour_demand.min_bars,excluded.min_bars)""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def remove_contour_demand(self, contour_id: str, instrument_key: str) -> None:
+        """Спрос инструмента, вышедшего из состава контура."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM contour_demand WHERE contour_id=? AND instrument_key=?", (contour_id, instrument_key))
+
     def contour_demands(self) -> list[dict]:
         """Спрос всех контуров: ``contour_id``, ``instrument_key``, ``interval``, ``min_bars``, ``instrument``."""
         with self._lock, self._connect() as conn:

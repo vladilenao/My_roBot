@@ -91,6 +91,8 @@ _DEFAULTS = {
     # как часто читать ленту и потребности контуров; канал Telegram контура —
     # имя переменной окружения с id канала.
     "contours_feed_poll_secs": 1,
+    # Пара без спроса контуров и обязательств снимается ядром через столько секунд.
+    "contours_demand_release_secs": 900,
     "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
@@ -164,6 +166,7 @@ DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
 MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
 CONTOURS_FEED_POLL_SECS = _CONFIG["contours_feed_poll_secs"]
+CONTOURS_DEMAND_RELEASE_SECS = _CONFIG["contours_demand_release_secs"]
 CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_channel_env"]
 
 

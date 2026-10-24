@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.5.0-proposal
+  version: 1.6.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -12,7 +12,7 @@ info:
       и подтверждает курсор.
     * Clusters — отчёт кластерного фильтра входа (данные ClusterSource).
     * Contours — запуск, остановка и повторный запуск торгового контура
-      эмуляции командами, его состояние и журнал.
+      эмуляции командами, изменение его состава на ходу, состояние и журнал.
 
     Когда сервер работает: только в режиме эмуляции (торговля на живых
     данных с симулятором исполнения), сразу после раннего сбора рыночных
@@ -48,8 +48,8 @@ tags:
   - name: Contours
     description: |
       Запуск, остановка и повторный запуск торгового контура эмуляции,
-      его желаемое и фактическое состояние, журнал процесса контура.
-      Смена состава на ходу появится позже.
+      изменение состава на ходу, желаемое и фактическое состояние, журнал
+      процесса контура.
 paths:
   /openapi.yaml:
     get:
@@ -415,6 +415,7 @@ paths:
                         exit_code: null
                         desired: null
                         actual: null
+                        members: []
                 running:
                   summary: Торговля запущена командой
                   value:
@@ -438,6 +439,8 @@ paths:
                           open_positions: 1
                           pending_entries: 0
                           last_tick_at: '2026-10-22T10:16:00Z'
+                        members:
+                          - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
                 stopping:
                   summary: Контур доживает сделки после stop no_entries
                   value:
@@ -460,6 +463,8 @@ paths:
                           open_positions: 1
                           pending_entries: 0
                           last_tick_at: '2026-10-22T11:02:00Z'
+                        members:
+                          - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
                 failed:
                   summary: Процесс контура упал
                   value:
@@ -477,6 +482,7 @@ paths:
                         exit_code: 1
                         desired: {running: true, stop_mode: null, generation: 1}
                         actual: null
+                        members: []
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
     post:
@@ -547,6 +553,7 @@ paths:
                 exit_code: null
                 desired: {running: true, stop_mode: null, generation: 1}
                 actual: null
+                members: []
         '202':
           description: Проверка инструментов у брокера ещё идёт; итог — в `GET /api/v1/contours`.
           headers:
@@ -569,6 +576,7 @@ paths:
                 exit_code: null
                 desired: null
                 actual: null
+                members: []
         '400':
           description: Тело не JSON, неизвестные поля, `kind` не `emulation` или `instruments` не список строк.
           content:
@@ -606,6 +614,7 @@ paths:
                   exit_code: null
                   desired: {running: true, stop_mode: null, generation: 1}
                   actual: null
+                  members: []
         '422':
           description: Хотя бы один инструмент отклонён; торговля не начата, робот ждёт новую команду.
           content:
@@ -701,6 +710,8 @@ paths:
                     open_positions: 1
                     pending_entries: 0
                     last_tick_at: '2026-10-22T11:01:00Z'
+                  members:
+                    - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
         '200':
           description: Повтор той же остановки; поколение не изменилось.
           content:
@@ -722,6 +733,113 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ContourConflict'}
+  /api/v1/contours/{contour_id}/instruments:
+    parameters:
+      - $ref: '#/components/parameters/ContourId'
+    post:
+      tags: [Contours]
+      summary: Изменить состав работающего контура
+      description: |
+        Добавляет или убирает инструменты без перезапуска контура. Тело
+        содержит ровно одно из полей:
+
+        * `add` — токены по тем же правилам, что у `POST /api/v1/contours`
+          (тикер акции, код семейства — ближайший контракт, контракт). Отказ
+          строгий: хотя бы один токен отклонён — состав не меняется (`422`).
+          Новый инструмент сначала прогревается (`warming`), затем проходит
+          стартовый обзор и торгует.
+        * `remove` — короткое имя контракта, тикер акции или код семейства,
+          если в составе ровно один его контракт. `mode`: `no_entries`
+          (по умолчанию) — новых входов нет, неисполненные входы снимаются,
+          позиции доживают; `close_all` — позиции закрываются на открытии
+          следующего бара. Без сделок инструмент выходит из состава.
+
+        Изменение получает новое поколение и применяется на ближайшей
+        границе тика. Повтор без изменений — `200`. `add` убираемого
+        инструмента возвращает его в торговлю.
+      operationId: changeContourInstruments
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContourMembershipRequest'}
+            examples:
+              addGas:
+                summary: Добавить газ
+                value: {add: [NG]}
+              removeSber:
+                summary: Убрать Сбер, сделки доживают
+                value: {remove: [SBER]}
+              closeGas:
+                summary: Убрать газ и закрыть его позиции
+                value: {remove: [NG-12.26], mode: close_all}
+      responses:
+        '202':
+          description: Изменение записано новым поколением; выполнение — по `members[].actual` и `actual.applied_generation`.
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/contours/emulation}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourMembershipAccepted'}
+              example:
+                generation: 2
+                contour:
+                  id: emulation
+                  kind: emulation
+                  state: running
+                  source: api
+                  instruments:
+                    - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
+                    - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                  started_at: '2026-10-24T10:15:00Z'
+                  command: --mode emulation --instruments SBER
+                  rejections: []
+                  pid: 81412
+                  exit_code: null
+                  desired: {running: true, stop_mode: null, generation: 2}
+                  actual:
+                    state: running
+                    applied_generation: 1
+                    open_positions: 0
+                    pending_entries: 0
+                    last_tick_at: '2026-10-24T11:01:00Z'
+                  members:
+                    - {name: SBER, instrument_type: share, desired: active, remove_mode: null, actual: trading}
+                    - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: null}
+        '200':
+          description: Команда ничего не меняет (повтор); поколение прежнее.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourMembershipAccepted'}
+        '400':
+          description: 'Тело не `{"add": [...]}` и не `{"remove": [...], "mode": ...}`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiError'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/ContourNotFound'}
+        '409':
+          description: |
+            `NOT_RUNNING` — процесс контура не работает; `STOPPING` — контур
+            выполняет остановку; `MODE_CONFLICT` — `no_entries` поверх
+            `close_all` у убираемого инструмента.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourConflict'}
+        '422':
+          description: Хотя бы один токен не разрешён или инструмента нет в составе; состав не изменён.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LaunchRejected'}
+              example:
+                code: INSTRUMENTS_REJECTED
+                message: Состав не изменён.
+                rejections:
+                  - {token: GAZP, reason: Инструмента нет в составе контура.}
   /api/v1/contours/{contour_id}/log:
     parameters:
       - $ref: '#/components/parameters/ContourId'
@@ -1099,7 +1217,7 @@ components:
       type: object
       additionalProperties: false
       required: [id, kind, state, source, instruments, started_at, command, rejections, pid, exit_code, desired,
-                 actual]
+                 actual, members]
       properties:
         id: {type: string, example: emulation}
         kind: {type: string, enum: [emulation]}
@@ -1121,6 +1239,7 @@ components:
           description: Откуда пришёл запуск; null, пока робот ждёт команду.
         instruments:
           type: array
+          description: Текущий желаемый активный состав; после команд состава — уже новый, а не состав запуска.
           items: {$ref: '#/components/schemas/ContourInstrument'}
         started_at:
           type: string
@@ -1150,6 +1269,56 @@ components:
           allOf: [{$ref: '#/components/schemas/ContourActual'}]
           nullable: true
           description: Фактическое из `status.json` контура; null до первого снимка этого запуска ядра или если файл не читается.
+        members:
+          type: array
+          description: Все инструменты желаемого состава, включая убираемые, с фактическим состоянием контура.
+          items: {$ref: '#/components/schemas/ContourMember'}
+    ContourMember:
+      type: object
+      additionalProperties: false
+      required: [name, instrument_type, desired, remove_mode, actual]
+      properties:
+        name: {type: string, description: Короткое имя контракта или тикер акции.}
+        instrument_type: {type: string, enum: [share, future]}
+        desired: {type: string, enum: [active, removed]}
+        remove_mode:
+          type: string
+          nullable: true
+          enum: [no_entries, close_all, null]
+        actual:
+          type: string
+          nullable: true
+          enum: [warming, trading, draining, closing, null]
+          description: |
+            `warming` — ядро прогревает пары; `trading` — анализ и входы;
+            `draining` / `closing` — убирается, сделки доживают или
+            закрываются. `null` — контур ещё не применил изменение или
+            инструмент уже вышел из состава.
+    ContourMembershipRequest:
+      type: object
+      additionalProperties: false
+      description: Ровно одно из полей `add` и `remove`; `mode` — только вместе с `remove`.
+      properties:
+        add:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        remove:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        mode: {type: string, enum: [no_entries, close_all], default: no_entries}
+    ContourMembershipAccepted:
+      type: object
+      additionalProperties: false
+      required: [generation, contour]
+      properties:
+        generation:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Поколение изменения; null — разрешение ещё идёт (не уложилось в 60 с).
+        contour: {$ref: '#/components/schemas/Contour'}
     ContourDesired:
       type: object
       additionalProperties: false

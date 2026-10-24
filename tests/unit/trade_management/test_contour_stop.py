@@ -11,7 +11,7 @@ import pytest
 
 from src.trade_journal.storage import Storage
 from src.trade_management.actions import AddToTrade, CancelEntry, CloseTrade, OpenTrade
-from src.trade_management.manager import CONTOUR_STOP, CONTOUR_STOPPING
+from src.trade_management.manager import CONTOUR_STOP, CONTOUR_STOPPING, INSTRUMENT_REMOVE, INSTRUMENT_REMOVING
 from tests.support.session_schedule import msk
 from tests.unit.trade_management.test_intraday_session_guard import Env, _plan
 
@@ -93,3 +93,61 @@ def test_stop_can_be_lifted_and_rejects_unknown_mode(storage):
     assert len(env.planned) == 1
     with pytest.raises(ValueError):
         env.manager.stop_contour("pause")
+
+
+# ── Снятие одного инструмента (add-contour-membership) ──
+
+def open_on(env, trade_id, instrument_id, *, quantity=4):
+    plan = replace(_plan(TF, trade_id=trade_id, created_at=env.now), assignment_id=f"a-{trade_id}",
+                   instrument_id=instrument_id)
+    assert env.manager.submit_plan(plan, OpenTrade(f"open-{trade_id}", trade_id, 0, "entry", quantity),
+                                   price_step=1, step_cost=1)
+    env.manager.dispatch(env.now.replace(tzinfo=timezone.utc))
+
+
+def test_signal_of_removed_instrument_is_rejected_neighbour_admitted(storage):
+    from src.instruments.model import instrument_key
+    from tests.unit.trade_management.test_signal_pipeline import INSTRUMENT
+
+    env = Env(storage, msk(16, 11))
+    env.manager.stop_instrument("SBER", "no_entries")
+    env.signal(TF)
+    assert len(env.planned) == 1                                   # соседний инструмент допускается
+    env.manager.stop_instrument(instrument_key(INSTRUMENT), "no_entries")
+    admission = env.signal(TF, event_id="second")
+    assert [reason.code for reason in admission.rejections] == [INSTRUMENT_REMOVING] and len(env.planned) == 1
+
+
+def test_close_all_of_one_instrument_keeps_neighbour(storage):
+    env = Env(storage, msk(16, 11))
+    open_on(env, "ng", "NGV6")
+    open_on(env, "sber", "SBER")
+    actions = env.manager.stop_instrument("SBER", "close_all")
+    env.manager.dispatch(env.now.replace(tzinfo=timezone.utc))
+    assert [(type(action), action.trade_id, action.reason) for action in actions] == [
+        (CloseTrade, "sber", INSTRUMENT_REMOVE)]
+    assert env.manager.contour_remainder("SBER") == (0, 0) and env.manager.contour_remainder("NGV6") == (1, 0)
+    assert env.manager.contour_remainder() == (1, 0)
+
+
+def test_add_refused_only_for_removed_instrument(storage):
+    env = Env(storage, msk(16, 11))
+    open_on(env, "ng", "NGV6", quantity=2)
+    open_on(env, "sber", "SBER", quantity=2)
+    env.manager.stop_instrument("SBER", "no_entries")
+    revisions = {item.plan.trade_id: item.state.state_revision for item in env.manager.restore()}
+    blocked = AddToTrade("add-s", "sber", revisions["sber"], "levels-profitable-add", 1)
+    assert env.manager.submit_action(blocked, assignment_id="a-sber") is False
+
+
+def test_lifting_instrument_stop_restores_entries(storage):
+    from src.instruments.model import instrument_key
+    from tests.unit.trade_management.test_signal_pipeline import INSTRUMENT
+
+    env = Env(storage, msk(16, 11))
+    env.manager.stop_instrument(instrument_key(INSTRUMENT), "no_entries")
+    env.signal(TF)
+    assert env.planned == []
+    assert env.manager.stop_instrument(instrument_key(INSTRUMENT), None) == ()
+    env.signal(TF, event_id="again")
+    assert len(env.planned) == 1

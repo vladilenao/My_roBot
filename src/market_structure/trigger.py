@@ -47,6 +47,12 @@ class PatternTrigger:
         # Новый список целиком: поток сторожа читает ссылку без блокировки.
         self._pairs = self._pairs + fresh
 
+    def remove_pairs(self, pairs) -> None:
+        """Пары, снятые ядром с обслуживания (add-contour-membership)."""
+        gone = {(instrument.ticker, instrument.instrument_type, timeframe) for instrument, timeframe in pairs}
+        self._pairs = [(instrument, timeframe) for instrument, timeframe in self._pairs
+                       if (instrument.ticker, instrument.instrument_type, timeframe) not in gone]
+
     def _run(self) -> None:
         generation = None
         while not self._stop.is_set():

@@ -23,6 +23,8 @@ REASON_LABELS = {
     "session-schedule-unknown": "расписание торгов неизвестно",
     "contour-stopping": "контур останавливается",
     "contour-stop": "остановка контура командой",
+    "instrument-removing": "инструмент убирается из состава",
+    "instrument-remove": "инструмент убран из состава",
     "profile-entry": "вход по профилю",
     "protective": "стоп",
     "tp": "цель по цене",

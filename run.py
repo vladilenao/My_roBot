@@ -52,6 +52,7 @@ from src.bot.launch import (
     RunConfigurationError,
     describe_choice,
     equivalent_command,
+    parse_instrument_tokens,
     parse_launch_args,
     parse_moment,
     resolve_emulation,
@@ -250,7 +251,8 @@ def _run_contour(kind: str) -> int:
     # Желаемое ядра читается на границе тика; завершение остановки ставит тот же флаг, что stdin.
     control = ContourControl(core_db=data_dir / CORE_DATABASE_FILE, contour_id=kind,
                              journal_db=directory / DATABASE_FILE, status_path=directory / STATUS_FILE,
-                             request_stop=stop.request, version=__version__)
+                             request_stop=stop.request, version=__version__,
+                             warm_timeout=MARKET_DATA_SETTINGS.startup_wait_timeout_secs)
     instruments = [instrument_from_payload(item) for item in launch["instruments"]]
     services = FeedMarketServices(MarketDataStore(data_dir / MARKET_DATA_DATABASE_FILE), contour_id=kind,
                                   data_dir=data_dir, tracks_obligations=trading_enabled(),
@@ -608,11 +610,17 @@ def _launch(
             snapshot = control.snapshot()
             return [normalize_instrument(item) for item in chosen], SOURCE_API, snapshot.get("command") or ""
 
+        def resolve_tokens(tokens):
+            """Токены команды состава — по правилам запуска, в главном потоке ядра (add-contour-membership)."""
+            request = LaunchRequest(MODE_EMULATION, SOURCE_API, parse_instrument_tokens(tokens))
+            return _resolve_request(request, client_provider,
+                                    None if core.early is None else core.early.request_budget, None, history=False)
+
         try:
             code = core.run_contour(instruments, kind=MODE_EMULATION, control=control, core_state=core_state,
                                     source="" if launch is None else launch.source,
                                     command="" if control is None else control.snapshot().get("command") or "",
-                                    next_launch=next_launch)
+                                    next_launch=next_launch, resolve=resolve_tokens)
         except JournalMigrationError as exc:
             print(str(exc))
             code = 2

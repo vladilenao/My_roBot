@@ -196,17 +196,21 @@ class LiveAnalysis:
     def register_needs(self):
         """Потребности прогрева без сети: owner передаёт их фоновой полосе."""
         for instrument in self.bot._instruments:
-            self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
-                                            max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
-            for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                for binding in self._bindings(instrument, tf):
-                    for need_tf, count in self._required(binding).items():
-                        self.cache.prepare_live_history(instrument, need_tf, count,
-                                                        max_close=self._warmup_close(instrument, need_tf))
-            # ТФ планов открытых сделок загружаются с прогревом их профилей,
-            # даже если привязок на этом ТФ в конфигурации не осталось.
-            for tf, count in self.bot._management_needs(instrument).items():
-                self.cache.prepare_live_history(instrument, tf, count, max_close=self._warmup_close(instrument, tf))
+            self.register_needs_for(instrument)
+
+    def register_needs_for(self, instrument):
+        """Потребности прогрева одного инструмента — и при старте, и при добавлении в состав."""
+        self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
+                                        max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
+        for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
+            for binding in self._bindings(instrument, tf):
+                for need_tf, count in self._required(binding).items():
+                    self.cache.prepare_live_history(instrument, need_tf, count,
+                                                    max_close=self._warmup_close(instrument, need_tf))
+        # ТФ планов открытых сделок загружаются с прогревом их профилей,
+        # даже если привязок на этом ТФ в конфигурации не осталось.
+        for tf, count in self.bot._management_needs(instrument).items():
+            self.cache.prepare_live_history(instrument, tf, count, max_close=self._warmup_close(instrument, tf))
 
     def bootstrap(self):
         """Стартовый пакет состояний имеет явную границу для консольной группировки."""
@@ -224,61 +228,76 @@ class LiveAnalysis:
         if callable(waiter):
             waiter()
         for instrument in self.bot._instruments:
+            self.bootstrap_instrument(instrument)
+
+    def bootstrap_instrument(self, instrument):
+        """Стартовый обзор одного инструмента: состояния пар, курсоры анализа без переигрывания.
+
+        Курсор — сохранённый в рыночной базе или последний бар; так же
+        обозревается инструмент, добавленный в состав на ходу (add-contour-membership).
+        """
+        try:
+            self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
+                                            max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
+        except Exception as exc:
+            self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} 1m")
+        needs = self.bot._management_needs(instrument)
+        for tf in sorted(set(needs) - {a.timeframe for a in self.bot._strategies_for(instrument)}):
             try:
-                self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
-                                                max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
-            except Exception as exc:
-                self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} 1m")
-            needs = self.bot._management_needs(instrument)
-            for tf in sorted(set(needs) - {a.timeframe for a in self.bot._strategies_for(instrument)}):
-                try:
-                    frame = self._prime_management_pair(instrument, tf, needs[tf])
-                    self.publish_status(instrument, tf, frame)
-                except Exception as exc:
-                    self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} {tf}")
-            for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                bindings = self._bindings(instrument, tf)
-                required = max([*(self._required(a)[tf] for a in bindings), needs.get(tf, 0)])
-                rows, frame, reason = [], pd.DataFrame(), ""
-                try:
-                    frame = self.cache.prepare_live_history(instrument, tf, required,
-                                                            max_close=self._warmup_close(instrument, tf))
-                except Exception as exc:
-                    reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
-                    frame = self.cache.frame_for(instrument, tf)
-                any_calculated = False
-                for binding in bindings:
-                    row = {"assignment_id": binding.id, "strategy": binding.strategy,
-                           "filter_profile": binding.filter_profile, "outcome": "",
-                           "indicators": "", "reason": reason}
-                    try:
-                        quality = self._quality(instrument, binding, frame, prepare=True)
-                        row["reason"] = (reason + "; " + quality) if reason and quality else quality
-                        if not row["reason"]:
-                            decision, _, ta, filtered, _ = self._calculate(instrument, binding, frame)
-                            row["outcome"] = "FILTERED" if filtered else decision.signal_type.name
-                            row["indicators"] = self.bot._ta_digest(ta)
-                            any_calculated = True
-                    except Exception as exc:
-                        row["reason"] = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
-                    rows.append(row)
-                    last = frame["datetime"].iloc[-1] if not frame.empty else None
-                    saved = self.cache.analysis_cursor(instrument, tf, binding.id)
-                    self.cursors[binding.id, instrument_key(instrument)] = saved if saved is not None else last
-                    if saved is None and last is not None and row["outcome"]:
-                        self.cache.mark_analyzed(instrument, tf, binding.id, last)
-                close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
-                complete = any_calculated and not any(row["reason"] for row in rows)
-                state = LivePairState("tbank_exchange", instrument_key(instrument), tf,
-                    received_bar=close, analyzed_bar=close if any_calculated else None,
-                    analysis_mode="overview" if any_calculated else "", available_bars=len(frame),
-                    required_bars=required, coverage_complete=complete,
-                    reason=next((row["reason"] for row in rows if row["reason"]), ""))
-                self.states[self._key(instrument, tf)] = state
-                self.bot._bus.publish(Event.startup_analysis(self.bot._display_name(instrument),
-                    published_at=self.timeline.now(), bar_time=close, timeframe=tf, results=rows,
-                    available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
+                frame = self._prime_management_pair(instrument, tf, needs[tf])
                 self.publish_status(instrument, tf, frame)
+            except Exception as exc:
+                self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} {tf}")
+        for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
+            bindings = self._bindings(instrument, tf)
+            required = max([*(self._required(a)[tf] for a in bindings), needs.get(tf, 0)])
+            rows, frame, reason = [], pd.DataFrame(), ""
+            try:
+                frame = self.cache.prepare_live_history(instrument, tf, required,
+                                                        max_close=self._warmup_close(instrument, tf))
+            except Exception as exc:
+                reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+                frame = self.cache.frame_for(instrument, tf)
+            any_calculated = False
+            for binding in bindings:
+                row = {"assignment_id": binding.id, "strategy": binding.strategy,
+                       "filter_profile": binding.filter_profile, "outcome": "",
+                       "indicators": "", "reason": reason}
+                try:
+                    quality = self._quality(instrument, binding, frame, prepare=True)
+                    row["reason"] = (reason + "; " + quality) if reason and quality else quality
+                    if not row["reason"]:
+                        decision, _, ta, filtered, _ = self._calculate(instrument, binding, frame)
+                        row["outcome"] = "FILTERED" if filtered else decision.signal_type.name
+                        row["indicators"] = self.bot._ta_digest(ta)
+                        any_calculated = True
+                except Exception as exc:
+                    row["reason"] = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+                rows.append(row)
+                last = frame["datetime"].iloc[-1] if not frame.empty else None
+                saved = self.cache.analysis_cursor(instrument, tf, binding.id)
+                self.cursors[binding.id, instrument_key(instrument)] = saved if saved is not None else last
+                if saved is None and last is not None and row["outcome"]:
+                    self.cache.mark_analyzed(instrument, tf, binding.id, last)
+            close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
+            complete = any_calculated and not any(row["reason"] for row in rows)
+            state = LivePairState("tbank_exchange", instrument_key(instrument), tf,
+                received_bar=close, analyzed_bar=close if any_calculated else None,
+                analysis_mode="overview" if any_calculated else "", available_bars=len(frame),
+                required_bars=required, coverage_complete=complete,
+                reason=next((row["reason"] for row in rows if row["reason"]), ""))
+            self.states[self._key(instrument, tf)] = state
+            self.bot._bus.publish(Event.startup_analysis(self.bot._display_name(instrument),
+                published_at=self.timeline.now(), bar_time=close, timeframe=tf, results=rows,
+                available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
+            self.publish_status(instrument, tf, frame)
+
+    def forget_instrument(self, instrument):
+        """Инструмент вышел из состава: его состояния пар и курсоры больше не нужны."""
+        key = instrument_key(instrument)
+        self.states = {item: state for item, state in self.states.items() if item[0] != key}
+        self.cursors = {item: cursor for item, cursor in self.cursors.items()
+                        if not (len(item) == 2 and item[1] == key) and not (len(item) == 3 and item[1] == key)}
 
     def _management_cursor(self, instrument, tf):
         return "management", instrument_key(instrument), tf

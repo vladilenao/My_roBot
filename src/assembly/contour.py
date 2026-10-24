@@ -201,7 +201,7 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
-             update_obligations=None, after_tick=None, control=None) -> None:
+             update_obligations=None, after_tick=None, control=None, forget=None) -> None:
     def post_tick(ready_tfs):
         # Желаемое ядра применяется на границе тика, до сопровождения и исполнения (add-control-api).
         if control is not None:
@@ -219,8 +219,6 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
             after_tick()
         return result
 
-    if control is not None:
-        control.start(runtime.trade_manager)
     bot = TradingBot(
         instruments=instruments,
         bus=bus,
@@ -247,11 +245,64 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         action_executor=runtime.action_executor,
         run=session,
     )
+    if control is not None:
+        control.start(runtime.trade_manager, _Roster(bot, runtime, data_cache, forget))
     try:
         bot.run()
     finally:
         if control is not None:
             control.close()
+
+
+class _Roster:
+    """Состав торговой части для ``ContourControl`` (add-contour-membership).
+
+    Знает внутренности бота и живого анализа, чтобы модуль управления их не
+    знал: прогрев, готовность пар, обзор и вход в цикл, выход из цикла.
+    """
+
+    def __init__(self, bot, runtime, cache, forget=None) -> None:
+        self._bot = bot
+        self._runtime = runtime
+        self._cache = cache
+        self._forget = forget
+
+    def keys(self) -> set:
+        return {instrument_key(item) for item in self._bot._instruments}
+
+    def instrument(self, key):
+        return next((item for item in self._bot._instruments if instrument_key(item) == key), None)
+
+    def warm(self, instrument) -> bool:
+        """Потребности прогрева — ядру; ``False``, пока живой анализ ещё не запущен."""
+        live = self._bot._live_analysis
+        if live is None:
+            return False
+        live.register_needs_for(instrument)
+        return True
+
+    def ready(self, instrument) -> bool:
+        timeframes = {self._bot._protection_timeframe} | {a.timeframe for a in self._bot._strategies_for(instrument)}
+        status = getattr(self._cache, "pair_status", None)
+        return status is None or all(status(instrument, tf)["state"] != "BOOTSTRAPPING" for tf in timeframes)
+
+    def admit(self, instrument, contracts=None) -> None:
+        """Стартовый обзор без переигрывания истории, затем инструмент — в цикле анализа и исполнения."""
+        self._runtime.add_instrument(instrument, contracts)
+        live = self._bot._live_analysis
+        if live is not None:
+            live.bootstrap_instrument(instrument)
+        if instrument_key(instrument) not in self.keys():
+            self._bot._instruments.append(instrument)
+
+    def retire(self, instrument) -> None:
+        key = instrument_key(instrument)
+        self._bot._instruments[:] = [item for item in self._bot._instruments if instrument_key(item) != key]
+        self._runtime.remove_instrument(instrument)
+        if self._bot._live_analysis is not None:
+            self._bot._live_analysis.forget_instrument(instrument)
+        if self._forget is not None:
+            self._forget(instrument)
 
 
 class _UnsafeExecutionState(RuntimeError):
@@ -270,6 +321,36 @@ class _Runtime:
         self.ingestion_worker = None
         self.execution_aliases = {}
         self.execution_instruments = []
+        # Финансовая часть (add-contour-membership): список допуска доставки и приём карточек контрактов.
+        self.instruments = None
+        self.on_contracts = None
+
+    def add_instrument(self, instrument, contracts=None) -> None:
+        """Инструмент вошёл в состав на ходу: карточки, жизненный цикл, исполнение, алиасы."""
+        key = instrument_key(instrument)
+        for target in self._instrument_lists():
+            if key not in {instrument_key(item) for item in target}:
+                target.append(instrument)
+        if self.storage is not None:
+            self.execution_aliases.update({key: key, instrument.ticker: key})
+        if contracts and self.on_contracts is not None:
+            self.on_contracts(contracts)
+
+    def remove_instrument(self, instrument) -> None:
+        """Инструмент вышел из состава: сделок по нему нет, исполнение его больше не ведёт."""
+        key = instrument_key(instrument)
+        for target in self._instrument_lists():
+            target[:] = [item for item in target if instrument_key(item) != key]
+        self.execution_aliases = {alias: value for alias, value in self.execution_aliases.items() if value != key}
+
+    def _instrument_lists(self):
+        lists = [self.execution_instruments]
+        if self.instruments is not None:
+            lists.append(self.instruments)
+        lifecycle = self.contract_lifecycle
+        if lifecycle is not None and not getattr(lifecycle, "automatic", False) and hasattr(lifecycle, "instruments"):
+            lists.append(lifecycle.instruments)
+        return [target for index, target in enumerate(lists) if all(target is not other for other in lists[:index])]
 
 
 def _build_runtime(
@@ -571,6 +652,18 @@ def _build_runtime(
         storage=storage,
         contract_lifecycle=lifecycle,
     )
+    runtime.instruments = instruments
+
+    def accept_contracts(metas):
+        # Тот же словарь видит исполнение по барам: карточка нового контракта — сразу в работе.
+        contracts.update(metas)
+        broker.set_contracts(metas)
+        storage.set_contract_metadata(metas)
+        names = _instrument_names(runtime.execution_instruments or instruments)
+        storage.set_names(names)
+        broker.set_names(names)
+        trade_manager.configure_visual_context(runtime.execution_instruments or instruments)
+    runtime.on_contracts = accept_contracts
     runtime_ref.append(runtime)
     return runtime
 
@@ -599,10 +692,10 @@ def _dispatch_evidence(data_cache, instruments, storage, intent_since):
     между проверкой и локальной доставкой.
     """
     from src.trade_management.manager import DispatchDataEvidence, created_before_step
-    by_key = {instrument_key(item): item for item in instruments}
 
     def inspect(instrument_id, action, command):
-        instrument = by_key.get(instrument_id)
+        # Список живой: инструмент, добавленный в состав на ходу, тоже получает допуск доставки.
+        instrument = next((item for item in instruments if instrument_key(item) == instrument_id), None)
         if instrument is None:
             return None
         execution = data_cache.pair_status(instrument, "1m")["state"] == "READY"
@@ -814,7 +907,8 @@ class TradingContour:
         _run_bot(self.settings.instruments, self.bus, self.runtime, services.data_cache, services.timeline,
                  session=self.settings.session, live_waiter=live_waiter,
                  update_obligations=services.update_obligations if services.tracks_obligations else None,
-                 after_tick=services.acknowledge_tick, control=self.settings.control)
+                 after_tick=services.acknowledge_tick, control=self.settings.control,
+                 forget=getattr(services, "forget_instrument", None))
 
     def finish(self) -> None:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""

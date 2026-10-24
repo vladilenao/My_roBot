@@ -384,3 +384,37 @@ class TestStopAndLogApi:
         status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY, {"mode": "close_all"},
                                    host=f"evil.example:{srv.address[1]}")
         assert status == 403 and payload["code"] == "FORBIDDEN_HOST"
+
+
+class TestMembershipApi:
+    def test_add_matches_contract(self, controlled_server):
+        srv, control, _ = controlled_server
+
+        def main():
+            command = control.next_membership(2)
+            control.answer_membership(command, 202, {"generation": 2, "contour": control.snapshot()})
+        threading.Thread(target=main, daemon=True).start()
+        status, payload, headers = _call(srv, "POST", "/api/v1/contours/emulation/instruments", CONTROL_KEY,
+                                         {"add": ["NG"]})
+        assert status == 202 and headers["Location"] == "/api/v1/contours/emulation"
+        _check(payload, {"$ref": "#/components/schemas/ContourMembershipAccepted"})
+        _check(payload["contour"], {"$ref": "#/components/schemas/Contour"})
+
+    @pytest.mark.parametrize("body", [{}, {"add": []}, {"add": ["NG"], "remove": ["SBER"]}, b"{bad"])
+    def test_bad_body(self, controlled_server, body):
+        srv, _, _ = controlled_server
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/instruments", CONTROL_KEY, body)
+        assert status == 400 and payload["code"] == "INVALID_REQUEST"
+
+    def test_unknown_contour_and_keys(self, controlled_server):
+        srv, _, _ = controlled_server
+        assert _call(srv, "POST", "/api/v1/contours/account/instruments", CONTROL_KEY, {"add": ["NG"]})[0] == 404
+        assert _call(srv, "POST", "/api/v1/contours/emulation/instruments", EXPORT_KEY, {"add": ["NG"]})[0] == 401
+
+    def test_not_running_matches_contract(self, controlled_server):
+        srv, control, _ = controlled_server
+        control.mark_exited(0)
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/instruments", CONTROL_KEY,
+                                   {"remove": ["NG"]})
+        assert status == 409 and payload["code"] == "NOT_RUNNING"
+        _check(payload, {"$ref": "#/components/schemas/ContourConflict"})
