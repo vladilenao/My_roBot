@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.6.0-proposal
+  version: 1.7.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -45,6 +45,8 @@ tags:
     description: Чтение изменений локального рыночного журнала.
   - name: Clusters
     description: Отчёт кластерного фильтра входа.
+  - name: Core
+    description: Состояние ядра робота — пульс, рыночные данные, запросы к брокеру.
   - name: Contours
     description: |
       Запуск, остановка и повторный запуск торгового контура эмуляции,
@@ -380,6 +382,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /api/v1/core:
+    get:
+      tags: [Core]
+      summary: Состояние ядра
+      description: |
+        Версия и pid ядра, пульс для контуров, сводка готовности живых пар
+        и запросы к брокеру за последнюю минуту по сервисам и полосам.
+        Секретов, адресов и токенов в ответе нет.
+      operationId: getCore
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состояние ядра.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CoreState'}
+              example:
+                version: 7.1.0
+                pid: 4242
+                started_at: '2026-10-24T09:00:00Z'
+                heartbeat: {beat_at: '2026-10-24T11:02:05Z', interval_secs: 5}
+                market_data:
+                  producer_id: tbank-7f3a
+                  max_change_id: 812345
+                  pairs: {total: 14, by_status: {READY: 13, BOOTSTRAPPING: 1}}
+                quotas:
+                  quotes: {per_minute: 41, ceiling: 180, lanes: {live: 30, evidence: 11}, retry_after: null}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404':
+          description: Процесс без ядра — состояние недоступно.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiError'}
   /api/v1/contours:
     get:
       tags: [Contours]
@@ -414,6 +451,7 @@ paths:
                         pid: null
                         exit_code: null
                         desired: null
+                        recovery: null
                         actual: null
                         members: []
                 running:
@@ -433,12 +471,40 @@ paths:
                         pid: 81412
                         exit_code: null
                         desired: {running: true, stop_mode: null, generation: 1}
+                        recovery: null
                         actual:
                           state: running
                           applied_generation: 1
                           open_positions: 1
                           pending_entries: 0
                           last_tick_at: '2026-10-22T10:16:00Z'
+                          core_link: ok
+                        members:
+                          - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
+                adopted:
+                  summary: После рестарта ядра подхвачен живой контур
+                  value:
+                    contours:
+                      - id: emulation
+                        kind: emulation
+                        state: running
+                        source: api
+                        instruments:
+                          - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                        started_at: '2026-10-24T09:00:05Z'
+                        command: --mode emulation --instruments NG-12.26
+                        rejections: []
+                        pid: 81412
+                        exit_code: null
+                        desired: {running: true, stop_mode: null, generation: 7}
+                        recovery: adopted
+                        actual:
+                          state: running
+                          applied_generation: 7
+                          open_positions: 1
+                          pending_entries: 0
+                          last_tick_at: '2026-10-24T09:01:00Z'
+                          core_link: ok
                         members:
                           - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
                 stopping:
@@ -457,12 +523,14 @@ paths:
                         pid: 81412
                         exit_code: null
                         desired: {running: false, stop_mode: no_entries, generation: 2}
+                        recovery: null
                         actual:
                           state: stopping_no_entries
                           applied_generation: 2
                           open_positions: 1
                           pending_entries: 0
                           last_tick_at: '2026-10-22T11:02:00Z'
+                          core_link: ok
                         members:
                           - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
                 failed:
@@ -481,6 +549,7 @@ paths:
                         pid: null
                         exit_code: 1
                         desired: {running: true, stop_mode: null, generation: 1}
+                        recovery: null
                         actual: null
                         members: []
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -552,6 +621,7 @@ paths:
                 pid: 81412
                 exit_code: null
                 desired: {running: true, stop_mode: null, generation: 1}
+                recovery: null
                 actual: null
                 members: []
         '202':
@@ -575,6 +645,7 @@ paths:
                 pid: null
                 exit_code: null
                 desired: null
+                recovery: null
                 actual: null
                 members: []
         '400':
@@ -613,6 +684,7 @@ paths:
                   pid: 81412
                   exit_code: null
                   desired: {running: true, stop_mode: null, generation: 1}
+                  recovery: null
                   actual: null
                   members: []
         '422':
@@ -704,12 +776,14 @@ paths:
                   pid: 81412
                   exit_code: null
                   desired: {running: false, stop_mode: no_entries, generation: 2}
+                  recovery: null
                   actual:
                     state: running
                     applied_generation: 1
                     open_positions: 1
                     pending_entries: 0
                     last_tick_at: '2026-10-22T11:01:00Z'
+                    core_link: ok
                   members:
                     - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
         '200':
@@ -800,12 +874,14 @@ paths:
                   pid: 81412
                   exit_code: null
                   desired: {running: true, stop_mode: null, generation: 2}
+                  recovery: null
                   actual:
                     state: running
                     applied_generation: 1
                     open_positions: 0
                     pending_entries: 0
                     last_tick_at: '2026-10-24T11:01:00Z'
+                    core_link: ok
                   members:
                     - {name: SBER, instrument_type: share, desired: active, remove_mode: null, actual: trading}
                     - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: null}
@@ -1213,11 +1289,64 @@ components:
       properties:
         token: {type: string}
         reason: {type: string}
+    CoreState:
+      type: object
+      additionalProperties: false
+      required: [version, pid, started_at, heartbeat, market_data, quotas]
+      properties:
+        version: {type: string, example: 7.1.0}
+        pid: {type: integer}
+        started_at: {type: string, format: date-time, nullable: true}
+        heartbeat:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [beat_at, interval_secs]
+          description: Последний удар пульса в `core.sqlite3`; контуры без свежего удара не входят в новые сделки.
+          properties:
+            beat_at: {type: string, format: date-time, nullable: true}
+            interval_secs: {type: integer, minimum: 1}
+        market_data:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [producer_id, max_change_id, pairs]
+          properties:
+            producer_id: {type: string}
+            max_change_id: {type: integer, minimum: 0}
+            pairs:
+              type: object
+              additionalProperties: false
+              required: [total, by_status]
+              properties:
+                total: {type: integer, minimum: 0}
+                by_status:
+                  type: object
+                  description: Число живых пар по состоянию готовности (`READY`, `BOOTSTRAPPING` и т. д.).
+                  additionalProperties: {type: integer, minimum: 0}
+        quotas:
+          type: object
+          description: Запросы к брокеру за последнюю минуту по сервисам (`quotes`, `instruments`).
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [per_minute, ceiling, lanes, retry_after]
+            properties:
+              per_minute: {type: integer, minimum: 0}
+              ceiling: {type: integer, nullable: true}
+              lanes:
+                type: object
+                additionalProperties: {type: integer, minimum: 0}
+              retry_after:
+                type: string
+                format: date-time
+                nullable: true
+                description: До какого момента сервис на паузе после ограничения брокера.
     Contour:
       type: object
       additionalProperties: false
       required: [id, kind, state, source, instruments, started_at, command, rejections, pid, exit_code, desired,
-                 actual, members]
+                 recovery, actual, members]
       properties:
         id: {type: string, example: emulation}
         kind: {type: string, enum: [emulation]}
@@ -1230,8 +1359,11 @@ components:
             `stopping_close_all` — процесс жив, а желаемое — остановка в этом
             режиме; `stopped` — процесс завершился штатно (код 0);
             `failed` — завершился с другим кодом или не запустился, сам не
-            перезапускается. После рестарта ядра — `waiting_command` с
-            прежним желаемым: контур сам не поднимается.
+            перезапускается до следующего старта ядра. После рестарта ядра
+            контур поднимается сам (`recovery: autostart`) или подхватывается
+            живым (`recovery: adopted`); `waiting_command` с прежним
+            желаемым — только если желаемое не «работает» или
+            `[contours] autostart = false`.
         source:
           type: string
           nullable: true
@@ -1260,7 +1392,16 @@ components:
         exit_code:
           type: integer
           nullable: true
-          description: Код выхода процесса контура после его завершения.
+          description: Код выхода процесса контура после его завершения; у подхваченного процесса неизвестен — null.
+        recovery:
+          type: string
+          nullable: true
+          enum: [autostart, adopted, null]
+          description: |
+            Как этот запуск ядра получил процесс: `autostart` — поднят без
+            команды по желаемому из `core.sqlite3`, `adopted` — подхвачен
+            живым процессом той же версии; null — запущен командой или
+            параметрами.
         desired:
           allOf: [{$ref: '#/components/schemas/ContourDesired'}]
           nullable: true
@@ -1333,7 +1474,7 @@ components:
     ContourActual:
       type: object
       additionalProperties: false
-      required: [state, applied_generation, open_positions, pending_entries, last_tick_at]
+      required: [state, applied_generation, open_positions, pending_entries, last_tick_at, core_link]
       properties:
         state:
           type: string
@@ -1345,6 +1486,14 @@ components:
           type: string
           format: date-time
           nullable: true
+        core_link:
+          type: string
+          nullable: true
+          enum: [ok, lost, null]
+          description: |
+            Видит ли контур пульс ядра; `lost` — удара нет дольше
+            `[contours] heartbeat_timeout_secs`, новые входы запрещены
+            (`core-lost`). null — снимок контура версии до пульса.
     ContourStopRequest:
       type: object
       additionalProperties: false

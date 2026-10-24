@@ -64,6 +64,9 @@ _SECTIONS: dict[str, dict[str, str]] = {
     "contours": {
         "feed_poll_secs": "contours_feed_poll_secs",
         "demand_release_secs": "contours_demand_release_secs",
+        "heartbeat_secs": "contours_heartbeat_secs",
+        "heartbeat_timeout_secs": "contours_heartbeat_timeout_secs",
+        "autostart": "contours_autostart",
     },
     "instruments": {
         "fallback_type": "instrument_type",
@@ -135,6 +138,9 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_emulation_telegram_channel_env": str,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
+    "contours_heartbeat_secs": int,
+    "contours_heartbeat_timeout_secs": int,
+    "contours_autostart": bool,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -595,8 +601,10 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             )
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
-        if key == "contours_feed_poll_secs" and (isinstance(value, bool) or value < 1):
-            raise ConfigError(f"{path}: [contours] feed_poll_secs должен быть целым числом > 0, получено {value!r}")
+        if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
+                isinstance(value, bool) or value < 1):
+            raise ConfigError(f"{path}: [contours] {key.removeprefix('contours_')} должен быть целым числом > 0, "
+                              f"получено {value!r}")
         if key == "market_structure_redis_port" and value > 65535:
             raise ConfigError(f"{path}: [market_structure] redis_port не может быть больше 65535")
         if key == "market_structure_redis_db" and (isinstance(value, bool) or value < 0):
@@ -973,6 +981,10 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
         validate_combination({key.removeprefix("market_data_"): value for key, value in config.items() if key in _INGESTION_KEYS})
     except SettingError as exc:
         raise ConfigError(f"{path}: [market_data] {exc}") from None
+    beat, timeout = config.get("contours_heartbeat_secs", 5), config.get("contours_heartbeat_timeout_secs", 30)
+    if timeout <= beat:
+        raise ConfigError(f"{path}: [contours] heartbeat_timeout_secs ({timeout}) должен быть больше "
+                          f"heartbeat_secs ({beat})")
     assignment_ids: set[str] = set()
     floor = config.get("contract_expiry_block_days", 2)
     for family, settings in config.get("historical_rollover", {}).get("families", {}).items():

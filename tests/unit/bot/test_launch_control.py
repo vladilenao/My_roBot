@@ -301,9 +301,10 @@ class TestStopAndRelaunch:
         directory.mkdir(parents=True)
         write_status(directory / "status.json", {"state": "running", "applied_generation": 1, "open_positions": 2,
                                                  "pending_entries": 0, "last_tick_at": "2026-10-24T10:00:00Z",
-                                                 "pid": 4242, "version": "7.1.0"})
+                                                 "pid": 4242, "version": "7.1.0", "core_link": "lost"})
         assert control.snapshot()["actual"] == {"state": "running", "applied_generation": 1, "open_positions": 2,
-                                               "pending_entries": 0, "last_tick_at": "2026-10-24T10:00:00Z"}
+                                               "pending_entries": 0, "last_tick_at": "2026-10-24T10:00:00Z",
+                                               "core_link": "lost"}
         (directory / "status.json").write_text("{broken", encoding="utf-8")
         assert control.snapshot()["actual"] is None
 
@@ -418,3 +419,27 @@ class TestMembershipApi:
                                    {"remove": ["NG"]})
         assert status == 409 and payload["code"] == "NOT_RUNNING"
         _check(payload, {"$ref": "#/components/schemas/ContourConflict"})
+
+
+class TestCoreApi:
+    """GET /api/v1/core (add-contour-recovery)."""
+
+    STATE = {"version": "7.1.0", "pid": 4242, "started_at": "2026-10-24T09:00:00Z",
+             "heartbeat": {"beat_at": "2026-10-24T09:00:05Z", "interval_secs": 5},
+             "market_data": {"producer_id": "tbank-test", "max_change_id": 7,
+                             "pairs": {"total": 2, "by_status": {"READY": 1, "BOOTSTRAPPING": 1}}},
+             "quotas": {"quotes": {"per_minute": 3, "ceiling": 180, "lanes": {"live": 3}, "retry_after": None}}}
+
+    def test_state_matches_contract(self, controlled_server):
+        srv, _, _ = controlled_server
+        srv.core_state = lambda: self.STATE
+        status, payload, _ = _call(srv, "GET", "/api/v1/core", CONTROL_KEY)
+        assert status == 200 and payload == self.STATE
+        _check(payload, {"$ref": "#/components/schemas/CoreState"})
+
+    def test_export_key_is_refused_and_missing_core_is_404(self, controlled_server):
+        srv, _, _ = controlled_server
+        srv.core_state = lambda: self.STATE
+        assert _call(srv, "GET", "/api/v1/core", EXPORT_KEY)[0] == 401
+        srv.core_state = None
+        assert _call(srv, "GET", "/api/v1/core", CONTROL_KEY)[0] == 404

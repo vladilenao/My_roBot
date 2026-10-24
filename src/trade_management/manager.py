@@ -71,6 +71,8 @@ CONTOUR_STOP = "contour-stop"           # снятие входа и закры�
 # Снятие инструмента из состава контура (add-contour-membership).
 INSTRUMENT_REMOVING = "instrument-removing"   # отказ новому входу или добору по инструменту
 INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и закрытие позиции инструмента
+# Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
+CORE_LOST = "core-lost"
 
 
 def _check_stop_mode(mode) -> None:
@@ -341,6 +343,8 @@ class TradeManager:
         self._contour_stop: str | None = None
         # Снятие инструментов из состава (add-contour-membership): ключ инструмента → режим.
         self._instrument_stops: dict[str, str] = {}
+        # Запрет входов без связи с ядром (add-contour-recovery).
+        self._core_lost = False
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -1505,6 +1509,24 @@ class TradeManager:
         self._instrument_stops[key] = mode
         return self._stop_trades(mode, INSTRUMENT_REMOVE, key)
 
+    def hold_entries(self, held: bool) -> None:
+        """Запрет входов и доборов без связи с ядром; неисполненные входы и закрытия не трогаются."""
+        held = bool(held)
+        if held == self._core_lost:
+            return
+        self._core_lost = held
+        log.info("Связь с ядром: %s", "потеряна — новые входы запрещены" if held else "восстановлена — запрет снят")
+        self._traces.record(calculation_trace(
+            "contour.core_link",
+            inputs={"held": MeasuredValue(held, "held")},
+            result=MeasuredValue(not held, "allowed"),
+            reason=CORE_LOST,
+            formula="no core heartbeat: no new entries or adds; pending entries and exits follow their plan",
+            links=TraceLinks(),
+            outcome=TraceOutcome.REJECTED if held else TraceOutcome.ACCEPTED,
+            algorithm_version="contour-recovery",
+        ))
+
     def _stop_trades(self, mode: str, reason: str, key: str | None) -> tuple[TradeAction, ...]:
         submitted: list[TradeAction] = []
         for recovered in self.restore():
@@ -1546,11 +1568,13 @@ class TradeManager:
         return positions, entries
 
     def _entry_block(self, key: str) -> str | None:
-        """Причина отказа новому входу или добору: остановка контура или снятие инструмента."""
+        """Причина отказа новому входу или добору: остановка контура, снятие инструмента, нет связи с ядром."""
         if self._contour_stop is not None:
             return CONTOUR_STOPPING
         if key in self._instrument_stops:
             return INSTRUMENT_REMOVING
+        if self._core_lost:
+            return CORE_LOST
         return None
 
     def _contour_stop_trace(self, action: str | None, links: TraceLinks, *, mode: str | None = None,

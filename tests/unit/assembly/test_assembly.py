@@ -141,7 +141,7 @@ def test_emulation_launch_runs_contour_process_after_core(monkeypatch, tmp_path)
             return self
 
         def run_contour(self, instruments, *, kind, control=None, source="", command="", core_state=None,
-                        next_launch=None, resolve=None):
+                        next_launch=None, resolve=None, recovery=None):
             assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
             # Желаемое ядра ведётся и без ключа управления; без API следующей команды нет.
             assert core_state is not None and core_state.path == tmp_path / "core.sqlite3"

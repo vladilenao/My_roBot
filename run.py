@@ -4,11 +4,15 @@ from src import __version__
 from datetime import datetime, timedelta
 from pathlib import Path
 from shutil import rmtree
+import os
 import sys
 
 from src.config import (
     ACTIVE_TIMEFRAMES,
+    CONTOURS_AUTOSTART,
     CONTOURS_FEED_POLL_SECS,
+    CONTOURS_HEARTBEAT_SECS,
+    CONTOURS_HEARTBEAT_TIMEOUT_SECS,
     MARKET_DATA_DATABASE_FILE,
     trading_enabled,
     DATA_REFRESH_MIN_INTERVAL,
@@ -66,6 +70,8 @@ from src.assembly.core import LiveCore, _say
 from src.assembly.history import HistoricalMarketServices
 from src.assembly.core_state import CORE_DATABASE_FILE, CoreStateStore
 from src.assembly.process import JournalMigrationError, contour_dir
+from src.assembly.pulse import CorePulseWriter
+from src.assembly import recovery as contour_recovery
 from src.assembly.services import _timeframes
 from src.bot.launch_control import LaunchControl
 from src.bot.run_session import build_run_session
@@ -217,6 +223,7 @@ def _run_contour(kind: str) -> int:
     from src.config import DATABASE_FILE
     from src.assembly.feed import FeedMarketServices
     from src.assembly.process import LaunchFileError, StdinStop, read_launch
+    from src.assembly.pulse import CorePulse
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
@@ -253,6 +260,10 @@ def _run_contour(kind: str) -> int:
                              journal_db=directory / DATABASE_FILE, status_path=directory / STATUS_FILE,
                              request_stop=stop.request, version=__version__,
                              warm_timeout=MARKET_DATA_SETTINGS.startup_wait_timeout_secs)
+    # Пульс ядра (add-contour-recovery): без него — запрет входов, «остановлено» и чужая версия — выход.
+    pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
+                      timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=control.touch)
+    pulse.start()
     instruments = [instrument_from_payload(item) for item in launch["instruments"]]
     services = FeedMarketServices(MarketDataStore(data_dir / MARKET_DATA_DATABASE_FILE), contour_id=kind,
                                   data_dir=data_dir, tracks_obligations=trading_enabled(),
@@ -265,7 +276,11 @@ def _run_contour(kind: str) -> int:
     try:
         contour.build()
         contour.run(services.serve(contour.demand()))
+        pulse.close()
+        # Штатный выход — отметка для ядра, подхватившего процесс без кода возврата.
+        control.finish(stop.reason or "цикл завершён")
     finally:
+        pulse.close()
         services.close()
         contour.close()
     log.info("Контур %s остановлен: %s", kind, stop.reason or "цикл завершён")
@@ -499,6 +514,11 @@ def _launch(
     # Желаемое и журнал команд ядра (add-control-api): записываются при любом запуске эмуляции,
     # иначе контур прочитал бы оставшуюся с прошлого раза остановку.
     core_state = None if history else CoreStateStore(state_dir / CORE_DATABASE_FILE)
+    if core_state is not None:
+        # Пульс — до любого решения о контуре: свежий контур не должен прочитать «остановлено» прошлого ядра.
+        core.pulse = CorePulseWriter(core_state, pid=os.getpid(), version=__version__,
+                                     interval=CONTOURS_HEARTBEAT_SECS)
+        core.pulse.start()
     control = (LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
                              log_file=LOGGING_FILE)
                if not history and ROBOT_CONTROL_TOKEN else None)
@@ -509,6 +529,16 @@ def _launch(
             control.mark_starting(SOURCE_MENU if launch is None else launch.source)
     if core is not None and core.early is not None:
         core.start_api(control)
+    recovery = None
+    if core_state is not None and instruments is None:
+        recovery = _recover_contour(state_dir, core_state, control, launch)
+        if recovery.action == contour_recovery.BLOCKED:
+            _stop_core(core)
+            return 2, None, None
+        if recovery.action in (contour_recovery.ADOPT, contour_recovery.AUTOSTART):
+            instruments = recovery.instruments()
+        else:
+            recovery = None
     if instruments is None:
         try:
             instruments = _choose_instruments(
@@ -620,7 +650,7 @@ def _launch(
             code = core.run_contour(instruments, kind=MODE_EMULATION, control=control, core_state=core_state,
                                     source="" if launch is None else launch.source,
                                     command="" if control is None else control.snapshot().get("command") or "",
-                                    next_launch=next_launch, resolve=resolve_tokens)
+                                    next_launch=next_launch, resolve=resolve_tokens, recovery=recovery)
         except JournalMigrationError as exc:
             print(str(exc))
             code = 2
@@ -641,6 +671,57 @@ def _launch(
         contour.finish()
         contour.close()
     return 0, None, selection or instruments
+
+
+def _recover_contour(state_dir, core_state, control, launch):
+    """Судьба контура при старте ядра: подхват, замена другой версии, автоподъём (add-contour-recovery)."""
+    from src.assembly.process import STOP_TIMEOUT_SECS, terminate_pid, wait_exit
+
+    directory = contour_dir(state_dir, MODE_EMULATION)
+    explicit = launch is None or not launch.wait_command
+    # Без ключа управления контур, поднятый сам, нечем остановить, кроме Ctrl+C: ожидание команды и так отказывает.
+    autostart = CONTOURS_AUTOSTART and control is not None
+
+    def plan():
+        return contour_recovery.plan_recovery(
+            directory, version=__version__, desired=core_state.desired(MODE_EMULATION), explicit=explicit,
+            autostart=autostart, timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS)
+
+    result = plan()
+    if result.action == contour_recovery.REPLACE:
+        if result.status.get("version") != __version__:
+            _say(f"Контур другой версии ({result.status.get('version')}, pid {result.pid}) завершается: "
+                 f"ядро {__version__} поднимет контур своей версии")
+        else:
+            _say(f"Контур (pid {result.pid}) ещё завершается — ядро ждёт его выхода")
+        # Контур увидит пульс чужой версии и выйдет после тика; иначе — принудительно.
+        if not wait_exit(result.pid, STOP_TIMEOUT_SECS + CONTOURS_HEARTBEAT_SECS):
+            log.error("Контур pid %s не вышел за %.0f с — завершается принудительно", result.pid, STOP_TIMEOUT_SECS)
+            terminate_pid(result.pid)
+            wait_exit(result.pid, 5)
+        result = plan()
+        if result.action in (contour_recovery.ADOPT, contour_recovery.REPLACE):
+            result = contour_recovery.RecoveryPlan(contour_recovery.BLOCKED, result.pid, result.status)
+    desired = core_state.desired(MODE_EMULATION)
+    if result.action == contour_recovery.BLOCKED:
+        message = (f"Папка контура {directory} занята процессом pid {result.pid}, который не подтверждает себя "
+                   f"как контур робота. Завершите этот процесс; если такого процесса робота нет — удалите "
+                   f"{directory / 'robot.pid'}. Контур не запускается.")
+        print(message)
+        log.error("%s", message)
+    elif result.action == contour_recovery.ADOPT:
+        if explicit:
+            _say(f"Контур эмуляции уже работает (pid {result.pid}) и подхвачен: параметры запуска не применены, "
+                 "состав меняется командой /api/v1/contours/emulation/instruments")
+        _say(f"Контур эмуляции подхвачен: pid {result.pid}, поколение {desired.generation if desired else '—'}")
+        if control is not None:
+            control.mark_recovered(contour_recovery.RECOVERY_ADOPTED, desired)
+    elif result.action == contour_recovery.AUTOSTART:
+        names = ", ".join(member.name for member in result.members)
+        _say(f"Контур эмуляции поднимается без команды: {names}, поколение {desired.generation}")
+        if control is not None:
+            control.mark_recovered(contour_recovery.RECOVERY_AUTOSTART, desired)
+    return result
 
 
 def _stop_core(core) -> None:

@@ -146,6 +146,8 @@ class LaunchControl:
         self._log_file = log_file
         self._launched = False
         self._membership: queue.Queue[MembershipCommand] = queue.Queue()
+        # Как поднят процесс этим ядром: autostart / adopted / None (add-contour-recovery).
+        self._recovery: str | None = None
 
     # --- для API ----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -164,12 +166,13 @@ class LaunchControl:
                 "pid": self._pid,
                 "exit_code": self._exit_code,
                 "desired": None if desired is None else desired.payload(),
+                "recovery": self._recovery,
             }
             launched = self._launched
         # Снимок прошлого запуска ядра не выдаётся за фактическое этого.
         status = self._status() if launched else None
         snapshot["actual"] = None if status is None else {name: status.get(name) for name in (
-            "state", "applied_generation", "open_positions", "pending_entries", "last_tick_at")}
+            "state", "applied_generation", "open_positions", "pending_entries", "last_tick_at", "core_link")}
         members = () if desired is None else desired.members
         if members:
             # Текущий желаемый состав (add-contour-membership), а не состав запуска.
@@ -326,10 +329,26 @@ class LaunchControl:
             self._rejections = []
             self._accepting = False
             self._pending = None
+            self._recovery = None
         if pending is not None:
             pending.status = 201
             pending.payload = self.snapshot()
             pending.done.set()
+
+    def mark_recovered(self, recovery: str, desired) -> None:
+        """Процесс поднят без команды (``autostart``) или подхвачен живым (``adopted``): источник — из желаемого."""
+        chosen = [] if desired is None else [
+            Chosen(item["token"], item["name"], item["instrument_type"], item.get("days_to_expiry"))
+            for item in (_chosen_payload(member) for member in desired.members if member.active)]
+        with self._lock:
+            self._state = STATE_STARTING
+            self._source = None if desired is None else desired.source or None
+            self._command = None if desired is None else desired.command or None
+            self._chosen = chosen
+            self._started_at = self._clock()
+            self._rejections = []
+            self._accepting = False
+            self._recovery = recovery
 
     def mark_process(self, pid: int) -> None:
         with self._lock:
@@ -343,8 +362,11 @@ class LaunchControl:
             if self._state == STATE_STARTING and self._pid is not None:
                 self._state = STATE_RUNNING
 
-    def mark_exited(self, code: int, *, stopping: bool = False) -> None:
-        """Процесс контура завершился: код 0 — ``stopped``, иначе ``failed`` (сам не перезапускается)."""
+    def mark_exited(self, code: int | None, *, stopping: bool = False) -> None:
+        """Процесс контура завершился: код 0 — ``stopped``, иначе ``failed`` (сам не перезапускается).
+
+        ``None`` — подхваченный процесс вышел без отметки штатного выхода.
+        """
         with self._lock:
             self._pid = None
             self._exit_code = code

@@ -4,6 +4,10 @@
 (``read_desired``). Каждая команда, меняющая желаемое, увеличивает номер
 поколения: контур применяет его на границе тика и сообщает применённое
 поколение в своём ``status.json``.
+
+Таблица ``heartbeat`` — пульс ядра (add-contour-recovery): pid, версия, время
+старта и последнего удара, ``running`` / ``stopped``. Контур читает её
+``read_heartbeat`` и без свежего удара перестаёт входить в новые сделки.
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ STOP_MODES = (NO_ENTRIES, CLOSE_ALL)
 
 # Исходы команд в журнале.
 ACCEPTED, REJECTED, CONFLICT, IGNORED = "accepted", "rejected", "conflict", "ignored"
+# Состояния пульса ядра.
+BEAT_RUNNING, BEAT_STOPPED = "running", "stopped"
 
 
 def _now() -> str:
@@ -51,6 +57,55 @@ class Desired:
     @property
     def active(self) -> tuple:
         return tuple(member for member in self.members if member.active)
+
+
+@dataclass(frozen=True)
+class Heartbeat:
+    """Последний удар пульса ядра."""
+
+    core_pid: int
+    core_version: str
+    started_at: str
+    beat_at: str
+    state: str
+
+    @property
+    def stopped(self) -> bool:
+        return self.state == BEAT_STOPPED
+
+    def age(self, now: datetime | None = None) -> float:
+        """Секунды с последнего удара по часам машины."""
+        moment = now or datetime.now(timezone.utc)
+        return (moment - parse_time(self.beat_at)).total_seconds()
+
+    def payload(self) -> dict:
+        return {"core_pid": self.core_pid, "core_version": self.core_version, "started_at": self.started_at,
+                "beat_at": self.beat_at, "state": self.state}
+
+
+def parse_time(text: str) -> datetime:
+    """Время базы ядра и ``status.json`` (ISO с ``Z``) → aware UTC."""
+    value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _heartbeat(row) -> Heartbeat | None:
+    if row is None:
+        return None
+    return Heartbeat(int(row["core_pid"]), row["core_version"], row["started_at"], row["beat_at"], row["state"])
+
+
+def read_heartbeat(path: Path) -> Heartbeat | None:
+    """Сторона контура: пульс ядра только на чтение; нет базы, таблицы или строки — ``None``."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            return _heartbeat(conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone())
+        except sqlite3.OperationalError:
+            return None  # база ядра версии до add-contour-recovery
 
 
 @dataclass(frozen=True)
@@ -203,6 +258,14 @@ class CoreStateStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (contour_id, instrument_key)
                 );
+                CREATE TABLE IF NOT EXISTS heartbeat (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    core_pid INTEGER NOT NULL,
+                    core_version TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    beat_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('running', 'stopped'))
+                );
             """)
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
@@ -226,6 +289,27 @@ class CoreStateStore:
     def desired(self, contour_id: str) -> Desired | None:
         with self._connect() as conn:
             return _desired(conn, conn.execute("SELECT * FROM contours WHERE contour_id=?", (contour_id,)).fetchone())
+
+    # ── Пульс ядра (add-contour-recovery) ──
+
+    def beat(self, pid: int, version: str, started_at: str) -> Heartbeat:
+        """Удар пульса: ядро живо; строка одна на базу, новое ядро её перезаписывает."""
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO heartbeat(id,core_pid,core_version,started_at,beat_at,state)
+                VALUES(1,?,?,?,?,'running') ON CONFLICT(id) DO UPDATE SET core_pid=excluded.core_pid,
+                core_version=excluded.core_version, started_at=excluded.started_at, beat_at=excluded.beat_at,
+                state='running'""", (pid, version, started_at, now))
+        return Heartbeat(pid, version, started_at, now, BEAT_RUNNING)
+
+    def mark_stopped(self, pid: int) -> None:
+        """Штатная остановка ядра: контуры этого ядра выходят после тика; чужую строку не трогает."""
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE heartbeat SET state='stopped', beat_at=? WHERE id=1 AND core_pid=?", (_now(), pid))
+
+    def heartbeat(self) -> Heartbeat | None:
+        with self._connect() as conn:
+            return _heartbeat(conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone())
 
     def record_launch(self, contour_id: str, kind: str, instruments, *, source: str = "", command: str = "",
                       payload: dict | None = None, members=None) -> int:

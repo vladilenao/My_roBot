@@ -2,8 +2,10 @@
 
 Ядро после выбора инструментов пишет ``launch.json`` в папку контура и
 запускает процесс тем же исполняемым файлом с ``--contour <вид>``. Канал
-stdin держится открытым: строка ``stop`` — штатная остановка после тика,
-конец потока — ядро завершилось (D1, D2, D5). Журнал эмуляции один раз
+stdin держится открытым: строка ``stop`` — штатная остановка после тика
+(D1, D2, D5). Конец потока контур только отмечает в журнале: о смерти ядра
+он судит по пульсу, а новое ядро может подхватить его без stdin
+(``AdoptedProcess``, add-contour-recovery). Журнал эмуляции один раз
 переезжает из ``data/`` в папку контура, исходные файлы остаются для отката
 (D6). Модуль не импортирует контур.
 """
@@ -13,14 +15,17 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src.logging_setup import get_logger
+from src.runtime_lock import _process_alive
 
 log = get_logger(__name__)
 
@@ -200,8 +205,85 @@ class ContourProcess:
         return self.exit_code
 
 
+def terminate_pid(pid: int) -> None:
+    """Принудительное завершение чужого (не порождённого этим ядром) процесса контура."""
+    try:
+        # На Windows os.kill с любым сигналом — TerminateProcess; на POSIX — SIGKILL.
+        os.kill(pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        log.warning("Процесс контура pid %s не завершён (%s)", pid, type(exc).__name__)
+
+
+def wait_exit(pid: int, timeout: float, *, alive=_process_alive, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Ждать выхода процесса до ``timeout`` секунд; ``True`` — процесс вышел."""
+    deadline = clock() + timeout
+    while alive(pid):
+        if clock() >= deadline:
+            return False
+        sleep(0.5)
+    return True
+
+
+class AdoptedProcess:
+    """Подхваченный живой процесс контура: надзор по pid, без stdin и кода выхода (add-contour-recovery).
+
+    Остановку контур берёт из пульса ядра ``stopped`` (её пишет ядро до
+    ``stop``) или из желаемого в ``core.sqlite3``. ``stop`` ждёт выхода до
+    ``stop_timeout`` и затем завершает процесс принудительно.
+    """
+
+    def __init__(self, kind: str, pid: int, *, on_exit=None, alive=_process_alive, kill=terminate_pid,
+                 poll_secs: float = 1.0, stop_timeout: float = STOP_TIMEOUT_SECS, sleep=time.sleep) -> None:
+        self.kind = kind
+        self._pid = pid
+        self._on_exit = on_exit
+        self._alive = alive
+        self._kill = kill
+        self._poll = poll_secs
+        self._stop_timeout = stop_timeout
+        self._sleep = sleep
+        self._stopping = False
+        self._exited = threading.Event()
+        self._watcher: threading.Thread | None = None
+        self.exit_code: int | None = None
+
+    @property
+    def pid(self) -> int | None:
+        return None if self._exited.is_set() else self._pid
+
+    @property
+    def running(self) -> bool:
+        return not self._exited.is_set()
+
+    def start(self) -> int:
+        self._watcher = threading.Thread(target=self._watch, name=f"contour-{self.kind}-adopted", daemon=True)
+        self._watcher.start()
+        log.info("Процесс контура %s подхвачен, pid %s", self.kind, self._pid)
+        return self._pid
+
+    def _watch(self) -> None:
+        while self._alive(self._pid):
+            if self._exited.wait(self._poll):
+                return
+        self._exited.set()
+        log.info("Подхваченный процесс контура %s (pid %s) завершился", self.kind, self._pid)
+        if self._on_exit is not None:
+            self._on_exit(None, self._stopping)
+
+    def stop(self) -> int | None:
+        self._stopping = True
+        if self.running and not wait_exit(self._pid, self._stop_timeout, alive=self._alive, sleep=self._sleep):
+            log.error("Контур %s (pid %s) не остановился за %.0f с — завершается принудительно",
+                      self.kind, self._pid, self._stop_timeout)
+            self._kill(self._pid)
+            wait_exit(self._pid, 5, alive=self._alive, sleep=self._sleep)
+        if self._watcher is not None:
+            self._watcher.join(timeout=self._poll + 5)
+        return None
+
+
 class StdinStop:
-    """Сторона контура: ``stop`` или конец stdin ставят флаг остановки на границе тика."""
+    """Сторона контура: строка ``stop`` в stdin ставит флаг остановки на границе тика; конец потока — нет."""
 
     def __init__(self, stream=None) -> None:
         self._stream = stream if stream is not None else sys.stdin
@@ -225,4 +307,5 @@ class StdinStop:
                     return
         except (OSError, ValueError):
             pass
-        self.request("ядро завершилось")
+        # Ядро завершилось или закрыло канал: дальше решает пульс (add-contour-recovery).
+        log.info("Канал stdin ядра закрыт: контур продолжает, связь с ядром — по пульсу")

@@ -42,6 +42,8 @@ class MarketDataExportServer:
         # Управление контуром (src.bot.launch_control.LaunchControl) и его отдельный ключ.
         self.control = control
         self.control_token = control_token or None
+        # Состояние ядра для GET /api/v1/core (add-contour-recovery): функция без аргументов или None.
+        self.core_state = None
         self.host = host
         self.port = port
         self._server: ThreadingHTTPServer | None = None
@@ -96,6 +98,13 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == _CONTOURS:
             if self._control_allowed():
                 self._json(HTTPStatus.OK, {"contours": [self.export_server.control.snapshot()]})
+            return
+        if parsed.path == "/api/v1/core":
+            if self._control_allowed():
+                if self.export_server.core_state is None:
+                    self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Состояние ядра недоступно в этом процессе.")
+                else:
+                    self._json(HTTPStatus.OK, self.export_server.core_state())
             return
         contour = _CONTOUR.match(parsed.path)
         if contour is not None and contour.group(2) not in ("stop", "instruments"):
