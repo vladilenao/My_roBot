@@ -203,6 +203,11 @@ class CompletenessLane:
             floor = self._cache.live_floor(uid, timeframe)
             if floor is not None:
                 candidates.append(floor)
+            # Исполнение контура стоит перед минутой после своего курсора и без
+            # сделок: окно не уже него (fix-contour-cursor-window).
+            cursor = self._store.contour_cursor_floor(source=self._source, instrument_uid=uid, interval=timeframe)
+            if cursor is not None:
+                candidates.append(_naive(grid.bar_close(cursor)))
         lower = min(candidates)
         previous = self.windows.get((uid, timeframe))
         if previous != lower:

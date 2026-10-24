@@ -1273,6 +1273,15 @@ class MarketDataStore:
         result = dict(row) if row is not None else {"received_through": None, "resolved_through": None}
         return {**result, "processed_through": processed}
 
+    def contour_cursor_floor(self, *, source: str, instrument_uid: str, interval: str) -> pd.Timestamp | None:
+        """Наименьшая граница обработки пары по контурам (naive UTC) или None."""
+        with self._lock, self._connect() as conn:
+            value = conn.execute(
+                "SELECT MIN(processed_through) FROM contour_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                (source, instrument_uid, interval),
+            ).fetchone()[0]
+        return None if value is None else pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+
     @staticmethod
     def _advance_cursor(
         conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
