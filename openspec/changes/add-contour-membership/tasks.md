@@ -17,16 +17,23 @@
 - [ ] 3.3 `ContourControl`: сравнение состава, `warming` до готовности пар или срока, обзор, `trading`; снятие — `draining`/`closing` до пустого остатка, затем выход; возврат; применение всего состава при старте; `members` в `status.json`
 - [ ] 3.4 Тесты: прогрев и обзор без переигрывания, торговля соседей не прерывается, выход после последней сделки, выход без сделок, срок прогрева, возврат, старт процесса с `removed` и открытой сделкой
 
-## 4. Ядро и API
+## 4. Спрос контура и пары ядра
 
-- [ ] 4.1 Очередь команд состава в `LaunchControl`; `_supervise` разбирает её в главном потоке: разрешение токенов, карточки, `contour_members`, паттерны и инструменты обязательств ядра
-- [ ] 4.2 `POST /api/v1/contours/{id}/instruments`: 202/200/400/404/409/422, ожидание 60 с; `instruments` и `members` в состоянии
-- [ ] 4.3 Swagger `docs/openapi.yaml` `1.6.0-proposal`: маршрут, примеры, схемы `ContourMembershipRequest`, `ContourMember`, `ContourMembershipAccepted`; проверка валидатором
-- [ ] 4.4 Тесты API и ядра: добавить с карточкой фьючерса, отклонённое добавление, убрать отсутствующий, `STOPPING`, `NOT_RUNNING`, повтор `200`, схема ответа
+- [ ] 4.1 `MarketDataStore.replace_contour_demand` и `remove_contour_demand`; `FeedMarketServices.serve` заменяет спрос, `StoreCoreLink.forget` при выходе инструмента
+- [ ] 4.2 `ContourDemandPoller`: отметка пар без спроса и обязательств, снятие через `demand_release_secs` (`unregister_live_pair`, `retire_roster_pairs`, пары паттернов), отмена отметки при новом спросе
+- [ ] 4.3 `[contours] demand_release_secs` в конфиге и `default.toml`
+- [ ] 4.4 Тесты: замена спроса при запуске, удаление строк при выходе, снятие после выдержки, отказ снимать при обязательстве, отмена при вернувшемся спросе
 
-## 5. Документы и проверка
+## 5. Ядро и API
 
-- [ ] 5.1 `docs/architecture/core-contours.md` и артефакт документа 1: состав — инструменты (`contour_members`, `/instruments`), П5 ✓
-- [ ] 5.2 `README.txt`, `CHANGELOG.md`
-- [ ] 5.3 Полный `pytest`, `ruff` (F821/F401), `openspec validate add-contour-membership --strict`
-- [ ] 5.4 Живая проверка на 8102: запуск SBER → `add NG` → прогрев и обзор NG → `remove SBER` при открытой позиции → дожитие и выход → `add SBER` → `remove NG close_all`
+- [ ] 5.1 Очередь команд состава в `LaunchControl`; `_supervise` разбирает её в главном потоке: разрешение токенов, карточки, `contour_members`, паттерны и инструменты обязательств ядра
+- [ ] 5.2 `POST /api/v1/contours/{id}/instruments`: 202/200/400/404/409/422, ожидание 60 с; `instruments` и `members` в состоянии
+- [ ] 5.3 Swagger `docs/openapi.yaml` `1.6.0-proposal`: маршрут, примеры, схемы `ContourMembershipRequest`, `ContourMember`, `ContourMembershipAccepted`; проверка валидатором
+- [ ] 5.4 Тесты API и ядра: добавить с карточкой фьючерса, отклонённое добавление, убрать отсутствующий, `STOPPING`, `NOT_RUNNING`, повтор `200`, схема ответа
+
+## 6. Документы и проверка
+
+- [ ] 6.1 `docs/architecture/core-contours.md` и артефакт документа 1: состав — инструменты (`contour_members`, `/instruments`), П5 ✓
+- [ ] 6.2 `README.txt`, `CHANGELOG.md`
+- [ ] 6.3 Полный `pytest`, `ruff` (F821/F401), `openspec validate add-contour-membership --strict`
+- [ ] 6.4 Живая проверка на 8102: запуск SBER → `add NG` → прогрев и обзор NG → `remove SBER` при открытой позиции → дожитие и выход → `add SBER` → `remove NG close_all`
