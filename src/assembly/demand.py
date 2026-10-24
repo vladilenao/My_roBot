@@ -58,6 +58,12 @@ class ContourDemandPoller:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def add_instruments(self, instruments) -> None:
+        """Инструменты повторного запуска контура: их границы исполнения тоже применяются."""
+        known = {instrument_key(item) for item in self._instruments}
+        self._instruments = self._instruments + [item for item in instruments if instrument_key(item) not in known]
+        self._obligations = None
+
     def start(self) -> None:
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="contour-demand", daemon=True)

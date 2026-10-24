@@ -4,6 +4,8 @@ from urllib import error, request
 
 import pytest
 
+from src.assembly.contour_control import write_status
+from src.assembly.core_state import CoreStateStore
 from src.bot.launch import Chosen, Rejection, SOURCE_API, SOURCE_CLI
 from src.bot.launch_control import BadCommand, LaunchControl, parse_command
 from src.data.export_api import MarketDataExportServer
@@ -225,3 +227,160 @@ def test_swagger_declares_control_routes():
     post = SPEC["paths"]["/api/v1/contours"]["post"]
     assert post["security"] == [{"ControlToken": []}]
     assert set(post["responses"]) >= {"201", "202", "400", "401", "403", "409", "422"}
+
+
+# ── Остановка, повторный запуск, лог (add-control-api) ──
+
+def _controlled(tmp_path, *, alive=True):
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    control = LaunchControl(reply_timeout=2, core_state=store, contour_dir=tmp_path / "contours" / "emulation")
+    control.mark_launched(SOURCE_API, [NG], "--mode emulation --instruments NG-12.26")
+    store.record_launch("emulation", "emulation", [NG.payload()], source="api")
+    if alive:
+        control.mark_process(4242)
+    return control, store
+
+
+class TestStopAndRelaunch:
+    def test_stop_records_generation_and_shows_stopping(self, tmp_path):
+        control, store = _controlled(tmp_path)
+        status, payload = control.stop("emulation", "no_entries")
+        assert status == 202 and payload["generation"] == 2
+        assert payload["contour"]["state"] == "stopping_no_entries"
+        assert payload["contour"]["desired"] == {"running": False, "stop_mode": "no_entries", "generation": 2}
+
+    def test_repeat_and_mode_rules(self, tmp_path):
+        control, _ = _controlled(tmp_path)
+        control.stop("emulation", "no_entries")
+        assert control.stop("emulation", "no_entries")[0] == 200
+        assert control.stop("emulation", "close_all")[1]["generation"] == 3
+        status, payload = control.stop("emulation", "no_entries")
+        assert status == 409 and payload["code"] == "MODE_CONFLICT"
+
+    def test_nothing_to_stop_and_unknown_contour(self, tmp_path):
+        control, store = _controlled(tmp_path, alive=False)
+        status, payload = control.stop("emulation", "close_all")
+        assert status == 409 and payload["code"] == "NOT_RUNNING"
+        assert store.desired("emulation").running and store.commands()[0]["outcome"] == "conflict"
+        assert control.stop("account", "close_all")[0] == 404
+
+    def test_launch_while_draining_is_stopping_conflict(self, tmp_path):
+        control, _ = _controlled(tmp_path)
+        control.mark_contour_running()
+        control.stop("emulation", "no_entries")
+        control.accept_commands()
+        status, payload = control.submit(parse_command({"kind": "emulation"}))
+        assert status == 409 and payload["code"] == "STOPPING"
+
+    def test_relaunch_after_stopped_is_accepted(self, tmp_path):
+        control, _ = _controlled(tmp_path)
+        control.stop("emulation", "no_entries")
+        control.mark_exited(0)
+        control.accept_commands()
+        assert control.snapshot()["state"] == "stopped"
+        _main_thread(control, "run")
+        status, payload = control.submit(parse_command({"kind": "emulation", "instruments": ["NG"]}))
+        assert status == 201 and payload["state"] == "starting"
+
+    def test_core_restart_shows_previous_desired_and_waits(self, tmp_path):
+        CoreStateStore(tmp_path / "core.sqlite3").record_launch("emulation", "emulation", [NG.payload()])
+        directory = tmp_path / "contours" / "emulation"
+        directory.mkdir(parents=True)
+        write_status(directory / "status.json", {"state": "running", "applied_generation": 1})
+        control = LaunchControl(core_state=CoreStateStore(tmp_path / "core.sqlite3"), contour_dir=directory)
+        control.accept_commands()
+        snapshot = control.snapshot()
+        assert snapshot["state"] == "waiting_command" and snapshot["pid"] is None
+        assert snapshot["desired"] == {"running": True, "stop_mode": None, "generation": 1}
+        # Снимок прошлого запуска ядра не выдаётся за фактическое.
+        assert snapshot["actual"] is None
+
+    def test_actual_comes_from_status_file(self, tmp_path):
+        control, _ = _controlled(tmp_path)
+        directory = tmp_path / "contours" / "emulation"
+        directory.mkdir(parents=True)
+        write_status(directory / "status.json", {"state": "running", "applied_generation": 1, "open_positions": 2,
+                                                 "pending_entries": 0, "last_tick_at": "2026-10-24T10:00:00Z",
+                                                 "pid": 4242, "version": "7.1.0"})
+        assert control.snapshot()["actual"] == {"state": "running", "applied_generation": 1, "open_positions": 2,
+                                               "pending_entries": 0, "last_tick_at": "2026-10-24T10:00:00Z"}
+        (directory / "status.json").write_text("{broken", encoding="utf-8")
+        assert control.snapshot()["actual"] is None
+
+
+@pytest.fixture
+def controlled_server(tmp_path):
+    control, store = _controlled(tmp_path)
+    srv = MarketDataExportServer(MarketDataStore(tmp_path / "market.sqlite3"), EXPORT_KEY, port=0,
+                                 control=control, control_token=CONTROL_KEY)
+    try:
+        srv.start()
+    except PermissionError:
+        pytest.skip("Песочница не разрешает открыть loopback-сокет")
+    yield srv, control, tmp_path
+    srv.close()
+
+
+def _text(srv, path, key):
+    address, port = srv.address
+    req = request.Request(f"http://{address}:{port}{path}", headers={"Authorization": f"Bearer {key}"})
+    try:
+        with request.urlopen(req, timeout=5) as response:
+            return response.status, response.read().decode("utf-8"), dict(response.headers)
+    except error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+
+
+class TestStopAndLogApi:
+    def test_stop_matches_contract(self, controlled_server):
+        srv, _, _ = controlled_server
+        status, payload, headers = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY,
+                                         {"mode": "no_entries"})
+        assert status == 202 and headers["Location"] == "/api/v1/contours/emulation"
+        _check(payload, {"$ref": "#/components/schemas/ContourStopAccepted"})
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY, {"mode": "no_entries"})
+        assert status == 200 and payload["generation"] == 2
+        status, payload, _ = _call(srv, "GET", "/api/v1/contours/emulation", CONTROL_KEY)
+        assert status == 200 and payload["state"] == "stopping_no_entries"
+        _check(payload, {"$ref": "#/components/schemas/Contour"})
+
+    @pytest.mark.parametrize("body", [{"mode": "pause"}, {}, {"mode": "close_all", "extra": 1}, b"{bad"])
+    def test_bad_stop_body(self, controlled_server, body):
+        srv, _, _ = controlled_server
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY, body)
+        assert status == 400 and payload["code"] == "INVALID_REQUEST"
+
+    def test_unknown_contour(self, controlled_server):
+        srv, _, _ = controlled_server
+        assert _call(srv, "GET", "/api/v1/contours/account", CONTROL_KEY)[0] == 404
+        assert _call(srv, "POST", "/api/v1/contours/account/stop", CONTROL_KEY, {"mode": "close_all"})[0] == 404
+        assert _text(srv, "/api/v1/contours/account/log", CONTROL_KEY)[0] == 404
+
+    def test_stop_conflict_matches_contract(self, controlled_server):
+        srv, control, _ = controlled_server
+        control.mark_exited(0)
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY, {"mode": "close_all"})
+        assert status == 409 and payload["code"] == "NOT_RUNNING"
+        _check(payload, {"$ref": "#/components/schemas/ContourConflict"})
+
+    def test_log_tail_and_limits(self, controlled_server):
+        srv, _, tmp_path = controlled_server
+        directory = tmp_path / "contours" / "emulation"
+        assert _text(srv, "/api/v1/contours/emulation/log", CONTROL_KEY)[:2] == (200, "")
+        directory.mkdir(parents=True)
+        lines = [f"строка {number} токен [скрыто]\n" for number in range(5000)]
+        (directory / "bot_debug.log").write_text("".join(lines), encoding="utf-8")
+        status, text, headers = _text(srv, "/api/v1/contours/emulation/log?tail=3", CONTROL_KEY)
+        assert status == 200 and text == "".join(lines[-3:]) and headers["Content-Type"].startswith("text/plain")
+        assert len(_text(srv, "/api/v1/contours/emulation/log", CONTROL_KEY)[1].splitlines()) == 200
+        for tail in ("0", "5000", "abc"):
+            assert _text(srv, f"/api/v1/contours/emulation/log?tail={tail}", CONTROL_KEY)[0] == 400
+        assert CONTROL_KEY not in _text(srv, "/api/v1/contours/emulation/log?tail=1000", CONTROL_KEY)[1]
+
+    def test_new_routes_require_control_key_and_loopback(self, controlled_server):
+        srv, _, _ = controlled_server
+        assert _call(srv, "POST", "/api/v1/contours/emulation/stop", EXPORT_KEY, {"mode": "close_all"})[0] == 401
+        assert _text(srv, "/api/v1/contours/emulation/log", EXPORT_KEY)[0] == 401
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours/emulation/stop", CONTROL_KEY, {"mode": "close_all"},
+                                   host=f"evil.example:{srv.address[1]}")
+        assert status == 403 and payload["code"] == "FORBIDDEN_HOST"

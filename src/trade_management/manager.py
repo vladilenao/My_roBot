@@ -63,6 +63,11 @@ log = get_logger(__name__)
 
 _INCREASES = (OpenTrade, AddToTrade)
 _MANAGEABLE = {TradePhase.OPEN, TradePhase.BUILDING, TradePhase.REDUCING}
+# Остановка торгового контура командой (add-control-api).
+CONTOUR_NO_ENTRIES = "no_entries"
+CONTOUR_CLOSE_ALL = "close_all"
+CONTOUR_STOPPING = "contour-stopping"   # отказ новому входу или добору
+CONTOUR_STOP = "contour-stop"           # снятие входа и закрытие позиции
 _TERMINAL = {TradePhase.CLOSED, TradePhase.CANCELLED}
 _DEFAULT_RISK_LIMITS = RiskLimits(
     per_trade=Decimal("100"),
@@ -323,6 +328,9 @@ class TradeManager:
         self._session_calendar = session_calendar
         self._protection_timeframe = protection_timeframe
         self._session_instruments: dict[str, object] = {}
+        # Остановка торгового контура командой (add-control-api): None — торгует,
+        # иначе режим ``no_entries`` / ``close_all``; новых входов и доборов нет.
+        self._contour_stop: str | None = None
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -689,6 +697,10 @@ class TradeManager:
             if row and not self.contract_lifecycle.can_increase(row[0], self._clock.now()):
                 return False
         if isinstance(action, AddToTrade) and not self._intraday_add_allowed(action):
+            return False
+        if isinstance(action, AddToTrade) and self._contour_stop is not None:
+            log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(CONTOUR_STOPPING))
+            self._traces.record(self._contour_stop_trace("AddToTrade", TraceLinks(trade_id=action.trade_id)))
             return False
         if isinstance(action, (CloseTrade, ReduceTrade)) and action.reference_price is None and market_close is not None:
             action = replace(action, reference_price=Decimal(str(market_close)))
@@ -1175,6 +1187,12 @@ class TradeManager:
             if owned is not None:
                 actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
                 return SignalAdmission(actions=actions)
+            if self._contour_stop is not None:
+                log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker,
+                         rejection_message(CONTOUR_STOPPING))
+                self._traces.record(self._contour_stop_trace(
+                    None, TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id)))
+                return SignalAdmission(rejections=(rejection_reason(CONTOUR_STOPPING),))
             session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
             if session_rejection is not None:
                 return SignalAdmission(rejections=(session_rejection,))
@@ -1441,6 +1459,72 @@ class TradeManager:
             links=links,
             outcome=outcome,
             algorithm_version=session_guard.ALGORITHM_VERSION,
+        )
+
+    # ── Остановка торгового контура командой (add-control-api) ──
+    @property
+    def contour_stop(self) -> str | None:
+        return self._contour_stop
+
+    def stop_contour(self, mode: str | None) -> tuple[TradeAction, ...]:
+        """Режим остановки контура: запрет входов и доборов, снятие входов, при ``close_all`` — закрытие.
+
+        ``None`` снимает остановку. Повтор безопасен: по сделке с уже идущей
+        заявкой снятия или закрытия второе действие не создаётся, а сделки,
+        перешедшие в другие фазы, пропускаются.
+        """
+        if mode not in (None, CONTOUR_NO_ENTRIES, CONTOUR_CLOSE_ALL):
+            raise ValueError(f"Неизвестный режим остановки контура: {mode!r}")
+        if mode != self._contour_stop:
+            log.info("Остановка контура: режим %s", mode or "снята")
+        self._contour_stop = mode
+        if mode is None:
+            return ()
+        submitted: list[TradeAction] = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
+            if state.phase is TradePhase.ENTRY_PENDING:
+                if self._open_order(plan.trade_id, "CANCEL"):
+                    continue
+                log.info("Остановка контура: снятие неисполненного входа %s", plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason=CONTOUR_STOP)
+            elif mode == CONTOUR_CLOSE_ALL and state.phase in _MANAGEABLE and state.quantity > 0:
+                if self._open_order(plan.trade_id, "CLOSE"):
+                    continue
+                log.info("Остановка контура: закрытие позиции %s", plan.trade_id)
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                    state_revision=state.state_revision, reason=CONTOUR_STOP)
+            else:
+                continue
+            if self.submit_action(action, assignment_id=plan.assignment_id,
+                                  trace=self._contour_stop_trace(type(action).__name__, links)):
+                submitted.append(action)
+        return tuple(submitted)
+
+    def contour_remainder(self) -> tuple[int, int]:
+        """Открытые позиции и неисполненные входы: контур завершает остановку, когда оба нули."""
+        positions = entries = 0
+        for recovered in self.restore():
+            state = recovered.state
+            if state.phase is TradePhase.ENTRY_PENDING:
+                entries += 1
+            elif state.phase in _MANAGEABLE and state.quantity > 0:
+                positions += 1
+        return positions, entries
+
+    def _contour_stop_trace(self, action: str | None, links: TraceLinks):
+        return calculation_trace(
+            "contour.stop",
+            inputs={"mode": MeasuredValue(self._contour_stop, "mode"),
+                    "action": MeasuredValue(action, "action")},
+            result=MeasuredValue(action is not None and action != "AddToTrade", "allowed"),
+            reason=CONTOUR_STOP if action in ("CancelEntry", "CloseTrade") else CONTOUR_STOPPING,
+            formula="contour stopping: no new entries or adds; cancel pending entries; close_all closes positions",
+            links=links,
+            outcome=(TraceOutcome.ACCEPTED if action in ("CancelEntry", "CloseTrade") else TraceOutcome.REJECTED),
+            algorithm_version="control-api",
         )
 
     def _intraday_entry_rejection(self, instrument, assignment, decision, timeframe: str | None):

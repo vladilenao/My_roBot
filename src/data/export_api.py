@@ -22,6 +22,8 @@ log = get_logger(__name__)
 _CONSUMER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _CONTROL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 _CONTOURS = "/api/v1/contours"
+# /api/v1/contours/{id}[/stop|/log] — маршруты одного контура (add-control-api).
+_CONTOUR = re.compile(r"^/api/v1/contours/([a-z0-9][a-z0-9-]{0,62})(?:/(stop|log))?$")
 _OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
 
 
@@ -94,6 +96,11 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == _CONTOURS:
             if self._control_allowed():
                 self._json(HTTPStatus.OK, {"contours": [self.export_server.control.snapshot()]})
+            return
+        contour = _CONTOUR.match(parsed.path)
+        if contour is not None and contour.group(2) != "stop":
+            if self._control_allowed():
+                self._contour_get(contour.group(1), contour.group(2), parse_qs(parsed.query))
             return
         if not self._authorised():
             self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Токен отсутствует или неверен.")
@@ -186,6 +193,11 @@ class _Handler(BaseHTTPRequestHandler):
         from src.bot.launch_control import BadCommand, parse_command
 
         parsed = urlparse(self.path)
+        contour = _CONTOUR.match(parsed.path)
+        if contour is not None and contour.group(2) == "stop":
+            if self._control_allowed():
+                self._contour_stop(contour.group(1))
+            return
         if parsed.path != _CONTOURS:
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
@@ -206,6 +218,43 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus(status), payload, headers={"Location": _CONTOURS})
         else:
             self._json(HTTPStatus(status), payload)
+
+    def _contour_get(self, contour_id: str, part: str | None, query: dict) -> None:
+        from src.bot.launch_control import LOG_TAIL_DEFAULT, LOG_TAIL_MAX
+
+        control = self.export_server.control
+        if part is None:
+            snapshot = control.contour(contour_id)
+            if snapshot is None:
+                self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Контура {contour_id!r} нет.")
+            else:
+                self._json(HTTPStatus.OK, snapshot)
+            return
+        raw = query.get("tail", [str(LOG_TAIL_DEFAULT)])
+        if len(raw) != 1 or not raw[0].isdigit() or not 1 <= int(raw[0]) <= LOG_TAIL_MAX:
+            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", f"tail — целое число от 1 до {LOG_TAIL_MAX}.")
+            return
+        text = control.log_tail(contour_id, int(raw[0]))
+        if text is None:
+            self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Контура {contour_id!r} нет.")
+        else:
+            self._send_text(HTTPStatus.OK, text, "text/plain; charset=utf-8")
+
+    def _contour_stop(self, contour_id: str) -> None:
+        from src.bot.launch_control import BadCommand, parse_stop
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            mode = parse_stop(json.loads(self.rfile.read(length).decode("utf-8")) if length else None)
+        except BadCommand as exc:
+            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
+            return
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело остановки — JSON-объект с полем mode.")
+            return
+        status, payload = self.export_server.control.stop(contour_id, mode)
+        headers = {"Location": f"{_CONTOURS}/{contour_id}"} if status == HTTPStatus.ACCEPTED else None
+        self._json(HTTPStatus(status), payload, headers=headers)
 
     def _authorised(self) -> bool:
         return _bearer_matches(self.headers.get("Authorization", ""), self.export_server.token)

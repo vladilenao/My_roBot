@@ -140,8 +140,12 @@ def test_emulation_launch_runs_contour_process_after_core(monkeypatch, tmp_path)
             order.append("data")
             return self
 
-        def run_contour(self, instruments, *, kind, control=None, source="", command=""):
+        def run_contour(self, instruments, *, kind, control=None, source="", command="", core_state=None,
+                        next_launch=None):
             assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
+            # Желаемое ядра ведётся и без ключа управления; без API следующей команды нет.
+            assert core_state is not None and core_state.path == tmp_path / "core.sqlite3"
+            assert next_launch() is None
             order.append("run_contour")
             return 0
 
@@ -209,3 +213,51 @@ def test_feed_cursor_is_acknowledged_only_after_committed_tick(monkeypatch, resu
     runtime = contour._Runtime(post_tick=lambda ready: result)
     contour._run_bot([], None, runtime, data_cache=None, timeline=None, after_tick=lambda: acks.append(1))
     assert captured["result"] is result and len(acks) == acknowledged
+
+
+def test_control_hooks_wrap_execution_in_tick(monkeypatch):
+    order = []
+
+    class Bot:
+        def __init__(self, **kwargs):
+            self.post_tick = kwargs["post_tick"]
+
+        def run(self):
+            order.append("run")
+            self.post_tick({"1m"})
+
+    class Control:
+        def start(self, manager):
+            order.append(f"start:{manager}")
+
+        def before_tick(self):
+            order.append("before")
+
+        def after_tick(self):
+            order.append("after")
+
+        def close(self):
+            order.append("close")
+
+    monkeypatch.setattr(contour, "TradingBot", Bot)
+    runtime = contour._Runtime(post_tick=lambda ready: order.append("execute") or True, trade_manager="tm")
+    contour._run_bot([], None, runtime, data_cache=None, timeline=None, after_tick=lambda: order.append("ack"),
+                     control=Control())
+    assert order == ["start:tm", "run", "before", "execute", "after", "ack", "close"]
+
+
+def test_control_hook_runs_without_financial_part(monkeypatch):
+    seen = {}
+
+    class Bot:
+        def __init__(self, **kwargs):
+            seen["post_tick"] = kwargs["post_tick"]
+
+        def run(self):
+            seen["result"] = seen["post_tick"]({"1m"})
+
+    control = SimpleNamespace(start=lambda manager: None, before_tick=lambda: None, after_tick=lambda: None,
+                              close=lambda: None)
+    monkeypatch.setattr(contour, "TradingBot", Bot)
+    contour._run_bot([], None, contour._Runtime(), data_cache=None, timeline=None, control=control)
+    assert seen["result"] is True

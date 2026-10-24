@@ -175,3 +175,59 @@ def test_run_contour_writes_launch_without_secrets_and_tracks_state(tmp_path, mo
 def test_after(stamp, expected):
     assert core_module._after(stamp, datetime(2026, 10, 23, 10, 0, tzinfo=timezone.utc)) is expected
 
+
+
+class ExitingProcess(FakeProcess):
+    """Процесс контура, который сам завершается после старта: остановка командой выполнена."""
+
+    def start(self):
+        self.exit_code = 0
+        self.on_exit(0, False)
+        return 4300 + len(FakeProcess.instances)
+
+
+def test_relaunch_after_stop_starts_new_process_without_second_serve(tmp_path, monkeypatch):
+    from src.assembly.core_state import CoreStateStore
+    from src.bot.launch_control import LaunchControl
+    from src.portfolio.models import ContractMeta
+
+    monkeypatch.setattr(core_module, "_load_contracts_metadata", lambda instruments, **kw: {
+        item.ticker: ContractMeta(item.ticker, 0.01, 0.1, 0.0, 0.0) for item in instruments})
+    monkeypatch.setattr(core_module, "trading_enabled", lambda: True)
+    live = core_module.LiveCore.__new__(core_module.LiveCore)
+    live.state_dir = tmp_path
+    live.client_provider = None
+    live.request_budget = None
+    live.market_store = MarketDataStore(tmp_path / "market.sqlite3")
+    live.data_cache = FakeCache()
+    live._worker = FakeWorker()
+    live._cluster_consumer = None
+    pairs = []
+    live._pattern_trigger = type("Trigger", (), {"add_pairs": lambda self, items: pairs.extend(items)})()
+    served = []
+    monkeypatch.setattr(core_module.LiveCore, "serve", lambda self, demand: served.append(demand) or None)
+    monkeypatch.setattr(core_module.LiveCore, "start_clusters", lambda self: None)
+    monkeypatch.setattr(core_module, "_pattern_pairs", lambda instruments: tuple((item, "1h") for item in instruments))
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    control = LaunchControl(core_state=store, contour_dir=tmp_path / "contours" / "emulation")
+    launches = iter([([NG], "api", "--mode emulation --instruments NG-12.26"), None])
+
+    def next_launch():
+        assert control.snapshot()["state"] == "stopped"
+        return next(launches)
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("time.sleep", interrupt)
+    FakeProcess.instances.clear()
+
+    code = live.run_contour([SBER], kind="emulation", control=control, source="cli", command="--mode emulation",
+                            core_state=store, next_launch=next_launch, process_factory=ExitingProcess, poll_secs=0)
+
+    assert code == 0 and len(served) == 1 and len(FakeProcess.instances) == 2
+    payload = json.loads((tmp_path / "contours" / "emulation" / "launch.json").read_text(encoding="utf-8"))
+    assert [item["ticker"] for item in payload["instruments"]] == ["NGZ6"] and payload["generation"] == 2
+    assert [(row["action"], row["generation"]) for row in reversed(store.commands())] == [("launch", 1), ("launch", 2)]
+    assert store.desired("emulation").instruments[0]["ticker"] == "NGZ6"
+    assert pairs == [(NG, "1h")]
