@@ -1,5 +1,4 @@
 import threading
-from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,11 +6,8 @@ import pytest
 
 import run
 from src.assembly import core
-from src.bot.launch import (
-    MODE_EMULATION, SOURCE_CLI, SOURCE_MENU, Chosen, LaunchRequest, Rejection, Resolution,
-)
+from src.bot.launch import Chosen, Rejection, Resolution
 from src.bot.launch_control import LaunchControl, parse_command
-from src.data.market_store import MarketDataStore
 
 NG = Chosen("NG", "NG-12.26", "future", 52, "NG", True)
 NG_TUPLE = ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26")
@@ -23,118 +19,77 @@ def _no_input(*_args):
 
 class TestMain:
     @patch("builtins.input", side_effect=_no_input)
-    @patch("run._run_live", return_value=0)
-    def test_parameters_start_emulation_without_questions(self, run_live, _input):
-        assert run.main(["--mode", "emulation", "--instruments", "NG"]) == 0
-        request = run_live.call_args.args[0]
-        assert request.instruments == ("NG",) and request.source == SOURCE_CLI
+    @patch("run._run_robot", return_value=0)
+    def test_start_without_parameters_and_questions(self, run_robot, _input):
+        assert run.main([]) == 0
+        run_robot.assert_called_once_with()
 
+    @pytest.mark.parametrize("argv", [
+        ["--mode", "emulation", "--instruments", "NG"],
+        ["--mode", "history", "--from", "2026-09-01 10:00", "--to", "2026-09-02 10:00", "--pause", "0"],
+        ["--no-prompt"],
+        ["--wait-command"],
+    ])
     @patch("builtins.input", side_effect=_no_input)
-    @patch("run._run_history", return_value=0)
-    def test_history_parameters(self, run_history, _input):
-        assert run.main(["--mode", "history", "--from", "2026-09-01 10:00", "--to", "2026-09-02 10:00", "--pause", "0"]) == 0
-        start, end, pause, request = run_history.call_args.args
-        assert (start, end, pause) == (datetime(2026, 9, 1, 10), datetime(2026, 9, 2, 10), 0.0)
-        assert request.source == SOURCE_CLI
-
-    @patch("builtins.input", side_effect=_no_input)
-    @patch("run._run_live", return_value=0)
-    def test_bad_parameters_exit_with_two(self, run_live, _input, capsys):
-        assert run.main(["--mode", "emulation", "--wait-command", "--instruments", "NG"]) == 2
-        run_live.assert_not_called()
-        assert "одновременно" in capsys.readouterr().out
-
-    @patch("run._run_live", return_value=0)
-    @patch("builtins.input", side_effect=["1", "2"])
-    def test_menu_can_wait_for_command(self, _input, run_live):
-        assert run.main() == 0
-        request = run_live.call_args.args[0]
-        assert request.wait_command and request.source == SOURCE_MENU
-
-
-class TestChooseInstruments:
-    def _choose(self, launch, **kwargs):
-        defaults = dict(history=False, client_provider=None, clock=None, early=None, control=None, export_server=None)
-        defaults.update(kwargs)
-        return run._choose_instruments(launch, **defaults)
-
-    def test_wait_without_control_key_stops(self, capsys):
-        launch = LaunchRequest(MODE_EMULATION, SOURCE_CLI, None, wait_command=True)
-        assert self._choose(launch) is None
-        assert "ROBOT_CONTROL_TOKEN" in capsys.readouterr().out
-
-    def test_rejected_parameters_stop(self, capsys):
-        launch = LaunchRequest(MODE_EMULATION, SOURCE_CLI, ("NG", "AFLT"))
-        resolution = Resolution([NG_TUPLE], [NG], [Rejection("AFLT", "Неизвестный инструмент.")])
-        with patch.object(run, "_resolve_request", return_value=resolution):
-            assert self._choose(launch) is None
+    @patch("run._run_robot", return_value=0)
+    def test_old_parameters_exit_with_two_and_api_hint(self, run_robot, _input, argv, capsys):
+        assert run.main(argv) == 2
+        run_robot.assert_not_called()
         out = capsys.readouterr().out
-        assert "✗ AFLT" in out and "Торговля не запущена" in out
+        assert "POST /api/v1/contours" in out and '"kind": "history"' in out
 
-    def test_accepted_parameters_mark_starting(self, capsys):
-        launch = LaunchRequest(MODE_EMULATION, SOURCE_CLI, ("NG",))
-        control = LaunchControl()
-        with patch.object(run, "_resolve_request", return_value=Resolution([NG_TUPLE], [NG], [])):
-            assert self._choose(launch, control=control) == [NG_TUPLE]
-        assert "Повторить запуск: --mode emulation --instruments NG-12.26" in capsys.readouterr().out
-        snapshot = control.snapshot()
-        assert snapshot["state"] == "starting" and snapshot["source"] == SOURCE_CLI
+    @patch("run._run_history_contour", return_value=0)
+    def test_history_contour_entry(self, run_history_contour):
+        assert run.main(["--contour", "history", "20261024-101500"]) == 0
+        run_history_contour.assert_called_once_with("20261024-101500")
 
-    def test_menu_drops_instruments_without_assignments(self, monkeypatch, capsys):
-        monkeypatch.setattr(run, "SHARE_STRATEGIES", {"SBER": ["a"]})
-        monkeypatch.setattr(run, "FUTURE_STRATEGIES", {"NG": ["a"]})
-        picked = [("SBER", "SBER", "share", "SBER"), ("GAZP", "GAZP", "share", "GAZP"), NG_TUPLE]
-        with patch.object(run, "select_instruments", return_value=picked):
-            selected = self._choose(LaunchRequest(MODE_EMULATION, SOURCE_MENU, None))
-        assert selected == [picked[0], NG_TUPLE]
-        assert "✗ GAZP" in capsys.readouterr().out
-
-    def test_direct_call_keeps_old_menu(self):
-        with patch.object(run, "select_instruments", return_value=[NG_TUPLE]):
-            assert self._choose(None) == [NG_TUPLE]
-
-    def test_waits_for_command_until_accepted(self, capsys):
-        control = LaunchControl(reply_timeout=5)
-        export_server = SimpleNamespace(address=("127.0.0.1", 8101))
-        results = iter([Resolution([], [], [Rejection("AFLT", "нет привязок")]), Resolution([NG_TUPLE], [NG], [])])
-        answers = []
-
-        def send(body):
-            answers.append(control.submit(parse_command(body))[0])
-
-        def client():
-            for _ in range(500):                      # главный поток ещё не начал принимать команды
-                if control._accepting:
-                    break
-                threading.Event().wait(0.01)
-            send({"kind": "emulation", "instruments": ["AFLT"]})
-            send({"kind": "emulation", "instruments": ["NG"]})
-
-        thread = threading.Thread(target=client, daemon=True)
-        with patch.object(run, "_resolve_request", side_effect=lambda *a, **k: next(results)):
-            thread.start()
-            selected = self._choose(LaunchRequest(MODE_EMULATION, SOURCE_CLI, None, wait_command=True),
-                                    control=control, export_server=export_server)
-        thread.join(5)
-        assert selected == [NG_TUPLE]
-        assert answers == [422, 201]
-        out = capsys.readouterr().out
-        assert "Робот ждёт команду запуска: POST http://127.0.0.1:8101/api/v1/contours" in out
+    def test_unknown_contour_kind(self, capsys):
+        assert run.main(["--contour", "account"]) == 2
+        assert "emulation и history" in capsys.readouterr().out
 
 
-def test_local_api_starts_with_control_key_only(tmp_path, monkeypatch, capsys):
+def test_waits_for_command_until_accepted(capsys):
+    control = LaunchControl(reply_timeout=5)
+    export_server = SimpleNamespace(address=("127.0.0.1", 8101))
+    results = iter([Resolution([], [], [Rejection("AFLT", "нет привязок")]), Resolution([NG_TUPLE], [NG], [])])
+    answers = []
+
+    def send(body):
+        answers.append(control.submit(parse_command(body))[0])
+
+    def client():
+        for _ in range(500):                      # главный поток ещё не начал принимать команды
+            if control._accepting:
+                break
+            threading.Event().wait(0.01)
+        send({"kind": "emulation", "instruments": ["AFLT"]})
+        send({"kind": "emulation", "instruments": ["NG"]})
+
+    thread = threading.Thread(target=client, daemon=True)
+    with patch.object(run, "_resolve_request", side_effect=lambda *a, **k: next(results)):
+        thread.start()
+        selected = run._await_command(control, export_server, None, None, None)
+    thread.join(5)
+    assert selected == [NG_TUPLE]
+    assert answers == [422, 201]
+    out = capsys.readouterr().out
+    assert "Робот ждёт команду запуска: POST http://127.0.0.1:8101/api/v1/contours" in out
+    assert 'Повторить запуск: POST /api/v1/contours {"kind": "emulation", "instruments": ["NG-12.26"]}' in out
+
+
+def test_control_api_starts_before_market_data_with_control_key_only(monkeypatch, capsys):
     monkeypatch.setattr(core, "MARKET_DATA_EXPORT_TOKEN", None)
     monkeypatch.setattr(core, "ROBOT_CONTROL_TOKEN", "control-test-key")
     monkeypatch.setattr(core, "MARKET_DATA_EXPORT_PORT", 0)
     try:
-        server = core._start_local_api(MarketDataStore(tmp_path / "market.sqlite3"), tmp_path, control=LaunchControl())
+        server = core._start_control_api(LaunchControl())
     except PermissionError:
         pytest.skip("Песочница не разрешает открыть loopback-сокет")
     try:
         # Сравнение без вывода значения ключа: при сбое pytest не напечатает секрет.
-        key_matches = server is not None and server.control_token == "control-test-key"
+        key_matches = server.control_token == "control-test-key"
         assert key_matches
-        assert server.token is None
+        assert server.token is None and server.store is None
         out = capsys.readouterr().out
         assert "MARKET_DATA_EXPORT_TOKEN" in out and "control-test-key" not in out
     finally:
@@ -144,4 +99,6 @@ def test_local_api_starts_with_control_key_only(tmp_path, monkeypatch, capsys):
 def test_control_key_is_a_logging_secret():
     import inspect
 
-    assert "ROBOT_CONTROL_TOKEN" in inspect.getsource(run._launch)
+    source = inspect.getsource(run)
+    assert "ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD)" in source
+    assert source.count("secrets=_SECRETS") >= 3

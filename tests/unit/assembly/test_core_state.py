@@ -174,3 +174,15 @@ def test_contour_reads_members_read_only(running, tmp_path):
     running.record_membership("emulation", add=[member(NG_CARD)])
     desired = read_desired(running.path, "emulation")
     assert [(m.key, m.active) for m in desired.members] == [("SBER", True), ("uid-ng", True)]
+
+
+def test_history_stop_flag_on_old_base_without_table(tmp_path):
+    import sqlite3
+
+    from src.assembly.core_state import read_history_stop
+
+    old = tmp_path / "old.sqlite3"
+    with sqlite3.connect(old) as conn:
+        conn.execute("CREATE TABLE contours (contour_id TEXT)")
+    assert read_history_stop(old, "history-a") is False
+    assert read_history_stop(tmp_path / "absent.sqlite3", "history-a") is False

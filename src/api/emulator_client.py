@@ -453,6 +453,10 @@ class EmulatorClientProvider(ClientProvider):
 
         return EmulatorScheduleSource(store, self, horizon_days=horizon_days)
 
+    def use_snapshot(self, generation: int | None) -> None:
+        """Снимок, сверенный роботом до старта прогона (add-history-contour): ``sync`` не вызывается."""
+        self._snapshot_generation = generation
+
     def prepare_snapshot(self) -> dict:
         """Один раз догнать журнал и закрепить свечной снимок за провайдером."""
         self._snapshot_generation = None

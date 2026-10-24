@@ -65,39 +65,102 @@ def _configured_cluster_mode() -> str:
     return modes.pop() if len(modes) == 1 else "mixed"
 
 
-def _start_local_api(market_store, state_dir, control=None):
-    """Локальный HTTP API: экспорт, отчёт кластерного фильтра и управление контуром.
-
-    Сервер поднимается, если задан хотя бы один ключ; маршруты без своего ключа
-    отвечают 401. Без ключей API не запускается, а робот работает дальше:
-    ошибка конфигурации доступа не должна останавливать торговлю.
-    """
+def _cluster_report(market_store, state_dir):
+    """Отчёт кластерного фильтра по журналу эмуляции и 1m свечам рыночной базы."""
     from src.clusters.report import ClusterReport
-
-    control_token = ROBOT_CONTROL_TOKEN if control is not None else None
-    if not MARKET_DATA_EXPORT_TOKEN and not control_token:
-        _say("Локальный API не запущен: в .env не задан MARKET_DATA_EXPORT_TOKEN")
-        _say("Управление по API недоступно: в .env не задан ROBOT_CONTROL_TOKEN")
-        return None
-    if not MARKET_DATA_EXPORT_TOKEN:
-        _say("Экспорт и отчёт кластеров недоступны: в .env не задан MARKET_DATA_EXPORT_TOKEN")
-    if not control_token:
-        _say("Управление по API недоступно: в .env не задан ROBOT_CONTROL_TOKEN")
     from src.assembly.process import contour_dir
 
     # Журнал эмуляции живёт в папке контура (add-contour-process, D7).
-    report = ClusterReport(
+    return ClusterReport(
         contour_dir(state_dir, "emulation") / DATABASE_FILE,
         lambda uid: market_store.current_frame(source=SOURCE_TBANK, instrument_uid=uid, interval="1m"),
         configured_mode=_configured_cluster_mode(),
     )
+
+
+def _start_control_api(control):
+    """Локальный HTTP API до ядра (add-history-contour): управление сразу, экспорт — когда ядро откроет базу.
+
+    Ошибка подъёма (порт занят) уходит вызывающему: без API роботом не управлять.
+    """
+    if not MARKET_DATA_EXPORT_TOKEN:
+        _say("Экспорт и отчёт кластеров недоступны: в .env не задан MARKET_DATA_EXPORT_TOKEN")
     server = MarketDataExportServer(
-        market_store, MARKET_DATA_EXPORT_TOKEN,
-        host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT, clusters_report=report,
-        control=control, control_token=control_token,
+        None, MARKET_DATA_EXPORT_TOKEN, host=MARKET_DATA_EXPORT_HOST, port=MARKET_DATA_EXPORT_PORT,
+        control=control, control_token=ROBOT_CONTROL_TOKEN, export_enabled=MARKET_DATA_EXPORT_ENABLED,
     )
     server.start()
     return server
+
+
+CORE_STARTING, CORE_READY, CORE_RETRYING, CORE_FAILED = "starting", "ready", "retrying", "failed"
+# Паузы между попытками старта ядра, секунд; дальше — последняя (add-history-contour).
+CORE_RETRY_DELAYS = (30, 60, 120, 240, 300)
+
+
+class CoreStarter:
+    """Старт ядра с повтором: сбой не останавливает робота, API и история работают дальше."""
+
+    def __init__(self, core, *, token_required: bool, delays=CORE_RETRY_DELAYS, sleep=None, clock=None) -> None:
+        import threading
+        import time
+        from datetime import datetime, timezone
+
+        self._core = core
+        self._token_required = token_required
+        self._delays = tuple(delays)
+        self._sleep = sleep or time.sleep
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._lock = threading.Lock()
+        self._state = CORE_STARTING
+        self._error: str | None = None
+        self._attempts = 0
+        self._next_retry_at = None
+
+    def payload(self) -> dict:
+        with self._lock:
+            return {"state": self._state, "error": self._error, "attempts": self._attempts,
+                    "next_retry_at": None if self._next_retry_at is None
+                    else self._next_retry_at.isoformat().replace("+00:00", "Z")}
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._state == CORE_READY
+
+    def run(self) -> bool:
+        """Попытки до успеха; ``False`` — без токена брокера ядро не стартует, повтора нет."""
+        from datetime import timedelta
+
+        from src.logging_setup import redact
+
+        if self._token_required and not TINKOFF_TOKEN:
+            with self._lock:
+                self._state, self._error = CORE_FAILED, "в .env не задан TINKOFF_TOKEN"
+            _say("Ядро не запущено: в .env не задан TINKOFF_TOKEN. Эмуляция недоступна, история работает.")
+            return False
+        while True:
+            with self._lock:
+                self._state, self._attempts, self._next_retry_at = CORE_STARTING, self._attempts + 1, None
+                attempt = self._attempts
+            try:
+                self._core.start_market()
+            except Exception as exc:  # сбой старта ядра не должен ронять робота: API и история работают
+                self._core.reset_market()
+                delay = self._delays[min(attempt - 1, len(self._delays) - 1)]
+                error = f"{type(exc).__name__}: {redact(str(exc))}" if str(exc) else type(exc).__name__
+                with self._lock:
+                    self._state, self._error = CORE_RETRYING, error
+                    self._next_retry_at = self._clock() + timedelta(seconds=delay)
+                log.warning("Старт ядра не удался (попытка %d): %s", attempt, error, exc_info=True)
+                print(f"Ядро не запустилось ({error}); следующая попытка через {delay} с. История работает.")
+                self._sleep(delay)
+                continue
+            with self._lock:
+                self._state, self._error, self._next_retry_at = CORE_READY, None, None
+            if attempt > 1:
+                _say(f"Ядро запущено с попытки {attempt}")
+            return True
 
 
 def _after(stamp: str, moment) -> bool:
@@ -380,6 +443,8 @@ class LiveCore:
         self._tracks = False
         # Пульс ядра (add-contour-recovery): ставит run.py, останавливается до ожидания контура.
         self.pulse = None
+        # Старт ядра с повтором (add-history-contour): ставит run.py; состояние — в GET /api/v1/core.
+        self.starter = None
 
     def start_early(self):
         """Ранний сбор данных до выбора инструментов (независимые полосы)."""
@@ -387,13 +452,33 @@ class LiveCore:
         self._adopt(self.early)
         return self.early
 
-    def start_api(self, control=None):
-        """Локальный API, как только есть рыночная база; иначе — после сборки данных."""
-        if self.export_server is None and self.market_store is not None and MARKET_DATA_EXPORT_ENABLED:
-            self.export_server = _start_local_api(self.market_store, self.state_dir, control=control)
-            if self.export_server is not None:
-                self.export_server.core_state = self.core_snapshot
+    def start_control_api(self, control):
+        """API управления до рыночных данных (add-history-contour); ``OSError`` — порт занят."""
+        self.export_server = _start_control_api(control)
+        self.export_server.core_state = self.core_snapshot
         return self.export_server
+
+    def start_market(self):
+        """Попытка старта ядра: рыночная база и полосы (или только база без независимых полос), затем экспорт."""
+        if MARKET_DATA_SETTINGS.independent_lanes:
+            self.start_early()
+        else:
+            self.ensure_market_data()
+        if self.export_server is not None:
+            self.export_server.attach_market(self.market_store, _cluster_report(self.market_store, self.state_dir))
+        return self
+
+    def reset_market(self) -> None:
+        """Неудачная попытка: закрыть то, что успело открыться, чтобы повтор начинал с чистого листа."""
+        poller = getattr(self.early, "poller", None)
+        if poller is not None:
+            try:
+                poller.close()
+            except Exception:  # закрытие обломков не должно мешать повтору
+                log.warning("Полосы неудачной попытки старта не закрыты", exc_info=True)
+        self.early = None
+        self.timeline = self.market_store = self.request_budget = None
+        self.market_calendar = self.market_reconciler = self.data_cache = None
 
     def core_snapshot(self) -> dict:
         """``GET /api/v1/core`` (add-contour-recovery): версия, пульс, готовность пар, запросы к брокеру."""
@@ -402,6 +487,7 @@ class LiveCore:
         from src import __version__
 
         pulse = getattr(self, "pulse", None)
+        starter = getattr(self, "starter", None)
         market = None
         if self.market_store is not None:
             info = self.market_store.source_info()
@@ -410,6 +496,8 @@ class LiveCore:
                       "pairs": {"total": len(readiness),
                                 "by_status": dict(Counter(str(item.get("state")) for item in readiness))}}
         return {
+            **({"state": CORE_READY, "error": None, "attempts": 1, "next_retry_at": None}
+               if starter is None else starter.payload()),
             "version": __version__, "pid": os.getpid(),
             "started_at": None if pulse is None else pulse.started_at,
             "heartbeat": None if pulse is None else pulse.payload(),

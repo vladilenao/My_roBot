@@ -97,6 +97,8 @@ _DEFAULTS = {
     "contours_heartbeat_secs": 5,
     "contours_heartbeat_timeout_secs": 30,
     "contours_autostart": True,
+    # Одновременных прогонов истории, остальные ждут в очереди (add-history-contour).
+    "contours_max_history_runs": 2,
     "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
@@ -174,6 +176,7 @@ CONTOURS_DEMAND_RELEASE_SECS = _CONFIG["contours_demand_release_secs"]
 CONTOURS_HEARTBEAT_SECS = _CONFIG["contours_heartbeat_secs"]
 CONTOURS_HEARTBEAT_TIMEOUT_SECS = _CONFIG["contours_heartbeat_timeout_secs"]
 CONTOURS_AUTOSTART = _CONFIG["contours_autostart"]
+CONTOURS_MAX_HISTORY_RUNS = _CONFIG["contours_max_history_runs"]
 CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_channel_env"]
 
 

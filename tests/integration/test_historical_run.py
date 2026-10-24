@@ -16,6 +16,7 @@ from t_tech.invest import schemas
 from t_tech.invest.schemas import CandleInterval
 
 import run
+from src.assembly.history_runs import prepare_import
 from src.assembly import contour, history, services
 from src.data.timeutil import to_naive
 from src.history.preflight import PreflightReport
@@ -236,7 +237,6 @@ def _assignment_patch():
         patch.object(contour, "SHARE_STRATEGIES", {}),
         patch.object(run, "_strategy_map", return_value={"always_buy": AlwaysBuyStrategy()}),
         patch.object(contour, "_strategy_map", return_value={"always_buy": AlwaysBuyStrategy()}),
-        patch.object(run, "ACTIVE_TIMEFRAMES", frozenset({TF}), create=True),
         patch.object(services, "ACTIVE_TIMEFRAMES", frozenset({TF})),
     )
 
@@ -248,13 +248,8 @@ def _run_history(state_dir, *, pause=0.0, rows=None, start=START, end=END, crash
     with contextlib.ExitStack() as stack:
         for item in _assignment_patch():
             stack.enter_context(item)
-        stack.enter_context(
-            patch.object(run, "EmulatorClientProvider", return_value=StubProvider(client))
-        )
-        stack.enter_context(patch.object(run, "select_instruments", return_value=[INSTRUMENT]))
         # Прогон без расписания торгов: сессионная защита запретила бы входы 1m.
         stack.enter_context(patch.object(contour, "INTRADAY_SETTINGS", IntradaySettings(enabled=False)))
-        stack.enter_context(patch.object(run, "state_dir_for", return_value=state_dir))
         stack.enter_context(patch.object(run, "setup_logging"))
         stack.enter_context(patch.object(contour, "print_contract_metadata"))
         stack.enter_context(
@@ -271,7 +266,11 @@ def _run_history(state_dir, *, pause=0.0, rows=None, start=START, end=END, crash
         stack.enter_context(patch("builtins.print", side_effect=print))
         if crash_after is not None:
             stack.enter_context(_interrupting_bot(crash_after))
-        code = run._run_history(start, end, pause)
+        provider = StubProvider(client)
+        # Сверку импорта делает робот до старта процесса прогона (add-history-contour).
+        sync, _, _ = prepare_import(provider)
+        code = run._run_history(start, end, pause, None, state_dir=state_dir, provider=provider,
+                                market_data_sync=sync, instruments=[INSTRUMENT])
     return code, client
 
 

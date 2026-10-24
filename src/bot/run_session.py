@@ -85,6 +85,8 @@ class HistoricalRunSession(RunSession):
         self.terminal_gap = None
         self._source_failed = False
         self._drivers_complete = True
+        # Стоп прогона командой или остановкой робота (add-history-contour): выход после тика с отчётом.
+        self._operator_stop = ""
         # Сигналы и недопуски по привязкам — для отчёта прогона.
         from src.history.admission_stats import SignalAdmissionStats
         self.admission_stats = SignalAdmissionStats()
@@ -110,6 +112,11 @@ class HistoricalRunSession(RunSession):
 
     def mark_contract_failure(self, reason):
         self._contract_failure = reason
+
+    def request_stop(self, reason: str = "остановлено оператором") -> None:
+        """Остановить прогон на границе тика; отчёт пишется с этой причиной."""
+        if not self._operator_stop:
+            self._operator_stop = reason
 
     @property
     def start(self):
@@ -161,9 +168,12 @@ class HistoricalRunSession(RunSession):
         )
 
     def should_stop(self) -> bool:
-        return bool(self._contract_failure) or self._data_exhausted_at is not None or self._clock.finished
+        return (bool(self._operator_stop) or bool(self._contract_failure) or self._data_exhausted_at is not None
+                or self._clock.finished)
 
     def stop_reason(self) -> str:
+        if self._operator_stop:
+            return self._operator_stop
         if self._contract_failure:
             return f"незавершённый контрактный переход: {self._contract_failure}"
         if self._data_exhausted_at is not None:

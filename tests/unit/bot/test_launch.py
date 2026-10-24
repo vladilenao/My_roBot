@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -6,8 +7,7 @@ import pytest
 from src.bot.launch import (
     ALL,
     MODE_EMULATION,
-    MODE_HISTORY,
-    SOURCE_CLI,
+    SOURCE_API,
     Chosen,
     LaunchError,
     LaunchRequest,
@@ -18,7 +18,6 @@ from src.bot.launch import (
     parse_launch_args,
     resolve_emulation,
     resolve_history,
-    without_assignments,
 )
 
 SHARES = {"SBER": ["a"], "GAZP": []}
@@ -27,50 +26,25 @@ NOW = datetime(2026, 10, 22, 12, 0)
 
 
 class TestParseLaunchArgs:
-    def test_no_arguments_means_menu(self):
+    def test_no_arguments_start_robot(self):
         assert parse_launch_args([]) is None
 
-    def test_emulation_defaults_to_all(self):
-        request = parse_launch_args(["--mode", "emulation"])
-        assert request == LaunchRequest(MODE_EMULATION, SOURCE_CLI, (ALL,))
-
-    def test_instruments_are_upper_cased_and_deduplicated(self):
-        request = parse_launch_args(["--mode", "emulation", "--instruments", "ng, sber,NG"])
-        assert request.instruments == ("NG", "SBER")
-
-    def test_no_prompt_is_emulation_without_questions(self):
-        assert parse_launch_args(["--no-prompt"]).mode == MODE_EMULATION
-
-    def test_wait_command_has_no_instruments(self):
-        request = parse_launch_args(["--mode", "emulation", "--wait-command"])
-        assert request.wait_command and request.instruments is None
-
-    def test_history_with_default_pause(self):
-        request = parse_launch_args(["--mode", "history", "--from", "2026-09-01 10:00", "--to", "2026-09-08 10:00"])
-        assert request.mode == MODE_HISTORY
-        assert (request.start, request.end, request.pause) == (datetime(2026, 9, 1, 10), datetime(2026, 9, 8, 10), 1.0)
-
-    @pytest.mark.parametrize("argv, fragment", [
-        (["--mode", "history", "--from", "2026-09-01 10:00"], "--from и --to"),
-        (["--mode", "history", "--from", "2026-09-08 10:00", "--to", "2026-09-01 10:00"], "раньше конца"),
-        (["--mode", "history", "--from", "01.09.2026", "--to", "2026-09-08 10:00"], "ГГГГ-ММ-ДД"),
-        (["--mode", "history", "--from", "2026-09-01", "--to", "2026-09-02", "--pause", "-1"], "отрицательной"),
-        (["--mode", "emulation", "--from", "2026-09-01 10:00"], "только с --mode history"),
-        (["--mode", "emulation", "--wait-command", "--instruments", "NG"], "одновременно"),
-        (["--mode", "history", "--wait-command", "--from", "2026-09-01", "--to", "2026-09-02"], "только с --mode emulation"),
-        (["--no-prompt", "--mode", "history"], "не сочетается"),
-        (["--instruments", "NG"], "Укажите режим"),
-        (["--mode", "live"], "Неверные параметры"),
-        (["--mode", "emulation", "--instruments", "all,NG"], "all нельзя"),
+    @pytest.mark.parametrize("argv", [
+        ["--mode", "emulation"], ["--mode", "history", "--from", "2026-09-01 10:00", "--to", "2026-09-08 10:00"],
+        ["--no-prompt"], ["--wait-command"], ["--instruments", "NG"], ["--pause", "0"],
     ])
-    def test_errors_are_explained(self, argv, fragment):
+    def test_launch_parameters_are_refused_with_api_hint(self, argv):
         with pytest.raises(LaunchError) as exc:
             parse_launch_args(argv)
-        assert fragment in str(exc.value)
+        message = str(exc.value)
+        assert "без параметров" in message and '"kind": "emulation"' in message and '"kind": "history"' in message
 
     def test_empty_list_rejected(self):
         with pytest.raises(LaunchError):
             parse_instrument_tokens(" , ")
+
+    def test_tokens_are_upper_cased_and_deduplicated(self):
+        assert parse_instrument_tokens(["ng", " sber", "NG"]) == ("NG", "SBER")
 
 
 class TestClassifyTokens:
@@ -163,27 +137,11 @@ class TestResolveHistory:
 
 
 class TestCommandAndMenu:
-    def test_emulation_command_uses_short_names(self):
-        request = LaunchRequest(MODE_EMULATION, SOURCE_CLI, ("NG", "SBER"))
+    def test_emulation_command_is_api_body_with_short_names(self):
+        request = LaunchRequest(MODE_EMULATION, SOURCE_API, ("NG", "SBER"))
         chosen = [Chosen("NG", "NG-12.26", "future", 52, "NG", True), Chosen("SBER", "SBER", "share")]
-        assert equivalent_command(request, chosen) == "--mode emulation --instruments NG-12.26,SBER"
-
-    def test_history_command_repeats_range(self):
-        request = LaunchRequest(MODE_HISTORY, SOURCE_CLI, ("NG",), start=datetime(2026, 9, 1, 10),
-                                end=datetime(2026, 9, 8, 10), pause=0.0)
-        chosen = [Chosen("NG", "NG", "future", family="NG", automatic=True)]
-        assert equivalent_command(request, chosen) == (
-            '--mode history --from "2026-09-01 10:00" --to "2026-09-08 10:00" --pause 0 --instruments NG')
-
-    def test_command_round_trip(self):
-        command = '--mode history --from "2026-09-01 10:00" --to "2026-09-08 10:00" --pause 0 --instruments NG,SBER'
-        argv = [part.strip('"') for part in __import__("shlex").split(command)]
-        request = parse_launch_args(argv)
-        assert request.instruments == ("NG", "SBER") and request.pause == 0.0
-
-    def test_menu_choice_without_assignments(self):
-        chosen = [Chosen("SBER", "SBER", "share"), Chosen("GAZP", "GAZP", "share"), Chosen("BR-12.26", "BR-12.26", "future")]
-        assert without_assignments(chosen, SHARES, FUTURES) == ["GAZP", "BR-12.26"]
+        assert json.loads(equivalent_command(request, chosen)) == {"kind": "emulation",
+                                                                   "instruments": ["NG-12.26", "SBER"]}
 
     def test_days_word(self):
         assert describe_choice(Chosen("NG", "NG-12.26", "future", 52, "NG", True)).endswith("52 суток")

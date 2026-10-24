@@ -1,14 +1,14 @@
-"""Параметры запуска робота и разрешение инструментов без консоли.
+"""Параметры запуска контуров и разрешение инструментов без консоли.
 
-Один объект ``LaunchRequest`` описывает запуск, откуда бы он ни пришёл:
-из командной строки, меню или команды локального API. Разрешение токенов
-инструментов одно для всех источников: тикер акции, код семейства фьючерсов
-или контракт, а по умолчанию — все инструменты с привязками в конфигурации.
+Робот стартует без параметров (add-history-contour); эмуляция и прогоны
+истории приходят командами локального API. Объект ``LaunchRequest`` описывает
+такой запуск. Разрешение токенов инструментов одно для всех команд: тикер
+акции, код семейства фьючерсов или контракт, а по умолчанию — все
+инструменты с привязками в конфигурации.
 """
 
 from __future__ import annotations
 
-import argparse
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -126,60 +126,21 @@ def validate_range(start: datetime, end: datetime, pause: float) -> tuple[dateti
 
 # --- командная строка ---------------------------------------------------------
 
-class _Parser(argparse.ArgumentParser):
-    def error(self, message):  # noqa: D401 - argparse API
-        raise LaunchError(f"Неверные параметры запуска: {message}")
+START_HINT = ("Робот запускается без параметров и ждёт команд API: эмуляция — "
+              "POST /api/v1/contours {\"kind\": \"emulation\", \"instruments\": [...]}, история — "
+              "POST /api/v1/contours {\"kind\": \"history\", \"from\": ..., \"to\": ...}.")
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="robot", description="Запуск робота без вопросов в консоли. Без --mode — меню.")
-    parser.add_argument("--mode", choices=(MODE_EMULATION, MODE_HISTORY),
-                        help="emulation — живые данные и симулятор исполнения; history — прошлый диапазон")
-    parser.add_argument("--from", dest="start", help="начало истории, ГГГГ-ММ-ДД ЧЧ:ММ (UTC)")
-    parser.add_argument("--to", dest="end", help="конец истории, ГГГГ-ММ-ДД ЧЧ:ММ (UTC, не входит)")
-    parser.add_argument("--pause", type=float, help=f"пауза между тиками истории, с (по умолчанию {HISTORY_DEFAULT_PAUSE:g})")
-    parser.add_argument("--instruments", help="через запятую: SBER, NG (ближайший контракт), NG-12.26; по умолчанию all")
-    parser.add_argument("--wait-command", action="store_true",
-                        help="эмуляция: прогреть данные и ждать POST /api/v1/contours (нужен ROBOT_CONTROL_TOKEN)")
-    parser.add_argument("--no-prompt", action="store_true", help="то же, что --mode emulation")
-    return parser
+def parse_launch_args(argv) -> None:
+    """Робот стартует без параметров (add-history-contour): режим и инструменты приходят командами API.
 
-
-def parse_launch_args(argv) -> LaunchRequest | None:
-    """``LaunchRequest`` из аргументов или ``None``, если запуск идёт через меню.
-
-    Ошибка в параметрах — ``LaunchError`` с понятной причиной.
+    Любой параметр — ``LaunchError`` с подсказкой; служебные флаги (``--contour``,
+    ``--version`` и другие) разбирает ``run.py`` до этого вызова.
     """
-    args = _parser().parse_args(list(argv))
-    history_args = args.start is not None or args.end is not None or args.pause is not None
-    mode = args.mode
-    if args.no_prompt:
-        if mode == MODE_HISTORY:
-            raise LaunchError("--no-prompt означает эмуляцию и не сочетается с --mode history.")
-        mode = MODE_EMULATION
-    if mode is None:
-        if history_args or args.instruments is not None or args.wait_command:
-            raise LaunchError("Укажите режим: --mode emulation или --mode history.")
-        return None
-    if args.wait_command and mode != MODE_EMULATION:
-        raise LaunchError("--wait-command работает только с --mode emulation.")
-    if args.wait_command and args.instruments is not None:
-        raise LaunchError("Ждать команду и задавать --instruments одновременно нельзя.")
-    instruments = None if args.wait_command else parse_instrument_tokens(args.instruments)
-    if mode == MODE_EMULATION:
-        if history_args:
-            raise LaunchError("--from, --to и --pause задаются только с --mode history.")
-        return LaunchRequest(MODE_EMULATION, SOURCE_CLI, instruments, wait_command=args.wait_command)
-    if args.start is None or args.end is None:
-        raise LaunchError("Для --mode history нужны --from и --to в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
-    pause = HISTORY_DEFAULT_PAUSE if args.pause is None else args.pause
-    if pause < 0:
-        raise LaunchError("Пауза не может быть отрицательной.")
-    try:
-        start, end, pause = validate_range(parse_moment(args.start), parse_moment(args.end), pause)
-    except (ValueError, RunConfigurationError) as exc:
-        raise LaunchError(str(exc)) from None
-    return LaunchRequest(MODE_HISTORY, SOURCE_CLI, instruments, start=start, end=end, pause=pause)
+    args = [str(item) for item in argv]
+    if args:
+        raise LaunchError(f"Параметры {' '.join(args)} не принимаются. {START_HINT}")
+    return None
 
 
 def parse_instrument_tokens(raw) -> tuple[str, ...]:
@@ -410,43 +371,7 @@ def describe_choice(chosen: Chosen) -> str:
 
 
 def equivalent_command(request: LaunchRequest, chosen: list[Chosen]) -> str:
-    """Команда, повторяющая запуск без вопросов; контракты — коротким именем."""
-    names = ",".join(item.name for item in chosen)
-    if request.mode == MODE_HISTORY:
-        pause = HISTORY_DEFAULT_PAUSE if request.pause is None else request.pause
-        return (f'--mode history --from "{request.start:%Y-%m-%d %H:%M}" --to "{request.end:%Y-%m-%d %H:%M}" '
-                f"--pause {pause:g} --instruments {names}")
-    return f"--mode emulation --instruments {names}"
+    """Тело команды API, повторяющей запуск эмуляции; контракты — коротким именем."""
+    import json
 
-
-def tokens_from_menu(selected, *, history: bool) -> list[Chosen]:
-    """Выбор меню в виде ``Chosen`` для эквивалентной команды и состояния API."""
-    if history:
-        chosen = [Chosen(item.short_name or "контракт не указан", item.short_name or "контракт не указан",
-                         item.instrument_type) for item in selected.fixed]
-        return chosen + [Chosen(family, family, "future", family=family, automatic=True) for family in selected.families]
-    result = []
-    for item in selected:
-        instrument = normalize_instrument(item)
-        name = instrument.short_name or "контракт не указан"
-        result.append(Chosen(name, name, instrument.instrument_type))
-    return result
-
-
-def without_assignments(chosen: list[Chosen], share_strategies: dict, future_strategies: dict) -> list[str]:
-    """Имена выбранного в меню, у которых нет привязок в конфигурации."""
-    missing = []
-    for item in chosen:
-        if item.instrument_type == SHARE_INSTRUMENT_TYPE:
-            if not share_strategies.get(item.name.upper()):
-                missing.append(item.name)
-            continue
-        family = item.family
-        if family is None:
-            try:
-                family = family_for(item.name, item.name)
-            except ValueError:
-                family = None
-        if family is None or not _family_has_assignments(family, future_strategies):
-            missing.append(item.name)
-    return missing
+    return json.dumps({"kind": MODE_EMULATION, "instruments": [item.name for item in chosen]}, ensure_ascii=False)

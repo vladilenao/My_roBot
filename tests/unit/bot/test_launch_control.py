@@ -10,6 +10,7 @@ from src.bot.launch import Chosen, Rejection, SOURCE_API, SOURCE_CLI
 from src.bot.launch_control import BadCommand, LaunchControl, parse_command
 from src.data.export_api import MarketDataExportServer
 from src.data.market_store import MarketDataStore
+from src.history.report import MarketDataSync
 from tests.unit.clusters.test_report import SPEC, _check
 
 CONTROL_KEY = "control-test-key"
@@ -27,7 +28,14 @@ class TestParseCommand:
     @pytest.mark.parametrize("body, code", [
         ([], "INVALID_REQUEST"),
         ({"kind": "emulation", "extra": 1}, "INVALID_REQUEST"),
-        ({"kind": "history"}, "UNSUPPORTED_KIND"),
+        ({"kind": "account"}, "UNSUPPORTED_KIND"),
+        ({"kind": "history"}, "INVALID_REQUEST"),
+        ({"kind": "history", "from": "2026-09-08 10:00", "to": "2026-09-01 10:00"}, "INVALID_REQUEST"),
+        ({"kind": "history", "from": "2026-09-01", "to": "2026-09-02", "pause": -1}, "INVALID_REQUEST"),
+        ({"kind": "history", "from": "2026-09-01", "to": "2026-09-02", "pause": True}, "INVALID_REQUEST"),
+        ({"kind": "history", "from": "01.09.2026", "to": "2026-09-02"}, "INVALID_REQUEST"),
+        ({"kind": "history", "from": "2026-09-01", "to": "2026-09-02", "mode": "x"}, "INVALID_REQUEST"),
+        ({"kind": "emulation", "from": "2026-09-01"}, "INVALID_REQUEST"),
         ({"kind": "emulation", "instruments": []}, "INVALID_REQUEST"),
         ({"kind": "emulation", "instruments": ["NG", 5]}, "INVALID_REQUEST"),
         ({"kind": "emulation", "instruments": ["all", "NG"]}, "INVALID_REQUEST"),
@@ -174,7 +182,7 @@ class TestContoursApi:
         status, payload, headers = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, {"kind": "emulation"})
         assert status == 202 and headers["Location"] == "/api/v1/contours"
 
-    @pytest.mark.parametrize("body, code", [(b"{bad", "INVALID_REQUEST"), ({"kind": "history"}, "UNSUPPORTED_KIND")])
+    @pytest.mark.parametrize("body, code", [(b"{bad", "INVALID_REQUEST"), ({"kind": "account"}, "UNSUPPORTED_KIND")])
     def test_bad_body(self, server, body, code):
         srv, control = server
         control.accept_commands()
@@ -424,7 +432,8 @@ class TestMembershipApi:
 class TestCoreApi:
     """GET /api/v1/core (add-contour-recovery)."""
 
-    STATE = {"version": "7.1.0", "pid": 4242, "started_at": "2026-10-24T09:00:00Z",
+    STATE = {"state": "ready", "error": None, "attempts": 1, "next_retry_at": None,
+             "version": "7.1.0", "pid": 4242, "started_at": "2026-10-24T09:00:00Z",
              "heartbeat": {"beat_at": "2026-10-24T09:00:05Z", "interval_secs": 5},
              "market_data": {"producer_id": "tbank-test", "max_change_id": 7,
                              "pairs": {"total": 2, "by_status": {"READY": 1, "BOOTSTRAPPING": 1}}},
@@ -443,3 +452,114 @@ class TestCoreApi:
         assert _call(srv, "GET", "/api/v1/core", EXPORT_KEY)[0] == 401
         srv.core_state = None
         assert _call(srv, "GET", "/api/v1/core", CONTROL_KEY)[0] == 404
+
+
+@pytest.fixture
+def history_server(tmp_path):
+    """Сервер с очередью прогонов истории (без потока очереди: прогоны остаются в queued до _fill)."""
+    from src.assembly.history_runs import HistoryRuns
+    from tests.unit.assembly.test_history_runs import FakeProcess
+
+    FakeProcess.started = []
+    control, store = _controlled(tmp_path)
+    queue = HistoryRuns(store, tmp_path, max_runs=1, version="7.1.0", heartbeat_timeout=30,
+                        share_strategies={"SBER": ["a"]}, future_strategies={"NG": ["a"]}, provider_factory=object,
+                        prepare=lambda provider: (MarketDataSync(), None, "импорт не подтверждён"),
+                        process_factory=FakeProcess, say=lambda line: None)
+    control.history = queue
+    srv = MarketDataExportServer(None, EXPORT_KEY, port=0, control=control, control_token=CONTROL_KEY)
+    try:
+        srv.start()
+    except PermissionError:
+        pytest.skip("Песочница не разрешает открыть loopback-сокет")
+    yield srv, control, queue
+    srv.close()
+
+
+HISTORY = {"kind": "history", "from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 0, "instruments": ["NG"]}
+
+
+class TestHistoryApi:
+    """Прогон истории — контур вида history в /api/v1/contours (add-history-contour)."""
+
+    def test_history_is_queued_and_listed_with_limits(self, history_server):
+        srv, control, queue = history_server
+        status, payload, headers = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)
+        assert status == 202 and payload["state"] == "queued" and headers["Location"] == f"/api/v1/contours/{payload['id']}"
+        _check(payload, {"$ref": "#/components/schemas/AnyContour"})
+        _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)
+        queue._fill()
+        status, listing, _ = _call(srv, "GET", "/api/v1/contours", CONTROL_KEY)
+        assert status == 200
+        _check(listing, {"$ref": "#/components/schemas/ContourList"})
+        assert [item["kind"] for item in listing["contours"]] == ["emulation", "history", "history"]
+        assert listing["limits"] == {"max_history_runs": 1, "running": 1, "queued": 1}
+        assert [item["kind"] for item in _call(srv, "GET", "/api/v1/contours?kind=history", CONTROL_KEY)[1]["contours"]] \
+            == ["history", "history"]
+        assert [item["kind"] for item in _call(srv, "GET", "/api/v1/contours?kind=emulation", CONTROL_KEY)[1]["contours"]] \
+            == ["emulation"]
+        status, one, _ = _call(srv, "GET", f"/api/v1/contours/{payload['id']}", CONTROL_KEY)
+        assert status == 200 and one["state"] == "running"
+        _check(one, {"$ref": "#/components/schemas/AnyContour"})
+
+    @pytest.mark.parametrize("query", ["?kind=account", "?limit=0", "?limit=201", "?limit=x"])
+    def test_bad_list_query(self, history_server, query):
+        srv, _, _ = history_server
+        assert _call(srv, "GET", "/api/v1/contours" + query, CONTROL_KEY)[0] == 400
+
+    def test_finished_runs_are_limited(self, history_server):
+        srv, _, queue = history_server
+        for _ in range(3):
+            run_id = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)[1]["id"]
+            queue.stop(run_id)
+        listing = _call(srv, "GET", "/api/v1/contours?kind=history&limit=2", CONTROL_KEY)[1]
+        assert [item["state"] for item in listing["contours"]] == ["cancelled", "cancelled"]
+
+    def test_history_is_accepted_while_core_is_not_ready_but_emulation_is_not(self, history_server):
+        srv, control, _ = history_server
+        control.accept_commands()
+        control.core_status = lambda: {"state": "retrying", "error": "ConnectError", "attempts": 1,
+                                       "next_retry_at": "2026-10-24T09:00:30Z", "version": "7.1.0", "pid": 1,
+                                       "started_at": None, "heartbeat": None, "market_data": None, "quotas": {}}
+        assert _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)[0] == 202
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, {"kind": "emulation"})
+        assert status == 409 and payload["code"] == "CORE_NOT_READY" and payload["core"]["state"] == "retrying"
+        _check(payload, {"$ref": "#/components/schemas/CoreNotReady"})
+
+    def test_emulation_refused_while_contour_folder_is_busy(self, history_server):
+        srv, control, _ = history_server
+        control.accept_commands()
+        control.contour_busy = lambda: 4242
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, {"kind": "emulation"})
+        assert status == 409 and payload["code"] == "CONTOUR_DIR_BUSY" and payload["pid"] == 4242
+        _check(payload, {"$ref": "#/components/schemas/ContourConflict"})
+
+    def test_stop_without_body_and_membership_not_supported(self, history_server):
+        srv, _, queue = history_server
+        run_id = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)[1]["id"]
+        status, payload, _ = _call(srv, "POST", f"/api/v1/contours/{run_id}/instruments", CONTROL_KEY, {"add": ["SBER"]})
+        assert status == 409 and payload["code"] == "NOT_SUPPORTED"
+        _check(payload, {"$ref": "#/components/schemas/ContourConflict"})
+        status, payload, _ = _call(srv, "POST", f"/api/v1/contours/{run_id}/stop", CONTROL_KEY)
+        assert status == 200 and payload["contour"]["state"] == "cancelled"
+        _check(payload, {"$ref": "#/components/schemas/HistoryStopAccepted"})
+        status, payload, _ = _call(srv, "POST", f"/api/v1/contours/{run_id}/stop", CONTROL_KEY, {})
+        assert status == 409 and payload["code"] == "NOT_RUNNING"
+        assert _call(srv, "POST", "/api/v1/contours/history-none/stop", CONTROL_KEY)[0] == 404
+
+    def test_log_of_run(self, history_server):
+        srv, _, queue = history_server
+        run_id = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, HISTORY)[1]["id"]
+        queue._fill()
+        from src.assembly.history_runs import run_dir
+
+        (run_dir(queue._data_dir, run_id) / "bot_debug.log").write_text("a\nb\nc\n", encoding="utf-8")
+        status, text, _ = _text(srv, f"/api/v1/contours/{run_id}/log?tail=2", CONTROL_KEY)
+        assert status == 200 and text == "b\nc\n"
+        assert _text(srv, "/api/v1/contours/history-none/log", CONTROL_KEY)[0] == 404
+
+    def test_rejected_tokens(self, history_server):
+        srv, _, _ = history_server
+        status, payload, _ = _call(srv, "POST", "/api/v1/contours", CONTROL_KEY, {**HISTORY, "instruments": ["NG", "AFLT"]})
+        assert status == 422 and payload["rejections"][0]["token"] == "AFLT"
+        _check(payload, {"$ref": "#/components/schemas/LaunchRejected"})
