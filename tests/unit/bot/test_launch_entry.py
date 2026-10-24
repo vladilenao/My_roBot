@@ -71,14 +71,14 @@ class TestChooseInstruments:
         out = capsys.readouterr().out
         assert "✗ AFLT" in out and "Торговля не запущена" in out
 
-    def test_accepted_parameters_mark_running(self, capsys):
+    def test_accepted_parameters_mark_starting(self, capsys):
         launch = LaunchRequest(MODE_EMULATION, SOURCE_CLI, ("NG",))
         control = LaunchControl()
         with patch.object(run, "_resolve_request", return_value=Resolution([NG_TUPLE], [NG], [])):
             assert self._choose(launch, control=control) == [NG_TUPLE]
         assert "Повторить запуск: --mode emulation --instruments NG-12.26" in capsys.readouterr().out
         snapshot = control.snapshot()
-        assert snapshot["state"] == "running" and snapshot["source"] == SOURCE_CLI
+        assert snapshot["state"] == "starting" and snapshot["source"] == SOURCE_CLI
 
     def test_menu_drops_instruments_without_assignments(self, monkeypatch, capsys):
         monkeypatch.setattr(run, "SHARE_STRATEGIES", {"SBER": ["a"]})

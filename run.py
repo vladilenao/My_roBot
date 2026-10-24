@@ -1,4 +1,5 @@
 
+import src.grpc_fork  # noqa: F401  — первым, до загрузки gRPC
 from src import __version__
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,7 +9,8 @@ import sys
 from src.config import (
     ACTIVE_TIMEFRAMES,
     CONTOURS_FEED_POLL_SECS,
-    CONTOURS_MARKET_FEED,
+    MARKET_DATA_DATABASE_FILE,
+    trading_enabled,
     DATA_REFRESH_MIN_INTERVAL,
     MARKET_DATA_EXPORT_ENABLED,
     MARKET_DATA_SETTINGS,
@@ -60,8 +62,8 @@ from src.bot.launch import (
 )
 from src.assembly.contour import ContourSettings, TradingContour, _family_warmup, _strategy_map
 from src.assembly.core import LiveCore, _say
-from src.assembly.feed import FeedMarketServices
 from src.assembly.history import HistoricalMarketServices
+from src.assembly.process import JournalMigrationError
 from src.assembly.services import _timeframes
 from src.bot.launch_control import LaunchControl
 from src.bot.run_session import build_run_session
@@ -182,6 +184,9 @@ def state_dir_for(start: datetime, end: datetime, started_at: datetime | None = 
 def main(argv=None, no_prompt: bool = False):
     """Точка входа: параметры командной строки или меню, затем общий путь запуска."""
     argv = list(argv or [])
+    if argv[:1] == ["--contour"]:
+        # Служебный вход процесса контура: его запускает ядро (add-contour-process).
+        return _run_contour(argv[1] if len(argv) > 1 else "")
     if no_prompt and "--no-prompt" not in argv:
         argv.append("--no-prompt")
     try:
@@ -199,6 +204,63 @@ def main(argv=None, no_prompt: bool = False):
         print(describe_scale(request.start, request.end, request.pause))
         return _run_history(request.start, request.end, request.pause, request)
     return _run_live(request)
+
+
+def _run_contour(kind: str) -> int:
+    """Процесс торгового контура: блокировка и журнал в своей папке, файл запуска, лента ядра (D1)."""
+    import signal
+
+    from src.assembly.contracts import contracts_from_payload, instrument_from_payload
+    from src.assembly.feed import FeedMarketServices
+    from src.assembly.process import LaunchFileError, StdinStop, contour_dir, read_launch
+    from src.bot.run_session import StoppableRunSession
+    from src.data.market_store import MarketDataStore
+
+    if kind != MODE_EMULATION:
+        print(f"Неизвестный вид контура {kind!r}: поддерживается только {MODE_EMULATION}.")
+        return 2
+    data_dir = runtime_dir()
+    directory = contour_dir(data_dir, kind)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        acquire_runtime_lock(directory)
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
+    setup_logging(
+        service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE),
+        secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
+                 MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
+        **_log_settings(False, None),
+    )
+    log.info("Контур %s v%s запущен", kind, __version__)
+    try:
+        launch = read_launch(directory, kind)
+    except LaunchFileError as exc:
+        log.error("%s", exc)
+        print(str(exc))
+        return 2
+    stop = StdinStop()
+    stop.start()
+    # Ctrl+C в консоли доходит и до контура: останавливаемся на границе тика, а не посреди него.
+    signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    instruments = [instrument_from_payload(item) for item in launch["instruments"]]
+    services = FeedMarketServices(MarketDataStore(data_dir / MARKET_DATA_DATABASE_FILE), contour_id=kind,
+                                  data_dir=data_dir, tracks_obligations=trading_enabled(),
+                                  poll_seconds=CONTOURS_FEED_POLL_SECS)
+    contour = TradingContour(ContourSettings(
+        kind=kind, state_dir=directory, channel_names=None, clock=None,
+        session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
+        contracts=contracts_from_payload(launch.get("contracts") or {}),
+    ), services)
+    try:
+        contour.build()
+        contour.run(services.serve(contour.demand()))
+    finally:
+        services.close()
+        contour.close()
+    log.info("Контур %s остановлен: %s", kind, stop.reason or "цикл завершён")
+    return 0
 
 
 def _menu_request() -> LaunchRequest:
@@ -521,16 +583,23 @@ def _launch(
         if selection is None:
             _preload_history_schedule(market_calendar, selection, instruments, session)
 
-    if history:
-        services = HistoricalMarketServices(state_dir, clock, provider, market_calendar, report.boundaries)
-    else:
-        services = core.ensure_market_data()
-        services.start_api(control)
-        if CONTOURS_MARKET_FEED:
-            # Контур эмуляции читает свечи из ленты ядра (add-contour-market-feed).
-            services = FeedMarketServices(core, contour_id=MODE_EMULATION, poll_seconds=CONTOURS_FEED_POLL_SECS)
+    if not history:
+        # Контур эмуляции — отдельный процесс на ленте ядра (add-contour-process).
+        core.ensure_market_data()
+        core.start_api(control)
+        try:
+            code = core.run_contour(instruments, kind=MODE_EMULATION, control=control,
+                                    source="" if launch is None else launch.source,
+                                    command="" if control is None else control.snapshot().get("command") or "")
+        except JournalMigrationError as exc:
+            print(str(exc))
+            code = 2
+        finally:
+            core.close()
+        return code, None, instruments
+    services = HistoricalMarketServices(state_dir, clock, provider, market_calendar, report.boundaries)
     contour = TradingContour(ContourSettings(
-        kind=MODE_HISTORY if history else MODE_EMULATION, state_dir=state_dir, channel_names=channel_names,
+        kind=MODE_HISTORY, state_dir=state_dir, channel_names=channel_names,
         clock=clock, session=session, client_provider=provider, instruments=instruments,
         market_data_sync=market_data_sync,
     ), services)
@@ -539,8 +608,7 @@ def _launch(
         contour.run(services.serve(contour.demand()))
     finally:
         services.close()
-        if history:
-            contour.finish()
+        contour.finish()
         contour.close()
     return 0, None, selection or instruments
 
@@ -637,7 +705,7 @@ def _announce(launch, chosen, control, source, pending=None) -> str:
     print(f"Повторить запуск: {command}")
     log.info("Повторить запуск: %s", command)
     if control is not None:
-        control.mark_running(source, chosen, command, pending)
+        control.mark_launched(source, chosen, command, pending)
     return command
 
 
@@ -755,7 +823,10 @@ if __name__ == "__main__":
         action.add_argument("--telegram-pending", action="store_true")
         action.add_argument("--telegram-retry", action="store_true")
         action.add_argument("--telegram-cleanup-files", action="store_true")
-        parser.add_argument("--state-dir", type=Path, default=runtime_dir())
+        # Доставка Telegram — журнал контура эмуляции (add-contour-process).
+        from src.assembly.process import contour_dir
+
+        parser.add_argument("--state-dir", type=Path, default=contour_dir(runtime_dir(), MODE_EMULATION))
         parser.add_argument("--id", type=int, dest="operation_id")
         parser.add_argument("--trade-id")
         parser.add_argument("--from", dest="day_from")

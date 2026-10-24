@@ -37,9 +37,13 @@ redis_db = 0  # Номер логической базы Redis для stream mar
 queue_maxsize = 1024  # Максимум необработанных закрытых свечей в фоновой очереди.
 retention_days = 90  # Сколько суток хранить события в Redis Stream; более старые удаляются.
 
+# Контур эмуляции — отдельный процесс (data/contours/emulation/), читает свечи
+# из ленты ядра и передаёт ему потребности строками в рыночной базе.
 [contours]
-market_feed = true  # Контур эмуляции читает свечи из ленты ядра; false — прямое чтение памяти ядра (откат).
-feed_poll_secs = 1  # Как часто контур читает ленту изменений рыночной базы, секунд.
+feed_poll_secs = 1  # Как часто контур читает ленту, а ядро — потребности контуров, секунд.
+
+[contours.emulation]
+telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env с id канала Telegram контура (сам id — только в .env).
 
 [instruments]
 fallback_type = "future"

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import run
-from src.assembly import contour, core
+from src.assembly import contour, contracts, core
 from src.assembly.history import HistoricalMarketServices
 from src.assembly.services import ContourDemand
 from src.instruments import Instrument
@@ -32,7 +32,8 @@ def _imports(path: Path) -> set[str]:
 @pytest.mark.parametrize("module", ["core.py", "history.py", "services.py"])
 def test_services_do_not_import_contour(module):
     imported = _imports(ROOT / "src" / "assembly" / module)
-    assert not any("contour" in name for name in imported), sorted(imported)
+    # Модуль контура не импортируется; имена про «контур» (процесс, потребности) — допустимы.
+    assert not {"src.assembly.contour", "contour"} & imported, sorted(imported)
 
 
 def test_feed_services_do_not_import_core_or_history():
@@ -47,15 +48,15 @@ def test_contour_reaches_data_only_through_services_port():
 
 class TestBuildDemand:
     def test_notify_only_has_no_obligations(self, monkeypatch):
-        monkeypatch.setattr(contour, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="1h")]})
+        monkeypatch.setattr(contracts, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="1h")]})
         demand = contour.build_demand(contour._Runtime(), [SBER], data_cache=None)
         assert demand == ContourDemand((SBER,), pattern_pairs=((SBER, "1h"),))
 
     def test_pattern_pairs_are_assignment_timeframes_of_selected_instruments(self, monkeypatch):
-        monkeypatch.setattr(contour, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="4h"),
+        monkeypatch.setattr(contracts, "SHARE_STRATEGIES", {"SBER": [SimpleNamespace(timeframe="4h"),
                                                                    SimpleNamespace(timeframe="1h"),
                                                                    SimpleNamespace(timeframe="1h")]})
-        monkeypatch.setattr(contour, "FUTURE_STRATEGIES", {"NG": [SimpleNamespace(timeframe="15m")]})
+        monkeypatch.setattr(contracts, "FUTURE_STRATEGIES", {"NG": [SimpleNamespace(timeframe="15m")]})
         demand = contour.build_demand(contour._Runtime(), [SBER, NG, ("GAZP", "GAZP", "share")], data_cache=None)
         assert [(item.ticker, tf) for item, tf in demand.pattern_pairs] == [("SBER", "1h"), ("SBER", "4h"),
                                                                            ("NGZ6", "15m")]
@@ -120,8 +121,8 @@ def test_live_core_without_serve_closes_early_lanes():
     assert order == ["early", "api"]
 
 
-@pytest.mark.parametrize("market_feed", [False, True])
-def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path, market_feed):
+def test_emulation_launch_runs_contour_process_after_core(monkeypatch, tmp_path):
+    """Эмуляция (add-contour-process): ранний сбор и API до выбора, затем процесс контура, затем остановка ядра."""
     order = []
 
     class FakeCore:
@@ -139,52 +140,19 @@ def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path, market_feed):
             order.append("data")
             return self
 
-        def serve(self, demand):
-            order.append("serve")
-            return "waiter"
+        def run_contour(self, instruments, *, kind, control=None, source="", command=""):
+            assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
+            order.append("run_contour")
+            return 0
 
         def close(self):
             order.append("core.close")
 
-    class FakeFeed:
-        def __init__(self, core, *, contour_id, poll_seconds):
-            assert isinstance(core, FakeCore) and contour_id == "emulation"
-            order.append("feed")
-            self.core = core
-
-        def serve(self, demand):
-            return self.core.serve(demand)
-
-        def close(self):
-            order.append("feed.close")
-            self.core.close()
-
-    services_class = FakeFeed if market_feed else FakeCore
-
-    class FakeContour:
-        def __init__(self, settings, services):
-            assert settings.kind == "emulation" and services.__class__ is services_class
-
-        def build(self):
-            order.append("build")
-            return self
-
-        def demand(self):
-            order.append("demand")
-
-        def run(self, waiter):
-            order.append(f"run:{waiter}")
-
-        def finish(self):
-            order.append("finish")
-
-        def close(self):
-            order.append("contour.close")
+    def no_contour(*args, **kwargs):
+        raise AssertionError("в эмуляции торговый контур не собирается в процессе ядра")
 
     monkeypatch.setattr(run, "LiveCore", FakeCore)
-    monkeypatch.setattr(run, "FeedMarketServices", FakeFeed)
-    monkeypatch.setattr(run, "CONTOURS_MARKET_FEED", market_feed)
-    monkeypatch.setattr(run, "TradingContour", FakeContour)
+    monkeypatch.setattr(run, "TradingContour", no_contour)
     monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
     monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
     monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", SimpleNamespace(independent_lanes=True))
@@ -192,10 +160,38 @@ def test_launch_keeps_start_and_stop_order(monkeypatch, tmp_path, market_feed):
     code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None, session=SimpleNamespace(),
                              channel_names=[])
     assert code == 0
-    feed = ["feed"] if market_feed else []
-    closing = ["feed.close", "core.close"] if market_feed else ["core.close"]
-    assert order == ["early", "api", "choose", "data", "api", *feed, "build", "demand", "serve", "run:waiter",
-                     *closing, "contour.close"]
+    assert order == ["early", "api", "choose", "data", "api", "run_contour", "core.close"]
+
+
+def test_journal_migration_failure_stops_launch(monkeypatch, tmp_path, capsys):
+    from src.assembly.process import JournalMigrationError
+
+    class FakeCore:
+        def __init__(self, state_dir, client_provider):
+            self.early = None
+            self.export_server = None
+
+        def start_api(self, control=None):
+            pass
+
+        def ensure_market_data(self):
+            return self
+
+        def run_contour(self, instruments, **kwargs):
+            raise JournalMigrationError("Журнал эмуляции не перенесён")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run, "LiveCore", FakeCore)
+    monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
+    monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
+    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", SimpleNamespace(independent_lanes=False))
+    monkeypatch.setattr(run, "_choose_instruments", lambda *a, **k: [("SBER", "SBER", "share", "SBER")])
+    code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None, session=SimpleNamespace(),
+                             channel_names=[])
+    assert code == 2
+    assert "Журнал эмуляции не перенесён" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("result, acknowledged", [(True, 1), (None, 1), (False, 0)])

@@ -43,7 +43,7 @@ def _main_thread(control, outcome):
         if outcome == "reject":
             control.reject(pending, [Rejection("AFLT", "У инструмента нет привязок в robot.toml.")])
         else:
-            control.mark_running(SOURCE_API, [NG], "--mode emulation --instruments NG-12.26", pending)
+            control.mark_launched(SOURCE_API, [NG], "--mode emulation --instruments NG-12.26", pending)
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return thread
@@ -55,7 +55,7 @@ class TestLaunchControl:
         control.accept_commands()
         _main_thread(control, "run")
         status, payload = control.submit(parse_command({"kind": "emulation", "instruments": ["NG"]}))
-        assert status == 201 and payload["state"] == "running" and payload["source"] == "api"
+        assert status == 201 and payload["state"] == "starting" and payload["source"] == "api"
         assert control.submit(parse_command({"kind": "emulation"}))[0] == 409
 
     def test_rejection_keeps_waiting(self):
@@ -75,9 +75,37 @@ class TestLaunchControl:
 
     def test_not_waiting_means_conflict(self):
         control = LaunchControl()
-        control.mark_running(SOURCE_CLI, [NG], "--mode emulation --instruments NG-12.26")
+        control.mark_launched(SOURCE_CLI, [NG], "--mode emulation --instruments NG-12.26")
         status, payload = control.submit(parse_command({"kind": "emulation"}))
         assert status == 409 and payload["contour"]["source"] == "cli"
+
+
+class TestContourProcessState:
+    """Состояние процесса контура (add-contour-process): starting → running → stopped/failed."""
+
+    def test_running_after_first_checkpoint(self):
+        control = LaunchControl()
+        control.mark_launched(SOURCE_CLI, [NG], "--mode emulation --instruments NG-12.26")
+        control.mark_contour_running()
+        assert control.snapshot()["state"] == "starting"
+        control.mark_process(4242)
+        control.mark_contour_running()
+        snapshot = control.snapshot()
+        assert (snapshot["state"], snapshot["pid"], snapshot["exit_code"]) == ("running", 4242, None)
+
+    def test_failed_keeps_exit_code(self):
+        control = LaunchControl()
+        control.mark_launched(SOURCE_API, [NG], "--mode emulation --instruments NG-12.26")
+        control.mark_process(4242)
+        control.mark_exited(1)
+        snapshot = control.snapshot()
+        assert (snapshot["state"], snapshot["pid"], snapshot["exit_code"]) == ("failed", None, 1)
+
+    def test_stopped_on_clean_exit(self):
+        control = LaunchControl()
+        control.mark_process(4242)
+        control.mark_exited(0, stopping=True)
+        assert control.snapshot()["state"] == "stopped"
 
 
 @pytest.fixture

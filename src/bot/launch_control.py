@@ -18,6 +18,8 @@ from src.bot.launch import (
 STATE_WAITING = "waiting_command"
 STATE_STARTING = "starting"
 STATE_RUNNING = "running"
+STATE_STOPPED = "stopped"
+STATE_FAILED = "failed"
 CONTOUR_ID = "emulation"
 REPLY_TIMEOUT_SECS = 60.0
 _ALLOWED_FIELDS = {"kind", "instruments"}
@@ -78,6 +80,9 @@ class LaunchControl:
         self._rejections: list[Rejection] = []
         self._accepting = False
         self._pending: _Pending | None = None
+        # Процесс контура (add-contour-process): pid, пока жив; код выхода — после.
+        self._pid: int | None = None
+        self._exit_code: int | None = None
 
     # --- для API ----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -88,6 +93,8 @@ class LaunchControl:
                 "started_at": self._started_at.isoformat().replace("+00:00", "Z") if self._started_at else None,
                 "command": self._command,
                 "rejections": [{"token": item.token, "reason": item.reason} for item in self._rejections],
+                "pid": self._pid,
+                "exit_code": self._exit_code,
             }
 
     def submit(self, request: LaunchRequest) -> tuple[int, dict]:
@@ -135,9 +142,10 @@ class LaunchControl:
                                "rejections": [{"token": item.token, "reason": item.reason} for item in rejections]}
         pending.done.set()
 
-    def mark_running(self, source: str, chosen: list[Chosen], command: str, pending: _Pending | None = None) -> None:
+    def mark_launched(self, source: str, chosen: list[Chosen], command: str, pending: _Pending | None = None) -> None:
+        """Инструменты приняты: контур запускается (``starting``) до первого подтверждения курсора."""
         with self._lock:
-            self._state = STATE_RUNNING
+            self._state = STATE_STARTING
             self._source = source
             self._chosen = list(chosen)
             self._command = command
@@ -149,6 +157,24 @@ class LaunchControl:
             pending.status = 201
             pending.payload = self.snapshot()
             pending.done.set()
+
+    def mark_process(self, pid: int) -> None:
+        with self._lock:
+            self._pid = pid
+            self._exit_code = None
+
+    def mark_contour_running(self) -> None:
+        """Контур первый раз подтвердил курсор ленты — торгует."""
+        with self._lock:
+            if self._state == STATE_STARTING and self._pid is not None:
+                self._state = STATE_RUNNING
+
+    def mark_exited(self, code: int, *, stopping: bool = False) -> None:
+        """Процесс контура завершился: код 0 — ``stopped``, иначе ``failed`` (сам не перезапускается)."""
+        with self._lock:
+            self._pid = None
+            self._exit_code = code
+            self._state = STATE_STOPPED if code == 0 else STATE_FAILED
 
     def mark_starting(self, source: str) -> None:
         with self._lock:

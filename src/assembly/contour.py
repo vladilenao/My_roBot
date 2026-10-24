@@ -8,13 +8,11 @@ from src.market_context import (
 
 from datetime import datetime
 from decimal import Decimal
-from dataclasses import replace
 from pathlib import Path
 import json
 
 from src.decision import SignalFilter
 from src.bot import TradingBot
-from src.bot.trading_bot import assignments_for
 from src.config import (
     MARKET_DATA_SETTINGS,
     FUTURE_STRATEGIES,
@@ -22,7 +20,6 @@ from src.config import (
     SHARE_STRATEGIES,
     TICK_POLL_SECS,
     TICK_TIMEOUT_SECS,
-    TINKOFF_TOKEN,
     TRIPLE_SCREEN_PARAMS,
     CLEARING_TIMES,
     INITIAL_DEPOSIT,
@@ -73,6 +70,11 @@ from src.notifier import build_channels, close_channels
 from dataclasses import dataclass
 
 from src.assembly.services import ContourDemand
+# Общее с ядром — в нейтральном модуле; имена здесь, чтобы подмены в тестах
+# и вызовы контура шли через этот модуль.
+from src.assembly.contracts import (  # noqa: F401
+    _instrument_ticker, _instrument_type, _load_contracts_metadata, _pattern_pairs, _token_client_context,
+)
 
 log = get_logger(__name__)
 
@@ -258,7 +260,8 @@ class _Runtime:
 
 
 def _build_runtime(
-    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None
+    instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None,
+    contracts=None,
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -387,7 +390,7 @@ def _build_runtime(
                 card = segment.card
                 contracts[card.uid] = ContractMeta(card.uid, float(card.price_step), float(card.step_cost),
                     float(card.go_buy), float(card.go_sell), currency=(card.currency or "RUB").upper(), expiration_date=card.expiration_date)
-    else:
+    elif contracts is None:
         contracts = _load_contracts_metadata(instruments, client_provider=client_provider,
                                              request_budget=getattr(data_cache, "_request_budget", None))
     broker.set_contracts(contracts)
@@ -649,11 +652,6 @@ def _risk_limits():
     )
 
 
-def _instrument_ticker(instrument) -> str | None:
-    """Реальный тикер инструмента: для селектора — второй элемент кортежа (display, ticker, ...)."""
-    if isinstance(instrument, (tuple, list)):
-        return str(instrument[1]) if len(instrument) > 1 else str(instrument[0])
-    return getattr(instrument, "ticker", None)
 
 
 def _instrument_names(instruments) -> dict[str, str]:
@@ -677,82 +675,10 @@ def _instrument_names(instruments) -> dict[str, str]:
     return names
 
 
-def _load_contracts_metadata(instruments, client_provider=None, request_budget=None):
-    """Кэш метаданных контрактов из источника данных прогона.
-
-    Акции и фьючерсы грузятся по-разному: у фьючерса есть шаг, стоимость шага,
-    ГО и дата экспирации, у акции — шаг цены и размер лота (цена лота выводится
-    как ``шаг × лот``, ГО отсутствует). Без метаданных входы отклоняются с
-    причиной `no-contract-metadata`, поэтому инструменты без метаданных
-    перечисляются в лог явно. При сбое — частичный кэш: без него потерян ровно
-    тот инструмент, чьи метаданные не прочитались.
-    """
-    by_type: dict[str, set[str]] = {}
-    for instrument in instruments:
-        ticker = _instrument_ticker(instrument)
-        if not ticker:
-            continue
-        by_type.setdefault(_instrument_type(instrument), set()).add(ticker)
-    if not by_type:
-        return {}
-
-    from src.api.instruments import load_futures_contracts, load_share_contracts
-
-    try:
-        context = (
-            client_provider.client_context() if client_provider is not None else None
-        ) or _token_client_context()
-    except Exception as exc:
-        log.warning("Не удалось открыть клиент источника (%s) — входы отклонятся.", exc)
-        return {}
-    if context is None:
-        log.warning("Нет TINKOFF_TOKEN — метаданные контрактов недоступны.")
-        return {}
-
-    contracts: dict[str, object] = {}
-    loaders = {"future": load_futures_contracts, "share": load_share_contracts}
-    with context as raw_client:
-        # Через общий арбитр: каталоги — сервис инструментов, их квота мала.
-        client = raw_client if request_budget is None else request_budget.wrap_client(raw_client, lane="interactive")
-        for instrument_type, tickers in by_type.items():
-            loader = loaders.get(instrument_type)
-            if loader is None:
-                log.warning(
-                    "Метаданные для типа %s не поддерживаются: %s — входы отклонятся.",
-                    instrument_type, sorted(tickers),
-                )
-                continue
-            try:
-                contracts.update(loader(client, tickers=tickers))
-            except Exception as exc:
-                log.warning(
-                    "Не удалось загрузить метаданные %s (%s) — входы по ним отклонятся.",
-                    sorted(tickers), exc,
-                )
-    known = set(contracts)
-    missing = sorted(t for ts in by_type.values() for t in ts if t not in known)
-    if missing:
-        log.warning("Нет метаданных контрактов для: %s — входы отклонятся.", missing)
-    log.info("Метаданные контрактов загружены: %s", sorted(contracts))
-    for instrument in instruments:
-        if isinstance(instrument, Instrument) and instrument.uid and instrument.ticker in contracts:
-            contracts[instrument_key(instrument)] = replace(contracts.pop(instrument.ticker), ticker=instrument_key(instrument))
-    return contracts
 
 
-def _token_client_context():
-    """Контекст клиента Тильды; без токена возвращается ``None``."""
-    if not TINKOFF_TOKEN:
-        return None
-    from src.api.client import client_context
-
-    return client_context()
 
 
-def _instrument_type(instrument) -> str:
-    if isinstance(instrument, (tuple, list)):
-        return str(instrument[2]) if len(instrument) > 2 else ""
-    return str(getattr(instrument, "instrument_type", "") or "")
 
 
 def print_contract_metadata(contracts, names=None) -> None:
@@ -815,15 +741,6 @@ def build_demand(runtime, instruments, data_cache) -> ContourDemand:
                          tuple(requests), tuple(lowers), patterns)
 
 
-def _pattern_pairs(instruments) -> tuple:
-    """ТФ привязок выбранных инструментов: их закрытые бары ядро ставит воркеру паттернов."""
-    pairs = []
-    for item in instruments:
-        instrument = item if isinstance(item, Instrument) else normalize_instrument(item)
-        timeframes = {assignment.timeframe for assignment in
-                      assignments_for(instrument, SHARE_STRATEGIES, FUTURE_STRATEGIES)}
-        pairs.extend((instrument, timeframe) for timeframe in sorted(timeframes))
-    return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -838,6 +755,8 @@ class ContourSettings:
     client_provider: object
     instruments: list
     market_data_sync: MarketDataSync | None = None
+    # Карточки контрактов от ядра (launch.json); None — контур грузит их сам (история).
+    contracts: dict | None = None
 
 
 class TradingContour:
@@ -868,6 +787,7 @@ class TradingContour:
         self.runtime = _build_runtime(
             settings.instruments, services.data_cache, self.bus, settings.state_dir, clock=settings.clock,
             session=settings.session, client_provider=settings.client_provider, cluster_gate=cluster_gate,
+            contracts=settings.contracts,
         )
         return self
 
