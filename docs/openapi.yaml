@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.7.0-proposal
+  version: 1.8.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -11,28 +11,37 @@ info:
       версии свечей и состояния покрытия из локального журнала, сохраняет их
       и подтверждает курсор.
     * Clusters — отчёт кластерного фильтра входа (данные ClusterSource).
-    * Contours — запуск, остановка и повторный запуск торгового контура
-      эмуляции командами, изменение его состава на ходу, состояние и журнал.
+    * Contours — торговые контуры: эмуляция (запуск, остановка, повторный
+      запуск, состав на ходу) и прогоны истории (очередь, ход, итог); их
+      состояние и журнал.
 
-    Когда сервер работает: только в режиме эмуляции (торговля на живых
-    данных с симулятором исполнения), сразу после раннего сбора рыночных
-    данных и до выбора инструментов, если в `.env` задан хотя бы один ключ.
-    Эмуляция запускается параметром `--mode emulation`, флагом `--no-prompt`
-    или пунктом меню «Эмуляция». В историческом режиме (`--mode history`)
-    сервер не запускается. Адрес и порт — `[market_data] export_host` и
-    `export_port`.
+    Когда сервер работает: всегда, пока работает робот. Робот запускается
+    без параметров и без вопросов в консоли; сервер поднимается первым, до
+    ядра (рыночной базы и полос брокера), поэтому управление и история
+    доступны, даже если ядро не стартовало и повторяет старт. Без
+    `ROBOT_CONTROL_TOKEN` робот не запускается. Адрес и порт —
+    `[market_data] export_host` и `export_port`.
+
+    Пока ядро не открыло рыночную базу, маршруты MarketDataExport и Clusters
+    отвечают `503 MARKET_DATA_NOT_READY`; при `[market_data] export_enabled =
+    false` — `404 EXPORT_DISABLED`.
 
     Ключи разные и не заменяют друг друга:
     * `ExportToken` — значение `MARKET_DATA_EXPORT_TOKEN`, экспорт и отчёт;
     * `ControlToken` — значение `ROBOT_CONTROL_TOKEN`, управление контуром.
     Ключ передаётся только в заголовке `Authorization: Bearer`.
 
-    Как запустить торговлю командой: запустите робота с
-    `--mode emulation --wait-command` (или выберите в меню «ждать команду
-    API»), дождитесь строки «Робот ждёт команду запуска» и отправьте
-    `POST /api/v1/contours`. Остановить — `POST /api/v1/contours/emulation/stop`;
-    после остановки `POST /api/v1/contours` запускает торговлю снова, ядро
-    при этом не перезапускается.
+    Как запустить торговлю командой: запустите робота без параметров,
+    дождитесь строки «Робот ждёт команду запуска» и отправьте
+    `POST /api/v1/contours` с `kind: emulation`. Остановить —
+    `POST /api/v1/contours/emulation/stop`; после остановки
+    `POST /api/v1/contours` запускает торговлю снова, ядро при этом не
+    перезапускается.
+
+    Как запустить историю: `POST /api/v1/contours` с `kind: history`,
+    диапазоном и инструментами — в любой момент, даже без эмуляции и до
+    готовности ядра. Прогон получает `id` вида `history-20261024-101500` и
+    дальше управляется теми же маршрутами `/api/v1/contours/{id}`.
 
     Команды, меняющие желаемое состояние, получают номер поколения
     (`desired.generation`). Контур применяет его на ближайшей границе тика;
@@ -49,9 +58,10 @@ tags:
     description: Состояние ядра робота — пульс, рыночные данные, запросы к брокеру.
   - name: Contours
     description: |
-      Запуск, остановка и повторный запуск торгового контура эмуляции,
-      изменение состава на ходу, желаемое и фактическое состояние, журнал
-      процесса контура.
+      Торговые контуры. Эмуляция — запуск, остановка и повторный запуск,
+      изменение состава на ходу, желаемое и фактическое состояние. Прогоны
+      истории (`kind: history`) — очередь до `[contours] max_history_runs`,
+      ход по рыночному времени, итог отчёта. Журнал процесса контура.
 paths:
   /openapi.yaml:
     get:
@@ -96,6 +106,7 @@ paths:
                 schema_version: 1
                 min_after_id: 0
                 max_change_id: 42
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401':
           $ref: '#/components/responses/Unauthorized'
         '503':
@@ -160,6 +171,7 @@ paths:
                       received_at: '2026-10-09T09:02:03Z'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401':
           $ref: '#/components/responses/Unauthorized'
         '409':
@@ -212,6 +224,7 @@ paths:
                 acknowledged_through: 42
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401':
           $ref: '#/components/responses/Unauthorized'
         '409':
@@ -244,8 +257,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ScheduleChangePage'
         '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '409': {$ref: '#/components/responses/ProducerMismatch'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /api/v1/market-data/consumers/{consumer_id}/trading-schedules-checkpoint:
     put:
       tags: [MarketDataExport]
@@ -269,8 +284,10 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/CheckpointResponse'}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '409': {$ref: '#/components/responses/ProducerMismatch'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /api/v1/clusters/report:
     get:
       tags: [Clusters]
@@ -375,9 +392,12 @@ paths:
               example:
                 code: BAD_PERIOD
                 message: Дата отчёта позже сегодняшней.
+        '404': {$ref: '#/components/responses/ExportDisabled'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '503':
-          description: База сделок или кластерных событий робота временно недоступна.
+          description: |
+            База сделок или кластерных событий робота временно недоступна;
+            `MARKET_DATA_NOT_READY` — ядро ещё не открыло рыночную базу.
           content:
             application/json:
               schema:
@@ -387,8 +407,10 @@ paths:
       tags: [Core]
       summary: Состояние ядра
       description: |
-        Версия и pid ядра, пульс для контуров, сводка готовности живых пар
-        и запросы к брокеру за последнюю минуту по сервисам и полосам.
+        Состояние старта ядра (`state`: `starting`, `ready`, `retrying`,
+        `failed`), версия и pid, пульс для контуров, сводка готовности живых
+        пар и запросы к брокеру за последнюю минуту по сервисам и полосам.
+        Отвечает при любом состоянии ядра: робот поднимает API раньше ядра.
         Секретов, адресов и токенов в ответе нет.
       operationId: getCore
       security:
@@ -399,17 +421,37 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/CoreState'}
-              example:
-                version: 7.1.0
-                pid: 4242
-                started_at: '2026-10-24T09:00:00Z'
-                heartbeat: {beat_at: '2026-10-24T11:02:05Z', interval_secs: 5}
-                market_data:
-                  producer_id: tbank-7f3a
-                  max_change_id: 812345
-                  pairs: {total: 14, by_status: {READY: 13, BOOTSTRAPPING: 1}}
-                quotas:
-                  quotes: {per_minute: 41, ceiling: 180, lanes: {live: 30, evidence: 11}, retry_after: null}
+              examples:
+                ready:
+                  summary: Ядро работает
+                  value:
+                    state: ready
+                    error: null
+                    attempts: 1
+                    next_retry_at: null
+                    version: 7.1.0
+                    pid: 4242
+                    started_at: '2026-10-24T09:00:00Z'
+                    heartbeat: {beat_at: '2026-10-24T11:02:05Z', interval_secs: 5}
+                    market_data:
+                      producer_id: tbank-7f3a
+                      max_change_id: 812345
+                      pairs: {total: 14, by_status: {READY: 13, BOOTSTRAPPING: 1}}
+                    quotas:
+                      quotes: {per_minute: 41, ceiling: 180, lanes: {live: 30, evidence: 11}, retry_after: null}
+                retrying:
+                  summary: Старт ядра не удался, следующая попытка через минуту
+                  value:
+                    state: retrying
+                    error: 'ConnectError: брокер недоступен'
+                    attempts: 2
+                    next_retry_at: '2026-10-24T09:02:30Z'
+                    version: 7.1.0
+                    pid: 4242
+                    started_at: '2026-10-24T09:00:00Z'
+                    heartbeat: {beat_at: '2026-10-24T09:01:35Z', interval_secs: 5}
+                    market_data: null
+                    quotas: {}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '404':
@@ -422,12 +464,25 @@ paths:
       tags: [Contours]
       summary: Состояние торговых контуров процесса
       description: |
-        В режиме эмуляции список содержит ровно один контур `emulation`:
-        ждёт ли он команды, запускается или торгует, какими контрактами и
-        откуда пришёл запуск. Сделок, баланса и секретов в ответе нет.
+        Без фильтра список содержит контур эмуляции `emulation` (ждёт ли он
+        команды, запускается или торгует, какими контрактами), все прогоны
+        истории в очереди и в работе и 20 последних завершённых, новые
+        первыми. `limits` — сколько прогонов может идти сразу, сколько идёт и
+        сколько ждёт. Сделок эмуляции, баланса и секретов в ответе нет.
       operationId: listContours
       security:
         - ControlToken: []
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          description: Только один вид контура.
+          schema: {type: string, enum: [emulation, history]}
+        - name: limit
+          in: query
+          required: false
+          description: Сколько завершённых прогонов истории показать.
+          schema: {type: integer, minimum: 1, maximum: 200, default: 20}
       responses:
         '200':
           description: Контуры процесса.
@@ -439,6 +494,7 @@ paths:
                 waiting:
                   summary: Робот ждёт команду
                   value:
+                    limits: {max_history_runs: 2, running: 0, queued: 0}
                     contours:
                       - id: emulation
                         kind: emulation
@@ -457,6 +513,7 @@ paths:
                 running:
                   summary: Торговля запущена командой
                   value:
+                    limits: {max_history_runs: 2, running: 0, queued: 0}
                     contours:
                       - id: emulation
                         kind: emulation
@@ -466,7 +523,7 @@ paths:
                           - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                           - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
                         started_at: '2026-10-22T10:15:00Z'
-                        command: --mode emulation --instruments NG-12.26,SBER
+                        command: '{"kind": "emulation", "instruments": ["NG-12.26", "SBER"]}'
                         rejections: []
                         pid: 81412
                         exit_code: null
@@ -484,6 +541,7 @@ paths:
                 adopted:
                   summary: После рестарта ядра подхвачен живой контур
                   value:
+                    limits: {max_history_runs: 2, running: 0, queued: 0}
                     contours:
                       - id: emulation
                         kind: emulation
@@ -492,7 +550,7 @@ paths:
                         instruments:
                           - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                         started_at: '2026-10-24T09:00:05Z'
-                        command: --mode emulation --instruments NG-12.26
+                        command: '{"kind": "emulation", "instruments": ["NG-12.26"]}'
                         rejections: []
                         pid: 81412
                         exit_code: null
@@ -510,6 +568,7 @@ paths:
                 stopping:
                   summary: Контур доживает сделки после stop no_entries
                   value:
+                    limits: {max_history_runs: 2, running: 0, queued: 0}
                     contours:
                       - id: emulation
                         kind: emulation
@@ -518,7 +577,7 @@ paths:
                         instruments:
                           - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                         started_at: '2026-10-22T10:15:00Z'
-                        command: --mode emulation --instruments NG-12.26
+                        command: '{"kind": "emulation", "instruments": ["NG-12.26"]}'
                         rejections: []
                         pid: 81412
                         exit_code: null
@@ -536,6 +595,7 @@ paths:
                 failed:
                   summary: Процесс контура упал
                   value:
+                    limits: {max_history_runs: 2, running: 0, queued: 0}
                     contours:
                       - id: emulation
                         kind: emulation
@@ -544,7 +604,7 @@ paths:
                         instruments:
                           - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                         started_at: '2026-10-22T10:15:00Z'
-                        command: --mode emulation --instruments NG-12.26
+                        command: '{"kind": "emulation", "instruments": ["NG-12.26"]}'
                         rejections: []
                         pid: null
                         exit_code: 1
@@ -552,19 +612,23 @@ paths:
                         recovery: null
                         actual: null
                         members: []
+        '400':
+          description: '`kind` не `emulation` и не `history` или `limit` вне 1–200.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiError'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
     post:
       tags: [Contours]
-      summary: Запустить торговлю эмуляции выбранными инструментами
+      summary: Запустить эмуляцию или поставить прогон истории в очередь
       description: |
-        Работает, когда робот ждёт команду: запущен с `--mode emulation
-        --wait-command` и ещё не торгует, либо контур уже остановлен
-        (`stopped`) или упал (`failed`) — тогда ядро запускает процесс
-        контура заново, приём данных не перезапускается, набор может быть
-        другим. Принятая команда записывает желаемое «работает» новым
-        поколением. Инструменты разрешаются по тем же правилам, что
-        параметр `--instruments`:
+        **Эмуляция** (`kind: emulation`). Работает, когда робот ждёт команду
+        и ядро готово (`GET /api/v1/core` — `state: ready`), либо контур уже
+        остановлен (`stopped`) или упал (`failed`) — тогда ядро запускает
+        процесс контура заново, приём данных не перезапускается, набор может
+        быть другим. Принятая команда записывает желаемое «работает» новым
+        поколением. Инструменты разрешаются так:
 
         * `all` или поле не задано — все инструменты с привязками в `robot.toml`;
         * тикер акции — `SBER`;
@@ -577,6 +641,18 @@ paths:
         начинается ни по одному инструменту (`422`), робот продолжает ждать.
         Проверка у брокера ограничена 60 секундами; если не уложилась —
         `202`, итог виден в `GET /api/v1/contours`.
+
+        **История** (`kind: history`). Ставит прогон `from`–`to` (UTC, `to`
+        не входит) в очередь и сразу отвечает `202` с контуром прогона
+        `history-ГГГГММДД-ЧЧММСС`. Принимается всегда — без эмуляции и до
+        готовности ядра: свечи прогону даёт эмулятор данных. Одновременно
+        идут не больше `[contours] max_history_runs` прогонов, остальные
+        ждут (`queued`). До ответа проверяются форма и привязки токенов
+        (семейство — автоматическая цепочка, контракт — фиксированный,
+        семейство вместе со своим контрактом — конфликт); контракты у
+        эмулятора и покрытие свечей проверяет процесс прогона, отказ виден
+        как `failed` с причиной. Инструмент, названный и в истории, и в
+        эмуляции, торгуется по одним привязкам `robot.toml`.
       operationId: startContour
       security:
         - ControlToken: []
@@ -596,6 +672,9 @@ paths:
               everything:
                 summary: Все инструменты с привязками
                 value: {kind: emulation}
+              history:
+                summary: Прогон истории газа за неделю без пауз
+                value: {kind: history, from: '2026-09-01 10:00', to: '2026-09-08 10:00', pause: 0, instruments: [NG]}
       responses:
         '201':
           description: |
@@ -616,7 +695,7 @@ paths:
                   - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                   - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
                 started_at: '2026-10-22T10:15:00Z'
-                command: --mode emulation --instruments NG-12.26,SBER
+                command: '{"kind": "emulation", "instruments": ["NG-12.26", "SBER"]}'
                 rejections: []
                 pid: 81412
                 exit_code: null
@@ -625,14 +704,17 @@ paths:
                 actual: null
                 members: []
         '202':
-          description: Проверка инструментов у брокера ещё идёт; итог — в `GET /api/v1/contours`.
+          description: |
+            Эмуляция: проверка инструментов у брокера ещё идёт; итог — в
+            `GET /api/v1/contours`. История: прогон принят в очередь,
+            `Location` — его адрес.
           headers:
             Location:
-              schema: {type: string, example: /api/v1/contours}
+              schema: {type: string, example: /api/v1/contours/history-20261024-101500}
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Contour'
+                $ref: '#/components/schemas/AnyContour'
               example:
                 id: emulation
                 kind: emulation
@@ -649,25 +731,35 @@ paths:
                 actual: null
                 members: []
         '400':
-          description: Тело не JSON, неизвестные поля, `kind` не `emulation` или `instruments` не список строк.
+          description: |
+            Тело не JSON, неизвестные поля, `kind` не `emulation` и не
+            `history` (`UNSUPPORTED_KIND`), `instruments` не список строк; у
+            истории — нет или неразборчивые `from`/`to`, начало не раньше
+            конца, `pause` не число или отрицательная.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
               example:
-                code: UNSUPPORTED_KIND
-                message: В этом процессе командой запускается только эмуляция.
+                code: INVALID_REQUEST
+                message: Начало диапазона (2026-09-08 10:00) должно быть раньше конца (2026-09-01 10:00). Прогон не запущен.
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '409':
           description: |
-            `ALREADY_RUNNING` — контур запускается или торгует (командой,
-            параметрами или меню); `STOPPING` — контур выполняет остановку и
-            доживает сделки: дождитесь `stopped` или вызовите stop с `close_all`.
+            Только эмуляция. `ALREADY_RUNNING` — контур запускается или
+            торгует; `STOPPING` — контур выполняет остановку и доживает
+            сделки: дождитесь `stopped` или вызовите stop с `close_all`;
+            `CORE_NOT_READY` — ядро стартует или повторяет старт, тело
+            содержит его состояние; `CONTOUR_DIR_BUSY` — папку контура держит
+            процесс, который не подтверждает себя контуром, тело содержит
+            его `pid`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ContourConflict'
+                oneOf:
+                  - {$ref: '#/components/schemas/ContourConflict'}
+                  - {$ref: '#/components/schemas/CoreNotReady'}
               example:
                 code: ALREADY_RUNNING
                 message: Контур эмуляции уже торгует; набор инструментов не изменён.
@@ -675,11 +767,11 @@ paths:
                   id: emulation
                   kind: emulation
                   state: running
-                  source: cli
+                  source: api
                   instruments:
                     - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                   started_at: '2026-10-22T09:00:00Z'
-                  command: --mode emulation --instruments NG-12.26
+                  command: '{"kind": "emulation", "instruments": ["NG-12.26"]}'
                   rejections: []
                   pid: 81412
                   exit_code: null
@@ -688,7 +780,9 @@ paths:
                   actual: null
                   members: []
         '422':
-          description: Хотя бы один инструмент отклонён; торговля не начата, робот ждёт новую команду.
+          description: |
+            Хотя бы один инструмент отклонён; эмуляция не начата, робот ждёт
+            новую команду; прогон истории не поставлен в очередь.
           content:
             application/json:
               schema:
@@ -712,7 +806,63 @@ paths:
           description: Контур, тот же объект, что в списке.
           content:
             application/json:
-              schema: {$ref: '#/components/schemas/Contour'}
+              schema: {$ref: '#/components/schemas/AnyContour'}
+              examples:
+                historyRunning:
+                  summary: Прогон истории идёт
+                  value:
+                    id: history-20261024-101500
+                    kind: history
+                    state: running
+                    request: {from: '2026-09-01 10:00', to: '2026-09-08 10:00', pause: 0.0, instruments: [NG]}
+                    accepted_at: '2026-10-24T10:15:00Z'
+                    started_at: '2026-10-24T10:15:02Z'
+                    finished_at: null
+                    queue_position: null
+                    pid: 90311
+                    exit_code: null
+                    reason: null
+                    market_data_sync: {status: synchronized, snapshot_generation: 41}
+                    actual:
+                      phase: running
+                      start: '2026-09-01T10:00:00Z'
+                      end: '2026-09-08T10:00:00Z'
+                      market_now: '2026-09-04T12:00:00Z'
+                      ticks: 4440
+                      progress: 0.4405
+                    result: null
+                    dir: contours/history/20261024-101500
+                historyFinished:
+                  summary: Прогон истории закончен
+                  value:
+                    id: history-20261024-101500
+                    kind: history
+                    state: finished
+                    request: {from: '2026-09-01 10:00', to: '2026-09-08 10:00', pause: 0.0, instruments: [NG]}
+                    accepted_at: '2026-10-24T10:15:00Z'
+                    started_at: '2026-10-24T10:15:02Z'
+                    finished_at: '2026-10-24T10:41:10Z'
+                    queue_position: null
+                    pid: null
+                    exit_code: 0
+                    reason: null
+                    market_data_sync: {status: synchronized, snapshot_generation: 41}
+                    actual:
+                      phase: finishing
+                      start: '2026-09-01T10:00:00Z'
+                      end: '2026-09-08T10:00:00Z'
+                      market_now: '2026-09-08T10:00:00Z'
+                      ticks: 10080
+                      progress: 1.0
+                    result:
+                      covered: true
+                      stop_reason: диапазон [2026-09-01 10:00 — 2026-09-08 10:00) обработан полностью
+                      trades: 7
+                      net_pnl: '1234.50'
+                      fees: '56.00'
+                      balance: '101234.50'
+                      open_positions: []
+                    dir: contours/history/20261024-101500
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '404': {$ref: '#/components/responses/ContourNotFound'}
@@ -735,13 +885,18 @@ paths:
 
         Повтор той же команды безопасен (`200`, поколение прежнее).
         `close_all` поверх `no_entries` принимается, обратно — `409`.
-        Ctrl+C в консоли ядра останавливает процесс контура, не меняя
+        Ctrl+C в консоли робота останавливает процесс контура, не меняя
         желаемое.
+
+        **Прогон истории** (`history-…`): тело можно не передавать, `mode`
+        не применяется. Прогон из очереди убирается (`cancelled`), идущий
+        останавливается после тика и пишет отчёт «остановлено оператором»
+        (`stopping` → `stopped`). Ответ `200` содержит прогон после команды.
       operationId: stopContour
       security:
         - ControlToken: []
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: {$ref: '#/components/schemas/ContourStopRequest'}
@@ -771,7 +926,7 @@ paths:
                   instruments:
                     - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                   started_at: '2026-10-22T10:15:00Z'
-                  command: --mode emulation --instruments NG-12.26
+                  command: '{"kind": "emulation", "instruments": ["NG-12.26"]}'
                   rejections: []
                   pid: 81412
                   exit_code: null
@@ -787,12 +942,15 @@ paths:
                   members:
                     - {name: NG-12.26, instrument_type: future, desired: active, remove_mode: null, actual: trading}
         '200':
-          description: Повтор той же остановки; поколение не изменилось.
+          description: Эмуляция — повтор той же остановки, поколение не изменилось; прогон истории — команда принята.
           content:
             application/json:
-              schema: {$ref: '#/components/schemas/ContourStopAccepted'}
+              schema:
+                oneOf:
+                  - {$ref: '#/components/schemas/ContourStopAccepted'}
+                  - {$ref: '#/components/schemas/HistoryStopAccepted'}
         '400':
-          description: 'Тело не `{"mode": "no_entries" | "close_all"}`.'
+          description: 'Тело остановки эмуляции не `{"mode": "no_entries" | "close_all"}`.'
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiError'}
@@ -802,8 +960,8 @@ paths:
         '409':
           description: |
             `NOT_RUNNING` — процесс контура не работает (`waiting_command`,
-            `stopped`, `failed`); `MODE_CONFLICT` — `no_entries` поверх
-            `close_all`.
+            `stopped`, `failed`) или прогон истории уже завершён;
+            `MODE_CONFLICT` — `no_entries` поверх `close_all`.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ContourConflict'}
@@ -869,7 +1027,7 @@ paths:
                     - {token: SBER, name: SBER, instrument_type: share, days_to_expiry: null}
                     - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
                   started_at: '2026-10-24T10:15:00Z'
-                  command: --mode emulation --instruments SBER
+                  command: '{"kind": "emulation", "instruments": ["SBER"]}'
                   rejections: []
                   pid: 81412
                   exit_code: null
@@ -902,7 +1060,8 @@ paths:
           description: |
             `NOT_RUNNING` — процесс контура не работает; `STOPPING` — контур
             выполняет остановку; `MODE_CONFLICT` — `no_entries` поверх
-            `close_all` у убираемого инструмента.
+            `close_all` у убираемого инструмента; `NOT_SUPPORTED` — прогон
+            истории: его состав после приёма не меняется.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ContourConflict'}
@@ -923,9 +1082,10 @@ paths:
       tags: [Contours]
       summary: Последние строки журнала процесса контура
       description: |
-        Строки `data/contours/<id>/bot_debug.log` так, как они записаны:
-        секреты в журнале уже заменены на `[скрыто]`. Нет журнала — пустой
-        ответ.
+        Строки `data/contours/emulation/bot_debug.log` или
+        `data/contours/history/<имя прогона>/bot_debug.log` так, как они
+        записаны: секреты в журнале уже заменены на `[скрыто]`. Нет
+        журнала — пустой ответ.
       operationId: getContourLog
       security:
         - ControlToken: []
@@ -957,7 +1117,7 @@ components:
       name: contour_id
       in: path
       required: true
-      description: Идентификатор контура; в этой версии — `emulation`.
+      description: Идентификатор контура — `emulation` или прогон истории `history-ГГГГММДД-ЧЧММСС[-N]`.
       schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$', example: emulation}
   securitySchemes:
     ExportToken:
@@ -973,6 +1133,12 @@ components:
         Ключ управления контуром — значение `ROBOT_CONTROL_TOKEN` из `.env`.
         Не даёт доступа к экспорту, а ключ экспорта не даёт управления.
   responses:
+    ExportDisabled:
+      description: 'Экспорт выключен: `[market_data] export_enabled = false`.'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ApiError'}
+          example: {code: EXPORT_DISABLED, message: 'Экспорт выключен: [market_data] export_enabled = false.'}
     ContourNotFound:
       description: Неизвестный идентификатор контура.
       content:
@@ -1019,7 +1185,10 @@ components:
             code: FORBIDDEN_HOST
             message: Управление доступно только по адресу 127.0.0.1, localhost или [::1].
     Unavailable:
-      description: Локальное рыночное хранилище временно недоступно.
+      description: |
+        Локальное рыночное хранилище временно недоступно или ядро ещё не
+        открыло его (`MARKET_DATA_NOT_READY`: робот запущен, ядро стартует
+        или повторяет старт — см. `GET /api/v1/core`).
       content:
         application/json:
           schema:
@@ -1257,19 +1426,43 @@ components:
           format: int64
           minimum: 0
     ContourLaunchRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/EmulationLaunchRequest'}
+        - {$ref: '#/components/schemas/HistoryLaunchRequest'}
+      discriminator:
+        propertyName: kind
+        mapping:
+          emulation: '#/components/schemas/EmulationLaunchRequest'
+          history: '#/components/schemas/HistoryLaunchRequest'
+    EmulationLaunchRequest:
       type: object
       additionalProperties: false
       required: [kind]
       properties:
-        kind:
-          type: string
-          enum: [emulation]
-          description: Вид контура. В этой версии командой запускается только эмуляция.
+        kind: {type: string, enum: [emulation]}
         instruments:
           type: array
           minItems: 1
           items: {type: string, minLength: 1}
           description: Токены инструментов; без поля — `all`.
+    HistoryLaunchRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, from, to]
+      properties:
+        kind: {type: string, enum: [history]}
+        from: {type: string, example: '2026-09-01 10:00', description: 'Начало, ГГГГ-ММ-ДД ЧЧ:ММ; без зоны — UTC.'}
+        to: {type: string, example: '2026-09-08 10:00', description: 'Конец, не входит в прогон.'}
+        pause:
+          type: number
+          minimum: 0
+          default: 1
+          description: Пауза между тиками, секунд; на сделки не влияет.
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Токены инструментов; без поля — `all`. Семейство — автоматическая цепочка, контракт — фиксированный.
     ContourInstrument:
       type: object
       additionalProperties: false
@@ -1292,8 +1485,25 @@ components:
     CoreState:
       type: object
       additionalProperties: false
-      required: [version, pid, started_at, heartbeat, market_data, quotas]
+      required: [state, error, attempts, next_retry_at, version, pid, started_at, heartbeat, market_data, quotas]
       properties:
+        state:
+          type: string
+          enum: [starting, ready, retrying, failed]
+          description: |
+            `starting` — идёт попытка старта ядра (рыночная база, полосы);
+            `ready` — ядро работает; `retrying` — попытка не удалась,
+            следующая в `next_retry_at` (паузы 30 с → 5 мин); `failed` — нет
+            `TINKOFF_TOKEN`, повтора нет. Эмуляция ждёт `ready`, история — нет.
+        error:
+          type: string
+          nullable: true
+          description: Причина последней неудачи старта — тип и текст ошибки без секретов.
+        attempts: {type: integer, minimum: 0, description: Число попыток старта ядра.}
+        next_retry_at:
+          type: string
+          format: date-time
+          nullable: true
         version: {type: string, example: 7.1.0}
         pid: {type: integer}
         started_at: {type: string, format: date-time, nullable: true}
@@ -1368,7 +1578,7 @@ components:
           type: string
           nullable: true
           enum: [cli, menu, api, null]
-          description: Откуда пришёл запуск; null, пока робот ждёт команду.
+          description: Откуда пришёл запуск; null, пока робот ждёт команду. `cli` и `menu` — только у желаемого прежних версий.
         instruments:
           type: array
           description: Текущий желаемый активный состав; после команд состава — уже новый, а не состав запуска.
@@ -1380,7 +1590,7 @@ components:
         command:
           type: string
           nullable: true
-          description: Эквивалентная команда запуска; контракты коротким именем.
+          description: 'Эквивалентная команда — тело `POST /api/v1/contours` (JSON строкой); контракты коротким именем.'
         rejections:
           type: array
           description: Отказы последней отклонённой команды.
@@ -1510,11 +1720,118 @@ components:
     ContourList:
       type: object
       additionalProperties: false
-      required: [contours]
+      required: [contours, limits]
       properties:
         contours:
           type: array
-          items: {$ref: '#/components/schemas/Contour'}
+          items: {$ref: '#/components/schemas/AnyContour'}
+        limits: {$ref: '#/components/schemas/ContourLimits'}
+    ContourLimits:
+      type: object
+      additionalProperties: false
+      required: [max_history_runs, running, queued]
+      properties:
+        max_history_runs: {type: integer, minimum: 0, description: '`[contours] max_history_runs`.'}
+        running: {type: integer, minimum: 0, description: Прогонов истории в работе (не в очереди).}
+        queued: {type: integer, minimum: 0, description: Прогонов в очереди.}
+    AnyContour:
+      oneOf:
+        - {$ref: '#/components/schemas/Contour'}
+        - {$ref: '#/components/schemas/HistoryContour'}
+      discriminator:
+        propertyName: kind
+        mapping:
+          emulation: '#/components/schemas/Contour'
+          history: '#/components/schemas/HistoryContour'
+    HistoryContour:
+      type: object
+      additionalProperties: false
+      description: Прогон истории — контур вида `history`, отдельный процесс в `data/contours/history/<имя>/`.
+      required: [id, kind, state, request, accepted_at, started_at, finished_at, queue_position, pid, exit_code,
+                 reason, market_data_sync, actual, result, dir]
+      properties:
+        id: {type: string, example: history-20261024-101500}
+        kind: {type: string, enum: [history]}
+        state:
+          type: string
+          enum: [queued, starting, running, stopping, finished, stopped, failed, cancelled, interrupted]
+          description: |
+            `queued` — ждёт места в очереди; `starting` — робот сверяет
+            импорт и запускает процесс; `running` — процесс жив; `stopping` —
+            стоп запрошен; `finished` — отчёт записан, код 0; `stopped` —
+            остановлен командой или Ctrl+C, отчёт записан; `failed` — процесс
+            не запустился, прогон отклонён (контракты, предпроверка) или
+            упал; `cancelled` — убран из очереди командой или остановкой
+            робота; `interrupted` — робот перезапущен, а процесса прогона
+            нет. После рестарта робота очередь не возобновляется.
+        request:
+          type: object
+          additionalProperties: false
+          required: [from, to, pause, instruments]
+          properties:
+            from: {type: string, example: '2026-09-01 10:00'}
+            to: {type: string, example: '2026-09-08 10:00'}
+            pause: {type: number, minimum: 0}
+            instruments:
+              type: array
+              items: {type: string}
+        accepted_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time, nullable: true}
+        finished_at: {type: string, format: date-time, nullable: true}
+        queue_position: {type: integer, minimum: 1, nullable: true, description: Место в очереди; только у `queued`.}
+        pid: {type: integer, nullable: true, description: 'PID процесса прогона, пока он жив.'}
+        exit_code: {type: integer, nullable: true}
+        reason: {type: string, nullable: true, description: 'Причина отказа, отмены или сбоя.'}
+        market_data_sync:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [status, snapshot_generation]
+          description: Сверка импорта My Robot в эмуляторе данных перед стартом; без подтверждения прогон идёт без снимка.
+          properties:
+            status: {type: string, nullable: true, example: synchronized}
+            snapshot_generation: {type: integer, nullable: true}
+        actual:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [phase, start, end, market_now, ticks, progress]
+          description: Ход прогона из его `status.json`.
+          properties:
+            phase:
+              type: string
+              nullable: true
+              enum: [checking, running, finishing, null]
+              description: '`checking` — контракты и предпроверка, `running` — тики, `finishing` — отчёт.'
+            start: {type: string, format: date-time, nullable: true, description: Начало с учётом сдвига на первую свечу.}
+            end: {type: string, format: date-time, nullable: true}
+            market_now: {type: string, format: date-time, nullable: true}
+            ticks: {type: integer, nullable: true}
+            progress: {type: number, nullable: true, minimum: 0, maximum: 1}
+        result:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [covered, stop_reason, trades, net_pnl, fees, balance, open_positions]
+          description: Итог из `report.json` прогона.
+          properties:
+            covered: {type: boolean, nullable: true}
+            stop_reason: {type: string, nullable: true}
+            trades: {type: integer, nullable: true}
+            net_pnl: {type: string, nullable: true}
+            fees: {type: string, nullable: true}
+            balance: {type: string, nullable: true}
+            open_positions:
+              type: array
+              nullable: true
+              items: {type: string}
+        dir: {type: string, example: contours/history/20261024-101500, description: Папка прогона относительно папки данных.}
+    HistoryStopAccepted:
+      type: object
+      additionalProperties: false
+      required: [contour]
+      properties:
+        contour: {$ref: '#/components/schemas/HistoryContour'}
     ContourConflict:
       type: object
       additionalProperties: false
@@ -1522,9 +1839,18 @@ components:
       properties:
         code:
           type: string
-          enum: [ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT]
+          enum: [ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CONTOUR_DIR_BUSY, NOT_SUPPORTED]
         message: {type: string}
-        contour: {$ref: '#/components/schemas/Contour'}
+        pid: {type: integer, description: 'Только у `CONTOUR_DIR_BUSY`: процесс, который держит папку контура.'}
+        contour: {$ref: '#/components/schemas/AnyContour'}
+    CoreNotReady:
+      type: object
+      additionalProperties: false
+      required: [code, message, core]
+      properties:
+        code: {type: string, enum: [CORE_NOT_READY]}
+        message: {type: string}
+        core: {$ref: '#/components/schemas/CoreState'}
     LaunchRejected:
       type: object
       additionalProperties: false

@@ -8,6 +8,10 @@
 Таблица ``heartbeat`` — пульс ядра (add-contour-recovery): pid, версия, время
 старта и последнего удара, ``running`` / ``stopped``. Контур читает её
 ``read_heartbeat`` и без свежего удара перестаёт входить в новые сделки.
+
+Таблица ``history_runs`` — журнал прогонов истории (add-history-contour):
+запрос, состояние, времена, pid, итог и флаг стопа. Процесс прогона читает
+свою строку только на чтение (``read_history_stop``).
 """
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ STOP_MODES = (NO_ENTRIES, CLOSE_ALL)
 ACCEPTED, REJECTED, CONFLICT, IGNORED = "accepted", "rejected", "conflict", "ignored"
 # Состояния пульса ядра.
 BEAT_RUNNING, BEAT_STOPPED = "running", "stopped"
+# Состояния прогона истории; первые четыре — прогон ещё не завершён.
+RUN_QUEUED, RUN_STARTING, RUN_RUNNING, RUN_STOPPING = "queued", "starting", "running", "stopping"
+RUN_FINISHED, RUN_STOPPED, RUN_FAILED = "finished", "stopped", "failed"
+RUN_CANCELLED, RUN_INTERRUPTED = "cancelled", "interrupted"
+RUN_ACTIVE = (RUN_QUEUED, RUN_STARTING, RUN_RUNNING, RUN_STOPPING)
 
 
 def _now() -> str:
@@ -106,6 +115,50 @@ def read_heartbeat(path: Path) -> Heartbeat | None:
             return _heartbeat(conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone())
         except sqlite3.OperationalError:
             return None  # база ядра версии до add-contour-recovery
+
+
+@dataclass(frozen=True)
+class HistoryRun:
+    """Строка журнала прогонов истории."""
+
+    run_id: str
+    directory: str
+    request: dict
+    state: str
+    accepted_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    pid: int | None = None
+    exit_code: int | None = None
+    reason: str | None = None
+    stop_requested: bool = False
+    market_data_sync: dict | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.state in RUN_ACTIVE
+
+
+def _history_run(row) -> HistoryRun | None:
+    if row is None:
+        return None
+    return HistoryRun(row["run_id"], row["directory"], json.loads(row["request_json"]), row["state"],
+                      row["accepted_at"], row["started_at"], row["finished_at"], row["pid"], row["exit_code"],
+                      row["reason"], bool(row["stop_requested"]),
+                      None if row["sync_json"] is None else json.loads(row["sync_json"]))
+
+
+def read_history_stop(path: Path, run_id: str) -> bool:
+    """Сторона прогона: запрошен ли стоп своей строки; база только на чтение."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)) as conn:
+        try:
+            row = conn.execute("SELECT stop_requested FROM history_runs WHERE run_id=?", (run_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return False
+    return bool(row and row[0])
 
 
 @dataclass(frozen=True)
@@ -266,6 +319,20 @@ class CoreStateStore:
                     beat_at TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN ('running', 'stopped'))
                 );
+                CREATE TABLE IF NOT EXISTS history_runs (
+                    run_id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    pid INTEGER,
+                    exit_code INTEGER,
+                    reason TEXT,
+                    stop_requested INTEGER NOT NULL DEFAULT 0,
+                    sync_json TEXT
+                );
             """)
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
@@ -310,6 +377,48 @@ class CoreStateStore:
     def heartbeat(self) -> Heartbeat | None:
         with self._connect() as conn:
             return _heartbeat(conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone())
+
+    # ── Прогоны истории (add-history-contour) ──
+
+    def add_history_run(self, run_id: str, directory: str, request: dict) -> HistoryRun:
+        """Новый прогон в очереди; ``run_id`` уникален — его подбирает очередь."""
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO history_runs(run_id,directory,request_json,state,accepted_at)
+                VALUES(?,?,?,?,?)""", (run_id, directory, json.dumps(request, ensure_ascii=False), RUN_QUEUED, now))
+        return HistoryRun(run_id, directory, dict(request), RUN_QUEUED, now)
+
+    def update_history_run(self, run_id: str, **fields) -> HistoryRun | None:
+        """Поля прогона: ``state``, времена, ``pid``, ``exit_code``, ``reason``, ``stop_requested``, ``market_data_sync``."""
+        columns = {"market_data_sync": "sync_json"}
+        values = {columns.get(name, name): (json.dumps(value, ensure_ascii=False, default=str)
+                                            if name == "market_data_sync" and value is not None
+                                            else int(value) if name == "stop_requested" else value)
+                  for name, value in fields.items()}
+        with self._lock, self._connect() as conn:
+            if values:
+                conn.execute(f"UPDATE history_runs SET {', '.join(f'{name}=?' for name in values)} WHERE run_id=?",
+                             (*values.values(), run_id))
+            return _history_run(conn.execute("SELECT * FROM history_runs WHERE run_id=?", (run_id,)).fetchone())
+
+    def history_run(self, run_id: str) -> HistoryRun | None:
+        with self._connect() as conn:
+            return _history_run(conn.execute("SELECT * FROM history_runs WHERE run_id=?", (run_id,)).fetchone())
+
+    def history_runs(self, *, active: bool | None = None, limit: int | None = None) -> list[HistoryRun]:
+        """Прогоны по времени приёма: ``active=True`` — незавершённые (старые первыми), ``False`` — завершённые (новые первыми)."""
+        marks = ",".join("?" * len(RUN_ACTIVE))
+        if active is None:
+            sql, args = "SELECT * FROM history_runs ORDER BY accepted_at DESC, run_id DESC", ()
+        elif active:
+            sql, args = f"SELECT * FROM history_runs WHERE state IN ({marks}) ORDER BY accepted_at, run_id", RUN_ACTIVE
+        else:
+            sql = f"SELECT * FROM history_runs WHERE state NOT IN ({marks}) ORDER BY accepted_at DESC, run_id DESC"
+            args = RUN_ACTIVE
+        if limit is not None:
+            sql, args = sql + " LIMIT ?", (*args, limit)
+        with self._connect() as conn:
+            return [_history_run(row) for row in conn.execute(sql, args).fetchall()]
 
     def record_launch(self, contour_id: str, kind: str, instruments, *, source: str = "", command: str = "",
                       payload: dict | None = None, members=None) -> int:

@@ -31,7 +31,7 @@ SCENARIOS = {
     7: ("test_source_absent_execution", "test_late_candle_flags_touched_stop_without_changing_facts"),
     8: ("test_request_arbiter", "test_waiting_live_lane_keeps_freed_slot_from_borrowers"),
     9: ("test_request_arbiter", "test_rate_limit_of_quotes_does_not_stop_instruments"),
-    10: ("test_early_start", "test_live_launch_starts_market_data_before_instrument_selection"),
+    10: ("test_early_start", "test_core_start_opens_market_data_then_attaches_export"),
     11: ("test_acceptance_matrix", "test_11_restart_continues_from_saved_checks_without_rescan"),
     12: ("test_lanes", "test_obligation_minutes_go_first"),
     13: ("test_acceptance_matrix", "test_13_two_positions_first_then_pairs_in_turn"),

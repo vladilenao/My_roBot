@@ -67,6 +67,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "heartbeat_secs": "contours_heartbeat_secs",
         "heartbeat_timeout_secs": "contours_heartbeat_timeout_secs",
         "autostart": "contours_autostart",
+        "max_history_runs": "contours_max_history_runs",
     },
     "instruments": {
         "fallback_type": "instrument_type",
@@ -141,6 +142,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_heartbeat_secs": int,
     "contours_heartbeat_timeout_secs": int,
     "contours_autostart": bool,
+    "contours_max_history_runs": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -605,6 +607,8 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 isinstance(value, bool) or value < 1):
             raise ConfigError(f"{path}: [contours] {key.removeprefix('contours_')} должен быть целым числом > 0, "
                               f"получено {value!r}")
+        if key == "contours_max_history_runs" and (isinstance(value, bool) or not 1 <= value <= 8):
+            raise ConfigError(f"{path}: [contours] max_history_runs должен быть целым числом от 1 до 8, получено {value!r}")
         if key == "market_structure_redis_port" and value > 65535:
             raise ConfigError(f"{path}: [market_structure] redis_port не может быть больше 65535")
         if key == "market_structure_redis_db" and (isinstance(value, bool) or value < 0):

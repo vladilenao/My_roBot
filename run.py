@@ -1,31 +1,27 @@
-
 import src.grpc_fork  # noqa: F401  — первым, до загрузки gRPC
 from src import __version__
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
-from shutil import rmtree
 import os
 import sys
 
 from src.config import (
-    ACTIVE_TIMEFRAMES,
     CONTOURS_AUTOSTART,
     CONTOURS_FEED_POLL_SECS,
     CONTOURS_HEARTBEAT_SECS,
     CONTOURS_HEARTBEAT_TIMEOUT_SECS,
+    CONTOURS_MAX_HISTORY_RUNS,
     MARKET_DATA_DATABASE_FILE,
     trading_enabled,
-    DATA_REFRESH_MIN_INTERVAL,
-    MARKET_DATA_EXPORT_ENABLED,
     MARKET_DATA_SETTINGS,
+    MARKET_DATA_EXPORT_HOST,
+    MARKET_DATA_EXPORT_PORT,
     MARKET_DATA_EXPORT_TOKEN,
     ROBOT_CONTROL_TOKEN,
     MARKET_STRUCTURE_REDIS_PASSWORD,
     FUTURE_STRATEGIES,
     SHARE_STRATEGIES,
-    TICKER,
     TINKOFF_TOKEN,
-    INSTRUMENT_TYPE,
     LOGGING_SERVICE_UID,
     LOGGING_FILE,
     LOGGING_LEVEL,
@@ -37,37 +33,30 @@ from src.config import (
     CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN,
     INTRADAY_SETTINGS,
     runtime_dir,
-    run_dir_name,
-    HIST_DIR,
     HISTORICAL_LOGGING,
     HISTORICAL_SCHEDULE,
     HISTORICAL_ROLLOVER,
 )
-from src.api.client import client_context, default_client_provider
+from src.api.client import client_context
 from src.api.emulator_client import EmulatorClientProvider, EmulatorError
 from src.bot.launch import (
-    HISTORY_DEFAULT_PAUSE,
     MODE_EMULATION,
+    MODE_HISTORY,
     SOURCE_API,
-    SOURCE_MENU,
     LaunchError,
     LaunchRequest,
     Rejection,
-    RunConfigurationError,
     describe_choice,
     equivalent_command,
     parse_instrument_tokens,
     parse_launch_args,
-    parse_moment,
     resolve_emulation,
     resolve_history,
-    tokens_from_menu,
-    validate_range,
-    without_assignments,
 )
 from src.assembly.contour import ContourSettings, TradingContour, _family_warmup, _strategy_map
-from src.assembly.core import LiveCore, _say
+from src.assembly.core import CoreStarter, LiveCore, _say
 from src.assembly.history import HistoricalMarketServices
+from src.assembly.history_runs import HistoryRuns, clear_attempt
 from src.assembly.core_state import CORE_DATABASE_FILE, CoreStateStore
 from src.assembly.process import JournalMigrationError, contour_dir
 from src.assembly.pulse import CorePulseWriter
@@ -83,138 +72,31 @@ from src.history.report import (
 )
 from src.scheduler.clock import HistoricalClock
 from src.data.loader import load_candles
-from src.instruments import normalize_instrument
-from src.instruments.selector import select_instruments
+from src.instruments import Instrument, normalize_instrument
 from src.logging_setup import get_logger, setup_logging
 from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
 
 log = get_logger(__name__)
 
-MODE_LIVE = "live"
-MODE_HISTORY = "history"
-MOMENT_FORMAT = "%Y-%m-%d %H:%M"
+_SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
+            MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD)
 
 
-def ask_mode(no_prompt: bool = False) -> str:
-    """Режим прогона. ``--no-prompt`` — эмуляция без единого вопроса."""
-    if no_prompt:
-        return MODE_LIVE
-    print("=== Режим работы ===")
-    print("  1. Эмуляция (живые данные, симулятор исполнения)")
-    print("  2. Историческая торговля (локальный эмулятор данных, заданный диапазон)")
-    while True:
-        answer = input("Выбор режима (1/2): ").strip()
-        if answer == "1":
-            return MODE_LIVE
-        if answer == "2":
-            return MODE_HISTORY
-        print("Нужен ответ 1 или 2.")
-
-
-def ask_emulation_source() -> bool:
-    """Меню эмуляции: ``True`` — ждать команду API, ``False`` — выбрать инструменты сейчас."""
-    print("Инструменты: выбрать сейчас — 1, ждать команду API — 2")
-    while True:
-        answer = input("Ваш выбор (1/2): ").strip()
-        if answer in ("1", ""):
-            return False
-        if answer == "2":
-            return True
-        print("Нужен ответ 1 или 2.")
-
-
-def ask_history_range() -> tuple[datetime, datetime, float]:
-    """Границы исторического прогона и пауза между тиками в секундах."""
-    start = _ask_moment("Начало диапазона")
-    end = _ask_moment("Конец диапазона (не входит в прогон)")
-    pause = _ask_pause()
-    return validate_range(start, end, pause)
-
-
-def _ask_moment(prompt: str) -> datetime:
-    while True:
-        raw = input(f"{prompt} (ГГГГ-ММ-ДД ЧЧ:ММ): ").strip()
-        try:
-            return parse_moment(raw)
-        except ValueError as exc:
-            print(str(exc))
-
-
-def _ask_pause() -> float:
-    while True:
-        raw = input(f"Пауза между тиками, с (Enter — {HISTORY_DEFAULT_PAUSE:g}): ").strip()
-        if not raw:
-            return HISTORY_DEFAULT_PAUSE
-        try:
-            value = float(raw)
-        except ValueError:
-            print("Пауза должна быть числом секунд.")
-            continue
-        if value < 0:
-            print("Пауза не может быть отрицательной.")
-            continue
-        return value
-
-
-def describe_scale(start: datetime, end: datetime, pause: float, timeframes=None) -> str:
-    """Оценка объёма прогона: тики, реальное время и каталог состояния."""
-    step = smallest_period(timeframes or (sorted(set(ACTIVE_TIMEFRAMES) | {"1m"})))
-    ticks = int((to_naive(end) - to_naive(start)).total_seconds() // step.total_seconds())
-    if pause:
-        waiting = f"Оценка реального времени при паузе {pause:g} с: {_duration(timedelta(seconds=ticks * pause))}"
-    else:
-        waiting = "Ожидание между тиками: нет (прогон без пауз, длительность определяется обработкой)"
-    return (
-        f"=== Масштаб прогона ===\n"
-        f"Шаг тика:        {step}\n"
-        f"Обработано тиков: {ticks}\n"
-        f"{waiting}\n"
-        f"Каталог состояния: {state_dir_for(start, end)}"
-    )
-
-
-def _duration(delta: timedelta) -> str:
-    seconds = int(delta.total_seconds())
-    if seconds < 60:
-        return f"{seconds} с"
-    if seconds < 3600:
-        return f"{seconds // 60} мин"
-    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
-
-
-def state_dir_for(start: datetime, end: datetime, started_at: datetime | None = None) -> Path:
-    """Каталог состояния исторического прогона — отдельный от боевого."""
-    return runtime_dir(Path(HIST_DIR)) / run_dir_name(
-        to_naive(start), to_naive(end), to_naive(started_at or datetime.now())
-    )
-
-
-def main(argv=None, no_prompt: bool = False):
-    """Точка входа: параметры командной строки или меню, затем общий путь запуска."""
+def main(argv=None):
+    """Точка входа: служебный вход процесса контура или робот без параметров (add-history-contour)."""
     argv = list(argv or [])
     if argv[:1] == ["--contour"]:
-        # Служебный вход процесса контура: его запускает ядро (add-contour-process).
-        return _run_contour(argv[1] if len(argv) > 1 else "")
-    if no_prompt and "--no-prompt" not in argv:
-        argv.append("--no-prompt")
+        # Служебный вход процесса контура: его запускает робот (add-contour-process).
+        return _run_contour(argv[1] if len(argv) > 1 else "", argv[2:])
     try:
-        request = parse_launch_args(argv)
+        parse_launch_args(argv)
     except LaunchError as exc:
         print(str(exc))
         return 2
-    if request is None:
-        try:
-            request = _menu_request()
-        except (RunConfigurationError, ValueError) as exc:
-            print(str(exc))
-            return 1
-    if request.mode == MODE_HISTORY:
-        print(describe_scale(request.start, request.end, request.pause))
-        return _run_history(request.start, request.end, request.pause, request)
-    return _run_live(request)
+    return _run_robot()
 
 
-def _run_contour(kind: str) -> int:
+def _run_contour(kind: str, args=()) -> int:
     """Процесс торгового контура: блокировка и журнал в своей папке, файл запуска, лента ядра (D1)."""
     import signal
 
@@ -227,8 +109,10 @@ def _run_contour(kind: str) -> int:
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
+    if kind == MODE_HISTORY:
+        return _run_history_contour(args[0] if args else "")
     if kind != MODE_EMULATION:
-        print(f"Неизвестный вид контура {kind!r}: поддерживается только {MODE_EMULATION}.")
+        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION} и {MODE_HISTORY}.")
         return 2
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -240,8 +124,7 @@ def _run_contour(kind: str) -> int:
         return 1
     setup_logging(
         service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE),
-        secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
-                 MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
+        secrets=_SECRETS,
         **_log_settings(False, None),
     )
     log.info("Контур %s v%s запущен", kind, __version__)
@@ -287,90 +170,200 @@ def _run_contour(kind: str) -> int:
     return 0
 
 
-def _menu_request() -> LaunchRequest:
-    """Меню собирает те же параметры запуска, что командная строка."""
-    if ask_mode() == MODE_HISTORY:
-        start, end, pause = ask_history_range()
-        return LaunchRequest(MODE_HISTORY, SOURCE_MENU, None, start=start, end=end, pause=pause)
-    return LaunchRequest(MODE_EMULATION, SOURCE_MENU, None, wait_command=ask_emulation_source())
+def _run_history_contour(name: str) -> int:
+    """Процесс прогона истории (add-history-contour): папка прогона, снимок от робота, прежний путь истории."""
+    import signal
 
+    from src.assembly.history_runs import RUN_PREFIX, HistoryProgress, history_dir
+    from src.assembly.process import LaunchFileError, StdinStop, read_launch
+    from src.bot.launch import parse_moment
 
-def _run_live(request: LaunchRequest | None = None):
+    data_dir = runtime_dir()
+    directory = history_dir(data_dir) / name
+    if not name or not directory.is_dir():
+        print(f"Нет папки прогона истории {directory}: прогон запускает робот командой API.")
+        return 2
     try:
-        code, _, _ = _launch(
-            state_dir=runtime_dir(),
-            client_provider=None,
-            clock=None,
-            session=build_run_session(MODE_LIVE),
-            channel_names=None,
-            launch=request,
-        )
+        acquire_runtime_lock(directory)
     except RuntimeLockError as exc:
         print(str(exc))
         return 1
+    setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE), secrets=_SECRETS,
+                  **_log_settings(True, None))
+    run_id = RUN_PREFIX + name
+    log.info("Прогон %s v%s запущен", run_id, __version__)
+    try:
+        launch = read_launch(directory, run_id)
+    except LaunchFileError as exc:
+        log.error("%s", exc)
+        print(str(exc))
+        return 2
+    stop = StdinStop()
+    stop.start()
+    # Ctrl+C в консоли доходит и до прогона: отчёт пишется после тика, а не обрывается.
+    signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    progress = HistoryProgress(directory, run_id=run_id, core_db=data_dir / CORE_DATABASE_FILE, version=__version__,
+                               interval=CONTOURS_HEARTBEAT_SECS, stop_event=stop.requested)
+    progress.start()
+    provider = EmulatorClientProvider()
+    provider.use_snapshot(launch.get("snapshot_generation"))
+    sync = MarketDataSync(**(launch.get("market_data_sync") or {}))
+    request = LaunchRequest(MODE_HISTORY, SOURCE_API, tuple(launch["instruments"]),
+                            start=parse_moment(launch["from"]), end=parse_moment(launch["to"]),
+                            pause=float(launch["pause"]))
+    code = 1
+    try:
+        code = _run_history(request.start, request.end, request.pause, request, state_dir=directory,
+                            provider=provider, market_data_sync=sync, progress=progress)
+    except Exception as exc:
+        log.exception("Прогон %s завершился сбоем", run_id)
+        progress.fail(f"сбой прогона: {type(exc).__name__}")
+        code = 1
+    finally:
+        progress.finish(code)
+    log.info("Прогон %s завершён с кодом %s", run_id, code)
     return code
 
 
-def _run_history(start, end, pause, request: LaunchRequest | None = None):
+def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
+    """Робот без параметров: API управления и очередь истории, затем ядро с повтором старта (add-history-contour)."""
+    state_dir = Path(state_dir or runtime_dir())
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        acquire_runtime_lock(state_dir)
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
+    setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(state_dir / LOGGING_FILE), secrets=_SECRETS,
+                  **_log_settings(False, None))
+    log.info("Робот v%s запущен", __version__)
+    if not ROBOT_CONTROL_TOKEN:
+        _say("Робот не запущен: в .env не задан ROBOT_CONTROL_TOKEN — без ключа управления роботом нельзя "
+             "управлять (эмуляция и история запускаются командами API).")
+        return 2
+    core_state = CoreStateStore(state_dir / CORE_DATABASE_FILE)
+    # Пульс — до любого решения о контурах: свежий контур не должен прочитать «остановлено» прошлого робота.
+    pulse = CorePulseWriter(core_state, pid=os.getpid(), version=__version__, interval=CONTOURS_HEARTBEAT_SECS)
+    pulse.start()
+    control = LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
+                            log_file=LOGGING_FILE)
+    control.accept_commands()
+    history = HistoryRuns(core_state, state_dir, max_runs=CONTOURS_MAX_HISTORY_RUNS, version=__version__,
+                          heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, share_strategies=SHARE_STRATEGIES,
+                          future_strategies=FUTURE_STRATEGIES, log_file=LOGGING_FILE,
+                          provider_factory=EmulatorClientProvider, say=_say)
+    history.recover()
+    control.history = history
+    core = LiveCore(state_dir, client_provider)
+    core.pulse = pulse
+    core.starter = CoreStarter(core, token_required=client_provider is None)
+    control.core_status = core.core_snapshot
+    control.contour_busy = lambda: _contour_busy(state_dir)
+    try:
+        server = core.start_control_api(control)
+    except OSError as exc:
+        _say(f"Робот не запущен: API управления не поднялся на {MARKET_DATA_EXPORT_HOST}:{MARKET_DATA_EXPORT_PORT} "
+             f"({type(exc).__name__}) — порт занят другим процессом?")
+        pulse.stop()
+        return 2
+    host, port = server.address
+    _say(f"Робот запущен, API: http://{host}:{port}")
+    history.start()
+    code = 0
+    try:
+        if core.starter.run():
+            code = _serve_emulation(state_dir, core, core_state, control, client_provider)
+        else:
+            _wait_for_ctrl_c()
+    except KeyboardInterrupt:
+        log.info("Робот останавливается по Ctrl+C")
+    finally:
+        # «Остановлено» в пульсе — раньше ожидания прогонов: подхваченные прогоны узнают об остановке из него.
+        pulse.stop()
+        history.close()
+        core.close()
+    return code
+
+
+def _wait_for_ctrl_c() -> None:
+    """Ядро не стартует без токена брокера: робот держит API и историю до Ctrl+C."""
+    import time
+
+    while True:
+        time.sleep(1)
+
+
+def _contour_busy(state_dir) -> int | None:
+    """pid процесса, который держит папку эмуляции и не подтверждает себя контуром; иначе ``None``."""
+    plan = contour_recovery.plan_recovery(
+        contour_dir(state_dir, MODE_EMULATION), version=__version__, desired=None, explicit=True, autostart=False,
+        timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS)
+    return plan.pid if plan.action == contour_recovery.BLOCKED else None
+
+
+def _serve_emulation(state_dir, core, core_state, control, client_provider) -> int:
+    """Ядро готово: судьба контура эмуляции (подхват, автоподъём) или ожидание команды, затем надзор."""
+    budget = None if core.early is None else core.early.request_budget
+    recovery = _recover_contour(state_dir, core_state, control)
+    if recovery.action in (contour_recovery.ADOPT, contour_recovery.AUTOSTART):
+        instruments = recovery.instruments()
+    else:
+        recovery = None
+        instruments = [normalize_instrument(item)
+                       for item in _await_command(control, core.export_server, client_provider, budget, None)]
+    core.ensure_market_data()
+
+    def next_launch():
+        """После выхода контура — следующая команда API (повторный запуск)."""
+        chosen = _await_command(control, core.export_server, client_provider,
+                                None if core.early is None else core.early.request_budget, None)
+        snapshot = control.snapshot()
+        return [normalize_instrument(item) for item in chosen], SOURCE_API, snapshot.get("command") or ""
+
+    def resolve_tokens(tokens):
+        """Токены команды состава — по правилам запуска, в главном потоке ядра (add-contour-membership)."""
+        request = LaunchRequest(MODE_EMULATION, SOURCE_API, parse_instrument_tokens(tokens))
+        return _resolve_request(request, client_provider,
+                                None if core.early is None else core.early.request_budget, None, history=False)
+
+    try:
+        return core.run_contour(instruments, kind=MODE_EMULATION, control=control, core_state=core_state,
+                                source=SOURCE_API, command=control.snapshot().get("command") or "",
+                                next_launch=next_launch, resolve=resolve_tokens, recovery=recovery)
+    except JournalMigrationError as exc:
+        print(str(exc))
+        return 2
+
+
+def _run_history(start, end, pause, request: LaunchRequest | None = None, *, state_dir, provider,
+                 market_data_sync: MarketDataSync | None = None, progress=None, instruments=None):
     """Прогон с повтором, если проверка сдвинула начало на первую доступную свечу.
 
-    Сдвиг меняет часы и каталог состояния, поэтому прогон собирается заново; уже
-    выбранные инструменты передаются в повтор, чтобы пользователя не спрашивали
-    второй раз. Повтор ровно один — границы для нового начала проверены.
+    Сдвиг меняет часы, поэтому прогон собирается заново в той же папке: файлы
+    журнала прошлой попытки удаляются, запуск, статус и логи остаются (add-history-contour).
+    Уже выбранные инструменты передаются в повтор. Повтор ровно один и идёт
+    на том же снимке эмулятора — сверку импорта сделал робот до старта.
     """
-    provider = EmulatorClientProvider()
-    try:
-        sync = provider.prepare_snapshot()
-    except EmulatorError as exc:
-        market_data_sync = MarketDataSync(reason=exc.message)
-        print(f"Импорт My Robot перед прогоном не подтверждён: {exc.message}")
-    else:
-        if sync["synchronized"]:
-            market_data_sync = MarketDataSync(
-                status="synchronized",
-                producer_id=sync["producer_id"],
-                target_change_id=sync["target_change_id"],
-                after_id=sync["after_id"],
-                snapshot_generation=sync["snapshot_generation"],
-            )
-            print(
-                "Импорт My Robot подтверждён: "
-                f"снимок {sync['snapshot_generation']}, "
-                f"курсор {sync['after_id']}/{sync['target_change_id']}."
-            )
-        else:
-            source = sync.get("source")
-            state = source.get("state") if isinstance(source, dict) else None
-            reason = (
-                f"эмулятор сообщил состояние {state}"
-                if state in {"incomplete", "blocked", "error"}
-                else "эмулятор не подтвердил полноту журнала"
-            )
-            market_data_sync = MarketDataSync(
-                producer_id=sync["producer_id"],
-                target_change_id=sync["target_change_id"],
-                after_id=sync["after_id"],
-                reason=reason,
-            )
-            print(f"Импорт My Robot перед прогоном не подтверждён: {reason}")
-    instruments = None
     for _ in range(2):
         clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
-        state_dir = state_dir_for(start, end)
+        session = build_run_session(MODE_HISTORY, clock)
+        if progress is not None:
+            progress.attach(clock, session)
         code, shifted, instruments = _launch(
             state_dir=state_dir,
             client_provider=provider,
             clock=clock,
-            session=build_run_session(MODE_HISTORY, clock),
+            session=session,
             channel_names=[],
             history=True,
             instruments=instruments,
             market_data_sync=market_data_sync,
             launch=request,
+            progress=progress,
         )
         if shifted is None:
             return code
-        rmtree(state_dir, ignore_errors=True)
+        clear_attempt(state_dir, LOGGING_FILE)
         start = shifted
     return code
 
@@ -475,188 +468,102 @@ def _launch(
     clock,
     session,
     channel_names,
-    history: bool = False,
+    history: bool = True,
     instruments=None,
     market_data_sync: MarketDataSync | None = None,
     launch: LaunchRequest | None = None,
-) -> tuple[int, datetime | None, list]:
-    """Единая сборка прогона: рыночные службы, затем торговый контур поверх них.
+    progress=None,
+) -> tuple[int, object, list]:
+    """Сборка исторического прогона: историческая служба данных, затем торговый контур поверх неё.
 
-    В эмуляции службы — ядро (``LiveCore``), в истории — историческая служба
-    данных (``HistoricalMarketServices``); контур (``TradingContour``) один и
-    тот же, поэтому исторический прогон идёт по тому же конвейеру, что и боевой.
+    Контур (``TradingContour``) тот же, что у эмуляции, поэтому исторический
+    прогон идёт по тому же конвейеру. Эмуляцию с add-history-contour собирает
+    ``_run_robot``; ``history`` остаётся для совместимости вызовов.
 
     Возвращает код завершения, сдвиг начала и выбранные инструменты: если
-    проверка перенесла начало на первую доступную свечу, собранные часы и каталог
-    уже не годятся, а прогонать диапазон должен вызывающий — он же передаст
-    сюда ``instruments``, чтобы не спрашивать пользователя повторно.
+    проверка перенесла начало на первую доступную свечу, собранные часы уже не
+    годятся, а прогонять диапазон должен вызывающий — он же передаст сюда
+    ``instruments``, чтобы не разрешать их повторно. ``progress`` —
+    ``HistoryProgress`` процесса прогона: фазы, отказы и причина для API.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    if not history:
-        acquire_runtime_lock(state_dir)
     setup_logging(
         service_uid=LOGGING_SERVICE_UID,
         log_file=str(state_dir / LOGGING_FILE),
-        secrets=(TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
-                 MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD),
-        **_log_settings(history, clock),
+        secrets=_SECRETS,
+        **_log_settings(True, clock),
     )
     log.info("Робот v%s запущен", __version__)
-    core = None
-    if not history:
-        core = LiveCore(state_dir, client_provider)
-        # Независимые полосы: данные собираются с момента запуска процесса, пока
-        # пользователь выбирает инструменты (add-independent-market-data-lanes).
-        if MARKET_DATA_SETTINGS.independent_lanes:
-            core.start_early()
-    # Локальный API — сразу после раннего сбора данных, до выбора инструментов:
-    # команда запуска приходит именно сюда (add-noninteractive-launch).
-    # Желаемое и журнал команд ядра (add-control-api): записываются при любом запуске эмуляции,
-    # иначе контур прочитал бы оставшуюся с прошлого раза остановку.
-    core_state = None if history else CoreStateStore(state_dir / CORE_DATABASE_FILE)
-    if core_state is not None:
-        # Пульс — до любого решения о контуре: свежий контур не должен прочитать «остановлено» прошлого ядра.
-        core.pulse = CorePulseWriter(core_state, pid=os.getpid(), version=__version__,
-                                     interval=CONTOURS_HEARTBEAT_SECS)
-        core.pulse.start()
-    control = (LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
-                             log_file=LOGGING_FILE)
-               if not history and ROBOT_CONTROL_TOKEN else None)
-    if control is not None:
-        if launch is not None and launch.wait_command:
-            control.accept_commands()
-        else:
-            control.mark_starting(SOURCE_MENU if launch is None else launch.source)
-    if core is not None and core.early is not None:
-        core.start_api(control)
-    recovery = None
-    if core_state is not None and instruments is None:
-        recovery = _recover_contour(state_dir, core_state, control, launch)
-        if recovery.action == contour_recovery.BLOCKED:
-            _stop_core(core)
-            return 2, None, None
-        if recovery.action in (contour_recovery.ADOPT, contour_recovery.AUTOSTART):
-            instruments = recovery.instruments()
-        else:
-            recovery = None
     if instruments is None:
-        try:
-            instruments = _choose_instruments(
-                launch, history=history, client_provider=client_provider, clock=clock,
-                early=None if core is None else core.early, control=control,
-                export_server=None if core is None else core.export_server,
-            )
-        except BaseException:
-            _stop_core(core)
-            raise
+        instruments = _history_instruments(launch, client_provider, clock, progress)
         if instruments is None:
-            _stop_core(core)
             return 2, None, None
-        if not isinstance(instruments, HistorySelection):
-            instruments = [normalize_instrument(item) for item in instruments]
+    if not isinstance(instruments, HistorySelection):
+        instruments = [item if isinstance(item, Instrument) else normalize_instrument(item) for item in instruments]
 
     selection = instruments if isinstance(instruments, HistorySelection) else None
     if selection is not None:
         try:
             selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS)
         except ValueError as exc:
-            print(f"Прогон невозможен — контрактная цепочка: {exc}")
-            return 2, None, selection
+            return _refused(f"Прогон невозможен — контрактная цепочка: {exc}", progress), None, selection
         instruments = selection.instruments
 
-    provider = client_provider if history or client_provider is not None else default_client_provider()
-    market_calendar = None
-    if history:
-        from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
+    provider = client_provider
+    from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
 
-        snapshot_store = SnapshotScheduleStore()
-        market_calendar = MarketCalendar(
-            snapshot_store,
-            EmulatorScheduleSource(snapshot_store, provider),
-            schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
-            allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
-        )
-        calendar_expectation = _historical_calendar_expectation(market_calendar)
-        if selection is not None:
-            # Рубежи экспирации уточняются по расписанию цепочки до сохранения и предпроверки.
-            _preload_history_schedule(market_calendar, selection, instruments, session)
-            try:
-                selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS,
-                                              cutoff_for=_history_expiry_cutoff(market_calendar))
-            except ValueError as exc:
-                print(f"Прогон невозможен — контрактная цепочка: {exc}")
-                return 2, None, selection
-            instruments = selection.instruments
-    else:
-        calendar_expectation = None
+    snapshot_store = SnapshotScheduleStore()
+    market_calendar = MarketCalendar(
+        snapshot_store,
+        EmulatorScheduleSource(snapshot_store, provider),
+        schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
+    )
+    calendar_expectation = _historical_calendar_expectation(market_calendar)
     if selection is not None:
+        # Рубежи экспирации уточняются по расписанию цепочки до сохранения и предпроверки.
+        _preload_history_schedule(market_calendar, selection, instruments, session)
+        try:
+            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS,
+                                          cutoff_for=_history_expiry_cutoff(market_calendar))
+        except ValueError as exc:
+            return _refused(f"Прогон невозможен — контрактная цепочка: {exc}", progress), None, selection
+        instruments = selection.instruments
         selection.save(state_dir)
         session.contract_selection = selection
 
-    if history:
-        if selection is not None and selection.families:
-            report = run_chain_preflight(selection,
-                requirements=_family_warmup, start=session.start, end=session.end,
-                load_candles=load_candles, client_provider=client_provider, clock=clock,
-                ping=_source_ping(client_provider),
-                coverage=_source_coverage(client_provider),
-                fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-                fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
-        else:
-            report = run_preflight(
-                active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-                start=session.start,
-                end=session.end,
-                warmup_bars=_warmup_bars(),
-                load_candles=load_candles,
-                client_provider=client_provider,
-                clock=clock,
-                ping=_source_ping(client_provider),
-                coverage=_source_coverage(client_provider),
-                calendar_expectation=calendar_expectation,
-            )
-        if not report.ok:
-            print(report.message())
-            return 2, None, selection or instruments
-        if report.start != session.start:
-            print(report.message())
-            return 3, report.start, selection or instruments
-        if report.notes:
-            print(report.message())
-        session.set_boundary_checks(report.boundaries)
-        if selection is None:
-            _preload_history_schedule(market_calendar, selection, instruments, session)
+    if selection is not None and selection.families:
+        report = run_chain_preflight(selection,
+            requirements=_family_warmup, start=session.start, end=session.end,
+            load_candles=load_candles, client_provider=client_provider, clock=clock,
+            ping=_source_ping(client_provider),
+            coverage=_source_coverage(client_provider),
+            fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
+    else:
+        report = run_preflight(
+            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            start=session.start,
+            end=session.end,
+            warmup_bars=_warmup_bars(),
+            load_candles=load_candles,
+            client_provider=client_provider,
+            clock=clock,
+            ping=_source_ping(client_provider),
+            coverage=_source_coverage(client_provider),
+            calendar_expectation=calendar_expectation,
+        )
+    if not report.ok:
+        return _refused(report.message(), progress), None, selection or instruments
+    if report.start != session.start:
+        print(report.message())
+        return 3, report.start, selection or instruments
+    if report.notes:
+        print(report.message())
+    session.set_boundary_checks(report.boundaries)
+    if selection is None:
+        _preload_history_schedule(market_calendar, selection, instruments, session)
 
-    if not history:
-        # Контур эмуляции — отдельный процесс на ленте ядра (add-contour-process).
-        core.ensure_market_data()
-        core.start_api(control)
-        def next_launch():
-            """После выхода контура — следующая команда API (повторный запуск); без API — Ctrl+C."""
-            if control is None or core.export_server is None:
-                return None
-            chosen = _await_command(control, core.export_server, client_provider,
-                                    None if core.early is None else core.early.request_budget, None)
-            snapshot = control.snapshot()
-            return [normalize_instrument(item) for item in chosen], SOURCE_API, snapshot.get("command") or ""
-
-        def resolve_tokens(tokens):
-            """Токены команды состава — по правилам запуска, в главном потоке ядра (add-contour-membership)."""
-            request = LaunchRequest(MODE_EMULATION, SOURCE_API, parse_instrument_tokens(tokens))
-            return _resolve_request(request, client_provider,
-                                    None if core.early is None else core.early.request_budget, None, history=False)
-
-        try:
-            code = core.run_contour(instruments, kind=MODE_EMULATION, control=control, core_state=core_state,
-                                    source="" if launch is None else launch.source,
-                                    command="" if control is None else control.snapshot().get("command") or "",
-                                    next_launch=next_launch, resolve=resolve_tokens, recovery=recovery)
-        except JournalMigrationError as exc:
-            print(str(exc))
-            code = 2
-        finally:
-            core.close()
-        return code, None, instruments
     services = HistoricalMarketServices(state_dir, clock, provider, market_calendar, report.boundaries)
     contour = TradingContour(ContourSettings(
         kind=MODE_HISTORY, state_dir=state_dir, channel_names=channel_names,
@@ -665,35 +572,62 @@ def _launch(
     ), services)
     try:
         contour.build()
+        if progress is not None:
+            progress.phase("running")
         contour.run(services.serve(contour.demand()))
     finally:
+        if progress is not None:
+            progress.phase("finishing")
         services.close()
         contour.finish()
         contour.close()
     return 0, None, selection or instruments
 
 
-def _recover_contour(state_dir, core_state, control, launch):
-    """Судьба контура при старте ядра: подхват, замена другой версии, автоподъём (add-contour-recovery)."""
+def _refused(message: str, progress) -> int:
+    """Прогон отклонён до первого тика: причина в консоль прогона и в ``status.json``."""
+    print(message)
+    if progress is not None:
+        progress.fail(message.strip().splitlines()[0] if message.strip() else "прогон отклонён")
+    return 2
+
+
+def _history_instruments(launch, client_provider, clock, progress):
+    """Инструменты прогона из токенов команды: семейства — цепочкой, акции и контракты — фиксированно."""
+    if launch is None or launch.instruments is None:
+        _refused("Инструменты прогона не заданы.", progress)
+        return None
+    resolution = _resolve_request(launch, client_provider, None, clock.now(), history=True)
+    _print_resolution(resolution)
+    if not resolution.ok:
+        print("Прогон не запущен: инструменты отклонены.")
+        if progress is not None:
+            progress.reject(resolution.rejections or [Rejection("*", "Не выбрано ни одного инструмента.")])
+        return None
+    return resolution.instruments
+
+
+def _recover_contour(state_dir, core_state, control):
+    """Судьба контура эмуляции, когда ядро готово: подхват, замена другой версии, автоподъём (add-contour-recovery).
+
+    Явного запуска при старте нет (add-history-contour): робот всегда стартует в ожидании команды.
+    """
     from src.assembly.process import STOP_TIMEOUT_SECS, terminate_pid, wait_exit
 
     directory = contour_dir(state_dir, MODE_EMULATION)
-    explicit = launch is None or not launch.wait_command
-    # Без ключа управления контур, поднятый сам, нечем остановить, кроме Ctrl+C: ожидание команды и так отказывает.
-    autostart = CONTOURS_AUTOSTART and control is not None
 
     def plan():
         return contour_recovery.plan_recovery(
-            directory, version=__version__, desired=core_state.desired(MODE_EMULATION), explicit=explicit,
-            autostart=autostart, timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS)
+            directory, version=__version__, desired=core_state.desired(MODE_EMULATION), explicit=False,
+            autostart=CONTOURS_AUTOSTART, timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS)
 
     result = plan()
     if result.action == contour_recovery.REPLACE:
         if result.status.get("version") != __version__:
             _say(f"Контур другой версии ({result.status.get('version')}, pid {result.pid}) завершается: "
-                 f"ядро {__version__} поднимет контур своей версии")
+                 f"робот {__version__} поднимет контур своей версии")
         else:
-            _say(f"Контур (pid {result.pid}) ещё завершается — ядро ждёт его выхода")
+            _say(f"Контур (pid {result.pid}) ещё завершается — робот ждёт его выхода")
         # Контур увидит пульс чужой версии и выйдет после тика; иначе — принудительно.
         if not wait_exit(result.pid, STOP_TIMEOUT_SECS + CONTOURS_HEARTBEAT_SECS):
             log.error("Контур pid %s не вышел за %.0f с — завершается принудительно", result.pid, STOP_TIMEOUT_SECS)
@@ -706,90 +640,18 @@ def _recover_contour(state_dir, core_state, control, launch):
     if result.action == contour_recovery.BLOCKED:
         message = (f"Папка контура {directory} занята процессом pid {result.pid}, который не подтверждает себя "
                    f"как контур робота. Завершите этот процесс; если такого процесса робота нет — удалите "
-                   f"{directory / 'robot.pid'}. Контур не запускается.")
+                   f"{directory / 'robot.pid'}. Эмуляция не запускается, пока папка занята; API и история работают.")
         print(message)
         log.error("%s", message)
     elif result.action == contour_recovery.ADOPT:
-        if explicit:
-            _say(f"Контур эмуляции уже работает (pid {result.pid}) и подхвачен: параметры запуска не применены, "
-                 "состав меняется командой /api/v1/contours/emulation/instruments")
         _say(f"Контур эмуляции подхвачен: pid {result.pid}, поколение {desired.generation if desired else '—'}")
-        if control is not None:
-            control.mark_recovered(contour_recovery.RECOVERY_ADOPTED, desired)
+        control.mark_recovered(contour_recovery.RECOVERY_ADOPTED, desired)
     elif result.action == contour_recovery.AUTOSTART:
         names = ", ".join(member.name for member in result.members)
         _say(f"Контур эмуляции поднимается без команды: {names}, поколение {desired.generation}")
-        if control is not None:
-            control.mark_recovered(contour_recovery.RECOVERY_AUTOSTART, desired)
+        control.mark_recovered(contour_recovery.RECOVERY_AUTOSTART, desired)
     return result
 
-
-def _stop_core(core) -> None:
-    """Запуск отменён до сборки: остановить API и ранние полосы данных."""
-    if core is not None:
-        core.close()
-
-
-def _choose_instruments(launch, *, history, client_provider, clock, early, control, export_server):
-    """Инструменты прогона из параметров, команды API или меню.
-
-    ``None`` — запуск отменён: параметры отклонены или ждать команду нельзя.
-    Без ``launch`` (прямой вызов) работает прежнее меню без фильтра и команды.
-    """
-    market_now = None if clock is None else clock.now()
-    budget = None if early is None else early.request_budget
-    if launch is not None and launch.wait_command:
-        if control is None or export_server is None:
-            if control is None:
-                reason = "в .env не задан ROBOT_CONTROL_TOKEN"
-            elif not MARKET_DATA_EXPORT_ENABLED:
-                reason = "локальный API выключен: в robot.toml [market_data] export_enabled = false"
-            elif early is None:
-                reason = "локальный API не поднят до выбора инструментов: в robot.toml [market_data] independent_lanes = false"
-            else:
-                reason = "локальный API не запустился, причина — в строках выше"
-            print(f"Ждать команду запуска нельзя: {reason}.")
-            return None
-        return _await_command(control, export_server, client_provider, budget, market_now)
-    if launch is not None and launch.instruments is not None:
-        resolution = _resolve_request(launch, client_provider, budget, market_now, history)
-        _print_resolution(resolution)
-        if not resolution.ok:
-            print("Торговля не запущена: исправьте --instruments.")
-            return None
-        _announce(launch, resolution.chosen, control, launch.source)
-        return resolution.instruments
-    while True:
-        selected = select_instruments(
-            validation_pause_secs=0.0 if history else DATA_REFRESH_MIN_INTERVAL,
-            client_provider=client_provider,
-            market_now=market_now,
-            historical=history,
-            request_budget=budget,
-        ) or [(TICKER, TICKER, INSTRUMENT_TYPE)]
-        if launch is None:
-            return selected
-        chosen = tokens_from_menu(selected, history=history)
-        missing = without_assignments(chosen, SHARE_STRATEGIES, FUTURE_STRATEGIES)
-        for name in missing:
-            print(f"  ✗ {name}: у инструмента нет привязок в robot.toml")
-        selected, chosen = _drop_unassigned(selected, chosen, missing, history)
-        if chosen:
-            break
-        print("Необходимо выбрать хотя бы один инструмент с привязками.")
-    _announce(launch, chosen, control, SOURCE_MENU)
-    return selected
-
-
-def _drop_unassigned(selected, chosen, missing, history):
-    if not missing:
-        return selected, chosen
-    keep = [item for item in chosen if item.name not in missing]
-    if history:
-        fixed = tuple(item for item in selected.fixed if (item.short_name or "контракт не указан") not in missing)
-        families = tuple(family for family in selected.families if family not in missing)
-        return HistorySelection(fixed, families, selected.catalog), keep
-    return [item for item in selected if (normalize_instrument(item).short_name or "контракт не указан") not in missing], keep
 
 
 def _resolve_request(request, client_provider, budget, market_now, history):
@@ -813,8 +675,8 @@ def _print_resolution(resolution) -> None:
 
 def _announce(launch, chosen, control, source, pending=None) -> str:
     command = equivalent_command(launch, chosen)
-    print(f"Повторить запуск: {command}")
-    log.info("Повторить запуск: %s", command)
+    print(f"Повторить запуск: POST /api/v1/contours {command}")
+    log.info("Повторить запуск: POST /api/v1/contours %s", command)
     if control is not None:
         control.mark_launched(source, chosen, command, pending)
     return command

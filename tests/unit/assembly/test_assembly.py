@@ -89,7 +89,7 @@ class TestBuildDemand:
 def test_historical_services_start_no_live_parts(monkeypatch, tmp_path):
     built = SimpleNamespace(set_boundary_checks=lambda checks: None)
     monkeypatch.setattr(core, "_build_market_data", lambda **kw: (object(), None, None, None, None, built))
-    for name in ("_start_early_market_data", "_start_live_ingestion", "_start_local_api"):
+    for name in ("_start_early_market_data", "_start_live_ingestion", "_start_control_api"):
         monkeypatch.setattr(core, name, lambda *a, **k: pytest.fail("история запустила живую часть"))
     services = HistoricalMarketServices(tmp_path, clock=object(), client_provider=object())
     assert services.serve(ContourDemand(())) is None
@@ -121,81 +121,122 @@ def test_live_core_without_serve_closes_early_lanes():
     assert order == ["early", "api"]
 
 
-def test_emulation_launch_runs_contour_process_after_core(monkeypatch, tmp_path):
-    """Эмуляция (add-contour-process): ранний сбор и API до выбора, затем процесс контура, затем остановка ядра."""
-    order = []
+class FakeCore:
+    """Ядро для ``_run_robot``: порядок вызовов в ``order``, сбои старта — ``failures`` раз."""
 
-    class FakeCore:
-        def __init__(self, state_dir, client_provider):
-            self.early = SimpleNamespace(request_budget=None)
-            self.export_server = None
+    order: list = []
+    failures = 0
+    run_error = None
 
-        def start_early(self):
-            order.append("early")
+    def __init__(self, state_dir, client_provider):
+        self.state_dir = state_dir
+        self.early = SimpleNamespace(request_budget=None)
+        self.export_server = None
+        self.pulse = self.starter = None
 
-        def start_api(self, control=None):
-            order.append("api")
+    def start_control_api(self, control):
+        self.order.append("api")
+        self.export_server = SimpleNamespace(address=("127.0.0.1", 8101), close=lambda: None)
+        return self.export_server
 
-        def ensure_market_data(self):
-            order.append("data")
-            return self
+    def core_snapshot(self):
+        return self.starter.payload()
 
-        def run_contour(self, instruments, *, kind, control=None, source="", command="", core_state=None,
-                        next_launch=None, resolve=None, recovery=None):
-            assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
-            # Желаемое ядра ведётся и без ключа управления; без API следующей команды нет.
-            assert core_state is not None and core_state.path == tmp_path / "core.sqlite3"
-            assert next_launch() is None
-            order.append("run_contour")
-            return 0
+    def start_market(self):
+        if FakeCore.failures:
+            FakeCore.failures -= 1
+            self.order.append("market-failed")
+            raise ConnectionError("брокер недоступен")
+        self.order.append("market")
+        return self
 
-        def close(self):
-            order.append("core.close")
+    def reset_market(self):
+        self.order.append("reset")
 
-    def no_contour(*args, **kwargs):
-        raise AssertionError("в эмуляции торговый контур не собирается в процессе ядра")
+    def ensure_market_data(self):
+        self.order.append("data")
+        return self
 
+    def run_contour(self, instruments, *, kind, control=None, source="", command="", core_state=None,
+                    next_launch=None, resolve=None, recovery=None):
+        if FakeCore.run_error is not None:
+            raise FakeCore.run_error
+        assert kind == "emulation" and [item.ticker for item in instruments] == ["SBER"]
+        assert core_state is not None and core_state.path == self.state_dir / "core.sqlite3"
+        assert control.history is not None and control.core_status()["state"] == "ready"
+        self.order.append("run_contour")
+        return 0
+
+    def close(self):
+        self.order.append("core.close")
+
+
+@pytest.fixture
+def robot(monkeypatch, tmp_path):
+    """``_run_robot`` на поддельном ядре: блокировка, журнал и ожидание команды подменены."""
+    FakeCore.order, FakeCore.failures, FakeCore.run_error = [], 0, None
+    sleeps = []
     monkeypatch.setattr(run, "LiveCore", FakeCore)
-    monkeypatch.setattr(run, "TradingContour", no_contour)
+    monkeypatch.setattr(run, "TradingContour", lambda *a, **k: pytest.fail("контур эмуляции собирается в процессе робота"))
     monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
     monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
-    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", SimpleNamespace(independent_lanes=True))
-    monkeypatch.setattr(run, "_choose_instruments", lambda *a, **k: order.append("choose") or [("SBER", "SBER", "share", "SBER")])
-    code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None, session=SimpleNamespace(),
-                             channel_names=[])
-    assert code == 0
-    assert order == ["early", "api", "choose", "data", "api", "run_contour", "core.close"]
+    monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", "control-test-key")
+    monkeypatch.setattr(run, "CoreStarter", lambda core, **kw: run.__dict__["_RealStarter"](core, sleep=sleeps.append, **kw))
+    monkeypatch.setitem(run.__dict__, "_RealStarter", core.CoreStarter)
+    monkeypatch.setattr(run, "_await_command",
+                        lambda *a, **k: FakeCore.order.append("command") or [("SBER", "SBER", "share", "SBER")])
+    return SimpleNamespace(run=lambda: run._run_robot(tmp_path, client_provider=object()), order=FakeCore.order,
+                           sleeps=sleeps, tmp_path=tmp_path)
 
 
-def test_journal_migration_failure_stops_launch(monkeypatch, tmp_path, capsys):
+def test_robot_raises_api_before_core_then_runs_contour_process(robot):
+    """Старт без параметров (add-history-contour): API, ядро, команда, процесс контура, остановка ядра."""
+    assert robot.run() == 0
+    assert robot.order == ["api", "market", "command", "data", "run_contour", "core.close"]
+
+
+def test_core_start_is_retried_with_growing_pauses(robot):
+    FakeCore.failures = 3
+    assert robot.run() == 0
+    assert robot.order[:7] == ["api", "market-failed", "reset", "market-failed", "reset", "market-failed", "reset"]
+    assert robot.order[7:9] == ["market", "command"]
+    assert robot.sleeps == [30, 60, 120]
+
+
+def test_journal_migration_failure_stops_contour(robot, capsys):
     from src.assembly.process import JournalMigrationError
 
-    class FakeCore:
-        def __init__(self, state_dir, client_provider):
-            self.early = None
-            self.export_server = None
-
-        def start_api(self, control=None):
-            pass
-
-        def ensure_market_data(self):
-            return self
-
-        def run_contour(self, instruments, **kwargs):
-            raise JournalMigrationError("Журнал эмуляции не перенесён")
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(run, "LiveCore", FakeCore)
-    monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
-    monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
-    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", SimpleNamespace(independent_lanes=False))
-    monkeypatch.setattr(run, "_choose_instruments", lambda *a, **k: [("SBER", "SBER", "share", "SBER")])
-    code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None, session=SimpleNamespace(),
-                             channel_names=[])
-    assert code == 2
+    FakeCore.run_error = JournalMigrationError("Журнал эмуляции не перенесён")
+    assert robot.run() == 2
     assert "Журнал эмуляции не перенесён" in capsys.readouterr().out
+
+
+def test_robot_needs_control_key(robot, monkeypatch, capsys):
+    monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", None)
+    assert robot.run() == 2
+    assert robot.order == []
+    assert "ROBOT_CONTROL_TOKEN" in capsys.readouterr().out
+
+
+def test_busy_api_port_stops_robot(robot, monkeypatch, capsys):
+    def busy(self, control):
+        raise OSError("address in use")
+
+    monkeypatch.setattr(FakeCore, "start_control_api", busy)
+    assert robot.run() == 2
+    assert "API управления не поднялся" in capsys.readouterr().out
+
+
+def test_without_broker_token_core_fails_but_robot_keeps_running(robot, monkeypatch):
+    monkeypatch.setattr(core, "TINKOFF_TOKEN", None)
+
+    def ctrl_c():
+        FakeCore.order.append("waiting")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(run, "_wait_for_ctrl_c", ctrl_c)
+    assert run._run_robot(robot.tmp_path) == 0
+    assert robot.order == ["api", "waiting", "core.close"]
 
 
 @pytest.mark.parametrize("result, acknowledged", [(True, 1), (None, 1), (False, 0)])

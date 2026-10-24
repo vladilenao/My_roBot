@@ -198,7 +198,7 @@ def test_recovered_contour_shows_source_from_desired(env):
 
 
 class TestCoreStart:
-    """run.py: решение о контуре при старте ядра до выбора инструментов."""
+    """run.py: решение о контуре, когда ядро готово (робот всегда стартует в ожидании команды)."""
 
     @pytest.fixture
     def launch(self, monkeypatch, tmp_path):
@@ -212,12 +212,19 @@ class TestCoreStart:
             def __init__(self, state_dir, client_provider):
                 self.early = SimpleNamespace(request_budget=None)
                 self.export_server = None
-                self.pulse = None
+                self.pulse = self.starter = None
 
-            def start_early(self):
-                pass
+            def start_control_api(self, control):
+                self.export_server = SimpleNamespace(address=("127.0.0.1", 8101), close=lambda: None)
+                return self.export_server
 
-            def start_api(self, control=None):
+            def core_snapshot(self):
+                return self.starter.payload()
+
+            def start_market(self):
+                return self
+
+            def reset_market(self):
                 pass
 
             def ensure_market_data(self):
@@ -231,45 +238,47 @@ class TestCoreStart:
                 if self.pulse is not None:
                     self.pulse.stop()
 
+        def command(*args, **kwargs):
+            calls["choose"] = True
+            return [NG]
+
         monkeypatch.setattr(run, "LiveCore", FakeCore)
         monkeypatch.setattr(run, "acquire_runtime_lock", lambda state_dir: None)
         monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
-        monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", SimpleNamespace(independent_lanes=True))
         monkeypatch.setattr(run, "ROBOT_CONTROL_TOKEN", "control-test-key")
-        monkeypatch.setattr(run, "_choose_instruments", lambda *a, **k: calls.setdefault("choose", True) and None)
+        monkeypatch.setattr(run, "_await_command", command)
         store = CoreStateStore(tmp_path / "core.sqlite3")
         store.record_launch("emulation", "emulation", [], source="api",
                             members=[core_module._member(core_module._normalized(NG), {}, [])])
         (tmp_path / "contours" / "emulation").mkdir(parents=True)
 
-        def start(request):
-            code, _, _ = run._launch(state_dir=tmp_path, client_provider=object(), clock=None,
-                                     session=SimpleNamespace(), channel_names=[], launch=request)
-            return code
+        def start():
+            return run._run_robot(tmp_path, client_provider=object())
         return SimpleNamespace(start=start, calls=calls, store=store, run=run, own_pid=os.getpid(),
-                               directory=tmp_path / "contours" / "emulation")
+                               directory=tmp_path / "contours" / "emulation", tmp_path=tmp_path)
 
-    def test_wait_command_start_autostarts_without_choice(self, launch):
-        from src.bot.launch import LaunchRequest
-
-        assert launch.start(LaunchRequest("emulation", "menu", None, wait_command=True)) == 0
+    def test_start_autostarts_without_command(self, launch):
+        assert launch.start() == 0
         assert launch.calls == {"run": (["NGZ6"], recovery.AUTOSTART)}
-        assert launch.store.heartbeat().stopped                     # ядро закрылось — пульс «остановлено»
+        assert launch.store.heartbeat().stopped                     # робот закрылся — пульс «остановлено»
 
-    def test_without_control_key_no_autostart(self, launch, monkeypatch):
-        from src.bot.launch import LaunchRequest
+    def test_autostart_off_waits_for_command(self, launch, monkeypatch):
+        monkeypatch.setattr(launch.run, "CONTOURS_AUTOSTART", False)
+        assert launch.start() == 0
+        assert launch.calls == {"choose": True, "run": (["NGZ6"], None)}
 
+    def test_without_control_key_robot_does_not_start(self, launch, monkeypatch):
         monkeypatch.setattr(launch.run, "ROBOT_CONTROL_TOKEN", "")
-        assert launch.start(LaunchRequest("emulation", "menu", None, wait_command=True)) == 2
-        assert launch.calls == {"choose": True}
+        assert launch.start() == 2
+        assert launch.calls == {}
 
-    def test_unconfirmed_pid_stops_core_start(self, launch, capsys):
-        from src.bot.launch import LaunchRequest
-
+    def test_unconfirmed_pid_keeps_robot_and_waits_for_free_folder(self, launch, capsys):
         (launch.directory / "robot.pid").write_text(str(launch.own_pid), encoding="utf-8")
-        assert launch.start(LaunchRequest("emulation", "menu", None, wait_command=True)) == 2
+        assert launch.run._contour_busy(launch.tmp_path) == launch.own_pid
+        assert launch.start() == 0
         out = capsys.readouterr().out
-        assert f"pid {launch.own_pid}" in out and "Контур не запускается" in out and launch.calls == {}
+        assert f"pid {launch.own_pid}" in out and "Эмуляция не запускается, пока папка занята" in out
+        assert launch.calls == {"choose": True, "run": (["NGZ6"], None)}
 
     def test_other_version_is_waited_then_killed_then_autostarted(self, launch, monkeypatch):
         from src.assembly import process
@@ -280,5 +289,5 @@ class TestCoreStart:
         waits, killed = [], []
         monkeypatch.setattr(process, "wait_exit", lambda pid, timeout: waits.append(pid) or len(waits) > 1)
         monkeypatch.setattr(process, "terminate_pid", killed.append)
-        result = launch.run._recover_contour(launch.directory.parents[1], launch.store, None, None)
+        result = launch.run._recover_contour(launch.directory.parents[1], launch.store, None)
         assert result.action == recovery.WAIT and waits == [5151, 5151] and killed == [5151]

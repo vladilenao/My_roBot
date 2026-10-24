@@ -108,7 +108,6 @@ def test_history_launch_never_starts_live_ingestion(tmp_path):
     report = PreflightReport(problems=(), notes=(), start=start, shift_to=None, checked_pairs=1, detail=[])
     with (
         patch.object(run, "setup_logging"),
-        patch.object(run, "select_instruments", return_value=[("Сбербанк", "SBER", "share")]),
         patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
         patch.object(run, "_warmup_bars", return_value=41),
         patch.object(run, "run_preflight", return_value=report),
@@ -119,7 +118,8 @@ def test_history_launch_never_starts_live_ingestion(tmp_path):
         patch.object(core, "_start_live_ingestion", side_effect=AssertionError("live-ingestion в истории")),
     ):
         code, _, _ = run._launch(state_dir=tmp_path / "state", client_provider=MagicMock(), clock=MagicMock(),
-                                 session=MagicMock(start=start, end=end), channel_names=[], history=True)
+                                 session=MagicMock(start=start, end=end), channel_names=[], history=True,
+                                 instruments=[("Сбербанк", "SBER", "share")])
     assert code == 0
     assert bot.call_args.kwargs["live_waiter"] is None
 

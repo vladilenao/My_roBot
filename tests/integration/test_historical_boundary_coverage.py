@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import run
+from src.assembly.history_runs import prepare_import
 from src.assembly import contour, services
 from src.api.emulator_client import EmulatorClientProvider
 from src.bot import TradingBot
@@ -86,12 +87,8 @@ class Exchange:
 def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail=False):
     exchange = Exchange(future_price)
     monkeypatch.setattr("src.api.emulator_client.request.urlopen", exchange)
-    monkeypatch.setattr(run, "EmulatorClientProvider", lambda: EmulatorClientProvider("http://local-source"))
-    monkeypatch.setattr(run, "select_instruments", lambda **kw: [("NG-1.25", "NGF5", "future", "NG-1.25")])
-    monkeypatch.setattr(run, "state_dir_for", lambda *args: path)
     monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
     monkeypatch.setattr(contour, "_token_client_context", lambda: pytest.fail("боевой API"))
-    monkeypatch.setattr(run, "ACTIVE_TIMEFRAMES", {"1m"})
     monkeypatch.setattr(services, "ACTIVE_TIMEFRAMES", {"1m"})
     assignments = {"NG": [Assignment("entry", "macd_rsi_stoch", "atr_trend", "raw", timeframe="1m")]}
     monkeypatch.setattr(run, "FUTURE_STRATEGIES", assignments)
@@ -146,7 +143,11 @@ def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail
         return runtime
 
     monkeypatch.setattr(contour, "_build_runtime", build)
-    code = run._run_history(START, END, 0)
+    provider = EmulatorClientProvider("http://local-source")
+    # Сверку импорта делает робот до старта процесса прогона (add-history-contour).
+    sync, _, _ = prepare_import(provider)
+    code = run._run_history(START, END, 0, None, state_dir=path, provider=provider, market_data_sync=sync,
+                            instruments=[("NG-1.25", "NGF5", "future", "NG-1.25")])
     report = json.loads((path / "report.json").read_text())
     return code, report, exchange
 

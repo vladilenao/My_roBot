@@ -2,6 +2,10 @@
 
 Сервер построен на стандартной библиотеке, чтобы запуск робота не зависел от
 web-фреймворка. По умолчанию он слушает только loopback.
+
+С add-history-contour сервер поднимается до ядра: управление работает сразу,
+а рыночная база и отчёт кластеров подключаются, когда ядро их открыло
+(``attach_market``). До этого маршруты экспорта отвечают ``503``.
 """
 
 from __future__ import annotations
@@ -25,16 +29,23 @@ _CONTOURS = "/api/v1/contours"
 # /api/v1/contours/{id}[/stop|/log] — маршруты одного контура (add-control-api).
 _CONTOUR = re.compile(r"^/api/v1/contours/([a-z0-9][a-z0-9-]{0,62})(?:/(stop|log|instruments))?$")
 _OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
+# Маршруты экспорта рыночных данных и отчёта кластеров: им нужна рыночная база ядра.
+_EXPORT_GET = ("/api/v1/market-data/source", "/api/v1/market-data/changes",
+               "/api/v1/market-data/trading-schedules", "/api/v1/clusters/report")
 
 
 class MarketDataExportServer:
     """Управляемый сервер API; ``start`` не блокирует основной цикл робота."""
 
-    def __init__(self, store: MarketDataStore, token: str | None, host: str = "127.0.0.1", port: int = 8101,
-                 clusters_report=None, control=None, control_token: str | None = None) -> None:
+    def __init__(self, store: MarketDataStore | None, token: str | None, host: str = "127.0.0.1", port: int = 8101,
+                 clusters_report=None, control=None, control_token: str | None = None,
+                 export_enabled: bool = True) -> None:
         if not token and not control_token:
             raise ValueError("Для локального API требуется хотя бы один непустой ключ")
+        # Рыночная база ядра; None — ядро ещё не открыло её (503 MARKET_DATA_NOT_READY).
         self.store = store
+        # [market_data] export_enabled = false — маршруты экспорта и отчёта кластеров отвечают 404.
+        self.export_enabled = export_enabled
         # Отчёт кластерного фильтра (src.clusters.report.ClusterReport); None — сервис недоступен.
         self.clusters_report = clusters_report
         # Ключ экспорта и отчёта; None — эти маршруты отвечают 401.
@@ -48,6 +59,11 @@ class MarketDataExportServer:
         self.port = port
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def attach_market(self, store: MarketDataStore, clusters_report=None) -> None:
+        """Ядро открыло рыночную базу: экспорт и отчёт кластеров начинают отвечать."""
+        self.clusters_report = clusters_report
+        self.store = store
 
     @property
     def address(self) -> tuple[str, int]:
@@ -97,7 +113,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == _CONTOURS:
             if self._control_allowed():
-                self._json(HTTPStatus.OK, {"contours": [self.export_server.control.snapshot()]})
+                self._contours_list(parse_qs(parsed.query))
             return
         if parsed.path == "/api/v1/core":
             if self._control_allowed():
@@ -111,8 +127,7 @@ class _Handler(BaseHTTPRequestHandler):
             if self._control_allowed():
                 self._contour_get(contour.group(1), contour.group(2), parse_qs(parsed.query))
             return
-        if not self._authorised():
-            self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Токен отсутствует или неверен.")
+        if not self._export_ready(parsed.path in _EXPORT_GET):
             return
         if parsed.path == "/api/v1/market-data/source":
             self._json(HTTPStatus.OK, self.export_server.store.source_info().as_dict())
@@ -150,6 +165,33 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
 
+    def _export_ready(self, known: bool) -> bool:
+        """Ключ экспорта, включённый экспорт и открытая рыночная база; при отказе ответ уже отправлен."""
+        server = self.export_server
+        if known and not server.export_enabled:
+            self._error(HTTPStatus.NOT_FOUND, "EXPORT_DISABLED", "Экспорт выключен: [market_data] export_enabled = false.")
+            return False
+        if not self._authorised():
+            self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Токен отсутствует или неверен.")
+            return False
+        if known and server.store is None:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "MARKET_DATA_NOT_READY",
+                        "Ядро ещё не открыло рыночную базу; состояние — GET /api/v1/core.")
+            return False
+        return True
+
+    def _contours_list(self, query: dict[str, list[str]]) -> None:
+        from src.assembly.history_runs import LIST_LIMIT_MAX
+
+        kind = _one(query, "kind")
+        limit = _integer(query, "limit", minimum=1)
+        if ("kind" in query and kind not in ("emulation", "history")) or \
+                ("limit" in query and (limit is None or limit > LIST_LIMIT_MAX)):
+            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST",
+                        f"kind — emulation или history; limit — целое от 1 до {LIST_LIMIT_MAX}.")
+            return
+        self._json(HTTPStatus.OK, self.export_server.control.contours(kind, limit))
+
     def _clusters_report(self, query: dict[str, list[str]]) -> None:
         from src.clusters.report import ReportError
 
@@ -174,8 +216,7 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         schedule_match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/trading-schedules-checkpoint", parsed.path)
         match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/checkpoint", parsed.path)
-        if not self._authorised():
-            self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Токен отсутствует или неверен.")
+        if not self._export_ready(bool(match or schedule_match)):
             return
         if not match and not schedule_match:
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
@@ -228,7 +269,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         status, payload = self.export_server.control.submit(request)
         if status == HTTPStatus.ACCEPTED:
-            self._json(HTTPStatus(status), payload, headers={"Location": _CONTOURS})
+            location = f"{_CONTOURS}/{payload['id']}" if payload.get("kind") == "history" else _CONTOURS
+            self._json(HTTPStatus(status), payload, headers={"Location": location})
         else:
             self._json(HTTPStatus(status), payload)
 
@@ -254,11 +296,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.OK, text, "text/plain; charset=utf-8")
 
     def _contour_stop(self, contour_id: str) -> None:
-        from src.bot.launch_control import BadCommand, parse_stop
+        from src.bot.launch_control import HISTORY_PREFIX, BadCommand, parse_stop
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            mode = parse_stop(json.loads(self.rfile.read(length).decode("utf-8")) if length else None)
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
+            # Прогон истории останавливается без режима: тело можно не передавать (add-history-contour).
+            mode = None if contour_id.startswith(HISTORY_PREFIX) else parse_stop(body)
         except BadCommand as exc:
             self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
             return

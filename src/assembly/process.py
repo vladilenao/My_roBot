@@ -130,24 +130,26 @@ def migrate_journal(data_dir: Path, target: Path, *, version: str) -> bool:
     return True
 
 
-def contour_command(kind: str) -> list[str]:
-    """Команда процесса контура: тот же исполняемый файл с ``--contour <вид>``."""
+def contour_command(kind: str, *args: str) -> list[str]:
+    """Команда процесса контура: тот же исполняемый файл с ``--contour <вид> [аргументы]``."""
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--contour", kind]
+        return [sys.executable, "--contour", kind, *args]
     entry = Path(__file__).resolve().parents[2] / "run.py"
-    return [sys.executable, str(entry), "--contour", kind]
+    return [sys.executable, str(entry), "--contour", kind, *args]
 
 
 class ContourProcess:
     """Надзор ядра за процессом контура: запуск, stdin, остановка, итог (D5)."""
 
     def __init__(self, kind: str, *, command: list[str] | None = None, on_exit=None,
-                 popen=subprocess.Popen, stop_timeout: float = STOP_TIMEOUT_SECS) -> None:
+                 popen=subprocess.Popen, stop_timeout: float = STOP_TIMEOUT_SECS, output: Path | None = None) -> None:
         self.kind = kind
         self._command = command or contour_command(kind)
         self._on_exit = on_exit
         self._popen = popen
         self._stop_timeout = stop_timeout
+        # Вывод процесса: консоль ядра (None) или файл — у прогонов истории ``console.log`` (add-history-contour).
+        self._output = None if output is None else Path(output)
         self._process = None
         self._stopping = False
         self._watcher: threading.Thread | None = None
@@ -162,8 +164,14 @@ class ContourProcess:
         return self._process is not None and self.exit_code is None
 
     def start(self) -> int:
-        # Вывод контура — в консоль ядра (наследуется); stdin — канал жизни.
-        self._process = self._popen(self._command, stdin=subprocess.PIPE, text=True, encoding="utf-8")
+        # Вывод контура — в консоль ядра (наследуется) или в свой файл; stdin — канал жизни.
+        if self._output is None:
+            self._process = self._popen(self._command, stdin=subprocess.PIPE, text=True, encoding="utf-8")
+        else:
+            self._output.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._output, "a", encoding="utf-8") as stream:
+                self._process = self._popen(self._command, stdin=subprocess.PIPE, stdout=stream,
+                                            stderr=subprocess.STDOUT, text=True, encoding="utf-8")
         self._watcher = threading.Thread(target=self._watch, name=f"contour-{self.kind}-watch", daemon=True)
         self._watcher.start()
         log.info("Процесс контура %s запущен, pid %s", self.kind, self._process.pid)
@@ -177,9 +185,23 @@ class ContourProcess:
         else:
             message = f"Процесс контура {self.kind} завершился с кодом {code}; торговля не перезапускается"
             log.error(message)
-            print(message)
+            if self._output is None:
+                # Итог прогона истории печатает очередь прогонов своей строкой.
+                print(message)
         if self._on_exit is not None:
             self._on_exit(code, self._stopping)
+
+    def request_stop(self) -> None:
+        """``stop`` в stdin без ожидания: несколько процессов останавливаются одновременно."""
+        if self._process is None or self.exit_code is not None:
+            return
+        self._stopping = True
+        try:
+            self._process.stdin.write("stop\n")
+            self._process.stdin.flush()
+            self._process.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     def stop(self) -> int | None:
         """``stop`` в stdin, ожидание до ``stop_timeout``, затем принудительное завершение."""
@@ -187,12 +209,7 @@ class ContourProcess:
             return None
         self._stopping = True
         if self.exit_code is None:
-            try:
-                self._process.stdin.write("stop\n")
-                self._process.stdin.flush()
-                self._process.stdin.close()
-            except (OSError, ValueError):
-                pass
+            self.request_stop()
             try:
                 self._process.wait(timeout=self._stop_timeout)
             except subprocess.TimeoutExpired:
@@ -269,6 +286,10 @@ class AdoptedProcess:
         log.info("Подхваченный процесс контура %s (pid %s) завершился", self.kind, self._pid)
         if self._on_exit is not None:
             self._on_exit(None, self._stopping)
+
+    def request_stop(self) -> None:
+        """stdin нет: остановку процесс берёт из пульса или базы ядра; здесь только отметка."""
+        self._stopping = True
 
     def stop(self) -> int | None:
         self._stopping = True

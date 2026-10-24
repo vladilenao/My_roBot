@@ -1,7 +1,9 @@
-"""Команда запуска эмуляции из локального API и состояние контура.
+"""Команды контуров из локального API и их состояние.
 
-Поток HTTP только кладёт запрос в очередь и ждёт ответа: разрешение
-инструментов, сборка и запуск торговли остаются в главном потоке робота.
+Эмуляция: поток HTTP только кладёт запрос в очередь и ждёт ответа —
+разрешение инструментов, сборка и запуск торговли остаются в главном потоке
+робота. Прогоны истории (``kind = history``, add-history-contour) уходят в
+очередь прогонов ``HistoryRuns``, которая не зависит от готовности ядра.
 """
 
 from __future__ import annotations
@@ -14,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.bot.launch import (
-    MODE_EMULATION, SOURCE_API, Chosen, LaunchError, LaunchRequest, Rejection, parse_instrument_tokens,
+    HISTORY_DEFAULT_PAUSE, MODE_EMULATION, MODE_HISTORY, SOURCE_API, Chosen, LaunchError, LaunchRequest, Rejection,
+    RunConfigurationError, parse_instrument_tokens, parse_moment, validate_range,
 )
 
 STATE_WAITING = "waiting_command"
@@ -24,7 +27,9 @@ STATE_STOPPED = "stopped"
 STATE_FAILED = "failed"
 CONTOUR_ID = "emulation"
 REPLY_TIMEOUT_SECS = 60.0
-_ALLOWED_FIELDS = {"kind", "instruments"}
+_ALLOWED_FIELDS = {MODE_EMULATION: {"kind", "instruments"},
+                   MODE_HISTORY: {"kind", "from", "to", "pause", "instruments"}}
+HISTORY_PREFIX = "history-"
 STOP_MODES = ("no_entries", "close_all")
 LOG_TAIL_DEFAULT = 200
 LOG_TAIL_MAX = 1000
@@ -48,15 +53,32 @@ class _Pending:
 
 
 def parse_command(body) -> LaunchRequest:
-    """Тело ``POST /api/v1/contours`` → ``LaunchRequest`` или ``BadCommand``."""
+    """Тело ``POST /api/v1/contours`` → ``LaunchRequest`` эмуляции или прогона истории, иначе ``BadCommand``."""
     if not isinstance(body, dict):
         raise BadCommand("INVALID_REQUEST", "Тело команды — JSON-объект с полями kind и instruments.")
-    unknown = set(body) - _ALLOWED_FIELDS
+    kind = body.get("kind")
+    if kind not in _ALLOWED_FIELDS:
+        raise BadCommand("UNSUPPORTED_KIND", "kind — emulation или history.")
+    unknown = set(body) - _ALLOWED_FIELDS[kind]
     if unknown:
         raise BadCommand("INVALID_REQUEST", f"Неизвестные поля: {', '.join(sorted(unknown))}.")
-    if body.get("kind") != MODE_EMULATION:
-        raise BadCommand("UNSUPPORTED_KIND", "В этом процессе командой запускается только эмуляция.")
-    raw = body.get("instruments")
+    tokens = _tokens(body.get("instruments"))
+    if kind == MODE_EMULATION:
+        return LaunchRequest(MODE_EMULATION, SOURCE_API, tokens)
+    start, end = body.get("from"), body.get("to")
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise BadCommand("INVALID_REQUEST", "from и to обязательны: строки ГГГГ-ММ-ДД ЧЧ:ММ (UTC).")
+    pause = body.get("pause", HISTORY_DEFAULT_PAUSE)
+    if isinstance(pause, bool) or not isinstance(pause, (int, float)) or pause < 0:
+        raise BadCommand("INVALID_REQUEST", "pause — число секунд не меньше 0.")
+    try:
+        start, end, pause = validate_range(parse_moment(start), parse_moment(end), pause)
+    except (ValueError, RunConfigurationError) as exc:
+        raise BadCommand("INVALID_REQUEST", str(exc)) from None
+    return LaunchRequest(MODE_HISTORY, SOURCE_API, tokens, start=start, end=end, pause=pause)
+
+
+def _tokens(raw) -> tuple[str, ...]:
     if raw is None:
         tokens = parse_instrument_tokens(None)
     else:
@@ -66,7 +88,7 @@ def parse_command(body) -> LaunchRequest:
             tokens = parse_instrument_tokens(raw)
         except LaunchError as exc:
             raise BadCommand("INVALID_REQUEST", str(exc)) from None
-    return LaunchRequest(MODE_EMULATION, SOURCE_API, tokens)
+    return tokens
 
 
 @dataclass
@@ -148,6 +170,11 @@ class LaunchControl:
         self._membership: queue.Queue[MembershipCommand] = queue.Queue()
         # Как поднят процесс этим ядром: autostart / adopted / None (add-contour-recovery).
         self._recovery: str | None = None
+        # add-history-contour: очередь прогонов истории (HistoryRuns), состояние ядра —
+        # функция без аргументов → ``GET /api/v1/core``, и проверка папки контура — pid чужого процесса или None.
+        self.history = None
+        self.core_status = None
+        self.contour_busy = None
 
     # --- для API ----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -190,7 +217,30 @@ class LaunchControl:
             return [item.payload() for item in self._chosen]
 
     def contour(self, contour_id: str) -> dict | None:
+        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
+            return self.history.contour(contour_id)
         return self.snapshot() if contour_id == CONTOUR_ID else None
+
+    def contours(self, kind: str | None = None, limit: int | None = None) -> dict:
+        """``GET /api/v1/contours``: эмуляция, прогоны в очереди и в работе, ``limit`` последних завершённых."""
+        from src.assembly.history_runs import LIST_LIMIT_DEFAULT
+
+        items = [] if kind == MODE_HISTORY else [self.snapshot()]
+        if kind != MODE_EMULATION and self.history is not None:
+            items += self.history.contours(LIST_LIMIT_DEFAULT if limit is None else limit)
+        limits = self.history.limits() if self.history is not None else {
+            "max_history_runs": 0, "running": 0, "queued": 0}
+        return {"contours": items, "limits": limits}
+
+    def _core_not_ready(self) -> dict | None:
+        """Тело ``409 CORE_NOT_READY``, пока ядро стартует или повторяет старт; ``None`` — ядро готово."""
+        if self.core_status is None:
+            return None
+        core = self.core_status()
+        if core.get("state", "ready") == "ready":
+            return None
+        return {"code": "CORE_NOT_READY", "message": "Ядро не готово: эмуляция запустится, когда ядро поднимется.",
+                "core": core}
 
     def _desired(self):
         return None if self._core_state is None else self._core_state.desired(CONTOUR_ID)
@@ -201,8 +251,10 @@ class LaunchControl:
         from src.assembly.contour_control import STATUS_FILE, read_status
         return read_status(self._contour_dir / STATUS_FILE)
 
-    def stop(self, contour_id: str, mode: str) -> tuple[int, dict]:
+    def stop(self, contour_id: str, mode: str | None) -> tuple[int, dict]:
         """Команда остановки: желаемое «остановлен» новым поколением; применит контур на границе тика."""
+        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
+            return self.history.stop(contour_id)
         if contour_id != CONTOUR_ID:
             return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
         with self._lock:
@@ -221,6 +273,12 @@ class LaunchControl:
 
     def change_membership(self, contour_id: str, command: MembershipCommand) -> tuple[int, dict]:
         """Команда состава из HTTP-потока: разбирает главный поток ядра, ответ — не дольше таймаута."""
+        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
+            run = self.history.contour(contour_id)
+            if run is None:
+                return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
+            return 409, {"code": "NOT_SUPPORTED", "message": "Состав прогона истории после приёма не меняется.",
+                         "contour": run}
         if contour_id != CONTOUR_ID:
             return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
         desired = self._desired()
@@ -250,6 +308,8 @@ class LaunchControl:
 
     def log_tail(self, contour_id: str, count: int) -> str | None:
         """Последние строки журнала процесса контура; секреты в нём уже замаскированы."""
+        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
+            return self.history.log_tail(contour_id, count)
         if contour_id != CONTOUR_ID:
             return None
         return "" if self._contour_dir is None else tail_lines(self._contour_dir / self._log_file, count)
@@ -258,8 +318,22 @@ class LaunchControl:
         """Передать команду главному потоку и дождаться ответа не дольше таймаута.
 
         Команда принимается, пока ядро ждёт её, в том числе после остановки или
-        падения контура (повторный запуск, add-control-api).
+        падения контура (повторный запуск, add-control-api). Прогон истории
+        уходит в свою очередь при любом состоянии ядра и эмуляции.
         """
+        if request.mode == MODE_HISTORY:
+            if self.history is None:
+                return 409, {"code": "HISTORY_UNAVAILABLE", "message": "Очередь прогонов истории не запущена."}
+            return self.history.submit(request)
+        not_ready = self._core_not_ready()
+        if not_ready is not None:
+            return 409, not_ready
+        busy = None if self.contour_busy is None else self.contour_busy()
+        if busy is not None:
+            return 409, {"code": "CONTOUR_DIR_BUSY",
+                         "message": f"Папку контура держит процесс pid {busy}, который не подтверждает себя контуром "
+                                    "робота. Завершите его; команда проверит папку заново.",
+                         "pid": busy, "contour": self.snapshot()}
         desired = self._desired()
         with self._lock:
             idle = self._state in (STATE_WAITING, STATE_STOPPED, STATE_FAILED) and self._pid is None

@@ -9,6 +9,7 @@ import pytest
 
 import run
 from src.assembly import contour, services
+from src.bot.launch import Chosen, LaunchRequest, Resolution
 from src.bot.run_session import HistoricalRunSession
 from src.data.cache import DataExhaustion
 from src.history.preflight import PreflightReport
@@ -485,7 +486,8 @@ class TestHistoryStartShift:
         session = MagicMock(start=self.START, end=self.END)
         with (
             patch.object(run, "setup_logging"),
-            patch.object(run, "select_instruments", return_value=[SELECTOR_SBER]) as selector,
+            patch.object(run, "_resolve_request",
+                         return_value=Resolution([SELECTOR_SBER], [Chosen("SBER", "SBER", "share")], [])) as selector,
             patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
             patch.object(run, "_warmup_bars", return_value=41),
             patch.object(run, "run_preflight", return_value=report),
@@ -498,6 +500,7 @@ class TestHistoryStartShift:
                 session=session,
                 channel_names=[],
                 history=True,
+                launch=LaunchRequest("history", "api", ("SBER",), start=self.START, end=self.END, pause=0.0),
             )
         return code, shifted, instruments, selector, channels
 
@@ -515,7 +518,7 @@ class TestHistoryStartShift:
 
         with (
             patch.object(run, "setup_logging"),
-            patch.object(run, "select_instruments") as selector,
+            patch.object(run, "_resolve_request") as selector,
             patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
             patch.object(run, "_warmup_bars", return_value=41),
             patch.object(
@@ -556,90 +559,47 @@ def test_historical_preflight_calendar_loads_once_before_returning_expectation()
 
 
 class TestRunHistoryRetry:
-    """Повтор исторического прогона: один раз, с теми же инструментами."""
+    """Повтор исторического прогона: один раз, в той же папке, с теми же инструментами и снимком."""
 
     START = datetime(2024, 1, 1, 0, 0)
     END = datetime(2024, 1, 5, 0, 0)
 
-    def _run(self, tmp_path, provider=None):
-        provider = provider or MagicMock()
-        if provider.prepare_snapshot.side_effect is None:
-            provider.prepare_snapshot.return_value = {
-                "producer_id": "robot-db-1", "target_change_id": 12,
-                "after_id": 12, "synchronized": True, "snapshot_generation": 42,
-            }
-        self.provider = provider
+    def _run(self, tmp_path):
+        self.provider = MagicMock()
+        self.sync = run.MarketDataSync(status="synchronized", snapshot_generation=42)
         with (
             patch.object(run, "HistoricalClock"),
             patch.object(run, "build_run_session"),
             patch.object(services, "_timeframes", return_value={"1m"}),
             patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
-            patch.object(run, "EmulatorClientProvider", return_value=provider),
-            patch.object(run, "state_dir_for", side_effect=lambda s, e: tmp_path / f"{s:%m%d%H%M}"),
         ):
-            return run._run_history(self.START, self.END, 0.0)
+            return run._run_history(self.START, self.END, 0.0, None, state_dir=tmp_path,
+                                    provider=self.provider, market_data_sync=self.sync)
 
-    def test_rejected_attempt_is_dropped_and_range_rerun(self, tmp_path):
+    def test_rejected_attempt_is_cleared_and_range_rerun_in_same_folder(self, tmp_path):
         calls = []
+        for name in ("launch.json", "status.json", "console.log", "bot_debug.log", "bot_debug.log.1"):
+            (tmp_path / name).write_text("keep", encoding="utf-8")
 
         def launch(**kwargs):
             calls.append(kwargs)
-            return [(3, SHIFTED_START, ["ready"]), (0, None, ["ready"])][len(calls) - 1]
+            if len(calls) == 1:
+                (tmp_path / "trades.sqlite3").write_text("first attempt", encoding="utf-8")
+                (tmp_path / "telegram-diagnostics").mkdir()
+                return 3, SHIFTED_START, ["ready"]
+            return 0, None, ["ready"]
 
-        with (
-            patch.object(run, "_launch", side_effect=launch),
-        ):
+        with patch.object(run, "_launch", side_effect=launch):
             code = self._run(tmp_path)
 
         assert code == 0
-        assert [call["state_dir"].name for call in calls] == ["01010000", "01030402"]
-        assert calls[0]["instruments"] is None
-        assert calls[1]["instruments"] == ["ready"]
-        assert calls[0]["client_provider"] is calls[1]["client_provider"]
-        assert calls[0]["market_data_sync"] == calls[1]["market_data_sync"]
-        assert calls[0]["market_data_sync"].snapshot_generation == 42
-        self.provider.prepare_snapshot.assert_called_once_with()
-        assert not (tmp_path / "01010000").exists()
-
-    def test_import_failure_keeps_independent_history_available(self, tmp_path, capsys):
-        provider = MagicMock()
-        provider.prepare_snapshot.side_effect = run.EmulatorError(
-            "SOURCE_UNAVAILABLE", "My Robot недоступен"
-        )
-        with patch.object(run, "_launch", return_value=(0, None, ["ready"])) as launcher:
-            assert self._run(tmp_path, provider) == 0
-
-        sync = launcher.call_args.kwargs["market_data_sync"]
-        assert sync.status == "unconfirmed"
-        assert sync.snapshot_generation is None
-        assert "не подтверждён" in capsys.readouterr().out
-
-    def test_new_history_run_checks_import_again(self, tmp_path):
-        first = MagicMock()
-        second = MagicMock()
-        first.prepare_snapshot.return_value = {
-            "producer_id": "robot-db-1", "target_change_id": 12,
-            "after_id": 12, "synchronized": True, "snapshot_generation": 42,
-        }
-        second.prepare_snapshot.return_value = {
-            "producer_id": "robot-db-1", "target_change_id": 13,
-            "after_id": 13, "synchronized": True, "snapshot_generation": 43,
-        }
-        with (
-            patch.object(run, "HistoricalClock"),
-            patch.object(run, "build_run_session"),
-            patch.object(services, "_timeframes", return_value={"1m"}),
-            patch.object(run, "smallest_period", return_value=timedelta(minutes=1)),
-            patch.object(run, "EmulatorClientProvider", side_effect=[first, second]),
-            patch.object(run, "state_dir_for", return_value=tmp_path / "run"),
-            patch.object(run, "_launch", return_value=(0, None, ["ready"])) as launcher,
-        ):
-            run._run_history(self.START, self.END, 0.0)
-            run._run_history(self.START, self.END, 0.0)
-
-        assert [call.kwargs["market_data_sync"].snapshot_generation for call in launcher.call_args_list] == [42, 43]
-        first.prepare_snapshot.assert_called_once_with()
-        second.prepare_snapshot.assert_called_once_with()
+        assert [call["state_dir"] for call in calls] == [tmp_path, tmp_path]
+        assert calls[0]["instruments"] is None and calls[1]["instruments"] == ["ready"]
+        assert calls[0]["client_provider"] is calls[1]["client_provider"] is self.provider
+        assert calls[0]["market_data_sync"] is calls[1]["market_data_sync"] is self.sync
+        assert sorted(item.name for item in tmp_path.iterdir()) == [
+            "bot_debug.log", "bot_debug.log.1", "console.log", "launch.json", "status.json"]
+        self.provider.prepare_snapshot.assert_not_called()
 
     def test_plain_run_is_not_repeated(self, tmp_path):
         with patch.object(run, "_launch", return_value=(2, None, ["ready"])) as launcher:

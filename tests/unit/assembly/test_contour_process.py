@@ -144,6 +144,21 @@ class TestContourProcess:
 
         assert child.stop() not in (0, None)
 
+    def test_history_run_output_goes_to_its_console_log_and_stop_is_requested_without_wait(self, tmp_path, capsys):
+        exits = []
+        log = tmp_path / "run" / "console.log"
+        child = ContourProcess("history", output=log, on_exit=lambda code, stopping: exits.append((code, stopping)),
+                               command=_script("import sys\nprint('прогон идёт', flush=True)\n"
+                                               "for line in sys.stdin:\n    if line.strip()=='stop': raise SystemExit(2)\n"))
+        child.start()
+        child.request_stop()
+        deadline = time.monotonic() + 10
+        while child.running and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert exits == [(2, True)]
+        assert "прогон идёт" in log.read_text(encoding="utf-8")
+        assert "завершился с кодом" not in capsys.readouterr().out    # итог печатает очередь прогонов
+
 
 class TestStdinStop:
     def test_stop_command(self):
@@ -173,6 +188,7 @@ def test_command_uses_same_entry(monkeypatch):
     monkeypatch.setattr(sys, "frozen", False)
     command = process.contour_command("emulation")
     assert command[1].endswith("run.py") and command[2:] == ["--contour", "emulation"]
+    assert process.contour_command("history", "20261024-101500")[-3:] == ["--contour", "history", "20261024-101500"]
 
 
 

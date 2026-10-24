@@ -16,19 +16,33 @@ from src.trade_journal.storage import Storage
 from src.trade_management.audit import CalculationTraceRepository
 from tests.unit.clusters.helpers import T
 from tests.unit.clusters.test_gate_admission import BR, _assignment, _decision, _gate, _store
-from src.assembly import core
 
 SPEC = yaml.safe_load((Path(__file__).resolve().parents[3] / "docs" / "openapi.yaml").read_text(encoding="utf-8"))
 SIGNAL_ID = "future-br-macd:BRX6:5m:SELL"
 
 
 def _check(instance, schema, path="report"):
-    """Мини-проверка ответа по схеме OpenAPI 3.0: $ref, allOf, nullable, типы, required, enum."""
+    """Мини-проверка ответа по схеме OpenAPI 3.0: $ref, allOf, oneOf, nullable, типы, required, enum."""
     if "$ref" in schema:
         schema = SPEC["components"]["schemas"][schema["$ref"].rsplit("/", 1)[-1]]
     if instance is None:
         assert schema.get("nullable"), f"{path}: null не разрешён"
         return
+    if "oneOf" in schema:
+        # Вариант по дискриминатору (вид контура), иначе — первый подходящий.
+        mapping = schema.get("discriminator", {}).get("mapping", {})
+        key = instance.get(schema.get("discriminator", {}).get("propertyName", "")) if isinstance(instance, dict) else None
+        if key in mapping:
+            _check(instance, {"$ref": mapping[key]}, path)
+            return
+        errors = []
+        for part in schema["oneOf"]:
+            try:
+                _check(instance, part, path)
+                return
+            except AssertionError as exc:
+                errors.append(str(exc))
+        raise AssertionError(f"{path}: не подошёл ни один вариант: {errors}")
     for part in schema.get("allOf", ()):
         _check(instance, part, path)
     kind = schema.get("type")
@@ -180,10 +194,28 @@ def test_rest_route(tmp_path):
         server.close()
 
 
-def test_local_api_without_token_does_not_start(tmp_path, monkeypatch, capsys):
-
-    monkeypatch.setattr(core, "MARKET_DATA_EXPORT_TOKEN", None)
-    monkeypatch.setattr(core, "ROBOT_CONTROL_TOKEN", None)
-
-    assert core._start_local_api(MarketDataStore(tmp_path / "market-data.sqlite3"), tmp_path) is None
-    assert "MARKET_DATA_EXPORT_TOKEN" in capsys.readouterr().out
+@pytest.mark.parametrize("enabled, code", [(True, 503), (False, 404)])
+def test_export_before_core_opens_market_base(tmp_path, enabled, code):
+    """API поднят до ядра (add-history-contour): экспорт и отчёт ждут рыночную базу или выключены."""
+    server = MarketDataExportServer(None, "secret", port=0, export_enabled=enabled)
+    try:
+        server.start()
+    except PermissionError:
+        pytest.skip("Песочница не разрешает открыть loopback-сокет")
+    try:
+        host, port = server.address
+        base = f"http://{host}:{port}"
+        for path in ("/api/v1/market-data/source", "/api/v1/clusters/report?date=2026-10-15"):
+            with pytest.raises(error.HTTPError) as refused:
+                _get(base, path)
+            assert refused.value.code == code
+            assert json.loads(refused.value.read())["code"] == ("MARKET_DATA_NOT_READY" if enabled else "EXPORT_DISABLED")
+        if enabled:
+            with pytest.raises(error.HTTPError) as anonymous:
+                _get(base, "/api/v1/market-data/source", token=None)
+            assert anonymous.value.code == 401
+            server.attach_market(MarketDataStore(tmp_path / "market-data.sqlite3"), _report(tmp_path))
+            assert _get(base, "/api/v1/market-data/source")[0] == 200
+            assert _get(base, "/api/v1/clusters/report?date=2026-10-15")[0] == 200
+    finally:
+        server.close()

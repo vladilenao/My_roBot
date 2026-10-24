@@ -21,37 +21,31 @@ from src.scheduler.timing import MultiTimeframeScheduler
 SOURCE = "tbank_exchange"
 
 
-def test_live_launch_starts_market_data_before_instrument_selection(monkeypatch, tmp_path):
+@pytest.mark.parametrize("lanes, started", [(True, "early"), (False, "data")])
+def test_core_start_opens_market_data_then_attaches_export(monkeypatch, tmp_path, lanes, started):
+    """Старт ядра (add-history-contour): полосы или только база, затем экспорт API получает базу."""
     order = []
-    budget = object()
-    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=True))
+    store = object()
+    monkeypatch.setattr(core, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=lanes))
     monkeypatch.setattr(core, "_start_early_market_data",
-                        lambda state_dir, provider: order.append("early") or SimpleNamespace(request_budget=budget))
-
-    def select(**kwargs):
-        order.append("select")
-        assert kwargs["request_budget"] is budget          # выбор идёт через тот же арбитр
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(run, "select_instruments", select)
-    with pytest.raises(KeyboardInterrupt):
-        run._launch(state_dir=tmp_path, client_provider=SimpleNamespace(), clock=None,
-                    session=SimpleNamespace(), channel_names=[])
-    assert order == ["early", "select"]
+                        lambda state_dir, provider: order.append("early") or SimpleNamespace(market_store=store))
+    monkeypatch.setattr(core, "_build_market_data",
+                        lambda **kw: order.append("data") or (None, store, None, None, None, object()))
+    monkeypatch.setattr(core, "_cluster_report", lambda market_store, state_dir: "report")
+    live = core.LiveCore(tmp_path, SimpleNamespace())
+    live.export_server = SimpleNamespace(attach_market=lambda market, report: order.append(("attach", market, report)))
+    live.start_market()
+    assert order == [started, ("attach", store, "report")]
 
 
-def test_history_launch_does_not_start_lanes(monkeypatch, tmp_path):
-    monkeypatch.setattr(run, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=True))
+def test_history_launch_does_not_start_lanes(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(core, "MARKET_DATA_SETTINGS", MarketDataSettings(independent_lanes=True))
     monkeypatch.setattr(core, "_start_early_market_data", lambda *a: pytest.fail("ранний старт в истории"))
-
-    def select(**kwargs):
-        assert kwargs["request_budget"] is None
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(run, "select_instruments", select)
-    with pytest.raises(KeyboardInterrupt):
-        run._launch(state_dir=tmp_path, client_provider=SimpleNamespace(), clock=SimpleNamespace(now=lambda: None),
-                    session=SimpleNamespace(), channel_names=[], history=True)
+    monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
+    code, _, _ = run._launch(state_dir=tmp_path, client_provider=SimpleNamespace(),
+                             clock=SimpleNamespace(now=lambda: None), session=SimpleNamespace(), channel_names=[],
+                             history=True)
+    assert code == 2 and "Инструменты прогона не заданы" in capsys.readouterr().out
 
 
 def owner(tmp_path):
