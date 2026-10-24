@@ -39,6 +39,14 @@ class PatternTrigger:
         if self._thread.is_alive():
             self._thread.join(timeout)
 
+    def add_pairs(self, pairs) -> None:
+        """Пары повторного запуска контура (add-control-api); уже известные не дублируются."""
+        known = {(instrument.ticker, instrument.instrument_type, timeframe) for instrument, timeframe in self._pairs}
+        fresh = [(instrument, timeframe) for instrument, timeframe in pairs
+                 if (instrument.ticker, instrument.instrument_type, timeframe) not in known]
+        # Новый список целиком: поток сторожа читает ссылку без блокировки.
+        self._pairs = self._pairs + fresh
+
     def _run(self) -> None:
         generation = None
         while not self._stop.is_set():

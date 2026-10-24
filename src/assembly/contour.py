@@ -201,20 +201,27 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
-             update_obligations=None, after_tick=None) -> None:
+             update_obligations=None, after_tick=None, control=None) -> None:
     def post_tick(ready_tfs):
+        # Желаемое ядра применяется на границе тика, до сопровождения и исполнения (add-control-api).
+        if control is not None:
+            control.before_tick()
         # Обязательства после тика контур считает сам и передаёт службам.
         if update_obligations is not None and runtime.storage is not None:
             update_obligations(_market_obligations(
                 runtime.storage.execution_bar_boundaries(), runtime.execution_aliases,
                 runtime.execution_instruments, data_cache))
-        result = runtime.post_tick(ready_tfs)
+        result = runtime.post_tick(ready_tfs) if runtime.post_tick is not None else True
+        if control is not None:
+            control.after_tick()
         # Курсор ленты подтверждается только после commit тика.
         if after_tick is not None and result is not False:
             after_tick()
         return result
 
-    TradingBot(
+    if control is not None:
+        control.start(runtime.trade_manager)
+    bot = TradingBot(
         instruments=instruments,
         bus=bus,
         strategy_map=_strategy_map(),
@@ -233,12 +240,18 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
             sr_calculator=SRLevelsCalculator(),
         ),
         signal_filter=SignalFilter(),
-        post_tick=post_tick if runtime.post_tick is not None else None,
+        # Без финансовой части хук нужен только для команд ядра.
+        post_tick=post_tick if runtime.post_tick is not None or control is not None else None,
         trade_manager=runtime.trade_manager,
         contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
-    ).run()
+    )
+    try:
+        bot.run()
+    finally:
+        if control is not None:
+            control.close()
 
 
 class _UnsafeExecutionState(RuntimeError):
@@ -757,6 +770,8 @@ class ContourSettings:
     market_data_sync: MarketDataSync | None = None
     # Карточки контрактов от ядра (launch.json); None — контур грузит их сам (история).
     contracts: dict | None = None
+    # Желаемое состояние ядра (add-control-api); None — процесс без управления (история).
+    control: object = None
 
 
 class TradingContour:
@@ -799,7 +814,7 @@ class TradingContour:
         _run_bot(self.settings.instruments, self.bus, self.runtime, services.data_cache, services.timeline,
                  session=self.settings.session, live_waiter=live_waiter,
                  update_obligations=services.update_obligations if services.tracks_obligations else None,
-                 after_tick=services.acknowledge_tick)
+                 after_tick=services.acknowledge_tick, control=self.settings.control)
 
     def finish(self) -> None:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""

@@ -392,24 +392,19 @@ class LiveCore:
                 market_store=self.market_store, data_cache=self.data_cache, state_dir=self.state_dir)
 
     def run_contour(self, instruments, *, kind: str, control=None, source: str = "", command: str = "",
-                    process_factory=None, poll_secs: float = 1.0) -> int:
-        """Контур отдельным процессом (add-contour-process): переезд журнала, прогрев, launch.json, надзор.
+                    core_state=None, next_launch=None, process_factory=None, poll_secs: float = 1.0) -> int:
+        """Цикл ядра: прогрев один раз, затем запуск процесса контура и надзор (add-contour-process, add-control-api).
 
-        Главный поток ядра ждёт Ctrl+C, даже если контур упал: приём данных и
-        API продолжают работать, контур сам не перезапускается (D5).
+        После выхода процесса ``next_launch`` ждёт следующую команду запуска и
+        возвращает ``(инструменты, источник, команда)``; контур запускается
+        заново без перезапуска приёма данных. Без ``next_launch`` (или если она
+        вернула ``None``) ядро, как прежде, ждёт Ctrl+C: приём данных и API
+        работают, контур сам не перезапускается.
         """
         import time
-        from datetime import datetime, timezone
 
-        from src import __version__
         from src.assembly.demand import ContourDemandPoller
-        from src.assembly.process import ContourProcess, contour_dir, migrate_journal, write_launch
-        from src.data.market_store import CONTOUR_CONSUMER_PREFIX
 
-        directory = contour_dir(self.state_dir, kind)
-        migrate_journal(self.state_dir, directory, version=__version__)
-        contracts = _load_contracts_metadata(instruments, client_provider=self.client_provider,
-                                             request_budget=self.request_budget)
         tracks = trading_enabled()
         poller = ContourDemandPoller(self.market_store, self.data_cache, instruments=instruments,
                                      tracks_obligations=tracks, poll_seconds=CONTOURS_FEED_POLL_SECS)
@@ -422,11 +417,48 @@ class LiveCore:
         self.start_clusters()
         if waiter is not None:
             waiter()
+        process = None
+        try:
+            while True:
+                process = self._start_contour_process(
+                    instruments, kind=kind, control=control, source=source, command=command,
+                    core_state=core_state, process_factory=process_factory)
+                self._supervise(process, kind=kind, control=control, poll_secs=poll_secs)
+                launch = None if next_launch is None else next_launch()
+                if launch is None:
+                    while True:
+                        time.sleep(poll_secs)
+                instruments, source, command = launch
+                # Новые инструменты повторного запуска: сопровождение и паттерны ядра.
+                poller.add_instruments(instruments)
+                if self._pattern_trigger is not None:
+                    self._pattern_trigger.add_pairs(_pattern_pairs(instruments))
+        except KeyboardInterrupt:
+            log.info("Ядро останавливается: контур %s получает stop", kind)
+        finally:
+            if process is not None:
+                process.stop()
+            poller.stop()
+        return 0 if process is None or process.exit_code in (0, None) else 1
+
+    def _start_contour_process(self, instruments, *, kind, control, source, command, core_state, process_factory):
+        """Переезд журнала, карточки контрактов, желаемое «работает», ``launch.json`` и процесс."""
+        from src import __version__
+        from src.assembly.process import ContourProcess, contour_dir, migrate_journal, write_launch
+
+        directory = contour_dir(self.state_dir, kind)
+        migrate_journal(self.state_dir, directory, version=__version__)
+        contracts = _load_contracts_metadata(instruments, client_provider=self.client_provider,
+                                             request_budget=self.request_budget)
+        payloads = [instrument_payload(item) for item in instruments]
+        # Желаемое — до запуска процесса: контур на старте не должен увидеть прежнюю остановку.
+        generation = None if core_state is None else core_state.record_launch(
+            kind, kind, payloads, source=source, command=command)
         write_launch(directory, {
             "contour_id": kind, "kind": kind, "core_pid": os.getpid(), "core_version": __version__,
-            "source": source, "command": command,
+            "source": source, "command": command, "generation": generation,
             "telegram_channel_env": CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV,
-            "instruments": [instrument_payload(item) for item in instruments],
+            "instruments": payloads,
             "contracts": contracts_payload(contracts),
         })
 
@@ -439,21 +471,23 @@ class LiveCore:
         pid = process.start()
         if control is not None:
             control.mark_process(pid)
+        return process
+
+    def _supervise(self, process, *, kind, control, poll_secs) -> None:
+        """Пока процесс жив: первое подтверждение курсора ленты переводит контур в ``running``."""
+        import time
+        from datetime import datetime, timezone
+
+        from src.data.market_store import CONTOUR_CONSUMER_PREFIX
+
         started = datetime.now(timezone.utc)
         consumer = CONTOUR_CONSUMER_PREFIX + kind
-        try:
-            while True:
-                if control is not None and process.running:
-                    saved = self.market_store.consumer_checkpoint(consumer)
-                    if saved is not None and _after(saved["acknowledged_at"], started):
-                        control.mark_contour_running()
-                time.sleep(poll_secs)
-        except KeyboardInterrupt:
-            log.info("Ядро останавливается: контур %s получает stop", kind)
-        finally:
-            process.stop()
-            poller.stop()
-        return 0 if process.exit_code in (0, None) else 1
+        while process.running:
+            if control is not None:
+                saved = self.market_store.consumer_checkpoint(consumer)
+                if saved is not None and _after(saved["acknowledged_at"], started):
+                    control.mark_contour_running()
+            time.sleep(poll_secs)
 
     def cluster_gate(self, state_dir):
         gate, self._cluster_consumer = _live_cluster_gate(

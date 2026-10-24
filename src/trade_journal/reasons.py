@@ -21,6 +21,8 @@ REASON_LABELS = {
     "intraday-session-closed": "вход вне разрешённой сессии",
     "intraday-close-near": "слишком близко к концу сессии",
     "session-schedule-unknown": "расписание торгов неизвестно",
+    "contour-stopping": "контур останавливается",
+    "contour-stop": "остановка контура командой",
     "profile-entry": "вход по профилю",
     "protective": "стоп",
     "tp": "цель по цене",

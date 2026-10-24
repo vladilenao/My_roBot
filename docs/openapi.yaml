@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 1.4.0-proposal
+  version: 1.5.0-proposal
   description: |
     Единый контракт всех HTTP-сервисов My Robot. Сервер встроен в робота,
     по умолчанию слушает только loopback и публикует этот файл по
@@ -11,7 +11,8 @@ info:
       версии свечей и состояния покрытия из локального журнала, сохраняет их
       и подтверждает курсор.
     * Clusters — отчёт кластерного фильтра входа (данные ClusterSource).
-    * Contours — запуск торгового контура эмуляции командой и его состояние.
+    * Contours — запуск, остановка и повторный запуск торгового контура
+      эмуляции командами, его состояние и журнал.
 
     Когда сервер работает: только в режиме эмуляции (торговля на живых
     данных с симулятором исполнения), сразу после раннего сбора рыночных
@@ -29,7 +30,13 @@ info:
     Как запустить торговлю командой: запустите робота с
     `--mode emulation --wait-command` (или выберите в меню «ждать команду
     API»), дождитесь строки «Робот ждёт команду запуска» и отправьте
-    `POST /api/v1/contours`.
+    `POST /api/v1/contours`. Остановить — `POST /api/v1/contours/emulation/stop`;
+    после остановки `POST /api/v1/contours` запускает торговлю снова, ядро
+    при этом не перезапускается.
+
+    Команды, меняющие желаемое состояние, получают номер поколения
+    (`desired.generation`). Контур применяет его на ближайшей границе тика;
+    команда выполнена, когда `actual.applied_generation` догнал поколение.
 servers:
   - url: /
     description: Тот же узел, где опубликован Swagger UI; по умолчанию loopback.
@@ -40,9 +47,9 @@ tags:
     description: Отчёт кластерного фильтра входа.
   - name: Contours
     description: |
-      Запуск торгового контура эмуляции командой и его состояние. В этой
-      версии процесс торгует одним набором инструментов: второй запуск,
-      остановка и смена состава через API появятся позже.
+      Запуск, остановка и повторный запуск торгового контура эмуляции,
+      его желаемое и фактическое состояние, журнал процесса контура.
+      Смена состава на ходу появится позже.
 paths:
   /openapi.yaml:
     get:
@@ -406,6 +413,8 @@ paths:
                         rejections: []
                         pid: null
                         exit_code: null
+                        desired: null
+                        actual: null
                 running:
                   summary: Торговля запущена командой
                   value:
@@ -422,6 +431,35 @@ paths:
                         rejections: []
                         pid: 81412
                         exit_code: null
+                        desired: {running: true, stop_mode: null, generation: 1}
+                        actual:
+                          state: running
+                          applied_generation: 1
+                          open_positions: 1
+                          pending_entries: 0
+                          last_tick_at: '2026-10-22T10:16:00Z'
+                stopping:
+                  summary: Контур доживает сделки после stop no_entries
+                  value:
+                    contours:
+                      - id: emulation
+                        kind: emulation
+                        state: stopping_no_entries
+                        source: api
+                        instruments:
+                          - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                        started_at: '2026-10-22T10:15:00Z'
+                        command: --mode emulation --instruments NG-12.26
+                        rejections: []
+                        pid: 81412
+                        exit_code: null
+                        desired: {running: false, stop_mode: no_entries, generation: 2}
+                        actual:
+                          state: stopping_no_entries
+                          applied_generation: 2
+                          open_positions: 1
+                          pending_entries: 0
+                          last_tick_at: '2026-10-22T11:02:00Z'
                 failed:
                   summary: Процесс контура упал
                   value:
@@ -437,14 +475,20 @@ paths:
                         rejections: []
                         pid: null
                         exit_code: 1
+                        desired: {running: true, stop_mode: null, generation: 1}
+                        actual: null
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
     post:
       tags: [Contours]
       summary: Запустить торговлю эмуляции выбранными инструментами
       description: |
-        Работает, когда робот запущен с `--mode emulation --wait-command` и
-        ещё не торгует. Инструменты разрешаются по тем же правилам, что
+        Работает, когда робот ждёт команду: запущен с `--mode emulation
+        --wait-command` и ещё не торгует, либо контур уже остановлен
+        (`stopped`) или упал (`failed`) — тогда ядро запускает процесс
+        контура заново, приём данных не перезапускается, набор может быть
+        другим. Принятая команда записывает желаемое «работает» новым
+        поколением. Инструменты разрешаются по тем же правилам, что
         параметр `--instruments`:
 
         * `all` или поле не задано — все инструменты с привязками в `robot.toml`;
@@ -501,6 +545,8 @@ paths:
                 rejections: []
                 pid: 81412
                 exit_code: null
+                desired: {running: true, stop_mode: null, generation: 1}
+                actual: null
         '202':
           description: Проверка инструментов у брокера ещё идёт; итог — в `GET /api/v1/contours`.
           headers:
@@ -521,6 +567,8 @@ paths:
                 rejections: []
                 pid: null
                 exit_code: null
+                desired: null
+                actual: null
         '400':
           description: Тело не JSON, неизвестные поля, `kind` не `emulation` или `instruments` не список строк.
           content:
@@ -533,7 +581,10 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '409':
-          description: Торговля уже запущена командой, параметрами или меню.
+          description: |
+            `ALREADY_RUNNING` — контур запускается или торгует (командой,
+            параметрами или меню); `STOPPING` — контур выполняет остановку и
+            доживает сделки: дождитесь `stopped` или вызовите stop с `close_all`.
           content:
             application/json:
               schema:
@@ -553,6 +604,8 @@ paths:
                   rejections: []
                   pid: 81412
                   exit_code: null
+                  desired: {running: true, stop_mode: null, generation: 1}
+                  actual: null
         '422':
           description: Хотя бы один инструмент отклонён; торговля не начата, робот ждёт новую команду.
           content:
@@ -564,7 +617,154 @@ paths:
                 message: Торговля не запущена.
                 rejections:
                   - {token: AFLT, reason: У инструмента нет привязок в robot.toml.}
+  /api/v1/contours/{contour_id}:
+    parameters:
+      - $ref: '#/components/parameters/ContourId'
+    get:
+      tags: [Contours]
+      summary: Состояние одного контура
+      operationId: getContour
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур, тот же объект, что в списке.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Contour'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/ContourNotFound'}
+  /api/v1/contours/{contour_id}/stop:
+    parameters:
+      - $ref: '#/components/parameters/ContourId'
+    post:
+      tags: [Contours]
+      summary: Остановить контур
+      description: |
+        Записывает желаемое «остановлен» с режимом и новым поколением.
+        Контур применяет его на ближайшей границе тика (не реже раза в
+        минуту), ядро, приём данных и API продолжают работать.
+
+        * `no_entries` — новых входов и доборов нет, неисполненные входы
+          снимаются, открытые позиции сопровождаются до закрытия; после
+          последней процесс контура завершается сам.
+        * `close_all` — то же, и все позиции закрываются на открытии
+          следующего бара; затем контур завершается.
+
+        Повтор той же команды безопасен (`200`, поколение прежнее).
+        `close_all` поверх `no_entries` принимается, обратно — `409`.
+        Ctrl+C в консоли ядра останавливает процесс контура, не меняя
+        желаемое.
+      operationId: stopContour
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContourStopRequest'}
+            examples:
+              noEntries:
+                summary: Больше не входить, сделки доживают
+                value: {mode: no_entries}
+              closeAll:
+                summary: Закрыть всё
+                value: {mode: close_all}
+      responses:
+        '202':
+          description: Остановка записана новым поколением; выполнение — по `actual.applied_generation`.
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/contours/emulation}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourStopAccepted'}
+              example:
+                generation: 2
+                contour:
+                  id: emulation
+                  kind: emulation
+                  state: stopping_no_entries
+                  source: api
+                  instruments:
+                    - {token: NG, name: NG-12.26, instrument_type: future, days_to_expiry: 52}
+                  started_at: '2026-10-22T10:15:00Z'
+                  command: --mode emulation --instruments NG-12.26
+                  rejections: []
+                  pid: 81412
+                  exit_code: null
+                  desired: {running: false, stop_mode: no_entries, generation: 2}
+                  actual:
+                    state: running
+                    applied_generation: 1
+                    open_positions: 1
+                    pending_entries: 0
+                    last_tick_at: '2026-10-22T11:01:00Z'
+        '200':
+          description: Повтор той же остановки; поколение не изменилось.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourStopAccepted'}
+        '400':
+          description: 'Тело не `{"mode": "no_entries" | "close_all"}`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiError'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/ContourNotFound'}
+        '409':
+          description: |
+            `NOT_RUNNING` — процесс контура не работает (`waiting_command`,
+            `stopped`, `failed`); `MODE_CONFLICT` — `no_entries` поверх
+            `close_all`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContourConflict'}
+  /api/v1/contours/{contour_id}/log:
+    parameters:
+      - $ref: '#/components/parameters/ContourId'
+    get:
+      tags: [Contours]
+      summary: Последние строки журнала процесса контура
+      description: |
+        Строки `data/contours/<id>/bot_debug.log` так, как они записаны:
+        секреты в журнале уже заменены на `[скрыто]`. Нет журнала — пустой
+        ответ.
+      operationId: getContourLog
+      security:
+        - ControlToken: []
+      parameters:
+        - name: tail
+          in: query
+          required: false
+          description: Сколько последних строк вернуть.
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+      responses:
+        '200':
+          description: Последние строки журнала.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: |
+                2026-10-22 11:02:00 [INFO] src.assembly.contour_control: Контур emulation: поколение 2 — остановка no_entries
+        '400':
+          description: '`tail` не целое число от 1 до 1000.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiError'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/ContourNotFound'}
 components:
+  parameters:
+    ContourId:
+      name: contour_id
+      in: path
+      required: true
+      description: Идентификатор контура; в этой версии — `emulation`.
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$', example: emulation}
   securitySchemes:
     ExportToken:
       type: http
@@ -579,6 +779,12 @@ components:
         Ключ управления контуром — значение `ROBOT_CONTROL_TOKEN` из `.env`.
         Не даёт доступа к экспорту, а ключ экспорта не даёт управления.
   responses:
+    ContourNotFound:
+      description: Неизвестный идентификатор контура.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ApiError'}
+          example: {code: NOT_FOUND, message: "Контура 'account' нет."}
     BadRequest:
       description: Неверный параметр или идентификатор вне допустимого диапазона.
       content:
@@ -892,18 +1098,22 @@ components:
     Contour:
       type: object
       additionalProperties: false
-      required: [id, kind, state, source, instruments, started_at, command, rejections, pid, exit_code]
+      required: [id, kind, state, source, instruments, started_at, command, rejections, pid, exit_code, desired,
+                 actual]
       properties:
         id: {type: string, example: emulation}
         kind: {type: string, enum: [emulation]}
         state:
           type: string
-          enum: [waiting_command, starting, running, stopped, failed]
+          enum: [waiting_command, starting, running, stopping_no_entries, stopping_close_all, stopped, failed]
           description: |
             `starting` — процесс контура запущен, но ещё не подтвердил курсор
-            ленты; `running` — контур торгует; `stopped` — процесс завершился
-            штатно (код 0) по остановке; `failed` — завершился с другим кодом
-            или не запустился, сам не перезапускается.
+            ленты; `running` — контур торгует; `stopping_no_entries` /
+            `stopping_close_all` — процесс жив, а желаемое — остановка в этом
+            режиме; `stopped` — процесс завершился штатно (код 0);
+            `failed` — завершился с другим кодом или не запустился, сам не
+            перезапускается. После рестарта ядра — `waiting_command` с
+            прежним желаемым: контур сам не поднимается.
         source:
           type: string
           nullable: true
@@ -932,6 +1142,53 @@ components:
           type: integer
           nullable: true
           description: Код выхода процесса контура после его завершения.
+        desired:
+          allOf: [{$ref: '#/components/schemas/ContourDesired'}]
+          nullable: true
+          description: Желаемое из `data/core.sqlite3`; null, если контур ни разу не запускался.
+        actual:
+          allOf: [{$ref: '#/components/schemas/ContourActual'}]
+          nullable: true
+          description: Фактическое из `status.json` контура; null до первого снимка этого запуска ядра или если файл не читается.
+    ContourDesired:
+      type: object
+      additionalProperties: false
+      required: [running, stop_mode, generation]
+      properties:
+        running: {type: boolean, description: Должен ли контур торговать.}
+        stop_mode:
+          type: string
+          nullable: true
+          enum: [no_entries, close_all, null]
+        generation: {type: integer, minimum: 1, description: Номер поколения желаемого состояния.}
+    ContourActual:
+      type: object
+      additionalProperties: false
+      required: [state, applied_generation, open_positions, pending_entries, last_tick_at]
+      properties:
+        state:
+          type: string
+          enum: [running, stopping_no_entries, stopping_close_all, stopped]
+        applied_generation: {type: integer, minimum: 0, description: 'Поколение, которое контур применил.'}
+        open_positions: {type: integer, minimum: 0}
+        pending_entries: {type: integer, minimum: 0, description: Неисполненные входы.}
+        last_tick_at:
+          type: string
+          format: date-time
+          nullable: true
+    ContourStopRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [no_entries, close_all]}
+    ContourStopAccepted:
+      type: object
+      additionalProperties: false
+      required: [generation, contour]
+      properties:
+        generation: {type: integer, minimum: 1}
+        contour: {$ref: '#/components/schemas/Contour'}
     ContourList:
       type: object
       additionalProperties: false
@@ -945,7 +1202,9 @@ components:
       additionalProperties: false
       required: [code, message, contour]
       properties:
-        code: {type: string, example: ALREADY_RUNNING}
+        code:
+          type: string
+          enum: [ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT]
         message: {type: string}
         contour: {$ref: '#/components/schemas/Contour'}
     LaunchRejected:

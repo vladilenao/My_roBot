@@ -63,7 +63,8 @@ from src.bot.launch import (
 from src.assembly.contour import ContourSettings, TradingContour, _family_warmup, _strategy_map
 from src.assembly.core import LiveCore, _say
 from src.assembly.history import HistoricalMarketServices
-from src.assembly.process import JournalMigrationError
+from src.assembly.core_state import CORE_DATABASE_FILE, CoreStateStore
+from src.assembly.process import JournalMigrationError, contour_dir
 from src.assembly.services import _timeframes
 from src.bot.launch_control import LaunchControl
 from src.bot.run_session import build_run_session
@@ -211,8 +212,10 @@ def _run_contour(kind: str) -> int:
     import signal
 
     from src.assembly.contracts import contracts_from_payload, instrument_from_payload
+    from src.assembly.contour_control import STATUS_FILE, ContourControl
+    from src.config import DATABASE_FILE
     from src.assembly.feed import FeedMarketServices
-    from src.assembly.process import LaunchFileError, StdinStop, contour_dir, read_launch
+    from src.assembly.process import LaunchFileError, StdinStop, read_launch
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
@@ -244,6 +247,10 @@ def _run_contour(kind: str) -> int:
     stop.start()
     # Ctrl+C в консоли доходит и до контура: останавливаемся на границе тика, а не посреди него.
     signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    # Желаемое ядра читается на границе тика; завершение остановки ставит тот же флаг, что stdin.
+    control = ContourControl(core_db=data_dir / CORE_DATABASE_FILE, contour_id=kind,
+                             journal_db=directory / DATABASE_FILE, status_path=directory / STATUS_FILE,
+                             request_stop=stop.request, version=__version__)
     instruments = [instrument_from_payload(item) for item in launch["instruments"]]
     services = FeedMarketServices(MarketDataStore(data_dir / MARKET_DATA_DATABASE_FILE), contour_id=kind,
                                   data_dir=data_dir, tracks_obligations=trading_enabled(),
@@ -251,7 +258,7 @@ def _run_contour(kind: str) -> int:
     contour = TradingContour(ContourSettings(
         kind=kind, state_dir=directory, channel_names=None, clock=None,
         session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
-        contracts=contracts_from_payload(launch.get("contracts") or {}),
+        contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
     ), services)
     try:
         contour.build()
@@ -487,7 +494,12 @@ def _launch(
             core.start_early()
     # Локальный API — сразу после раннего сбора данных, до выбора инструментов:
     # команда запуска приходит именно сюда (add-noninteractive-launch).
-    control = LaunchControl() if not history and ROBOT_CONTROL_TOKEN else None
+    # Желаемое и журнал команд ядра (add-control-api): записываются при любом запуске эмуляции,
+    # иначе контур прочитал бы оставшуюся с прошлого раза остановку.
+    core_state = None if history else CoreStateStore(state_dir / CORE_DATABASE_FILE)
+    control = (LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
+                             log_file=LOGGING_FILE)
+               if not history and ROBOT_CONTROL_TOKEN else None)
     if control is not None:
         if launch is not None and launch.wait_command:
             control.accept_commands()
@@ -587,10 +599,20 @@ def _launch(
         # Контур эмуляции — отдельный процесс на ленте ядра (add-contour-process).
         core.ensure_market_data()
         core.start_api(control)
+        def next_launch():
+            """После выхода контура — следующая команда API (повторный запуск); без API — Ctrl+C."""
+            if control is None or core.export_server is None:
+                return None
+            chosen = _await_command(control, core.export_server, client_provider,
+                                    None if core.early is None else core.early.request_budget, None)
+            snapshot = control.snapshot()
+            return [normalize_instrument(item) for item in chosen], SOURCE_API, snapshot.get("command") or ""
+
         try:
-            code = core.run_contour(instruments, kind=MODE_EMULATION, control=control,
+            code = core.run_contour(instruments, kind=MODE_EMULATION, control=control, core_state=core_state,
                                     source="" if launch is None else launch.source,
-                                    command="" if control is None else control.snapshot().get("command") or "")
+                                    command="" if control is None else control.snapshot().get("command") or "",
+                                    next_launch=next_launch)
         except JournalMigrationError as exc:
             print(str(exc))
             code = 2
@@ -824,8 +846,6 @@ if __name__ == "__main__":
         action.add_argument("--telegram-retry", action="store_true")
         action.add_argument("--telegram-cleanup-files", action="store_true")
         # Доставка Telegram — журнал контура эмуляции (add-contour-process).
-        from src.assembly.process import contour_dir
-
         parser.add_argument("--state-dir", type=Path, default=contour_dir(runtime_dir(), MODE_EMULATION))
         parser.add_argument("--id", type=int, dest="operation_id")
         parser.add_argument("--trade-id")
