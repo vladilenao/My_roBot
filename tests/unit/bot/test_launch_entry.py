@@ -7,7 +7,7 @@ import pytest
 import run
 from src.assembly import core
 from src.bot.launch import Chosen, Rejection, Resolution
-from src.bot.launch_control import LaunchControl, parse_command
+from src.bot.launch_control import LaunchControl, parse_target
 
 NG = Chosen("NG", "NG-12.26", "future", 52, "NG", True)
 NG_TUPLE = ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26")
@@ -36,7 +36,7 @@ class TestMain:
         assert run.main(argv) == 2
         run_robot.assert_not_called()
         out = capsys.readouterr().out
-        assert "POST /api/v1/contours" in out and '"kind": "history"' in out
+        assert "PUT /api/v1/emulation/target" in out and "POST /api/v1/history" in out
 
     @patch("run._run_history_contour", return_value=0)
     def test_history_contour_entry(self, run_history_contour):
@@ -55,15 +55,15 @@ def test_waits_for_command_until_accepted(capsys):
     answers = []
 
     def send(body):
-        answers.append(control.submit(parse_command(body))[0])
+        answers.append(control.put_target(*parse_target(body))[0])
 
     def client():
         for _ in range(500):                      # главный поток ещё не начал принимать команды
             if control._accepting:
                 break
             threading.Event().wait(0.01)
-        send({"kind": "emulation", "instruments": ["AFLT"]})
-        send({"kind": "emulation", "instruments": ["NG"]})
+        send({"mode": "on", "instruments": ["AFLT"]})
+        send({"mode": "on", "instruments": ["NG-12.26"]})
 
     thread = threading.Thread(target=client, daemon=True)
     with patch.object(run, "_resolve_request", side_effect=lambda *a, **k: next(results)):
@@ -71,10 +71,10 @@ def test_waits_for_command_until_accepted(capsys):
         selected = run._await_command(control, export_server, None, None, None)
     thread.join(5)
     assert selected == [NG_TUPLE]
-    assert answers == [422, 201]
+    assert answers == [422, 202]
     out = capsys.readouterr().out
-    assert "Робот ждёт команду запуска: POST http://127.0.0.1:8101/api/v1/contours" in out
-    assert 'Повторить запуск: POST /api/v1/contours {"kind": "emulation", "instruments": ["NG-12.26"]}' in out
+    assert "Робот ждёт команду запуска: PUT http://127.0.0.1:8101/api/v1/emulation/target" in out
+    assert 'Повторить запуск: PUT /api/v1/emulation/target {"mode": "on", "instruments": ["NG-12.26"]}' in out
 
 
 def test_control_api_starts_before_market_data_with_control_key_only(monkeypatch, capsys):

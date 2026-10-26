@@ -2,9 +2,10 @@
 
 Робот стартует без параметров (add-history-contour); эмуляция и прогоны
 истории приходят командами локального API. Объект ``LaunchRequest`` описывает
-такой запуск. Разрешение токенов инструментов одно для всех команд: тикер
-акции, код семейства фьючерсов или контракт, а по умолчанию — все
-инструменты с привязками в конфигурации.
+такой запуск. Без списка — все инструменты с привязками в конфигурации.
+Эмуляция принимает только тикер акции и короткое имя контракта
+(rework-contour-api); история — ещё код семейства (автоматическая цепочка)
+и биржевой тикер контракта.
 """
 
 from __future__ import annotations
@@ -54,6 +55,8 @@ class LaunchRequest:
     end: datetime | None = None
     pause: float | None = None
     wait_command: bool = False
+    # Ревизия из If-Match команды эмуляции (rework-contour-api); None — без проверки.
+    expected_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,8 @@ class _Target:
     token: str
     value: str
     family: str | None = None
+    # Семейство выбрано правилом «все с привязками», а не названо в команде.
+    automatic: bool = False
 
 
 # --- даты и диапазон истории -------------------------------------------------
@@ -127,8 +132,8 @@ def validate_range(start: datetime, end: datetime, pause: float) -> tuple[dateti
 # --- командная строка ---------------------------------------------------------
 
 START_HINT = ("Робот запускается без параметров и ждёт команд API: эмуляция — "
-              "POST /api/v1/contours {\"kind\": \"emulation\", \"instruments\": [...]}, история — "
-              "POST /api/v1/contours {\"kind\": \"history\", \"from\": ..., \"to\": ...}.")
+              "PUT /api/v1/emulation/target {\"mode\": \"on\", \"instruments\": [...]}, история — "
+              "POST /api/v1/history {\"from\": ..., \"to\": ...}.")
 
 
 def parse_launch_args(argv) -> None:
@@ -177,11 +182,16 @@ def _all_targets(share_strategies: dict, future_strategies: dict) -> list[_Targe
             continue
         if assignments and family not in families:
             families.append(family)
-    return targets + [_Target("family", family, family, family) for family in families]
+    return targets + [_Target("family", family, family, family, automatic=True) for family in families]
 
 
-def classify_tokens(tokens, share_strategies: dict, future_strategies: dict) -> tuple[list[_Target], list[Rejection]]:
-    """Токены → цели разрешения и отказы, без обращения к источнику."""
+def classify_tokens(tokens, share_strategies: dict, future_strategies: dict, *,
+                    conflicts: bool = True) -> tuple[list[_Target], list[Rejection]]:
+    """Токены → цели разрешения и отказы, без обращения к источнику.
+
+    ``conflicts`` — отклонять семейство вместе с его контрактом (история); в
+    эмуляции код семейства отклоняется сам, конфликта там нет.
+    """
     shares = {ticker.upper() for ticker, items in share_strategies.items() if items}
     if tuple(tokens) == (ALL,):
         return _all_targets(share_strategies, future_strategies), []
@@ -217,7 +227,7 @@ def classify_tokens(tokens, share_strategies: dict, future_strategies: dict) -> 
             rejections.append(Rejection(token, "У инструмента нет привязок в robot.toml."))
         else:
             rejections.append(Rejection(token, "Неизвестный инструмент: нет такой акции с привязками, семейства или контракта."))
-    families = {target.family for target in targets if target.kind == "family"}
+    families = {target.family for target in targets if target.kind == "family"} if conflicts else set()
     for target in list(targets):
         if target.kind == "contract" and target.family in families:
             targets.remove(target)
@@ -252,10 +262,11 @@ def _match_contract(futures, token):
 def resolve_emulation(tokens, client, *, share_strategies: dict, future_strategies: dict,
                       block_days: int, market_now: datetime | None = None, validate=None,
                       active_futures=None) -> Resolution:
-    """Эмуляция: акции, контракт семейства по правилу ближайшего, явные контракты.
+    """Эмуляция: акции, явные контракты коротким именем, у «всех с привязками» — ближайший контракт семейства.
 
-    Результат ``instruments`` — 4-кортежи ``(label, ticker, type, short_name)``
-    в том же виде, что раньше отдавало меню.
+    Код семейства и биржевой тикер контракта, названные в команде, отклоняются
+    с подсказкой короткого имени (rework-contour-api). Результат
+    ``instruments`` — 4-кортежи ``(label, ticker, type, short_name)``.
     """
     from src.api.instruments import find_working_instrument_with_name
     from src.instruments.selector import active_futures_with_expiry
@@ -263,7 +274,7 @@ def resolve_emulation(tokens, client, *, share_strategies: dict, future_strategi
     validate = validate or find_working_instrument_with_name
     active_futures = active_futures or active_futures_with_expiry
     now = to_naive(market_now) if market_now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
-    targets, rejections = classify_tokens(tokens, share_strategies, future_strategies)
+    targets, rejections = classify_tokens(tokens, share_strategies, future_strategies, conflicts=False)
     result = Resolution(instruments=[], rejections=rejections)
     futures = None
     for target in targets:
@@ -279,6 +290,11 @@ def resolve_emulation(tokens, client, *, share_strategies: dict, future_strategi
         if target.kind == "family":
             candidates = [entry for entry in futures if _entry_family(entry) == target.family]
             entry = next((item for item in candidates if item[4] - now > timedelta(days=block_days)), None)
+            if not target.automatic:
+                hint = (f"ближайший допустимый — {entry[3]}." if entry is not None else
+                        f"торгуемого контракта с экспирацией позже чем через {block_days} {_days_word(block_days)} нет.")
+                result.rejections.append(Rejection(target.token, f"Код семейства не принимается — укажите контракт; {hint}"))
+                continue
             if entry is None:
                 result.rejections.append(Rejection(
                     target.token, f"Нет торгуемого контракта семейства с экспирацией позже чем через {block_days} {_days_word(block_days)}."))
@@ -288,6 +304,10 @@ def resolve_emulation(tokens, client, *, share_strategies: dict, future_strategi
             if entry is None:
                 result.rejections.append(Rejection(
                     target.token, "Контракт не найден среди торгуемых стандартных контрактов ближайших шести месяцев."))
+                continue
+            if str(entry[3]).upper() != target.token:
+                result.rejections.append(Rejection(
+                    target.token, f"Биржевой тикер не принимается — укажите короткое имя {entry[3]}."))
                 continue
         found = _validate(validate, client, entry[1], "future", market_now, _display_token(target, entry), result.rejections)
         if found is None:
@@ -371,7 +391,7 @@ def describe_choice(chosen: Chosen) -> str:
 
 
 def equivalent_command(request: LaunchRequest, chosen: list[Chosen]) -> str:
-    """Тело команды API, повторяющей запуск эмуляции; контракты — коротким именем."""
+    """Тело ``PUT /api/v1/emulation/target``, повторяющее запуск эмуляции; контракты — коротким именем."""
     import json
 
-    return json.dumps({"kind": MODE_EMULATION, "instruments": [item.name for item in chosen]}, ensure_ascii=False)
+    return json.dumps({"mode": "on", "instruments": [item.name for item in chosen]}, ensure_ascii=False)

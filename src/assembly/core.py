@@ -565,11 +565,13 @@ class LiveCore:
                     process = self._adopt_contour_process(recovery.pid, kind=kind, control=control,
                                                           poll_secs=poll_secs)
                 else:
-                    autostart = recovery is not None and core_state is not None
+                    # Автоподъём или запуск, который команда уже записала в core.sqlite3 (rework-contour-api):
+                    # поколение — из базы, второго не создаётся.
+                    recorded = recovery is not None or (control is not None and control.launch_recorded())
                     process = self._start_contour_process(
                         instruments, kind=kind, control=control, source=source, command=command,
                         core_state=core_state, process_factory=process_factory,
-                        desired=core_state.desired(kind) if autostart else None)
+                        desired=core_state.desired(kind) if recorded and core_state is not None else None)
                 recovery = None
                 self._supervise(process, kind=kind, control=control, poll_secs=poll_secs,
                                 membership=lambda command: self._membership_command(
@@ -604,9 +606,10 @@ class LiveCore:
                                desired=None):
         """Переезд журнала, карточки контрактов, желаемое «работает», ``launch.json`` и процесс.
 
-        С ``desired`` — автоподъём (add-contour-recovery): желаемое не меняется,
-        процесс получает текущее поколение, а карточки, которые брокер не отдал,
-        берутся из сохранённого состава.
+        С ``desired`` — автоподъём (add-contour-recovery) или запуск, уже
+        записанный командой (rework-contour-api): желаемое не меняется, процесс
+        получает текущее поколение, карточки, которые брокер не отдал, берутся из
+        сохранённого состава, а полученные сохраняются участникам состава.
         """
         from src import __version__
         from src.assembly.contracts import contracts_from_payload
@@ -627,6 +630,10 @@ class LiveCore:
                     log.warning("Сохранённая карточка контракта %s не читается — без запасной карточки", member.name)
             contracts = {**stored, **contracts}
             generation, source, command = desired.generation, desired.source or "", desired.command or ""
+            if core_state is not None:
+                cards = {member.key: member.contract for member in (_member(item, contracts, chosen) for item in instruments)
+                         if member.contract is not None}
+                core_state.attach_contracts(kind, cards)
         else:
             # Желаемое — до запуска процесса: контур на старте не должен увидеть прежнюю остановку.
             generation = None if core_state is None else core_state.record_launch(
@@ -682,12 +689,21 @@ class LiveCore:
 
     def _membership_command(self, command, *, kind, control, core_state, poller, resolve) -> None:
         """Команда состава в главном потоке: разрешение, карточки, желаемое, потребности ядра."""
-        from src.assembly.core_state import ACCEPTED, IGNORED, match_members
+        from src.assembly.core_state import RevisionChanged
 
         if core_state is None:
-            control.answer_membership(command, 409, {"code": "NOT_RUNNING", "message": "Нет базы ядра.",
-                                                     "contour": control.snapshot()})
+            control.answer_membership(command, 409, {"code": "NOT_RUNNING", "message": "Нет базы ядра."})
             return
+        try:
+            self._change_members(command, kind=kind, control=control, core_state=core_state, poller=poller,
+                                 resolve=resolve)
+        except RevisionChanged as exc:
+            # If-Match не совпал при записи: состав не менялся, в журнале — conflict.
+            control.answer_membership(command, 412, {"code": "REVISION_CHANGED", "message": str(exc)})
+
+    def _change_members(self, command, *, kind, control, core_state, poller, resolve) -> None:
+        from src.assembly.core_state import ACCEPTED, IGNORED, match_members
+
         payload = {"add": list(command.add)} if command.add else {"remove": list(command.remove), "mode": command.mode}
         added: list = []
         if command.add:
@@ -707,14 +723,15 @@ class LiveCore:
                                                  request_budget=self.request_budget)
             chosen = [item.payload() for item in resolution.chosen]
             outcome = core_state.record_membership(kind, add=[_member(item, contracts, chosen) for item in added],
-                                                   payload=payload)
+                                                   payload=payload, expected=command.expected)
         else:
             desired = core_state.desired(kind)
             keys, rejections = match_members(() if desired is None else desired.members, command.remove)
             if rejections:
                 self._reject_membership(command, control, core_state, kind, payload, rejections)
                 return
-            outcome = core_state.record_membership(kind, remove=keys, mode=command.mode, payload=payload)
+            outcome = core_state.record_membership(kind, remove=keys, mode=command.mode, payload=payload,
+                                                   expected=command.expected)
         if outcome.outcome == ACCEPTED and added:
             # Ядро сразу ведёт сопровождение и паттерны нового инструмента; пары греет спрос контура.
             poller.add_instruments(added)
@@ -723,11 +740,10 @@ class LiveCore:
         if outcome.outcome in (ACCEPTED, IGNORED):
             log.info("Состав контура %s: %s — поколение %d", kind, payload, outcome.generation)
             control.answer_membership(command, 202 if outcome.outcome == ACCEPTED else 200,
-                                      {"generation": outcome.generation, "contour": control.snapshot()})
+                                      {"revision": outcome.generation})
         else:
             code = "STOPPING" if "останавливается" in outcome.reason else "MODE_CONFLICT"
-            control.answer_membership(command, 409, {"code": code, "message": f"Состав не изменён: {outcome.reason}.",
-                                                     "contour": control.snapshot()})
+            control.answer_membership(command, 409, {"code": code, "message": f"Состав не изменён: {outcome.reason}."})
 
     @staticmethod
     def _reject_membership(command, control, core_state, kind, payload, rejections) -> None:

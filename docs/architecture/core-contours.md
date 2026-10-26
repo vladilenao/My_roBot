@@ -98,7 +98,7 @@ robot/
         │   ├── status.json
         │   └── robot.pid
         └── history/
-            └── 20261024-101500/   # прогон history-20261024-101500 (П7 ✓)
+            └── 20261024-101500/   # прогон 20261024-101500 (П7 ✓)
 ```
 
 ```toml
@@ -157,21 +157,31 @@ flowchart LR
 
 ## 6. API управления
 
-Первые два запроса (`GET` и `POST /api/v1/contours`, только эмуляция) появляются уже на П1, в том же процессе; остальные — на П4. Ядро слушает только `127.0.0.1`. Ключ передаётся только в заголовке
-`Authorization: Bearer`, ядро проверяет `Host` и не отдаёт `CORS *`.
-Команды отвечают номером поколения.
+С API 2.0 (`rework-contour-api`) у каждого контура свой ресурс: эмуляция —
+`/api/v1/emulation`, прогоны истории — `/api/v1/history`; общая оболочка
+`/api/v1/contours` из П1–П7 удалена. Ядро слушает только `127.0.0.1`. Ключ
+передаётся только в заголовке `Authorization: Bearer`, ядро проверяет `Host` и
+не отдаёт `CORS *`. Наружу желаемое, фактическое и поколение называются
+`target`, `current` и `revision`; ревизия — заголовок `ETag`, `If-Match`
+защищает от двух одновременных команд (`412`). Ответы несут `_links` и
+`_actions`, ошибки — `application/problem+json`. Контракт —
+[docs/api/openapi.yaml](../api/openapi.yaml), решения —
+[docs/api/v2-decisions.md](../api/v2-decisions.md).
 
 | Запрос | Что делает ядро |
 | --- | --- |
+| `GET /api/v1` | Точка входа: версия, состояние ядра, сводка эмуляции и истории, ссылки по правам ключа. |
 | `GET /api/v1/core` | Состояние старта ядра (`starting`/`ready`/`retrying`/`failed`, П7 ✓), версия, пульс, готовность пар, запросы к брокеру за минуту (П6 ✓). |
-| `GET /api/v1/contours` | Контуры: эмуляция, прогоны истории в работе и 20 последних, `limits` очереди; фильтры `?kind=`, `?limit=` (П7 ✓). |
-| `POST /api/v1/contours` `{"kind": "emulation", "instruments": [...]}` | Запускает эмуляцию, если её нет; вторая не создаётся. До готовности ядра — `409 CORE_NOT_READY` (П7 ✓). |
-| `POST /api/v1/contours/{id}/instruments` `{"add": ["NG"]}` | Добавить инструмент со всеми его привязками: прогрев, обзор, торговля (П5 ✓). |
-| `POST /api/v1/contours/{id}/instruments` `{"remove": [...], "mode": "no_entries"}` | Убрать инструмент, его сделки доживают; `mode` по умолчанию. |
-| `POST /api/v1/contours/{id}/instruments` `{"remove": [...], "mode": "close_all"}` | Убрать инструмент и закрыть его сделки. |
-| `POST /api/v1/contours/{id}/stop` `{"mode": "no_entries" \| "close_all"}` | Остановить весь контур. |
-| `POST /api/v1/contours` `{"kind": "history", "from", "to", "pause", "instruments"}` | Прогон истории в очередь, `202` с id `history-…`; стоп, лог и состояние — теми же маршрутами `/api/v1/contours/{id}` (П7 ✓, решение владельца — без отдельного `/api/v1/history`). |
-| `GET /api/v1/contours/{id}/log?tail=200` | Последние строки лога. |
+| `GET /api/v1/emulation` | Эмуляция: `state`, `target`, `current`, `launch`, `process`, состав, `_actions`. |
+| `PUT /api/v1/emulation/target` `{"mode": "on", "instruments": [...]}` | Запускает эмуляцию, если её нет; вторая не создаётся. До готовности ядра — `409 CORE_NOT_READY`. |
+| `PUT /api/v1/emulation/target` `{"mode": "no_entries" \| "close_all"}` | Остановить весь контур. |
+| `POST /api/v1/emulation/instruments` `{"instruments": ["NG-12.26"]}` | Добавить инструменты со всеми привязками: прогрев, обзор, торговля (П5 ✓). |
+| `POST /api/v1/emulation/instruments/remove` `{"instruments": [...], "mode": "no_entries" \| "close_all"}` | Убрать инструменты пачкой: сделки доживают или закрываются; `no_entries` по умолчанию. |
+| `GET /api/v1/emulation/log?tail=200` | Последние строки лога эмуляции. |
+| `POST /api/v1/history` `{"from", "to", "pause", "instruments"}` | Прогон истории в очередь, `202` с `id` — именем папки прогона (П7 ✓). |
+| `GET /api/v1/history`, `GET /api/v1/history/{id}` | Прогоны: идущие, ждущие и 20 последних, `limits` очереди; фильтры `?state=`, `?limit=`. |
+| `POST /api/v1/history/{id}/stop` | Убрать из очереди или остановить с отчётом. |
+| `GET /api/v1/history/{id}/report`, `…/log` | Итог из `report.json` и последние строки лога прогона. |
 
 ## 7. Жизнь контура и привязки
 
@@ -366,6 +376,7 @@ flowchart TD
 | П5 ✓ | `add-contour-membership` | `add` и `remove` инструментов, состав на границе тика (`warming` → обзор → `trading`; `draining`/`closing` → выход), `contour_members`; спрос контура заменяется при запуске и чистится при выходе инструмента, ядро снимает пары без спроса после `demand_release_secs`. | привязки меняются без перезапуска |
 | П6 ✓ | `add-contour-recovery` | Пульс `heartbeat`, запрет `core-lost`, автоподъём при `--wait-command`, подхват живого контура той же версии, смена версии по пульсу, `GET /api/v1/core`. | три рестарта без потерь и двойных контуров |
 | П7 ✓ | `add-history-contour` | История — контур `kind: history` в `/api/v1/contours`, очередь до `max_history_runs`, процесс на прогон; старт без параметров и меню, API раньше ядра, повтор старта ядра. | история параллельно с эмуляцией |
+| П8 ✓ | `rework-contour-api` | API 2.0: `/api/v1/emulation` и `/api/v1/history` вместо `/api/v1/contours`, точка входа `/api/v1`, `target`/`current`/`revision`, `_links`/`_actions`, `ETag`/`If-Match`, `problem+json`; в эмуляции только тикер акции и короткое имя контракта; контракты в `docs/api/`. | эмуляцией и историей управляют новые маршруты, кнопки интерфейса — по `_actions` |
 
 Главный страховочный тест всего перехода: один и тот же исторический диапазон
 до и после каждого этапа даёт одинаковые сделки.

@@ -673,20 +673,21 @@ def _print_resolution(resolution) -> None:
         print(f"  ✗ {item.token}: {item.reason}")
 
 
-def _announce(launch, chosen, control, source, pending=None) -> str:
+def _announce(launch, chosen, control, source, pending=None, instruments=None) -> bool:
+    """Запуск принят: целевое «работает» записывается сразу; ``False`` — ревизия из If-Match устарела."""
     command = equivalent_command(launch, chosen)
-    print(f"Повторить запуск: POST /api/v1/contours {command}")
-    log.info("Повторить запуск: POST /api/v1/contours %s", command)
-    if control is not None:
-        control.mark_launched(source, chosen, command, pending)
-    return command
+    if control is not None and not control.mark_launched(source, chosen, command, pending, instruments=instruments):
+        return False
+    print(f"Повторить запуск: PUT /api/v1/emulation/target {command}")
+    log.info("Повторить запуск: PUT /api/v1/emulation/target %s", command)
+    return True
 
 
 def _await_command(control, export_server, client_provider, budget, market_now):
     """Главный поток ждёт команду API на месте выбора инструментов в консоли."""
     control.accept_commands()
     host, port = export_server.address
-    _say(f"Робот ждёт команду запуска: POST http://{host}:{port}/api/v1/contours")
+    _say(f"Робот ждёт команду запуска: PUT http://{host}:{port}/api/v1/emulation/target")
     while True:
         pending = control.next_command()
         try:
@@ -700,7 +701,10 @@ def _await_command(control, export_server, client_provider, budget, market_now):
             control.reject(pending, resolution.rejections or [Rejection("*", "Не выбрано ни одного инструмента.")])
             print("Команда запуска отклонена, робот ждёт следующую.")
             continue
-        _announce(pending.request, resolution.chosen, control, SOURCE_API, pending)
+        if not _announce(pending.request, resolution.chosen, control, SOURCE_API, pending,
+                         instruments=resolution.instruments):
+            print("Команда запуска отклонена: целевое состояние уже изменилось (If-Match), робот ждёт следующую.")
+            continue
         return resolution.instruments
 
 

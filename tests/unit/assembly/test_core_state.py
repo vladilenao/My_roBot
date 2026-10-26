@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from src.assembly.core_state import (
-    ACCEPTED, CONFLICT, IGNORED, REJECTED, SCHEMA_VERSION, CoreStateStore, Member, match_members, read_desired,
+    ACCEPTED, CONFLICT, IGNORED, REJECTED, SCHEMA_VERSION, CoreStateStore, Member, RevisionChanged, match_members, read_desired,
 )
 
 NG = {"token": "NG", "name": "NG-12.26"}
@@ -161,13 +161,33 @@ def test_contour_launched_before_membership_gets_members_from_cards(store):
     assert set(states(store)) == {"SBER", "uid-ng"}
 
 
-def test_match_members_by_name_ticker_and_family():
+def test_match_members_only_by_member_name():
     members = [member(SBER_CARD), member(NG_CARD), member(BR_CARD)]
-    keys, rejections = match_members(members, ["sber", "NG", "BRZ6", "GAZP", "NG-12.26"])
-    assert keys == ["SBER", "uid-ng", "uid-br"]
-    assert rejections == [("GAZP", "Инструмента нет в составе контура.")]
-    two = members + [member({**NG_CARD, "uid": "uid-ng2", "short_name": "NG-03.27", "ticker": "NGH7"})]
-    assert "несколько контрактов" in match_members(two, ["NG"])[1][0][1]
+    keys, rejections = match_members(members, ["sber", "NG-12.26", "ng-12.26", "NG", "BRZ6"])
+    assert keys == ["SBER", "uid-ng"]
+    assert [name for name, _ in rejections] == ["NG", "BRZ6"]
+    assert rejections[0][1] == "Инструмента нет в составе эмуляции."
+
+
+def test_if_match_is_checked_in_the_write_transaction(running):
+    with pytest.raises(RevisionChanged) as exc:
+        running.record_stop("emulation", "no_entries", expected=7)
+    assert (exc.value.expected, exc.value.current) == (7, 1)
+    assert running.desired("emulation").running and running.commands()[0]["outcome"] == CONFLICT
+    assert running.record_stop("emulation", "no_entries", expected=1).generation == 2
+    with pytest.raises(RevisionChanged):
+        running.record_stop("emulation", "close_all", expected=1)
+    with pytest.raises(RevisionChanged):
+        running.record_membership("emulation", add=[member(NG_CARD)], expected=1)
+    with pytest.raises(RevisionChanged):
+        running.record_launch("emulation", "emulation", [SBER_CARD], expected=1)
+    assert running.desired("emulation").generation == 2
+
+
+def test_contracts_are_attached_without_new_generation(running):
+    running.attach_contracts("emulation", {"SBER": {"SBER": {"price_step": 0.01}}})
+    desired = running.desired("emulation")
+    assert desired.generation == 1 and desired.members[0].contract == {"SBER": {"price_step": 0.01}}
 
 
 def test_contour_reads_members_read_only(running, tmp_path):

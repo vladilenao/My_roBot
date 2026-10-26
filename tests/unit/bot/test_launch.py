@@ -37,7 +37,8 @@ class TestParseLaunchArgs:
         with pytest.raises(LaunchError) as exc:
             parse_launch_args(argv)
         message = str(exc.value)
-        assert "без параметров" in message and '"kind": "emulation"' in message and '"kind": "history"' in message
+        assert "без параметров" in message and "PUT /api/v1/emulation/target" in message
+        assert "POST /api/v1/history" in message and "/api/v1/contours" not in message
 
     def test_empty_list_rejected(self):
         with pytest.raises(LaunchError):
@@ -90,18 +91,37 @@ class TestResolveEmulation:
         return resolve_emulation(tokens, object(), share_strategies=SHARES, future_strategies=FUTURES,
                                  block_days=block_days, market_now=NOW, validate=_validate, active_futures=futures)
 
-    def test_nearest_contract_skips_expiring_one(self):
-        result = self._resolve(("NG",), _futures(("NGX6", "NG-11.26", 1), ("NGZ6", "NG-12.26", 31)))
-        assert result.ok
-        assert result.instruments == [("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26")]
-        assert describe_choice(result.chosen[0]) == "NG → NG-12.26, до экспирации 31 сутки"
+    def test_all_takes_nearest_contract_skipping_expiring_one(self):
+        result = self._resolve((ALL,), _futures(("NGX6", "NG-11.26", 1), ("NGZ6", "NG-12.26", 31)))
+        assert not result.ok and [item.token for item in result.rejections] == ["RTS"]
+        ng = next(item for item in result.chosen if item.family == "NG")
+        assert ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26") in result.instruments
+        assert describe_choice(ng) == "NG → NG-12.26, до экспирации 31 сутки"
 
-    def test_explicit_contract_by_ticker_is_shown_by_short_name(self):
-        result = self._resolve(("NGX6",), _futures(("NGX6", "NG-11.26", 1)))
-        assert result.chosen[0].token == "NG-11.26" and result.chosen[0].name == "NG-11.26"
+    def test_family_code_is_refused_with_nearest_contract(self):
+        result = self._resolve(("NG",), _futures(("NGX6", "NG-11.26", 1), ("NGZ6", "NG-12.26", 31)))
+        assert not result.ok and result.instruments == []
+        assert result.rejections[0].reason == ("Код семейства не принимается — укажите контракт; "
+                                               "ближайший допустимый — NG-12.26.")
+
+    def test_family_prefix_is_refused_too(self):
+        result = self._resolve(("RI",), _futures())
+        assert result.rejections[0].token == "RI" and "Код семейства не принимается" in result.rejections[0].reason
+
+    def test_exchange_ticker_is_refused_with_short_name(self):
+        result = self._resolve(("NGZ6",), _futures(("NGZ6", "NG-12.26", 31)))
+        assert not result.ok and result.rejections[0].reason == "Биржевой тикер не принимается — укажите короткое имя NG-12.26."
+
+    def test_explicit_contract_by_short_name(self):
+        result = self._resolve(("NG-11.26",), _futures(("NGX6", "NG-11.26", 1)))
+        assert result.ok and result.chosen[0].token == "NG-11.26" and result.chosen[0].name == "NG-11.26"
+
+    def test_family_and_its_contract_are_not_a_conflict_in_emulation(self):
+        result = self._resolve(("NG", "NG-12.26"), _futures(("NGZ6", "NG-12.26", 31)))
+        assert [item.token for item in result.rejections] == ["NG"] and result.chosen[0].name == "NG-12.26"
 
     def test_no_suitable_contract(self):
-        result = self._resolve(("NG",), _futures(("NGX6", "NG-11.26", 1)))
+        result = self._resolve((ALL,), _futures(("NGX6", "NG-11.26", 1)))
         assert not result.ok and "позже чем через 2 суток" in result.rejections[0].reason
 
     def test_unknown_contract(self):
@@ -113,9 +133,9 @@ class TestResolveEmulation:
         assert result.instruments == [("SBER", "SBER", "share", "SBER")]
 
     def test_broker_errors_become_rejections_without_details(self):
-        result = self._resolve(("NG",), _futures(("BADZ6", "NG-12.26", 31)))
+        result = self._resolve(("NG-12.26",), _futures(("BADZ6", "NG-12.26", 31)))
         assert "не подтвердил" in result.rejections[0].reason
-        result = self._resolve(("NG",), _futures(("BOOM", "NG-12.26", 31)))
+        result = self._resolve(("NG-12.26",), _futures(("BOOM", "NG-12.26", 31)))
         assert result.rejections[0].reason == "Проверка у брокера не выполнена (ConnectionError)."
 
 
@@ -140,7 +160,7 @@ class TestCommandAndMenu:
     def test_emulation_command_is_api_body_with_short_names(self):
         request = LaunchRequest(MODE_EMULATION, SOURCE_API, ("NG", "SBER"))
         chosen = [Chosen("NG", "NG-12.26", "future", 52, "NG", True), Chosen("SBER", "SBER", "share")]
-        assert json.loads(equivalent_command(request, chosen)) == {"kind": "emulation",
+        assert json.loads(equivalent_command(request, chosen)) == {"mode": "on",
                                                                    "instruments": ["NG-12.26", "SBER"]}
 
     def test_days_word(self):

@@ -203,27 +203,29 @@ def _member_key(payload: dict) -> str:
     raise ValueError("Карточка инструмента без UID, тикера и имени")
 
 
-def match_members(members, tokens) -> tuple[list[str], list[tuple[str, str]]]:
-    """Токены снятия → ключи участников: короткое имя, тикер или код семейства при единственном контракте.
+def match_members(members, names) -> tuple[list[str], list[tuple[str, str]]]:
+    """Имена снятия → ключи участников; имя сравнивается только с ``name`` участника (rework-contour-api).
 
-    Возвращает ключи (без повторов, в порядке токенов) и отказы ``(токен, причина)``.
+    Возвращает ключи (без повторов, в порядке имён) и отказы ``(имя, причина)``.
     """
+    by_name = {member.name.upper(): member for member in members}
     keys, rejections = [], []
-    for token in tokens:
-        wanted = token.strip().upper()
-        exact = [m for m in members if wanted in {
-            m.name.upper(), str(m.instrument.get("ticker", "")).upper(), str(m.instrument.get("short_name") or "").upper(),
-            str((m.chosen or {}).get("token", "")).upper()}]
-        family = [m for m in members if str(m.instrument.get("family") or "").upper() == wanted]
-        found = exact or family
-        if not found:
-            rejections.append((token, "Инструмента нет в составе контура."))
-        elif len(found) > 1:
-            rejections.append((token, "В составе несколько контрактов: "
-                               + ", ".join(sorted(m.name for m in found)) + " — укажите контракт."))
-        elif found[0].key not in keys:
-            keys.append(found[0].key)
+    for name in names:
+        member = by_name.get(name.strip().upper())
+        if member is None:
+            rejections.append((name, "Инструмента нет в составе эмуляции."))
+        elif member.key not in keys:
+            keys.append(member.key)
     return keys, rejections
+
+
+class RevisionChanged(Exception):
+    """``If-Match`` не совпал с текущим поколением: команда не записана, в журнале — ``conflict``."""
+
+    def __init__(self, expected: int, current: int) -> None:
+        super().__init__(f"Ожидалась ревизия {expected}, текущая {current}.")
+        self.expected = expected
+        self.current = current
 
 
 @dataclass(frozen=True)
@@ -421,11 +423,12 @@ class CoreStateStore:
             return [_history_run(row) for row in conn.execute(sql, args).fetchall()]
 
     def record_launch(self, contour_id: str, kind: str, instruments, *, source: str = "", command: str = "",
-                      payload: dict | None = None, members=None) -> int:
+                      payload: dict | None = None, members=None, expected: int | None = None) -> int:
         """Запуск: желаемое «работает» новым поколением и выбранный состав; возвращает поколение.
 
         ``members`` — участники ``Member`` с карточками контрактов; без них
         состав собирается из карточек ``instruments``. Прежний состав заменяется.
+        ``expected`` — поколение из ``If-Match``: не совпало — ``RevisionChanged``.
         """
         instruments = list(instruments)
         if members is None:
@@ -433,8 +436,10 @@ class CoreStateStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                generation = self._generation(conn, contour_id) + 1
                 now = _now()
+                self._expect(conn, contour_id, "launch", payload if payload is not None else {"instruments": instruments},
+                             expected, now)
+                generation = self._generation(conn, contour_id) + 1
                 conn.execute("""INSERT INTO contours(contour_id,kind,desired,stop_mode,generation,instruments_json,
                     source,command,updated_at) VALUES(?,?,'running',NULL,?,?,?,?,?)
                     ON CONFLICT(contour_id) DO UPDATE SET kind=excluded.kind, desired='running', stop_mode=NULL,
@@ -452,15 +457,16 @@ class CoreStateStore:
                 raise
         return generation
 
-    def record_stop(self, contour_id: str, mode: str) -> StopOutcome:
+    def record_stop(self, contour_id: str, mode: str, expected: int | None = None) -> StopOutcome:
         """Остановка: новое поколение; повтор того же режима — ``ignored``; ``close_all`` → ``no_entries`` — отказ."""
         if mode not in STOP_MODES:
             raise ValueError(f"Неизвестный режим остановки: {mode!r}")
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                current = _desired(conn, conn.execute("SELECT * FROM contours WHERE contour_id=?", (contour_id,)).fetchone())
                 now = _now()
+                self._expect(conn, contour_id, "stop", {"mode": mode}, expected, now)
+                current = _desired(conn, conn.execute("SELECT * FROM contours WHERE contour_id=?", (contour_id,)).fetchone())
                 if current is None:
                     outcome = StopOutcome(CONFLICT, 0, "контур ещё не запускался")
                 elif not current.running and current.stop_mode == mode:
@@ -481,7 +487,7 @@ class CoreStateStore:
         return outcome
 
     def record_membership(self, contour_id: str, *, add=(), remove=(), mode: str = NO_ENTRIES,
-                          payload: dict | None = None) -> MembershipOutcome:
+                          payload: dict | None = None, expected: int | None = None) -> MembershipOutcome:
         """Изменение состава одной транзакцией с одним поколением.
 
         ``add`` — участники ``Member``: новые или возвращаемые из снятия;
@@ -495,9 +501,10 @@ class CoreStateStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                now = _now()
+                self._expect(conn, contour_id, "remove" if remove else "add", payload, expected, now)
                 current = _desired(conn, conn.execute("SELECT * FROM contours WHERE contour_id=?",
                                                       (contour_id,)).fetchone())
-                now = _now()
                 outcome = self._membership(conn, contour_id, current, add, remove, mode, now)
                 self._log(conn, contour_id, "remove" if remove else "add", payload, outcome.generation or None,
                           outcome.outcome, outcome.reason or None, now)
@@ -540,6 +547,25 @@ class CoreStateStore:
             self._put_member(conn, contour_id, member, generation, now)
         conn.execute("UPDATE contours SET generation=?, updated_at=? WHERE contour_id=?", (generation, now, contour_id))
         return MembershipOutcome(ACCEPTED, generation)
+
+    def attach_contracts(self, contour_id: str, contracts: dict) -> None:
+        """Карточки контрактов участникам состава без нового поколения: ключ участника → ``contracts_payload``."""
+        now = _now()
+        with self._lock, self._connect() as conn:
+            for key, contract in contracts.items():
+                conn.execute("UPDATE contour_members SET contract_json=?, updated_at=? WHERE contour_id=? AND instrument_key=?",
+                             (json.dumps(contract, ensure_ascii=False, default=str), now, contour_id, key))
+
+    def _expect(self, conn, contour_id, action, payload, expected, now) -> None:
+        """Сверка ``If-Match`` внутри транзакции записи: не совпало — запись ``conflict`` и ``RevisionChanged``."""
+        if expected is None:
+            return
+        current = self._generation(conn, contour_id)
+        if current != expected:
+            error = RevisionChanged(expected, current)
+            self._log(conn, contour_id, action, payload, current or None, CONFLICT, str(error), now)
+            conn.commit()
+            raise error
 
     @staticmethod
     def _put_member(conn, contour_id, member: Member, generation: int, now: str) -> None:

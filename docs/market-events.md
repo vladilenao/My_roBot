@@ -21,7 +21,7 @@ retention_days = 90  # Срок хранения событий в stream в с�
 появляется предупреждение `Паттерны: UID пары <имя> <ТФ> неизвестен`.
 
 Машиночитаемый контракт сообщений приведён в
-[`market-events.asyncapi.yaml`](market-events.asyncapi.yaml).
+[`api/market-events.asyncapi.yaml`](api/market-events.asyncapi.yaml).
 
 На сервере Redis требуется AOF с `appendfsync always`. Worker записывает
 паттерн в SQLite outbox до `XADD`, а затем повторяет недоставленные сообщения.

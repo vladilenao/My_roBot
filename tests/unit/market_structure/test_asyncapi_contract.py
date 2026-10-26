@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 
-CONTRACT_PATH = Path(__file__).resolve().parents[3] / "docs" / "market-events.asyncapi.yaml"
+CONTRACT_PATH = Path(__file__).resolve().parents[3] / "docs" / "api" / "market-events.asyncapi.yaml"
 
 
 def _document():
