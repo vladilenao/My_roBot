@@ -153,7 +153,7 @@ ClusterSource (Redis Stream `cluster.events`, локальная копия
 контракт у коллектора) никогда не запрещает вход. Сигналы по открытой
 сделке и доборы вердикт не получают. Алгоритм и пример расчёта —
 `openspec/changes/add-cluster-filter/design.md` (D5); отчёт по вердиктам —
-`GET /api/v1/clusters/report` в [OpenAPI](../openapi.yaml).
+`GET /api/v1/clusters/report` в [OpenAPI](../api/openapi.yaml).
 
 ### Сессионная защита внутридневных сделок
 

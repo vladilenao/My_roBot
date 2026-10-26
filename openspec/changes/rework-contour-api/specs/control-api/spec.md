@@ -90,10 +90,11 @@ API ДОЛЖЕН называть состояние словами операт
 | Объект и его состояние | Действия |
 | --- | --- |
 | эмуляция `waiting_command`, `stopped`, `failed` при готовом ядре | `start` |
-| эмуляция `starting`, `running` | `stop`, `stop-close-all`, `add-instruments` |
+| процесс эмуляции жив, `target.mode = on` (`starting`, `running`) | `stop`, `stop-close-all`, `add-instruments` |
 | эмуляция `stopping_no_entries` | `stop-close-all` |
+| эмуляция `starting` до запуска процесса | нет |
 | эмуляция `stopping_close_all`; эмуляция без процесса при неготовом ядре | нет |
-| участник `target = active` | `remove`, `remove-close-all` |
+| участник `target = active` (команды участника — только пока эмуляции доступно `add-instruments`) | `remove`, `remove-close-all` |
 | участник `target = removed`, режим `no_entries` | `remove-close-all`, `restore` |
 | участник `target = removed`, режим `close_all` | `restore` |
 | прогон `queued` | `cancel` |

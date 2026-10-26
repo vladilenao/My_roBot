@@ -55,10 +55,6 @@ def run_dir(data_dir: Path, run_id: str) -> Path:
     return history_dir(data_dir) / run_id.removeprefix(RUN_PREFIX)
 
 
-def is_history_id(contour_id: str) -> bool:
-    return contour_id.startswith(RUN_PREFIX)
-
-
 def clear_attempt(directory: Path, log_file: str) -> None:
     """Повтор после сдвига начала: убрать журнал и выбор прошлой попытки, оставить запуск, статус и логи."""
     for item in Path(directory).iterdir():
@@ -93,6 +89,11 @@ def prepare_import(provider):
     result = MarketDataSync(producer_id=sync["producer_id"], target_change_id=sync["target_change_id"],
                             after_id=sync["after_id"], reason=reason)
     return result, None, f"импорт My Robot не подтверждён: {reason}"
+
+
+def _money(amount) -> dict | None:
+    """Сумма итога ``report.json`` (строка) → ``Money`` контракта; суммы прогона — в рублях."""
+    return None if amount is None else {"amount": str(amount), "currency": "RUB"}
 
 
 def _read_json(path: Path) -> dict | None:
@@ -202,6 +203,8 @@ class HistoryRuns:
             self._thread.join(timeout=5)
 
     # --- API ------------------------------------------------------------------
+    # ``id`` прогона в API — имя его папки, без префикса ``history-`` (rework-contour-api);
+    # ключ строки ``history_runs`` прежний, поэтому строки прежней версии читаются без миграции.
     def submit(self, request) -> tuple[int, dict]:
         """Прогон из команды API: привязки и конфликт проверяются сразу, остальное — процессом прогона."""
         from src.bot.launch import classify_tokens
@@ -215,7 +218,7 @@ class HistoryRuns:
         with self._lock:
             name = self._free_name(datetime.now())
             run = self._store.add_history_run(RUN_PREFIX + name, f"{name}", payload)
-        log.info("Прогон %s принят: %s — %s, %s", run.run_id, payload["from"], payload["to"],
+        log.info("Прогон %s принят: %s — %s, %s", name, payload["from"], payload["to"],
                  ",".join(payload["instruments"]))
         self._wake.set()
         return 202, self.payload(run)
@@ -228,74 +231,103 @@ class HistoryRuns:
             name = f"{base}-{number}"
         return name
 
-    def contours(self, limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
-        """Прогоны в очереди и в работе (по очереди) и ``limit`` последних завершённых."""
-        runs = self._store.history_runs(active=True) + self._store.history_runs(active=False, limit=limit)
+    def runs(self, state: str | None = None, limit: int = LIST_LIMIT_DEFAULT) -> list[dict]:
+        """Прогоны в очереди и в работе (по очереди) и ``limit`` последних завершённых; ``state`` — active/finished."""
+        runs = [] if state == "finished" else self._store.history_runs(active=True)
+        if state != "active":
+            runs += self._store.history_runs(active=False, limit=limit)
         return [self.payload(run) for run in runs]
 
-    def contour(self, run_id: str) -> dict | None:
-        run = self._store.history_run(run_id)
+    def run(self, run_id: str) -> dict | None:
+        run = self._store.history_run(RUN_PREFIX + run_id)
         return None if run is None else self.payload(run)
 
     def limits(self) -> dict:
         active = self._store.history_runs(active=True)
-        return {"max_history_runs": self.max_runs,
+        return {"max": self.max_runs,
                 "running": sum(run.state != RUN_QUEUED for run in active),
                 "queued": sum(run.state == RUN_QUEUED for run in active)}
 
     def stop(self, run_id: str) -> tuple[int, dict]:
-        run = self._store.history_run(run_id)
+        """Из очереди — ``cancelled``; идущий — ``stopping``, отчёт пишет процесс; повтор — ``200``."""
+        key = RUN_PREFIX + run_id
+        run = self._store.history_run(key)
         if run is None:
-            return 404, {"code": "NOT_FOUND", "message": f"Контура {run_id!r} нет."}
+            return 404, {"code": "NOT_FOUND", "message": f"Прогона {run_id!r} нет."}
         if not run.active:
-            return 409, {"code": "NOT_RUNNING", "message": "Прогон завершён: останавливать нечего.",
-                         "contour": self.payload(run)}
+            return 409, {"code": "NOT_RUNNING", "message": "Прогон завершён: останавливать нечего."}
         if run.state == RUN_QUEUED:
-            run = self._store.update_history_run(run_id, state=RUN_CANCELLED, finished_at=_now(),
+            run = self._store.update_history_run(key, state=RUN_CANCELLED, finished_at=_now(),
                                                  reason="убран из очереди командой")
             log.info("Прогон %s убран из очереди", run_id)
-            return 200, {"contour": self.payload(run)}
-        run = self._store.update_history_run(run_id, state=RUN_STOPPING, stop_requested=True)
+            return 202, self.payload(run)
+        if run.stop_requested or run.state == RUN_STOPPING:
+            return 200, self.payload(run)
+        run = self._store.update_history_run(key, state=RUN_STOPPING, stop_requested=True)
         with self._lock:
-            process = self._processes.get(run_id)
+            process = self._processes.get(key)
         if process is not None:
             process.request_stop()
         log.info("Прогон %s останавливается командой", run_id)
-        return 200, {"contour": self.payload(run)}
+        return 202, self.payload(run)
+
+    def report(self, run_id: str) -> tuple[int, dict]:
+        """Итог из ``report.json``: только у завершённого прогона, иначе ``404 REPORT_NOT_READY``."""
+        from src.bot import control_views as views
+
+        run = self._store.history_run(RUN_PREFIX + run_id)
+        if run is None:
+            return 404, {"code": "NOT_FOUND", "message": f"Прогона {run_id!r} нет."}
+        report = None if run.active else _read_json(run_dir(self._data_dir, run.run_id) / REPORT_JSON)
+        if report is None:
+            return 404, {"code": "REPORT_NOT_READY", "message": "Прогон ещё не завершён или отчёт не записан."}
+        summary = report.get("result") or {}
+        return 200, {
+            "covered": bool(report.get("covered")), "stop_reason": report.get("stop_reason") or "",
+            "trades": summary.get("trades"), "net_pnl": _money(summary.get("net_pnl")),
+            "fees": _money(summary.get("fees")), "balance": _money(summary.get("balance")),
+            "open_positions": list(summary.get("open_positions") or ()),
+            "_links": views.links(run=views.run_href(run_id)),
+        }
 
     def log_tail(self, run_id: str, count: int) -> str | None:
         from src.bot.launch_control import tail_lines
 
-        if self._store.history_run(run_id) is None:
+        if self._store.history_run(RUN_PREFIX + run_id) is None:
             return None
         return tail_lines(run_dir(self._data_dir, run_id) / self._log_file, count)
 
     def payload(self, run) -> dict:
+        """Прогон в форме ``HistoryRun`` контракта: ход по ``status.json``, процесс, ссылки и действия."""
+        from src.bot import control_views as views
+
+        run_id = run.run_id.removeprefix(RUN_PREFIX)
         directory = run_dir(self._data_dir, run.run_id)
         status = read_status(directory / STATUS_FILE) if run.state != RUN_QUEUED else None
-        report = _read_json(directory / REPORT_JSON) if not run.active else None
         position = None
         if run.state == RUN_QUEUED:
             queued = [item.run_id for item in self._store.history_runs(active=True) if item.state == RUN_QUEUED]
             position = queued.index(run.run_id) + 1 if run.run_id in queued else None
         sync = run.market_data_sync
-        actual = None if status is None else {
+        progress = None if status is None else {
             "phase": status.get("phase"), "start": status.get("start"), "end": status.get("end"),
-            "market_now": status.get("market_now"), "ticks": status.get("ticks"), "progress": _progress(status)}
-        result = None
-        if report is not None:
-            summary = report.get("result") or {}
-            result = {"covered": report.get("covered"), "stop_reason": report.get("stop_reason"),
-                      **{name: summary.get(name) for name in ("trades", "net_pnl", "fees", "balance", "open_positions")}}
+            "market_now": status.get("market_now"), "ticks": status.get("ticks"), "fraction": _progress(status)}
+        process = None if run.started_at is None or run.state == RUN_CANCELLED and run.pid is None else {
+            "pid": run.pid if run.active else None, "exit_code": run.exit_code,
+            "exited_at": (status or {}).get("exited_at") or (None if run.active else run.finished_at),
+            "dir": directory.relative_to(self._data_dir).as_posix()}
+        href = views.run_href(run_id)
+        links = views.links(self=href, log=href + "/log", collection=views.HISTORY)
+        if not run.active and (directory / REPORT_JSON).is_file():
+            links["report"] = {"href": href + "/report"}
         return {
-            "id": run.run_id, "kind": HISTORY_KIND, "state": run.state, "request": run.request,
+            "id": run_id, "state": run.state, "request": run.request,
             "accepted_at": run.accepted_at, "started_at": run.started_at, "finished_at": run.finished_at,
-            "queue_position": position, "pid": run.pid if run.active else None, "exit_code": run.exit_code,
-            "reason": run.reason,
+            "queue_position": position, "reason": run.reason,
             "market_data_sync": None if sync is None else {"status": sync.get("status"),
                                                            "snapshot_generation": sync.get("snapshot_generation")},
-            "actual": actual, "result": result,
-            "dir": directory.relative_to(self._data_dir).as_posix(),
+            "progress": progress, "process": process,
+            "_links": links, "_actions": views.run_action_list(run_id, views.run_actions(run.state)),
         }
 
     # --- поток очереди ---------------------------------------------------------

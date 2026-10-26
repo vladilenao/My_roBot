@@ -1,13 +1,18 @@
-"""Команды контуров из локального API и их состояние.
+"""Команды эмуляции из локального API и её состояние (rework-contour-api).
 
-Эмуляция: поток HTTP только кладёт запрос в очередь и ждёт ответа —
-разрешение инструментов, сборка и запуск торговли остаются в главном потоке
-робота. Прогоны истории (``kind = history``, add-history-contour) уходят в
-очередь прогонов ``HistoryRuns``, которая не зависит от готовности ядра.
+Поток HTTP только кладёт запрос в очередь и ждёт ответа — разрешение
+инструментов, сборка и запуск торговли остаются в главном потоке робота.
+Прогоны истории уходят в очередь прогонов ``HistoryRuns``, которая не
+зависит от готовности ядра.
+
+Внутри робота — желаемое, фактическое и поколение (``core.sqlite3``,
+``status.json``); ответы API называют их ``target``, ``current`` и
+``revision``. Перевод — здесь, в ``emulation()`` и ``members()``.
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from collections import deque
@@ -15,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.bot import control_views as views
 from src.bot.launch import (
     HISTORY_DEFAULT_PAUSE, MODE_EMULATION, MODE_HISTORY, SOURCE_API, Chosen, LaunchError, LaunchRequest, Rejection,
     RunConfigurationError, parse_instrument_tokens, parse_moment, validate_range,
@@ -27,10 +33,9 @@ STATE_STOPPED = "stopped"
 STATE_FAILED = "failed"
 CONTOUR_ID = "emulation"
 REPLY_TIMEOUT_SECS = 60.0
-_ALLOWED_FIELDS = {MODE_EMULATION: {"kind", "instruments"},
-                   MODE_HISTORY: {"kind", "from", "to", "pause", "instruments"}}
-HISTORY_PREFIX = "history-"
-STOP_MODES = ("no_entries", "close_all")
+TARGET_MODES = (views.MODE_ON, views.NO_ENTRIES, views.CLOSE_ALL)
+STOP_MODES = (views.NO_ENTRIES, views.CLOSE_ALL)
+_HISTORY_FIELDS = {"from", "to", "pause", "instruments"}
 LOG_TAIL_DEFAULT = 200
 LOG_TAIL_MAX = 1000
 
@@ -52,19 +57,31 @@ class _Pending:
     payload: dict | None = None
 
 
-def parse_command(body) -> LaunchRequest:
-    """Тело ``POST /api/v1/contours`` → ``LaunchRequest`` эмуляции или прогона истории, иначе ``BadCommand``."""
+def parse_target(body, expected: int | None = None) -> tuple[str, LaunchRequest | None]:
+    """Тело ``PUT /api/v1/emulation/target`` → ``(режим, запуск)``; запуск — только у ``on``."""
+    message = "Тело — {\"mode\": \"on\", \"instruments\": [...]}, {\"mode\": \"no_entries\"} или {\"mode\": \"close_all\"}."
+    if not isinstance(body, dict) or body.get("mode") not in TARGET_MODES:
+        raise BadCommand("INVALID_REQUEST", message)
+    mode = body["mode"]
+    if mode != views.MODE_ON and "instruments" in body:
+        raise BadCommand("INVALID_REQUEST", "instruments передаётся только с mode = on.")
+    unknown = set(body) - {"mode", "instruments"}
+    if unknown:
+        raise BadCommand("INVALID_REQUEST", f"Неизвестные поля: {', '.join(sorted(unknown))}.")
+    if mode != views.MODE_ON:
+        return mode, None
+    return mode, LaunchRequest(MODE_EMULATION, SOURCE_API, _tokens(body.get("instruments")),
+                               expected_revision=expected)
+
+
+def parse_history(body) -> LaunchRequest:
+    """Тело ``POST /api/v1/history`` → ``LaunchRequest`` прогона истории, иначе ``BadCommand``."""
     if not isinstance(body, dict):
-        raise BadCommand("INVALID_REQUEST", "Тело команды — JSON-объект с полями kind и instruments.")
-    kind = body.get("kind")
-    if kind not in _ALLOWED_FIELDS:
-        raise BadCommand("UNSUPPORTED_KIND", "kind — emulation или history.")
-    unknown = set(body) - _ALLOWED_FIELDS[kind]
+        raise BadCommand("INVALID_REQUEST", "Тело прогона — JSON-объект с полями from, to, pause и instruments.")
+    unknown = set(body) - _HISTORY_FIELDS
     if unknown:
         raise BadCommand("INVALID_REQUEST", f"Неизвестные поля: {', '.join(sorted(unknown))}.")
     tokens = _tokens(body.get("instruments"))
-    if kind == MODE_EMULATION:
-        return LaunchRequest(MODE_EMULATION, SOURCE_API, tokens)
     start, end = body.get("from"), body.get("to")
     if not isinstance(start, str) or not isinstance(end, str):
         raise BadCommand("INVALID_REQUEST", "from и to обязательны: строки ГГГГ-ММ-ДД ЧЧ:ММ (UTC).")
@@ -82,7 +99,7 @@ def _tokens(raw) -> tuple[str, ...]:
     if raw is None:
         tokens = parse_instrument_tokens(None)
     else:
-        if not isinstance(raw, list) or not raw or not all(isinstance(item, str) and item.strip() for item in raw):
+        if not _names(raw):
             raise BadCommand("INVALID_REQUEST", "instruments — непустой список непустых строк.")
         try:
             tokens = parse_instrument_tokens(raw)
@@ -91,46 +108,59 @@ def _tokens(raw) -> tuple[str, ...]:
     return tokens
 
 
+def _names(raw) -> bool:
+    return isinstance(raw, list) and bool(raw) and all(isinstance(item, str) and item.strip() for item in raw)
+
+
 @dataclass
 class MembershipCommand:
-    """Команда состава контура (add-contour-membership): ровно одно из ``add`` / ``remove``."""
+    """Команда состава эмуляции: ровно одно из ``add`` / ``remove``; ``expected`` — ревизия из ``If-Match``."""
 
     add: tuple = ()
     remove: tuple = ()
-    mode: str = "no_entries"
+    mode: str = views.NO_ENTRIES
+    expected: int | None = None
     done: threading.Event = field(default_factory=threading.Event)
     status: int = 0
     payload: dict | None = None
 
 
-def parse_membership(body) -> MembershipCommand:
-    """Тело ``POST /api/v1/contours/{id}/instruments`` → команда или ``BadCommand``."""
-    message = "Тело — {\"add\": [...]} или {\"remove\": [...], \"mode\": \"no_entries\" | \"close_all\"}."
-    if not isinstance(body, dict) or len({"add", "remove"} & set(body)) != 1:
-        raise BadCommand("INVALID_REQUEST", message)
-    allowed = {"add"} if "add" in body else {"remove", "mode"}
-    tokens = body.get("add", body.get("remove"))
-    mode = body.get("mode", "no_entries")
-    if (set(body) - allowed or mode not in STOP_MODES or not isinstance(tokens, list) or not tokens
-            or not all(isinstance(item, str) and item.strip() for item in tokens)):
-        raise BadCommand("INVALID_REQUEST", message)
-    tokens = tuple(dict.fromkeys(item.strip() for item in tokens))
-    return MembershipCommand(add=tokens) if "add" in body else MembershipCommand(remove=tokens, mode=mode)
+def parse_add(body, expected: int | None = None) -> MembershipCommand:
+    """Тело ``POST /api/v1/emulation/instruments`` → команда или ``BadCommand``."""
+    if not isinstance(body, dict) or set(body) != {"instruments"} or not _names(body["instruments"]):
+        raise BadCommand("INVALID_REQUEST", "Тело — {\"instruments\": [\"NG-12.26\", \"SBER\"]}.")
+    return MembershipCommand(add=tuple(dict.fromkeys(item.strip() for item in body["instruments"])), expected=expected)
 
 
-def parse_stop(body) -> str:
-    """Тело ``POST /api/v1/contours/{id}/stop`` → режим остановки или ``BadCommand``."""
-    if not isinstance(body, dict) or set(body) != {"mode"} or body["mode"] not in STOP_MODES:
-        raise BadCommand("INVALID_REQUEST", "Тело остановки — {\"mode\": \"no_entries\"} или {\"mode\": \"close_all\"}.")
-    return body["mode"]
+def parse_remove(body, expected: int | None = None) -> MembershipCommand:
+    """Тело ``POST /api/v1/emulation/instruments/remove`` → команда или ``BadCommand``."""
+    message = "Тело — {\"instruments\": [...], \"mode\": \"no_entries\" | \"close_all\"}."
+    if not isinstance(body, dict) or "instruments" not in body or set(body) - {"instruments", "mode"}:
+        raise BadCommand("INVALID_REQUEST", message)
+    mode = body.get("mode", views.NO_ENTRIES)
+    if mode not in STOP_MODES or not _names(body["instruments"]):
+        raise BadCommand("INVALID_REQUEST", message)
+    return MembershipCommand(remove=tuple(dict.fromkeys(item.strip() for item in body["instruments"])), mode=mode,
+                             expected=expected)
 
 
 def _chosen_payload(member) -> dict:
-    """Участник состава в форме ``ContourInstrument``: как его назвали при разрешении."""
+    """Как участник назван при разрешении: токен, имя, тип и дни до экспирации."""
     chosen = member.chosen or {}
     return {"token": chosen.get("token") or member.instrument.get("ticker") or member.key,
             "name": member.name, "instrument_type": member.instrument.get("instrument_type"),
             "days_to_expiry": chosen.get("days_to_expiry")}
+
+
+def launch_request(command: str | None) -> dict | None:
+    """Эквивалентная команда запуска объектом; строка прежней версии без списка инструментов — ``None``."""
+    try:
+        payload = json.loads(command) if command else None
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("instruments"), list):
+        return None
+    return {"mode": views.MODE_ON, "instruments": [str(item) for item in payload["instruments"]]}
 
 
 def tail_lines(path: Path, count: int) -> str:
@@ -142,8 +172,12 @@ def tail_lines(path: Path, count: int) -> str:
         return ""
 
 
+def _iso(moment: datetime | None) -> str | None:
+    return moment.isoformat().replace("+00:00", "Z") if moment else None
+
+
 class LaunchControl:
-    """Состояние единственного контура процесса и очередь команды запуска."""
+    """Состояние контура эмуляции процесса робота и очередь команды запуска."""
 
     def __init__(self, *, reply_timeout: float = REPLY_TIMEOUT_SECS, clock=None, core_state=None,
                  contour_dir: Path | None = None, log_file: str = "bot_debug.log") -> None:
@@ -159,14 +193,17 @@ class LaunchControl:
         self._rejections: list[Rejection] = []
         self._accepting = False
         self._pending: _Pending | None = None
-        # Процесс контура (add-contour-process): pid, пока жив; код выхода — после.
+        # Процесс контура (add-contour-process): pid, пока жив; код и время выхода — после.
         self._pid: int | None = None
         self._exit_code: int | None = None
+        self._exited_at: datetime | None = None
         # Желаемое и журнал команд — в core.sqlite3; фактическое — status.json контура (add-control-api).
         self._core_state = core_state
         self._contour_dir = None if contour_dir is None else Path(contour_dir)
         self._log_file = log_file
         self._launched = False
+        # Запуск командой уже записан в core.sqlite3 (rework-contour-api): ядро не пишет его второй раз.
+        self._recorded = False
         self._membership: queue.Queue[MembershipCommand] = queue.Queue()
         # Как поднят процесс этим ядром: autostart / adopted / None (add-contour-recovery).
         self._recovery: str | None = None
@@ -176,61 +213,125 @@ class LaunchControl:
         self.core_status = None
         self.contour_busy = None
 
-    # --- для API ----------------------------------------------------------
+    # --- представление для API ------------------------------------------------
     def snapshot(self) -> dict:
+        """Внутренний снимок для ядра и консоли: состояние, источник, команда, процесс."""
         desired = self._desired()
         with self._lock:
-            alive = self._pid is not None
-            state = self._state
-            if alive and desired is not None and not desired.running:
-                state = f"stopping_{desired.stop_mode}"
-            snapshot = {
-                "id": CONTOUR_ID, "kind": MODE_EMULATION, "state": state, "source": self._source,
-                "instruments": [item.payload() for item in self._chosen],
-                "started_at": self._started_at.isoformat().replace("+00:00", "Z") if self._started_at else None,
-                "command": self._command,
-                "rejections": [{"token": item.token, "reason": item.reason} for item in self._rejections],
-                "pid": self._pid,
-                "exit_code": self._exit_code,
-                "desired": None if desired is None else desired.payload(),
-                "recovery": self._recovery,
-            }
+            return {"state": self._state_of(desired), "source": self._source, "command": self._command,
+                    "pid": self._pid, "exit_code": self._exit_code, "recovery": self._recovery}
+
+    def _state_of(self, desired) -> str:
+        """Общее состояние; вызывается под ``self._lock``."""
+        if self._pid is not None and desired is not None and not desired.running:
+            return f"stopping_{desired.stop_mode}"
+        return self._state
+
+    def emulation(self) -> dict:
+        """``GET /api/v1/emulation``: общее, целевое и текущее состояние, запуск, процесс, состав, ссылки, действия."""
+        desired = self._desired()
+        ready = self._core_not_ready() is None
+        with self._lock:
+            state = self._state_of(desired)
+            actions = self._actions_with(desired, ready)
             launched = self._launched
-        # Снимок прошлого запуска ядра не выдаётся за фактическое этого.
+            rejections = [{"instrument": item.token, "reason": item.reason} for item in self._rejections]
+            launch = None
+            if self._source is not None or rejections or desired is not None:
+                launch = {"source": self._source or (desired.source if desired is not None else None) or None,
+                          "recovery": self._recovery, "started_at": _iso(self._started_at),
+                          "request": launch_request(self._command or (desired.command if desired else None)),
+                          "rejections": rejections}
+            process = None if not launched else {
+                "pid": self._pid, "exit_code": self._exit_code, "exited_at": _iso(self._exited_at),
+                "dir": self._dir_name()}
+            chosen = list(self._chosen)
+        # Снимок прошлого запуска ядра не выдаётся за текущее состояние этого.
         status = self._status() if launched else None
-        snapshot["actual"] = None if status is None else {name: status.get(name) for name in (
-            "state", "applied_generation", "open_positions", "pending_entries", "last_tick_at", "core_link")}
+        current = None if status is None else {
+            "state": status.get("state"), "applied_revision": status.get("applied_generation"),
+            "open_positions": status.get("open_positions"), "pending_entries": status.get("pending_entries"),
+            "last_tick_at": status.get("last_tick_at"), "core_link": status.get("core_link")}
+        return {
+            "state": state,
+            "target": self._target(desired),
+            "current": current,
+            "launch": launch,
+            "process": process,
+            "instruments": self._member_views(desired, status, chosen, "add-instruments" in actions),
+            "_links": views.links(self=views.EMULATION, target=views.EMULATION_TARGET,
+                                  instruments=views.EMULATION_INSTRUMENTS, log=views.EMULATION_LOG),
+            "_actions": views.emulation_action_list(actions),
+        }
+
+    def _actions_with(self, desired, ready: bool) -> tuple[str, ...]:
+        """Допустимые команды эмуляции — для ``_actions`` и для проверки команд; вызывается под ``self._lock``."""
+        idle = self._state in (STATE_WAITING, STATE_STOPPED, STATE_FAILED) and self._pid is None
+        return views.emulation_actions(
+            alive=self._pid is not None and self._core_state is not None,
+            mode=None if desired is None else (views.MODE_ON if desired.running else desired.stop_mode),
+            can_start=idle and self._accepting and self._pending is None and ready)
+
+    @staticmethod
+    def _target(desired) -> dict | None:
+        if desired is None:
+            return None
+        return {"mode": views.MODE_ON if desired.running else desired.stop_mode, "revision": desired.generation}
+
+    def target(self) -> dict | None:
+        """``GET /api/v1/emulation/target``; ``None`` — эмуляцию ни разу не запускали."""
+        return self._target(self._desired())
+
+    def revision(self) -> int | None:
+        desired = self._desired()
+        return None if desired is None else desired.generation
+
+    def _dir_name(self) -> str:
+        if self._contour_dir is None:
+            return f"contours/{CONTOUR_ID}"
+        return f"{self._contour_dir.parent.name}/{self._contour_dir.name}"
+
+    def _member_views(self, desired, status, chosen, changeable: bool) -> list[dict]:
         members = () if desired is None else desired.members
+        current = {item.get("key"): item.get("state") for item in (status or {}).get("members") or ()}
         if members:
-            # Текущий желаемый состав (add-contour-membership), а не состав запуска.
-            snapshot["instruments"] = [_chosen_payload(member) for member in members if member.active]
-        actual = {item.get("key"): item.get("state") for item in (status or {}).get("members") or ()}
-        snapshot["members"] = [{"name": member.name, "instrument_type": member.instrument.get("instrument_type"),
-                                "desired": "active" if member.active else "removed",
-                                "remove_mode": member.remove_mode, "actual": actual.get(member.key)}
-                               for member in members]
-        return snapshot
+            # Текущий целевой состав (add-contour-membership), а не состав запуска.
+            items = [(member.name, member.instrument.get("instrument_type"), (member.chosen or {}).get("days_to_expiry"),
+                      member.active, member.remove_mode, current.get(member.key)) for member in members]
+        else:
+            items = [(item.name, item.instrument_type, item.days_to_expiry, True, None, None) for item in chosen]
+        return [{
+            "name": name, "instrument_type": kind, "days_to_expiry": days,
+            "target": "active" if active else "removed", "remove_mode": remove_mode, "current": state,
+            "_links": views.links(self=views.member_href(name)),
+            "_actions": views.member_action_list(name, views.member_actions(
+                changeable=changeable, active=active, remove_mode=remove_mode)),
+        } for name, kind, days, active, remove_mode, state in items]
+
+    def members(self, revision: int | None = -1) -> dict:
+        """``GET /api/v1/emulation/instruments`` и ответ команд состава; ``revision=None`` — итог ещё не известен."""
+        view = self.emulation()
+        if revision == -1:
+            revision = None if view["target"] is None else view["target"]["revision"]
+        return {"revision": revision, "items": view["instruments"],
+                "_links": views.links(self=views.EMULATION_INSTRUMENTS, emulation=views.EMULATION),
+                "_actions": [action for action in view["_actions"] if action["name"] == "add-instruments"]}
+
+    def member(self, name: str) -> dict | None:
+        wanted = name.strip().upper()
+        return next((item for item in self.emulation()["instruments"] if item["name"].upper() == wanted), None)
+
+    def summary(self) -> dict:
+        """Сводка эмуляции для точки входа ``GET /api/v1``."""
+        view = self.emulation()
+        return {"state": view["state"],
+                "instruments": sum(item["target"] == "active" for item in view["instruments"]),
+                "open_positions": (view["current"] or {}).get("open_positions")}
 
     def chosen_payloads(self) -> list[dict]:
         """Как инструменты последнего запуска названы при разрешении — для участников состава."""
         with self._lock:
             return [item.payload() for item in self._chosen]
-
-    def contour(self, contour_id: str) -> dict | None:
-        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
-            return self.history.contour(contour_id)
-        return self.snapshot() if contour_id == CONTOUR_ID else None
-
-    def contours(self, kind: str | None = None, limit: int | None = None) -> dict:
-        """``GET /api/v1/contours``: эмуляция, прогоны в очереди и в работе, ``limit`` последних завершённых."""
-        from src.assembly.history_runs import LIST_LIMIT_DEFAULT
-
-        items = [] if kind == MODE_HISTORY else [self.snapshot()]
-        if kind != MODE_EMULATION and self.history is not None:
-            items += self.history.contours(LIST_LIMIT_DEFAULT if limit is None else limit)
-        limits = self.history.limits() if self.history is not None else {
-            "max_history_runs": 0, "running": 0, "queued": 0}
-        return {"contours": items, "limits": limits}
 
     def _core_not_ready(self) -> dict | None:
         """Тело ``409 CORE_NOT_READY``, пока ядро стартует или повторяет старт; ``None`` — ядро готово."""
@@ -251,49 +352,62 @@ class LaunchControl:
         from src.assembly.contour_control import STATUS_FILE, read_status
         return read_status(self._contour_dir / STATUS_FILE)
 
-    def stop(self, contour_id: str, mode: str | None) -> tuple[int, dict]:
-        """Команда остановки: желаемое «остановлен» новым поколением; применит контур на границе тика."""
-        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
-            return self.history.stop(contour_id)
-        if contour_id != CONTOUR_ID:
-            return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
+    def _revision_changed(self, expected: int | None, action: str, payload: dict) -> dict | None:
+        """Быстрая сверка ``If-Match`` до разрешения инструментов; атомарная — при записи в ``core.sqlite3``."""
+        if expected is None:
+            return None
+        current = self.revision() or 0
+        if current == expected:
+            return None
+        if self._core_state is not None:
+            self._core_state.record_command(CONTOUR_ID, action, payload, "conflict",
+                                            f"Ожидалась ревизия {expected}, текущая {current}.")
+        return _revision_problem(expected, current)
+
+    # --- команды ----------------------------------------------------------------
+    def put_target(self, mode: str, request: LaunchRequest | None, expected: int | None = None) -> tuple[int, dict]:
+        """``PUT /api/v1/emulation/target``: ``on`` — запуск, ``no_entries`` / ``close_all`` — остановка."""
+        if mode == views.MODE_ON:
+            return self.submit(request)
+        return self.stop(mode, expected)
+
+    def stop(self, mode: str, expected: int | None = None) -> tuple[int, dict]:
+        """Остановка: целевое «остановлен» новым поколением; применит контур на границе тика."""
+        from src.assembly.core_state import RevisionChanged
+
         with self._lock:
             alive = self._pid is not None
         if not alive or self._core_state is None:
             if self._core_state is not None:
                 self._core_state.record_command(CONTOUR_ID, "stop", {"mode": mode}, "conflict", "контур не работает")
-            return 409, {"code": "NOT_RUNNING", "message": "Контур не работает: останавливать нечего.",
-                         "contour": self.snapshot()}
-        outcome = self._core_state.record_stop(CONTOUR_ID, mode)
+            return 409, {"code": "NOT_RUNNING", "message": "Эмуляция не работает: останавливать нечего."}
+        try:
+            outcome = self._core_state.record_stop(CONTOUR_ID, mode, expected)
+        except RevisionChanged as exc:
+            return 412, _revision_problem(exc.expected, exc.current)
         if outcome.outcome == "conflict":
-            return 409, {"code": "MODE_CONFLICT", "message": f"Остановка не принята: {outcome.reason}.",
-                         "contour": self.snapshot()}
-        status = 202 if outcome.outcome == "accepted" else 200
-        return status, {"generation": outcome.generation, "contour": self.snapshot()}
+            return 409, {"code": "MODE_CONFLICT", "message": f"Остановка не принята: {outcome.reason}."}
+        return (202 if outcome.outcome == "accepted" else 200), self.emulation()
 
-    def change_membership(self, contour_id: str, command: MembershipCommand) -> tuple[int, dict]:
+    def change_membership(self, command: MembershipCommand) -> tuple[int, dict]:
         """Команда состава из HTTP-потока: разбирает главный поток ядра, ответ — не дольше таймаута."""
-        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
-            run = self.history.contour(contour_id)
-            if run is None:
-                return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
-            return 409, {"code": "NOT_SUPPORTED", "message": "Состав прогона истории после приёма не меняется.",
-                         "contour": run}
-        if contour_id != CONTOUR_ID:
-            return 404, {"code": "NOT_FOUND", "message": f"Контура {contour_id!r} нет."}
         desired = self._desired()
         with self._lock:
             alive = self._pid is not None
         if not alive:
-            return 409, {"code": "NOT_RUNNING", "message": "Контур не работает: состав менять нечему.",
-                         "contour": self.snapshot()}
+            return 409, {"code": "NOT_RUNNING", "message": "Эмуляция не работает: состав менять нечему."}
         if desired is not None and not desired.running:
-            return 409, {"code": "STOPPING", "message": "Контур останавливается: состав не меняется.",
-                         "contour": self.snapshot()}
+            return 409, {"code": "STOPPING", "message": "Эмуляция останавливается: состав не меняется."}
+        payload = {"add": list(command.add)} if command.add else {"remove": list(command.remove), "mode": command.mode}
+        changed = self._revision_changed(command.expected, "add" if command.add else "remove", payload)
+        if changed is not None:
+            return 412, changed
         self._membership.put(command)
-        if command.done.wait(self._reply_timeout):
-            return command.status, command.payload
-        return 202, {"generation": None, "contour": self.snapshot()}
+        if not command.done.wait(self._reply_timeout):
+            return 202, self.members(revision=None)
+        if command.status in (200, 202):
+            return command.status, self.members(revision=command.payload.get("revision"))
+        return command.status, command.payload
 
     def next_membership(self, timeout: float):
         """Главный поток ядра: следующая команда состава или ``None`` за ``timeout``."""
@@ -306,25 +420,17 @@ class LaunchControl:
         command.status, command.payload = status, payload
         command.done.set()
 
-    def log_tail(self, contour_id: str, count: int) -> str | None:
-        """Последние строки журнала процесса контура; секреты в нём уже замаскированы."""
-        if self.history is not None and contour_id.startswith(HISTORY_PREFIX):
-            return self.history.log_tail(contour_id, count)
-        if contour_id != CONTOUR_ID:
-            return None
+    def log_tail(self, count: int) -> str:
+        """Последние строки журнала процесса эмуляции; секреты в нём уже замаскированы."""
         return "" if self._contour_dir is None else tail_lines(self._contour_dir / self._log_file, count)
 
     def submit(self, request: LaunchRequest) -> tuple[int, dict]:
-        """Передать команду главному потоку и дождаться ответа не дольше таймаута.
+        """Передать команду запуска главному потоку и дождаться ответа не дольше таймаута.
 
         Команда принимается, пока ядро ждёт её, в том числе после остановки или
-        падения контура (повторный запуск, add-control-api). Прогон истории
-        уходит в свою очередь при любом состоянии ядра и эмуляции.
+        падения контура (повторный запуск, add-control-api).
         """
-        if request.mode == MODE_HISTORY:
-            if self.history is None:
-                return 409, {"code": "HISTORY_UNAVAILABLE", "message": "Очередь прогонов истории не запущена."}
-            return self.history.submit(request)
+        launch_payload = {"instruments": list(request.instruments)}
         not_ready = self._core_not_ready()
         if not_ready is not None:
             return 409, not_ready
@@ -333,33 +439,34 @@ class LaunchControl:
             return 409, {"code": "CONTOUR_DIR_BUSY",
                          "message": f"Папку контура держит процесс pid {busy}, который не подтверждает себя контуром "
                                     "робота. Завершите его; команда проверит папку заново.",
-                         "pid": busy, "contour": self.snapshot()}
+                         "pid": busy}
+        changed = self._revision_changed(request.expected_revision, "launch", launch_payload)
+        if changed is not None:
+            return 412, changed
         desired = self._desired()
         with self._lock:
-            idle = self._state in (STATE_WAITING, STATE_STOPPED, STATE_FAILED) and self._pid is None
-            conflict = not self._accepting or not idle or self._pending is not None
+            allowed = "start" in self._actions_with(desired, True)
             stopping = self._pid is not None and desired is not None and not desired.running
-            if not conflict:
+            if allowed:
                 pending = _Pending(request)
                 self._pending = pending
                 self._state = STATE_STARTING
                 self._source = SOURCE_API
-        if conflict:
+        if not allowed:
             if self._core_state is not None:
-                self._core_state.record_command(CONTOUR_ID, "launch", {"instruments": list(request.instruments)},
-                                                "conflict", "контур останавливается" if stopping else "контур работает")
+                self._core_state.record_command(CONTOUR_ID, "launch", launch_payload, "conflict",
+                                                "контур останавливается" if stopping else "контур работает")
             if stopping:
                 return 409, {"code": "STOPPING",
-                             "message": "Контур останавливается и доживает сделки; дождитесь остановки "
-                                        "или вызовите stop с close_all.",
-                             "contour": self.snapshot()}
+                             "message": "Эмуляция останавливается и доживает сделки; дождитесь остановки "
+                                        "или передайте mode = close_all."}
             return 409, {"code": "ALREADY_RUNNING",
-                         "message": "Контур эмуляции уже запускается или торгует; набор инструментов не изменён.",
-                         "contour": self.snapshot()}
+                         "message": "Эмуляция уже запускается или торгует; состав меняется через "
+                                    "/api/v1/emulation/instruments."}
         self._queue.put(pending)
-        if pending.done.wait(self._reply_timeout):
+        if pending.done.wait(self._reply_timeout) and pending.status != 202:
             return pending.status, pending.payload
-        return 202, self.snapshot()
+        return 202, self.emulation()
 
     # --- для главного потока -------------------------------------------------
     def accept_commands(self) -> None:
@@ -392,8 +499,38 @@ class LaunchControl:
                                "rejections": [{"token": item.token, "reason": item.reason} for item in rejections]}
         pending.done.set()
 
-    def mark_launched(self, source: str, chosen: list[Chosen], command: str, pending: _Pending | None = None) -> None:
-        """Инструменты приняты: контур запускается (``starting``) до первого подтверждения курсора."""
+    def mark_launched(self, source: str, chosen: list[Chosen], command: str, pending: _Pending | None = None, *,
+                      instruments=None) -> bool:
+        """Инструменты приняты: контур запускается (``starting``) до первого подтверждения курсора.
+
+        С ``instruments`` целевое «работает» и состав записываются в
+        ``core.sqlite3`` сразу (rework-contour-api): ответ команды несёт новую
+        ревизию. ``If-Match`` команды сверяется в той же транзакции; не совпал —
+        ответ ``412``, робот ждёт следующую команду, возвращается ``False``.
+        """
+        from src.assembly.core_state import RevisionChanged
+
+        if instruments is not None and self._core_state is not None:
+            from src.assembly.contracts import instrument_payload
+            from src.assembly.core import _member
+            from src.instruments import normalize_instrument
+
+            normalized = [normalize_instrument(item) for item in instruments]
+            chosen_payloads = [item.payload() for item in chosen]
+            try:
+                self._core_state.record_launch(
+                    CONTOUR_ID, MODE_EMULATION, [instrument_payload(item) for item in normalized], source=source,
+                    command=command, members=[_member(item, {}, chosen_payloads) for item in normalized],
+                    expected=None if pending is None else pending.request.expected_revision)
+            except RevisionChanged as exc:
+                with self._lock:
+                    self._state = STATE_WAITING
+                    self._source = None
+                    self._pending = None
+                if pending is not None:
+                    pending.status, pending.payload = 412, _revision_problem(exc.expected, exc.current)
+                    pending.done.set()
+                return False
         with self._lock:
             self._state = STATE_STARTING
             self._source = source
@@ -404,10 +541,16 @@ class LaunchControl:
             self._accepting = False
             self._pending = None
             self._recovery = None
+            self._recorded = instruments is not None and self._core_state is not None
         if pending is not None:
-            pending.status = 201
-            pending.payload = self.snapshot()
+            pending.status = 202
             pending.done.set()
+        return True
+
+    def launch_recorded(self) -> bool:
+        """Запуск этой командой уже записан в ``core.sqlite3``: ядро берёт поколение оттуда."""
+        with self._lock:
+            return self._recorded
 
     def mark_recovered(self, recovery: str, desired) -> None:
         """Процесс поднят без команды (``autostart``) или подхвачен живым (``adopted``): источник — из желаемого."""
@@ -423,12 +566,15 @@ class LaunchControl:
             self._rejections = []
             self._accepting = False
             self._recovery = recovery
+            self._recorded = False
 
     def mark_process(self, pid: int) -> None:
         with self._lock:
             self._pid = pid
             self._exit_code = None
+            self._exited_at = None
             self._launched = True
+            self._recorded = False
 
     def mark_contour_running(self) -> None:
         """Контур первый раз подтвердил курсор ленты — торгует."""
@@ -444,9 +590,14 @@ class LaunchControl:
         with self._lock:
             self._pid = None
             self._exit_code = code
+            self._exited_at = self._clock()
             self._state = STATE_STOPPED if code == 0 else STATE_FAILED
 
     def mark_starting(self, source: str) -> None:
         with self._lock:
             self._state = STATE_STARTING
             self._source = source
+
+
+def _revision_problem(expected: int, current: int) -> dict:
+    return {"code": "REVISION_CHANGED", "message": f"Ожидалась ревизия {expected}, текущая {current}; перечитайте эмуляцию."}

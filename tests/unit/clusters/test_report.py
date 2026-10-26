@@ -17,7 +17,7 @@ from src.trade_management.audit import CalculationTraceRepository
 from tests.unit.clusters.helpers import T
 from tests.unit.clusters.test_gate_admission import BR, _assignment, _decision, _gate, _store
 
-SPEC = yaml.safe_load((Path(__file__).resolve().parents[3] / "docs" / "openapi.yaml").read_text(encoding="utf-8"))
+SPEC = yaml.safe_load((Path(__file__).resolve().parents[3] / "docs" / "api" / "openapi.yaml").read_text(encoding="utf-8"))
 SIGNAL_ID = "future-br-macd:BRX6:5m:SELL"
 
 

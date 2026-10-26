@@ -163,6 +163,24 @@ class TestCore:
         assert env.store.desired("emulation").generation == desired.generation == launch["generation"]
         assert set(launch["contracts"]) == {"NGZ6", "SBER"} and launch["source"] == "api" and started == ["emulation"]
 
+    def test_launch_recorded_by_command_is_not_recorded_again(self, live, tmp_path):
+        """rework-contour-api: команда записала целевое «работает»; ядро берёт поколение и сохраняет карточки."""
+        store = CoreStateStore(tmp_path / "core.sqlite3")
+        control = LaunchControl(core_state=store)
+        chosen = [Chosen("SBER", "SBER", "share")]
+        assert control.mark_launched(SOURCE_API, chosen, '{"mode": "on", "instruments": ["SBER"]}', instruments=[SBER])
+        assert store.desired("emulation").members[0].contract is None
+        started = []
+        process = SimpleNamespace(start=lambda: started.append("emulation") or 777)
+        live._start_contour_process([core_module._normalized(SBER)], kind="emulation", control=control, source="api",
+                                    command="", core_state=store, process_factory=lambda kind, on_exit: process,
+                                    desired=store.desired("emulation") if control.launch_recorded() else None)
+        launch = json.loads((tmp_path / "contours" / "emulation" / LAUNCH_FILE).read_text(encoding="utf-8"))
+        desired = store.desired("emulation")
+        assert desired.generation == launch["generation"] == 1 and started == ["emulation"]
+        assert desired.members[0].contract["SBER"]["price_step"] == 0.01
+        assert not control.launch_recorded()
+
     @pytest.mark.parametrize("exited, state", [(True, "stopped"), (False, "failed")])
     def test_adopted_exit_is_judged_by_status(self, env, live, monkeypatch, exited, state):
         control = LaunchControl(core_state=env.store, contour_dir=env.directory)
@@ -190,11 +208,11 @@ def test_recovered_contour_shows_source_from_desired(env):
     control = LaunchControl(core_state=env.store, contour_dir=env.directory)
     control.mark_recovered(recovery.RECOVERY_ADOPTED, env.store.desired("emulation"))
     control.mark_process(4242)
-    snapshot = control.snapshot()
-    assert (snapshot["state"], snapshot["recovery"], snapshot["source"]) == ("starting", "adopted", SOURCE_API)
-    assert [item["name"] for item in snapshot["instruments"]] == ["NG-12.26", "SBER"]
+    view = control.emulation()
+    assert (view["state"], view["launch"]["recovery"], view["launch"]["source"]) == ("starting", "adopted", SOURCE_API)
+    assert [item["name"] for item in view["instruments"]] == ["NG-12.26", "SBER"]
     control.mark_launched(SOURCE_API, [], "--mode emulation")
-    assert control.snapshot()["recovery"] is None
+    assert control.emulation()["launch"]["recovery"] is None
 
 
 class TestCoreStart:

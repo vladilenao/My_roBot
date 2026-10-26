@@ -6,6 +6,11 @@ web-фреймворка. По умолчанию он слушает тольк
 С add-history-contour сервер поднимается до ядра: управление работает сразу,
 а рыночная база и отчёт кластеров подключаются, когда ядро их открыло
 (``attach_market``). До этого маршруты экспорта отвечают ``503``.
+
+С rework-contour-api у каждого контура свой ресурс: ``/api/v1/emulation`` и
+``/api/v1/history``; точка входа — ``/api/v1``. Ошибки управления —
+``application/problem+json``, экспорта и отчёта кластеров — прежний
+``{code, message}``: его читает эмулятор данных.
 """
 
 from __future__ import annotations
@@ -17,18 +22,21 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from src.bot import control_views as views
 from src.data.market_store import CONTOUR_CONSUMER_PREFIX, CursorExpired, MarketDataStore, ProducerMismatch
 from src.logging_setup import get_logger
 
 log = get_logger(__name__)
 _CONSUMER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _CONTROL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+# Прежняя оболочка контуров (до rework-contour-api): все её маршруты отвечают 404.
 _CONTOURS = "/api/v1/contours"
-# /api/v1/contours/{id}[/stop|/log] — маршруты одного контура (add-control-api).
-_CONTOUR = re.compile(r"^/api/v1/contours/([a-z0-9][a-z0-9-]{0,62})(?:/(stop|log|instruments))?$")
-_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
+# /api/v1/history/{run_id}[/stop|/report|/log]; run_id — имя папки прогона.
+_RUN = re.compile(r"^/api/v1/history/([0-9]{8}-[0-9]{6}(?:-[0-9]+)?)(?:/(stop|report|log))?$")
+_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY)
+_OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.yaml"
 # Маршруты экспорта рыночных данных и отчёта кластеров: им нужна рыночная база ядра.
 _EXPORT_GET = ("/api/v1/market-data/source", "/api/v1/market-data/changes",
                "/api/v1/market-data/trading-schedules", "/api/v1/clusters/report")
@@ -111,21 +119,12 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/docs":
             self._send_text(HTTPStatus.OK, _swagger_html(), "text/html; charset=utf-8")
             return
-        if parsed.path == _CONTOURS:
-            if self._control_allowed():
-                self._contours_list(parse_qs(parsed.query))
+        if parsed.path == views.HOME:
+            self._home()
             return
-        if parsed.path == "/api/v1/core":
+        if _is_control(parsed.path):
             if self._control_allowed():
-                if self.export_server.core_state is None:
-                    self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Состояние ядра недоступно в этом процессе.")
-                else:
-                    self._json(HTTPStatus.OK, self.export_server.core_state())
-            return
-        contour = _CONTOUR.match(parsed.path)
-        if contour is not None and contour.group(2) not in ("stop", "instruments"):
-            if self._control_allowed():
-                self._contour_get(contour.group(1), contour.group(2), parse_qs(parsed.query))
+                self._control_get(parsed.path, parse_qs(parsed.query))
             return
         if not self._export_ready(parsed.path in _EXPORT_GET):
             return
@@ -180,17 +179,185 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _contours_list(self, query: dict[str, list[str]]) -> None:
-        from src.assembly.history_runs import LIST_LIMIT_MAX
+    # --- точка входа и управление (rework-contour-api) -----------------------------
+    def _home(self) -> None:
+        """``GET /api/v1``: любой из двух ключей; разделы — по правам ключа."""
+        from src import __version__
 
-        kind = _one(query, "kind")
-        limit = _integer(query, "limit", minimum=1)
-        if ("kind" in query and kind not in ("emulation", "history")) or \
-                ("limit" in query and (limit is None or limit > LIST_LIMIT_MAX)):
-            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST",
-                        f"kind — emulation или history; limit — целое от 1 до {LIST_LIMIT_MAX}.")
+        server = self.export_server
+        header = self.headers.get("Authorization", "")
+        control = server.control is not None and _bearer_matches(header, server.control_token)
+        export = _bearer_matches(header, server.token)
+        if not control and not export:
+            self._problem(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Ключ отсутствует или неверен.")
             return
-        self._json(HTTPStatus.OK, self.export_server.control.contours(kind, limit))
+        if control and not self._loopback_host():
+            return
+        core = server.core_state() if server.core_state is not None else None
+        history = server.control.history if control else None
+        found = {"self": views.HOME}
+        if control:
+            found.update(core=views.CORE, emulation=views.EMULATION, history=views.HISTORY)
+        if export:
+            found.update({"market-data": "/api/v1/market-data/source", "clusters-report": "/api/v1/clusters/report"})
+        found["docs"] = "/docs"
+        self._json(HTTPStatus.OK, {
+            "version": __version__,
+            "core": {"state": (core or {}).get("state", "ready")},
+            "emulation": server.control.summary() if control else None,
+            "history": None if not control else (history.limits() if history is not None else
+                                                 {"max": 0, "running": 0, "queued": 0}),
+            "live": None,
+            "_links": {name: {"href": href} for name, href in found.items()},
+        })
+
+    def _control_get(self, path: str, query: dict[str, list[str]]) -> None:
+        from src.assembly.history_runs import LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX
+
+        server, control = self.export_server, self.export_server.control
+        if path == views.CORE:
+            if server.core_state is None:
+                self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Состояние ядра недоступно в этом процессе.")
+            else:
+                self._json(HTTPStatus.OK, {**server.core_state(), "_links": views.links(self=views.CORE, home=views.HOME)})
+            return
+        if path == views.EMULATION:
+            view = control.emulation()
+            self._json(HTTPStatus.OK, view, headers=views.etag((view["target"] or {}).get("revision")))
+            return
+        if path == views.EMULATION_TARGET:
+            target = control.target()
+            if target is None:
+                self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эмуляцию ещё не запускали: целевого состояния нет.")
+            else:
+                self._json(HTTPStatus.OK, target, headers=views.etag(target["revision"]))
+            return
+        if path == views.EMULATION_INSTRUMENTS:
+            members = control.members()
+            self._json(HTTPStatus.OK, members, headers=views.etag(members["revision"]))
+            return
+        if path.startswith(views.EMULATION_INSTRUMENTS + "/") and "/" not in path[len(views.EMULATION_INSTRUMENTS) + 1:]:
+            name = unquote(path[len(views.EMULATION_INSTRUMENTS) + 1:])
+            member = control.member(name)
+            if member is None:
+                self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Инструмента {name!r} нет в составе эмуляции.")
+            else:
+                self._json(HTTPStatus.OK, member)
+            return
+        if path == views.EMULATION_LOG:
+            tail = self._tail(query)
+            if tail is not None:
+                self._send_text(HTTPStatus.OK, control.log_tail(tail), "text/plain; charset=utf-8")
+            return
+        history = control.history
+        if path == views.HISTORY:
+            state = _one(query, "state")
+            limit = _integer(query, "limit", default=LIST_LIMIT_DEFAULT, minimum=1)
+            if ("state" in query and state not in ("active", "finished")) or limit is None or limit > LIST_LIMIT_MAX:
+                self._problem(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST",
+                              f"state — active или finished; limit — целое от 1 до {LIST_LIMIT_MAX}.")
+                return
+            self._json(HTTPStatus.OK, {
+                "limits": history.limits() if history is not None else {"max": 0, "running": 0, "queued": 0},
+                "items": history.runs(state, limit) if history is not None else [],
+                "_links": views.links(self=views.HISTORY, home=views.HOME)})
+            return
+        run = _RUN.match(path)
+        if run is None or run.group(2) == "stop":
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+            return
+        run_id, part = run.groups()
+        if part == "log":
+            tail = self._tail(query)
+            if tail is None:
+                return
+            text = None if history is None else history.log_tail(run_id, tail)
+            if text is None:
+                self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run_id!r} нет.")
+            else:
+                self._send_text(HTTPStatus.OK, text, "text/plain; charset=utf-8")
+            return
+        if history is None:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run_id!r} нет.")
+            return
+        if part == "report":
+            self._reply(*history.report(run_id))
+            return
+        payload = history.run(run_id)
+        if payload is None:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run_id!r} нет.")
+        else:
+            self._json(HTTPStatus.OK, payload)
+
+    def _tail(self, query: dict[str, list[str]]) -> int | None:
+        """``?tail=`` журнала: 1–1000, по умолчанию 200; иначе ответ ``400`` уже отправлен."""
+        from src.bot.launch_control import LOG_TAIL_DEFAULT, LOG_TAIL_MAX
+
+        raw = query.get("tail", [str(LOG_TAIL_DEFAULT)])
+        if len(raw) != 1 or not raw[0].isdigit() or not 1 <= int(raw[0]) <= LOG_TAIL_MAX:
+            self._problem(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", f"tail — целое число от 1 до {LOG_TAIL_MAX}.")
+            return None
+        return int(raw[0])
+
+    def _control_command(self, path: str) -> None:
+        """Команды управления: режим эмуляции, состав пачкой, прогон истории и его остановка."""
+        from src.bot.launch_control import BadCommand, parse_add, parse_history, parse_remove, parse_target
+
+        control = self.export_server.control
+        run = _RUN.match(path)
+        if run is not None and run.group(2) == "stop" and self.command == "POST":
+            # Тело остановки прогона не нужно и не читается.
+            history = control.history
+            if history is None:
+                self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run.group(1)!r} нет.")
+            else:
+                self._reply(*history.stop(run.group(1)))
+            return
+        routes = {("PUT", views.EMULATION_TARGET), ("POST", views.EMULATION_INSTRUMENTS),
+                  ("POST", views.EMULATION_REMOVE), ("POST", views.HISTORY)}
+        if (self.command, path) not in routes:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+            return
+        expected = _if_match(self.headers.get("If-Match"))
+        try:
+            body = self._read_json()
+            if path == views.EMULATION_TARGET:
+                mode, request = parse_target(body, expected)
+                status, payload = control.put_target(mode, request, expected)
+                headers = views.etag((payload.get("target") or {}).get("revision")) if status < 400 else None
+                if status == HTTPStatus.ACCEPTED:
+                    headers = {**(headers or {}), "Location": views.EMULATION}
+                self._reply(status, payload, headers)
+                return
+            if path == views.HISTORY:
+                request = parse_history(body)
+                if control.history is None:
+                    self._problem(HTTPStatus.CONFLICT, "HISTORY_UNAVAILABLE", "Очередь прогонов истории не запущена.")
+                    return
+                status, payload = control.history.submit(request)
+                headers = {"Location": views.run_href(payload["id"])} if status == HTTPStatus.ACCEPTED else None
+                self._reply(status, payload, headers)
+                return
+            command = (parse_add if path == views.EMULATION_INSTRUMENTS else parse_remove)(body, expected)
+        except BadCommand as exc:
+            self._problem(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
+            return
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            self._problem(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело команды — JSON-объект.")
+            return
+        status, payload = control.change_membership(command)
+        self._reply(status, payload, views.etag(payload.get("revision")) if status < 400 else None)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length).decode("utf-8")) if length else None
+
+    def _reply(self, status: int, payload: dict, headers: dict | None = None) -> None:
+        """Ответ управления: успех — JSON, ошибка — ``problem+json`` из ``{code, message, …}``."""
+        if status >= 400:
+            self._problem(HTTPStatus(status), payload.get("code", "INTERNAL"), payload.get("message", ""), payload)
+        else:
+            self._json(HTTPStatus(status), payload, headers=headers)
 
     def _clusters_report(self, query: dict[str, list[str]]) -> None:
         from src.clusters.report import ReportError
@@ -214,6 +381,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if _is_control(parsed.path):
+            if self._control_allowed():
+                self._control_command(parsed.path)
+            return
         schedule_match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/trading-schedules-checkpoint", parsed.path)
         match = re.fullmatch(r"/api/v1/market-data/consumers/([^/]+)/checkpoint", parsed.path)
         if not self._export_ready(bool(match or schedule_match)):
@@ -240,94 +411,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Требуются producer_id и целый change_id.")
 
     def do_POST(self) -> None:  # noqa: N802
-        from src.bot.launch_control import BadCommand, parse_command
-
         parsed = urlparse(self.path)
-        contour = _CONTOUR.match(parsed.path)
-        if contour is not None and contour.group(2) == "stop":
-            if self._control_allowed():
-                self._contour_stop(contour.group(1))
-            return
-        if contour is not None and contour.group(2) == "instruments":
-            if self._control_allowed():
-                self._contour_members(contour.group(1))
-            return
-        if parsed.path != _CONTOURS:
+        if not _is_control(parsed.path):
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
-        if not self._control_allowed():
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
-            request = parse_command(body)
-        except BadCommand as exc:
-            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
-            return
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело команды — JSON-объект с полями kind и instruments.")
-            return
-        status, payload = self.export_server.control.submit(request)
-        if status == HTTPStatus.ACCEPTED:
-            location = f"{_CONTOURS}/{payload['id']}" if payload.get("kind") == "history" else _CONTOURS
-            self._json(HTTPStatus(status), payload, headers={"Location": location})
-        else:
-            self._json(HTTPStatus(status), payload)
-
-    def _contour_get(self, contour_id: str, part: str | None, query: dict) -> None:
-        from src.bot.launch_control import LOG_TAIL_DEFAULT, LOG_TAIL_MAX
-
-        control = self.export_server.control
-        if part is None:
-            snapshot = control.contour(contour_id)
-            if snapshot is None:
-                self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Контура {contour_id!r} нет.")
-            else:
-                self._json(HTTPStatus.OK, snapshot)
-            return
-        raw = query.get("tail", [str(LOG_TAIL_DEFAULT)])
-        if len(raw) != 1 or not raw[0].isdigit() or not 1 <= int(raw[0]) <= LOG_TAIL_MAX:
-            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", f"tail — целое число от 1 до {LOG_TAIL_MAX}.")
-            return
-        text = control.log_tail(contour_id, int(raw[0]))
-        if text is None:
-            self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Контура {contour_id!r} нет.")
-        else:
-            self._send_text(HTTPStatus.OK, text, "text/plain; charset=utf-8")
-
-    def _contour_stop(self, contour_id: str) -> None:
-        from src.bot.launch_control import HISTORY_PREFIX, BadCommand, parse_stop
-
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else None
-            # Прогон истории останавливается без режима: тело можно не передавать (add-history-contour).
-            mode = None if contour_id.startswith(HISTORY_PREFIX) else parse_stop(body)
-        except BadCommand as exc:
-            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
-            return
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело остановки — JSON-объект с полем mode.")
-            return
-        status, payload = self.export_server.control.stop(contour_id, mode)
-        headers = {"Location": f"{_CONTOURS}/{contour_id}"} if status == HTTPStatus.ACCEPTED else None
-        self._json(HTTPStatus(status), payload, headers=headers)
-
-    def _contour_members(self, contour_id: str) -> None:
-        from src.bot.launch_control import BadCommand, parse_membership
-
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            command = parse_membership(json.loads(self.rfile.read(length).decode("utf-8")) if length else None)
-        except BadCommand as exc:
-            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
-            return
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело состава — JSON-объект с полем add или remove.")
-            return
-        status, payload = self.export_server.control.change_membership(contour_id, command)
-        headers = {"Location": f"{_CONTOURS}/{contour_id}"} if status == HTTPStatus.ACCEPTED else None
-        self._json(HTTPStatus(status), payload, headers=headers)
+        if self._control_allowed():
+            self._control_command(parsed.path)
 
     def _authorised(self) -> bool:
         return _bearer_matches(self.headers.get("Authorization", ""), self.export_server.token)
@@ -336,12 +425,16 @@ class _Handler(BaseHTTPRequestHandler):
         """Ключ управления и loopback-``Host``; при отказе ответ уже отправлен."""
         server = self.export_server
         if server.control is None or not _bearer_matches(self.headers.get("Authorization", ""), server.control_token):
-            self._error(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Ключ управления отсутствует или неверен.")
+            self._problem(HTTPStatus.UNAUTHORIZED, "UNAUTHORIZED", "Ключ управления отсутствует или неверен.")
             return False
-        port = server.address[1]
+        return self._loopback_host()
+
+    def _loopback_host(self) -> bool:
+        """``Host`` — loopback-адрес с портом сервера; иначе ответ ``403`` уже отправлен."""
+        port = self.export_server.address[1]
         if self.headers.get("Host", "") not in {f"{host}:{port}" for host in _CONTROL_HOSTS}:
-            self._error(HTTPStatus.FORBIDDEN, "FORBIDDEN_HOST",
-                        "Управление доступно только по адресу 127.0.0.1, localhost или [::1].")
+            self._problem(HTTPStatus.FORBIDDEN, "FORBIDDEN_HOST",
+                          "Управление доступно только по адресу 127.0.0.1, localhost или [::1].")
             return False
         return True
 
@@ -350,7 +443,13 @@ class _Handler(BaseHTTPRequestHandler):
                         "application/json; charset=utf-8", headers=headers)
 
     def _error(self, status: HTTPStatus, code: str, message: str) -> None:
+        """Ошибка экспорта и отчёта кластеров — формат 1.8 ``{code, message}``."""
         self._json(status, {"code": code, "message": message})
+
+    def _problem(self, status: HTTPStatus, code: str, detail: str, extra: dict | None = None) -> None:
+        """Ошибка управления — ``application/problem+json`` (RFC 9457)."""
+        self._send_text(status, json.dumps(views.problem(status, code, detail, extra), ensure_ascii=False,
+                                           separators=(",", ":")), "application/problem+json; charset=utf-8")
 
     def _send_text(self, status: HTTPStatus, body: str, content_type: str, headers: dict | None = None) -> None:
         encoded = body.encode("utf-8")
@@ -361,6 +460,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(encoded)
+
+
+def _is_control(path: str) -> bool:
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _CONTROL_PREFIXES)
+
+
+def _if_match(header: str | None) -> int | None:
+    """``If-Match: "3"`` → 3; нет заголовка или ``*`` — без проверки; неразборчивое значение не совпадёт ни с чем."""
+    if header is None or header.strip() == "*":
+        return None
+    value = header.strip().removeprefix("W/").strip('"')
+    return int(value) if value.isdigit() else -1
 
 
 def _bearer_matches(header: str, token: str | None) -> bool:

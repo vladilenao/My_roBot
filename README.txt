@@ -59,62 +59,76 @@ GET /api/v1/core: если ядро не стартовало (например,
 
 Запуск эмуляции (пример для macOS и Linux; ключ подставьте свой):
 
-$ curl -X POST http://127.0.0.1:8101/api/v1/contours -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"kind": "emulation", "instruments": ["NG", "SBER"]}'
+$ curl -X PUT http://127.0.0.1:8101/api/v1/emulation/target -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"mode": "on", "instruments": ["NG-12.26", "SBER"]}'
 
-instruments — тикер акции (SBER), код семейства (NG — ближайший
-контракт, до экспирации которого больше contract_expiry_block_days
-суток) или контракт (NG-12.26); без поля — все инструменты с привязками
-в robot.toml. Ответ 201 — торговля запущена, 422 — какие инструменты не
-приняты и почему (робот ждёт новую команду), 409 CORE_NOT_READY — ядро
-ещё не готово. Строка «Повторить запуск: POST /api/v1/contours {…}» в
-консоли — тело той же команды.
+instruments — тикер акции (SBER) или короткое имя контракта (NG-12.26):
+то же имя потом видно в составе и им же инструмент убирается. Код
+семейства (NG) и биржевой тикер (NGZ6) эмуляция не принимает — ответ
+подскажет короткое имя ближайшего контракта. Без поля — все инструменты
+с привязками в robot.toml, у семейств — ближайший контракт, до
+экспирации которого больше contract_expiry_block_days суток. Ответ
+202 — торговля запускается, 422 — какие инструменты не приняты и почему
+(робот ждёт новую команду), 409 CORE_NOT_READY — ядро ещё не готово.
+Строка «Повторить запуск: PUT /api/v1/emulation/target {…}» в консоли —
+тело той же команды. Состояние эмуляции — GET /api/v1/emulation: в
+_actions перечислены команды, которые робот примет сейчас.
 
 Остановить эмуляцию, не останавливая робота:
 
-$ curl -X POST http://127.0.0.1:8101/api/v1/contours/emulation/stop -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"mode": "no_entries"}'
+$ curl -X PUT http://127.0.0.1:8101/api/v1/emulation/target -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"mode": "no_entries"}'
 
 no_entries — новых входов нет, открытые сделки доживают до закрытия;
 close_all — все позиции закрываются на открытии следующего бара. Когда
-сделок не осталось, контур завершается (состояние stopped), и тот же
-POST /api/v1/contours запускает торговлю снова, в том числе другим
-набором. Журнал контура — GET /api/v1/contours/emulation/log?tail=200.
+сделок не осталось, контур завершается (состояние stopped), и команда
+{"mode": "on"} запускает торговлю снова, в том числе другим набором.
+Журнал контура — GET /api/v1/emulation/log?tail=200.
 
 Изменить состав, не останавливая эмуляцию:
 
-$ curl -X POST http://127.0.0.1:8101/api/v1/contours/emulation/instruments -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"add": ["NG"]}'
+$ curl -X POST http://127.0.0.1:8101/api/v1/emulation/instruments -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"instruments": ["BR-12.26"]}'
 
-{"remove": ["SBER"]} — новых входов по инструменту нет, его сделки
-доживают; с "mode": "close_all" — закрываются. Состояние инструментов —
-members в GET /api/v1/contours: warming (прогрев), trading, draining,
+Убрать сразу несколько:
+
+$ curl -X POST http://127.0.0.1:8101/api/v1/emulation/instruments/remove -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"instruments": ["NG-12.26", "SBER"], "mode": "no_entries"}'
+
+no_entries (по умолчанию) — новых входов нет, сделки доживают;
+close_all — сделки закрываются. Состав и состояние каждого инструмента —
+GET /api/v1/emulation/instruments: warming (прогрев), trading, draining,
 closing.
 
-Прогон истории — той же командой с kind = history, в любой момент: без
-эмуляции, параллельно с ней и даже пока ядро не готово (свечи истории
-даёт эмулятор данных, historical_api_url):
+Ответы эмуляции несут заголовок ETag — номер ревизии целевого
+состояния. Если передать его в If-Match, команда по устаревшему
+состоянию (кто-то успел изменить эмуляцию раньше) получит 412 и ничего
+не изменит.
 
-$ curl -X POST http://127.0.0.1:8101/api/v1/contours -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"kind": "history", "from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 0, "instruments": ["NG"]}'
+Прогон истории — в любой момент: без эмуляции, параллельно с ней и даже
+пока ядро не готово (свечи истории даёт эмулятор данных,
+historical_api_url):
+
+$ curl -X POST http://127.0.0.1:8101/api/v1/history -H "Authorization: Bearer <ключ из .env>" -H "Content-Type: application/json" -d '{"from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 0, "instruments": ["NG"]}'
 
 from, to — ГГГГ-ММ-ДД ЧЧ:ММ, без зоны — UTC, to не входит; pause —
-секунды между тиками (по умолчанию 1); NG — автоматическая смена
-контрактов, NG-12.26 — один контракт. Ответ 202 с id прогона вида
-history-20261024-101500. Одновременно идут не больше
+секунды между тиками (по умолчанию 1). В истории NG — автоматическая
+смена контрактов, NG-12.26 — один контракт. Ответ 202 с id прогона вида
+20261024-101500 — это и имя его папки. Одновременно идут не больше
 [contours] max_history_runs (2) прогонов, остальные ждут в очереди
-(queued). Ход и итог — GET /api/v1/contours/<id> (actual, result),
-лог — GET /api/v1/contours/<id>/log, остановить —
-POST /api/v1/contours/<id>/stop без тела. Папка прогона —
-data/contours/history/<дата-время>/ (report.txt, report.json, журнал
-сделок, bot_debug.log, console.log). Инструмент, названный и в истории,
-и в эмуляции, торгуется по одним и тем же привязкам robot.toml.
+(queued). Список — GET /api/v1/history, ход — GET /api/v1/history/<id>
+(progress), итог — GET /api/v1/history/<id>/report, лог —
+GET /api/v1/history/<id>/log, остановить или убрать из очереди —
+POST /api/v1/history/<id>/stop без тела. Папка прогона —
+data/contours/history/<id>/ (report.txt, report.json, журнал сделок,
+bot_debug.log, console.log). Инструмент, названный и в истории, и в
+эмуляции, торгуется по одним и тем же привязкам robot.toml.
 
 Рестарт робота. Если эмуляция работала, следующий запуск поднимет её
 сам, как только ядро готово, — с тем же составом, без команды
-(recovery: autostart в GET /api/v1/contours). Ctrl+C останавливает
+(launch.recovery: autostart в GET /api/v1/emulation). Ctrl+C останавливает
 робота, контур и идущие прогоны истории (они пишут отчёт); очередь
-прогонов после рестарта не возобновляется. Остановка командой stop —
-навсегда, до нового POST. Если робот был убит, а контур остался жив,
+прогонов после рестарта не возобновляется. Остановка командой (no_entries, close_all) —
+навсегда, до новой команды {"mode": "on"}. Если робот был убит, а контур остался жив,
 контур без пульса робота (30 с) перестаёт входить в новые сделки и ждёт;
 новый запуск той же версии подхватывает его без второго процесса
-(recovery: adopted), новая версия дожидается его выхода и поднимает
+(launch.recovery: adopted), новая версия дожидается его выхода и поднимает
 свой. Отключить автоподъём — [contours] autostart = false.
 
 В текущем режиме при запуске показывается обзор последних доступных закрытых

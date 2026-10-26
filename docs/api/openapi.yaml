@@ -1,29 +1,26 @@
 openapi: 3.0.3
 info:
-  title: My Robot — локальный API (проект)
-  version: 2.0.0-draft
+  title: My Robot — локальный API
+  version: 2.0.0
   description: |
-    **Проект** целевого контракта. Ни один маршрут этого файла пока не
-    реализован; действующий контракт — `docs/openapi.yaml` (1.8.0), его
-    Swagger UI робот показывает на `/docs`. Решения и таблица «было →
-    станет» — в `docs/api/README.md`.
+    Локальный API робота: управление контурами, состояние ядра, экспорт
+    рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
+    контрактов — `docs/api/README.md`, решения и таблица «было → станет» —
+    `docs/api/v2-decisions.md`.
 
     Главное отличие от 1.8: вместо общей оболочки `/api/v1/contours` у
     каждого контура свой ресурс со своей схемой и своим жизненным циклом.
-    Маршруты `/api/v1/contours…` удаляются без периода `deprecated` — они
-    не выходили в релизе.
+    Маршруты `/api/v1/contours…` удалены без периода `deprecated` и
+    отвечают `404 NOT_FOUND`.
 
     * `/api/v1/emulation` — эмуляция: один контур, живёт долго, состав
       меняется на ходу.
     * `/api/v1/history` — прогоны истории: много, очередь, каждый
       выполняется до конца.
-    * `/api/v1/live` — место под боевую торговлю (документ 2).
-    * `/api/v1/instruments` — справочник: что можно запустить. Только
-      чтение, без состояния торговли. Состав торговли меняется только
-      внутри контура.
 
     Общие части (целевое и текущее состояние, процесс, участник
-    состава, ошибки) — общие схемы, которые подключаются в каждый контур.
+    состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
+    них же.
 
     **Ответы.** `application/json` со строгими схемами. В ответе:
     * `_links` — куда можно перейти (`self`, `log`, `instruments`, …);
@@ -60,8 +57,8 @@ info:
     одновременно. Внутри робота это `desired`/`actual`/`generation` в
     `core.sqlite3` и `status.json`.
 
-    **Ключи.** `ControlToken` (`ROBOT_CONTROL_TOKEN`) — контуры, ядро,
-    справочник. `ExportToken` (`MARKET_DATA_EXPORT_TOKEN`) — рыночные
+    **Ключи.** `ControlToken` (`ROBOT_CONTROL_TOKEN`) — контуры и ядро.
+    `ExportToken` (`MARKET_DATA_EXPORT_TOKEN`) — рыночные
     данные и отчёт кластеров. Только заголовок `Authorization: Bearer`.
 servers:
   - url: /
@@ -75,10 +72,6 @@ tags:
     description: Контур эмуляции — один, живёт долго, состав меняется на ходу.
   - name: История
     description: Прогоны истории — очередь, выполнение до конца, отчёт.
-  - name: Боевая торговля
-    description: Место под контур «Счёт» (документ 2). Пока только каркас.
-  - name: Справочник
-    description: Инструменты, которые робот знает, и их привязки. Только чтение.
   - name: Рыночные данные
     description: Лента изменений для Historical Broker API Emulator. Как в 1.8, без изменений.
   - name: Кластеры
@@ -94,11 +87,11 @@ paths:
       summary: Точка входа
       description: |
         Короткая сводка робота и ссылки на разделы. Набор ссылок зависит от
-        ключа: `ControlToken` видит ядро, контуры и справочник, `ExportToken`
-        — рыночные данные и отчёт кластеров. Заменяет общий список
+        ключа: `ControlToken` видит ядро и контуры, `ExportToken` —
+        рыночные данные и отчёт кластеров. Заменяет общий список
         `GET /api/v1/contours` как место, где «всё видно одним запросом».
+        С ключом управления действует и проверка `Host`.
       operationId: getHome
-      x-replaces: нет
       security:
         - ControlToken: []
         - ExportToken: []
@@ -122,7 +115,6 @@ paths:
                       core: {href: /api/v1/core}
                       emulation: {href: /api/v1/emulation}
                       history: {href: /api/v1/history}
-                      instruments: {href: /api/v1/instruments}
                       docs: {href: /docs}
                 export:
                   summary: Ключ экспорта
@@ -147,10 +139,8 @@ paths:
       description: |
         Как в 1.8: старт ядра (`starting`, `ready`, `retrying`, `failed`),
         пульс, готовность живых пар, запросы к брокеру за минуту. Отвечает
-        при любом состоянии ядра — API поднимается раньше него. Ответа
-        `404 «процесс без ядра»` больше нет: ядро всегда в процессе робота.
+        при любом состоянии ядра — API поднимается раньше него.
       operationId: getCore
-      x-replaces: GET /api/v1/core
       security:
         - ControlToken: []
       responses:
@@ -175,6 +165,7 @@ paths:
                   home: {href: /api/v1}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
 
   # --------------------------------------------------------------- эмуляция
   /api/v1/emulation:
@@ -186,7 +177,6 @@ paths:
         состав и действия, доступные сейчас. Заголовок `ETag` — ревизия
         целевого состояния; его можно передать в `If-Match` команды.
       operationId: getEmulation
-      x-replaces: GET /api/v1/contours/emulation
       security:
         - ControlToken: []
       responses:
@@ -246,7 +236,6 @@ paths:
                         current: trading
                         _links:
                           self: {href: /api/v1/emulation/instruments/NG-12.26}
-                          instrument: {href: /api/v1/instruments/NG-12.26}
                         _actions:
                           - {name: remove, title: 'Убрать, сделки доживают', method: POST, href: /api/v1/emulation/instruments/remove, body: {instruments: [NG-12.26], mode: no_entries}}
                           - {name: remove-close-all, title: 'Убрать и закрыть позиции', method: POST, href: /api/v1/emulation/instruments/remove, body: {instruments: [NG-12.26], mode: close_all}}
@@ -267,7 +256,6 @@ paths:
       tags: [Эмуляция]
       summary: Целевое состояние эмуляции
       operationId: getEmulationTarget
-      x-replaces: поле desired в GET /api/v1/contours/emulation
       security:
         - ControlToken: []
       responses:
@@ -296,9 +284,8 @@ paths:
         эмуляция ждёт команду, остановлена или упала, и ядро готово.
         `instruments` — тикеры акций (`SBER`) и короткие имена контрактов
         (`NG-12.26`), те же имена, что в составе и в удалении. Код семейства
-        (`NG`) не принимается: отказ подскажет ближайший допустимый
-        контракт, заранее его видно в `GET /api/v1/instruments/NG`
-        (`nearest`). Без поля или `all` — все инструменты с привязками, у
+        (`NG`) и биржевой тикер (`NGZ6`) не принимаются: отказ подскажет
+        короткое имя ближайшего допустимого контракта. Без поля или `all` — все инструменты с привязками, у
         семейств — ближайший контракт за порогом `contract_expiry_block_days`.
         Отказ строгий: хотя бы один инструмент отклонён — запуска нет (`422`). Если
         проверка у брокера не уложилась в 60 секунд — `202`, итог в
@@ -314,7 +301,6 @@ paths:
         эмуляция уже запускается или торгует, — `409 ALREADY_RUNNING`:
         состав меняется через `/api/v1/emulation/instruments`.
       operationId: putEmulationTarget
-      x-replaces: POST /api/v1/contours (kind emulation) и POST /api/v1/contours/emulation/stop
       security:
         - ControlToken: []
       parameters:
@@ -380,7 +366,6 @@ paths:
       summary: Состав эмуляции
       description: Все инструменты целевого состава, включая убираемые, с текущим состоянием.
       operationId: listEmulationInstruments
-      x-replaces: поле members в GET /api/v1/contours/emulation
       security:
         - ControlToken: []
       responses:
@@ -402,7 +387,6 @@ paths:
         (`warming`), проходит стартовый обзор и торгует. Добавление
         убираемого инструмента возвращает его в торговлю. Повтор — `200`.
       operationId: addEmulationInstruments
-      x-replaces: 'POST /api/v1/contours/emulation/instruments {"add": [...]}'
       security:
         - ControlToken: []
       parameters:
@@ -454,7 +438,6 @@ paths:
         бы одного инструмента нет в составе — ничего не меняется (`422`).
         Повтор — `200`; `no_entries` поверх `close_all` — `409 MODE_CONFLICT`.
       operationId: removeEmulationInstruments
-      x-replaces: 'POST /api/v1/contours/emulation/instruments {"remove": [...], "mode": ...}'
       security:
         - ControlToken: []
       parameters:
@@ -514,7 +497,6 @@ paths:
       tags: [Эмуляция]
       summary: Один участник состава
       operationId: getEmulationInstrument
-      x-replaces: нет
       security:
         - ControlToken: []
       responses:
@@ -532,7 +514,6 @@ paths:
       tags: [Эмуляция]
       summary: Последние строки журнала эмуляции
       operationId: getEmulationLog
-      x-replaces: GET /api/v1/contours/emulation/log
       security:
         - ControlToken: []
       parameters:
@@ -553,7 +534,6 @@ paths:
         первыми. `limits` — сколько прогонов может идти сразу, сколько идёт и
         сколько ждёт.
       operationId: listHistoryRuns
-      x-replaces: GET /api/v1/contours?kind=history
       security:
         - ControlToken: []
       parameters:
@@ -591,7 +571,6 @@ paths:
         Инструмент, названный и в истории, и в эмуляции, торгуется по одним
         привязкам `robot.toml`.
       operationId: createHistoryRun
-      x-replaces: POST /api/v1/contours (kind history)
       security:
         - ControlToken: []
       requestBody:
@@ -638,7 +617,6 @@ paths:
       tags: [История]
       summary: Один прогон
       operationId: getHistoryRun
-      x-replaces: GET /api/v1/contours/{history-…}
       security:
         - ControlToken: []
       responses:
@@ -688,7 +666,6 @@ paths:
         идущий останавливается после тика и пишет отчёт «остановлено
         оператором» (`stopping` → `stopped`). Повтор — `200`.
       operationId: stopHistoryRun
-      x-replaces: POST /api/v1/contours/{history-…}/stop
       security:
         - ControlToken: []
       responses:
@@ -721,7 +698,6 @@ paths:
         Сводка из `report.json`. Вынесена из прогона: она есть только у
         завершённого, а у идущего вместо неё `progress`.
       operationId: getHistoryRunReport
-      x-replaces: поле result в GET /api/v1/contours/{history-…}
       security:
         - ControlToken: []
       responses:
@@ -755,7 +731,6 @@ paths:
       tags: [История]
       summary: Последние строки журнала прогона
       operationId: getHistoryRunLog
-      x-replaces: GET /api/v1/contours/{history-…}/log
       security:
         - ControlToken: []
       parameters:
@@ -767,138 +742,6 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '404': {$ref: '#/components/responses/NotFound'}
 
-  # -------------------------------------------------------- боевая торговля
-  /api/v1/live:
-    get:
-      tags: [Боевая торговля]
-      summary: Контур «Счёт» (каркас)
-      description: |
-        Только место под будущий контур (документ 2). Устройство — как у
-        эмуляции: `/api/v1/live/target`, `/api/v1/live/instruments`,
-        `/api/v1/live/log` на тех же общих схемах `TradingContour`,
-        `TradingTarget`, `Member`. Отличия, которые решит документ 2: счёт
-        брокера, лимиты риска, возможно подтверждение команд и отдельный,
-        более строгий ключ.
-      operationId: getLive
-      x-implementation-status: planned
-      x-replaces: нет
-      security:
-        - ControlToken: []
-      responses:
-        '200':
-          description: Контур «Счёт».
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/LiveContour'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/ForbiddenHost'}
-
-  # ------------------------------------------------------------- справочник
-  /api/v1/instruments:
-    get:
-      tags: [Справочник]
-      summary: Найти инструмент
-      description: |
-        Инструменты, которые робот знает: акции и семейства фьючерсов из
-        `robot.toml` и контракты семейств от брокера. Только чтение: что
-        такое инструмент и можно ли его запустить. Где он торгуется, здесь
-        не показывается — это состояние контуров.
-      operationId: searchInstruments
-      x-replaces: нет (сейчас видно только по отказу запуска)
-      security:
-        - ControlToken: []
-      parameters:
-        - name: q
-          in: query
-          required: false
-          description: Тикер, код семейства, контракт или часть названия; без него — все.
-          schema: {type: string, minLength: 1}
-          example: NG
-        - name: type
-          in: query
-          required: false
-          schema: {type: string, enum: [share, future_family, future_contract]}
-        - name: assigned
-          in: query
-          required: false
-          description: Только с привязками стратегий (`true`) или только без них (`false`).
-          schema: {type: boolean}
-      responses:
-        '200':
-          description: Найденные инструменты.
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/InstrumentList'}
-              example:
-                query: NG
-                items:
-                  - {code: NG, name: Природный газ, instrument_type: future_family, assigned: true, _links: {self: {href: /api/v1/instruments/NG}}}
-                  - {code: NG-12.26, name: NG-12.26, instrument_type: future_contract, assigned: true, _links: {self: {href: /api/v1/instruments/NG-12.26}}}
-                _links:
-                  self: {href: '/api/v1/instruments?q=NG'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/ForbiddenHost'}
-
-  /api/v1/instruments/{code}:
-    parameters:
-      - name: code
-        in: path
-        required: true
-        description: Тикер акции (`SBER`), код семейства (`NG`) или контракт (`NG-12.26`, `NGZ6`).
-        schema: {type: string, minLength: 1}
-    get:
-      tags: [Справочник]
-      summary: Карточка инструмента
-      description: |
-        Привязки стратегий и для фьючерсов — контракты семейства, ближайший
-        допустимый контракт и порог экспирации. По этой карточке видно, какой
-        контракт передать в команду эмуляции, ещё до запуска. Список
-        контрактов приходит от брокера; пока ядро не готово, `contracts` —
-        `null`, а `notice` объясняет почему.
-      operationId: getInstrument
-      x-replaces: нет
-      security:
-        - ControlToken: []
-      responses:
-        '200':
-          description: Карточка.
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Instrument'}
-              examples:
-                family:
-                  summary: Семейство фьючерсов
-                  value:
-                    code: NG
-                    name: Природный газ
-                    instrument_type: future_family
-                    assignments:
-                      - {assignment_id: future-ng-macd, strategy: macd_rsi_stoch, timeframe: 15m, management: levels_rr, filter: triple_screen, priority: 10, clusters: shadow}
-                      - {assignment_id: future-ng-ma, strategy: ma_cloud_rsi_macd, timeframe: 1h, management: ma_cloud, filter: basic_levels, priority: 10, clusters: null}
-                    expiry_block_days: 5
-                    nearest: NG-12.26
-                    contracts:
-                      - {name: NG-11.26, ticker: NGX6, expires_on: '2026-10-27', days_to_expiry: 3, launchable: false}
-                      - {name: NG-12.26, ticker: NGZ6, expires_on: '2026-11-25', days_to_expiry: 32, launchable: true}
-                    notice: null
-                    _links:
-                      self: {href: /api/v1/instruments/NG}
-                      nearest: {href: /api/v1/instruments/NG-12.26}
-                share:
-                  summary: Акция без привязок
-                  value:
-                    code: AFLT
-                    name: Аэрофлот
-                    instrument_type: share
-                    assignments: []
-                    notice: У инструмента нет привязок в robot.toml — запустить его нельзя.
-                    _links:
-                      self: {href: /api/v1/instruments/AFLT}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/ForbiddenHost'}
-        '404': {$ref: '#/components/responses/NotFound'}
-
-  # --------------------------------------------- рыночные данные и кластеры
   # Перенесено из docs/openapi.yaml 1.8 без изменений (вариант А): экспорт
   # уже в релизе, его читает Historical Broker API Emulator.
   /api/v1/market-data/source:
@@ -1246,7 +1089,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: opaque
-      description: '`ROBOT_CONTROL_TOKEN` — контуры, ядро, справочник.'
+      description: '`ROBOT_CONTROL_TOKEN` — контуры и ядро.'
     ExportToken:
       type: http
       scheme: bearer
@@ -1437,7 +1280,8 @@ components:
           type: string
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
-                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED]
+                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, HISTORY_UNAVAILABLE,
+                 INTERNAL]
         rejections:
           type: array
           description: Только у `INSTRUMENTS_REJECTED`.
@@ -1566,10 +1410,10 @@ components:
       required: [state, applied_revision, open_positions, pending_entries, last_tick_at, core_link]
       description: Текущее состояние из `status.json` контура (там — `actual`).
       properties:
-        state: {type: string, enum: [running, stopping_no_entries, stopping_close_all, stopped]}
-        applied_revision: {type: integer, minimum: 0}
-        open_positions: {type: integer, minimum: 0}
-        pending_entries: {type: integer, minimum: 0}
+        state: {type: string, nullable: true, enum: [running, stopping_no_entries, stopping_close_all, stopped, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        open_positions: {type: integer, minimum: 0, nullable: true}
+        pending_entries: {type: integer, minimum: 0, nullable: true}
         last_tick_at: {type: string, format: date-time, nullable: true}
         core_link: {type: string, nullable: true, enum: [ok, lost, null]}
     TradingLaunch:
@@ -1579,7 +1423,7 @@ components:
       required: [source, recovery, started_at, request, rejections]
       description: Как появился текущий процесс.
       properties:
-        source: {type: string, enum: [api, cli, menu], description: '`cli` и `menu` — только у целевого состояния прежних версий.'}
+        source: {type: string, nullable: true, enum: [api, cli, menu, null], description: '`cli` и `menu` — только у целевого состояния прежних версий.'}
         recovery:
           type: string
           nullable: true
@@ -1587,8 +1431,18 @@ components:
           description: '`autostart` — поднят по целевому состоянию после рестарта; `adopted` — подхвачен живым.'
         started_at: {type: string, format: date-time, nullable: true}
         request:
-          allOf: [{$ref: '#/components/schemas/StartRequest'}]
-          description: Эквивалентная команда запуска — объектом, а не JSON строкой, как в 1.8.
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [mode]
+          properties:
+            mode: {type: string, enum: ['on']}
+            instruments:
+              type: array
+              items: {type: string}
+          description: |
+            Эквивалентная команда запуска — объектом, а не JSON строкой, как в 1.8.
+            null — команда записана прежней версией в другом виде.
         rejections:
           type: array
           description: Отказы последней отклонённой команды.
@@ -1611,7 +1465,7 @@ components:
       description: Участник состава торгового контура.
       properties:
         name: {type: string, description: 'Короткое имя контракта или тикер акции — то же, что в командах.'}
-        instrument_type: {type: string, enum: [share, future]}
+        instrument_type: {type: string, nullable: true, enum: [share, future, null]}
         days_to_expiry: {type: integer, nullable: true}
         target: {type: string, enum: [active, removed]}
         remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
@@ -1709,18 +1563,6 @@ components:
           description: Тикеры акций и короткие имена контрактов из состава.
         mode: {type: string, enum: [no_entries, close_all], default: no_entries}
 
-    # ------------------------------------------------------- боевая торговля
-    LiveContour:
-      allOf:
-        - {$ref: '#/components/schemas/TradingContour'}
-        - type: object
-          properties:
-            account:
-              type: object
-              nullable: true
-              description: Счёт брокера, лимиты и прочее — решит документ 2.
-      description: Каркас контура «Счёт».
-
     # --------------------------------------------------------------- история
     HistoryRunRequest:
       type: object
@@ -1784,7 +1626,7 @@ components:
           type: object
           required: [max, running, queued]
           properties:
-            max: {type: integer, minimum: 1, description: '`[contours] max_history_runs`.'}
+            max: {type: integer, minimum: 0, description: '`[contours] max_history_runs`.'}
             running: {type: integer, minimum: 0}
             queued: {type: integer, minimum: 0}
         items:
@@ -1805,114 +1647,6 @@ components:
         open_positions:
           type: array
           items: {type: string}
-        _links: {$ref: '#/components/schemas/Links'}
-
-    # ------------------------------------------------------------ справочник
-    InstrumentSummary:
-      type: object
-      additionalProperties: false
-      required: [code, name, instrument_type, assigned, _links]
-      properties:
-        code: {type: string}
-        name: {type: string}
-        instrument_type: {type: string, enum: [share, future_family, future_contract]}
-        assigned: {type: boolean, description: Есть ли привязки стратегий.}
-        _links: {$ref: '#/components/schemas/Links'}
-    InstrumentList:
-      type: object
-      additionalProperties: false
-      required: [query, items, _links]
-      properties:
-        query: {type: string, nullable: true}
-        items:
-          type: array
-          items: {$ref: '#/components/schemas/InstrumentSummary'}
-        _links: {$ref: '#/components/schemas/Links'}
-    Assignment:
-      type: object
-      additionalProperties: false
-      required: [assignment_id, strategy, timeframe, management, filter, priority, clusters]
-      description: Привязка стратегии из `robot.toml` (позже — объект БД).
-      properties:
-        assignment_id: {type: string, example: future-ng-macd}
-        strategy: {type: string, example: macd_rsi_stoch}
-        timeframe: {type: string, example: 15m}
-        management: {type: string, example: levels_rr}
-        filter: {type: string, nullable: true, example: triple_screen}
-        priority: {type: integer}
-        clusters: {type: string, nullable: true, enum: [off, shadow, enforce, null]}
-    ContractSummary:
-      type: object
-      additionalProperties: false
-      required: [name, ticker, expires_on, days_to_expiry, launchable]
-      properties:
-        name: {type: string, example: NG-12.26}
-        ticker: {type: string, example: NGZ6}
-        expires_on: {type: string, format: date}
-        days_to_expiry: {type: integer}
-        launchable: {type: boolean, description: 'Дальше порога экспирации — можно запустить.'}
-    Instrument:
-      oneOf:
-        - {$ref: '#/components/schemas/ShareInstrument'}
-        - {$ref: '#/components/schemas/FutureFamily'}
-        - {$ref: '#/components/schemas/FutureContract'}
-      discriminator:
-        propertyName: instrument_type
-        mapping:
-          share: '#/components/schemas/ShareInstrument'
-          future_family: '#/components/schemas/FutureFamily'
-          future_contract: '#/components/schemas/FutureContract'
-    ShareInstrument:
-      type: object
-      additionalProperties: false
-      required: [code, name, instrument_type, assignments, notice, _links]
-      properties:
-        code: {type: string}
-        name: {type: string}
-        instrument_type: {type: string, enum: [share]}
-        assignments:
-          type: array
-          items: {$ref: '#/components/schemas/Assignment'}
-        notice: {type: string, nullable: true, description: Почему инструмент нельзя запустить.}
-        _links: {$ref: '#/components/schemas/Links'}
-    FutureFamily:
-      type: object
-      additionalProperties: false
-      required: [code, name, instrument_type, assignments, expiry_block_days, nearest, contracts, notice, _links]
-      properties:
-        code: {type: string, example: NG}
-        name: {type: string}
-        instrument_type: {type: string, enum: [future_family]}
-        assignments:
-          type: array
-          items: {$ref: '#/components/schemas/Assignment'}
-        expiry_block_days: {type: integer, description: '`contract_expiry_block_days`.'}
-        nearest: {type: string, nullable: true, description: 'Ближайший допустимый контракт — его имя передают в команды эмуляции.'}
-        contracts:
-          type: array
-          nullable: true
-          description: null — брокер недоступен или ядро не готово.
-          items: {$ref: '#/components/schemas/ContractSummary'}
-        notice: {type: string, nullable: true}
-        _links: {$ref: '#/components/schemas/Links'}
-    FutureContract:
-      type: object
-      additionalProperties: false
-      required: [code, name, instrument_type, family, ticker, expires_on, days_to_expiry, launchable, assignments, notice, _links]
-      properties:
-        code: {type: string, example: NG-12.26}
-        name: {type: string}
-        instrument_type: {type: string, enum: [future_contract]}
-        family: {type: string, example: NG}
-        ticker: {type: string, example: NGZ6}
-        expires_on: {type: string, format: date}
-        days_to_expiry: {type: integer}
-        launchable: {type: boolean}
-        assignments:
-          type: array
-          description: Привязки семейства.
-          items: {$ref: '#/components/schemas/Assignment'}
-        notice: {type: string, nullable: true}
         _links: {$ref: '#/components/schemas/Links'}
 
     # ------------------------------------- рыночные данные и кластеры (как в 1.8)

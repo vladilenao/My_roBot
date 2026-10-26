@@ -19,6 +19,41 @@
 кодом 2 с подсказкой. Скрипты, запускавшие историю `--mode history`,
 переходят на `POST /api/v1/contours` с `"kind": "history"`.
 
+**Что важно знать (rework-contour-api, API 2.0):** общая оболочка
+`/api/v1/contours` удалена — её маршруты отвечают `404 NOT_FOUND`. У каждого
+контура свой ресурс; сохранённые запросы (Yaak, скрипты) нужно перевести по
+таблице:
+
+| Было (1.8) | Стало (2.0) |
+|---|---|
+| `GET /api/v1/contours` | `GET /api/v1` (сводка), `GET /api/v1/emulation`, `GET /api/v1/history` |
+| `POST /api/v1/contours` `{"kind": "emulation", "instruments"}` | `PUT /api/v1/emulation/target` `{"mode": "on", "instruments"}` |
+| `POST /api/v1/contours/emulation/stop` `{"mode"}` | `PUT /api/v1/emulation/target` `{"mode": "no_entries" \| "close_all"}` |
+| `POST /api/v1/contours/emulation/instruments` `{"add"}` | `POST /api/v1/emulation/instruments` `{"instruments"}` |
+| `POST /api/v1/contours/emulation/instruments` `{"remove", "mode"}` | `POST /api/v1/emulation/instruments/remove` `{"instruments", "mode"}` |
+| `GET /api/v1/contours/emulation/log` | `GET /api/v1/emulation/log` |
+| `POST /api/v1/contours` `{"kind": "history", …}` | `POST /api/v1/history` `{"from", "to", "pause", "instruments"}` |
+| `GET /api/v1/contours/history-20261024-101500` | `GET /api/v1/history/20261024-101500`; итог — `…/report` |
+| `POST /api/v1/contours/history-…/stop` | `POST /api/v1/history/{id}/stop` |
+| `desired` / `actual` / `generation` | `target` / `current` / `revision` (`ETag`) |
+| ошибки `{code, message}` | `application/problem+json` (экспорт и кластеры — как прежде) |
+
+Ещё изменилось:
+
+- в эмуляции инструмент называется только тикером акции (`SBER`) или
+  коротким именем контракта (`NG-12.26`) — в запуске, добавлении, составе и
+  удалении; на код семейства (`NG`) и биржевой тикер (`NGZ6`) — `422` с
+  подсказкой короткого имени. В истории код семейства по-прежнему —
+  автоматическая цепочка;
+- успешный запуск эмуляции — `202`, а не `201`; целевое состояние
+  записывается сразу при команде, ответ несёт новую ревизию;
+- остановка прогона из очереди и идущего — `202`, повтор — `200`;
+- ответы несут `_links` и `_actions` — команды, которые робот примет
+  сейчас; `If-Match` с устаревшей ревизией — `412 REVISION_CHANGED`;
+- контракты переехали в `docs/api/`: `openapi.yaml` 2.0.0,
+  `market-events.asyncapi.yaml`, обзор `README.md`, решения
+  `v2-decisions.md`.
+
 ### Добавлено
 
 - **История — контур робота, запускается командой API.**

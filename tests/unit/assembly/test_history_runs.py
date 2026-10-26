@@ -24,6 +24,11 @@ SHARES = {"SBER": ["a"]}
 FUTURES = {"NG": ["a"], "BR": []}
 
 
+def _key(run_id: str) -> str:
+    """Ключ строки ``history_runs``: ``id`` API — имя папки, строка хранит его с префиксом (rework-contour-api)."""
+    return history_runs.RUN_PREFIX + run_id
+
+
 def _request(*tokens, start=datetime(2026, 9, 1, 10), end=datetime(2026, 9, 8, 10)):
     return LaunchRequest("history", "api", tokens or ("NG",), start=start, end=end, pause=0.0)
 
@@ -74,11 +79,22 @@ def runs(tmp_path):
 class TestSubmit:
     def test_run_is_queued_with_id_and_folder(self, runs):
         status, payload = runs.queue.submit(_request("NG"))
-        assert status == 202 and payload["kind"] == "history" and payload["state"] == RUN_QUEUED
-        assert payload["id"].startswith("history-") and payload["dir"] == f"contours/history/{payload['id'][8:]}"
+        assert status == 202 and payload["state"] == RUN_QUEUED and "kind" not in payload
+        assert not payload["id"].startswith("history-")
+        assert runs.store.history_run(_key(payload["id"])).directory == payload["id"]
         assert payload["request"] == {"from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 0.0,
                                       "instruments": ["NG"]}
-        assert payload["queue_position"] == 1 and payload["actual"] is None and payload["result"] is None
+        assert payload["queue_position"] == 1 and payload["progress"] is None and payload["process"] is None
+        assert [action["name"] for action in payload["_actions"]] == ["cancel"]
+        assert payload["_links"]["self"] == {"href": f"/api/v1/history/{payload['id']}"}
+
+    def test_run_of_previous_version_is_found_by_folder_name(self, runs):
+        runs.store.add_history_run("history-20261024-091000", "20261024-091000",
+                                   {"from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 1.0, "instruments": ["NG"]})
+        run = runs.queue.run("20261024-091000")
+        assert run["id"] == "20261024-091000" and run["state"] == RUN_QUEUED
+        assert [item["id"] for item in runs.queue.runs("active")] == ["20261024-091000"]
+        assert runs.queue.runs("finished") == []
 
     def test_same_second_gets_number(self, runs):
         first = runs.queue.submit(_request())[1]["id"]
@@ -97,26 +113,28 @@ class TestQueue:
         ids = [runs.queue.submit(_request())[1]["id"] for _ in range(3)]
         runs.queue._fill()
         assert [p.command[-1] for p in FakeProcess.started] == [run_dir(runs.tmp_path, i).name for i in ids[:2]]
-        assert runs.queue.contour(ids[2])["queue_position"] == 1
-        assert runs.queue.limits() == {"max_history_runs": 2, "running": 2, "queued": 1}
+        assert runs.queue.run(ids[2])["queue_position"] == 1
+        assert runs.queue.limits() == {"max": 2, "running": 2, "queued": 1}
         assert len(runs.syncs) == 2                       # сверка — на каждый старт, по одной
         FakeProcess.started[0].exit(0)
         runs.queue._fill()
-        assert len(FakeProcess.started) == 3 and runs.store.history_run(ids[0]).state == RUN_FINISHED
-        assert runs.store.history_run(ids[2]).state == RUN_RUNNING
+        assert len(FakeProcess.started) == 3 and runs.store.history_run(_key(ids[0])).state == RUN_FINISHED
+        assert runs.store.history_run(_key(ids[2])).state == RUN_RUNNING
 
     def test_launch_file_carries_snapshot_and_request(self, runs):
         run_id = runs.queue.submit(_request("NG", "SBER"))[1]["id"]
         runs.queue._fill()
         process = FakeProcess.started[0]
         launch = json.loads((run_dir(runs.tmp_path, run_id) / "launch.json").read_text(encoding="utf-8"))
-        assert launch["contour_id"] == run_id and launch["kind"] == "history"
+        assert launch["contour_id"] == _key(run_id) and launch["kind"] == "history"
         assert launch["snapshot_generation"] == 42 and launch["market_data_sync"]["status"] == "synchronized"
         assert launch["instruments"] == ["NG", "SBER"] and launch["from"] == "2026-09-01 10:00"
         assert process.command[-3:] == ["--contour", "history", run_dir(runs.tmp_path, run_id).name]
         assert process.output == run_dir(runs.tmp_path, run_id) / "console.log"
-        run = runs.queue.contour(run_id)
-        assert run["state"] == RUN_RUNNING and run["pid"] == 9001
+        run = runs.queue.run(run_id)
+        assert run["state"] == RUN_RUNNING and run["process"]["pid"] == 9001
+        assert run["process"]["dir"] == f"contours/history/{run_id}"
+        assert [action["name"] for action in run["_actions"]] == ["stop"]
         assert run["market_data_sync"] == {"status": "synchronized", "snapshot_generation": 42}
         assert any("запущен" in line for line in runs.said)
 
@@ -134,8 +152,9 @@ class TestQueue:
         if stop:
             runs.queue.stop(run_id)
         FakeProcess.started[0].exit(code)
-        run = runs.queue.contour(run_id)
-        assert (run["state"], run["exit_code"], run["reason"], run["pid"]) == (state, code, reason, None)
+        run = runs.queue.run(run_id)
+        assert (run["state"], run["process"]["exit_code"], run["reason"], run["process"]["pid"]) == (state, code, reason, None)
+        assert run["_actions"] == [] and run["process"]["exited_at"] == run["finished_at"]
 
     def test_result_and_progress_come_from_run_files(self, runs):
         run_id = runs.queue.submit(_request())[1]["id"]
@@ -144,15 +163,21 @@ class TestQueue:
         write_status(directory / STATUS_FILE, {"phase": "running", "start": "2026-09-01T10:00:00Z",
                                                "end": "2026-09-08T10:00:00Z", "market_now": "2026-09-04T12:00:00Z",
                                                "ticks": 4440})
-        assert runs.queue.contour(run_id)["actual"]["progress"] == pytest.approx(74 / 168, abs=1e-4)
+        assert runs.queue.run(run_id)["progress"]["fraction"] == pytest.approx(74 / 168, abs=1e-4)
+        assert runs.queue.report(run_id) == (404, {"code": "REPORT_NOT_READY",
+                                                   "message": "Прогон ещё не завершён или отчёт не записан."})
+        assert "report" not in runs.queue.run(run_id)["_links"]
         (directory / "report.json").write_text(json.dumps({
             "covered": True, "stop_reason": "диапазон обработан полностью",
             "result": {"trades": 7, "net_pnl": "12.5", "fees": "1", "balance": "100012.5", "open_positions": [],
                        "fills": 9}}), encoding="utf-8")
         FakeProcess.started[0].exit(0)
-        assert runs.queue.contour(run_id)["result"] == {
-            "covered": True, "stop_reason": "диапазон обработан полностью", "trades": 7, "net_pnl": "12.5",
-            "fees": "1", "balance": "100012.5", "open_positions": []}
+        rub = lambda amount: {"amount": amount, "currency": "RUB"}  # noqa: E731
+        assert runs.queue.report(run_id) == (200, {
+            "covered": True, "stop_reason": "диапазон обработан полностью", "trades": 7, "net_pnl": rub("12.5"),
+            "fees": rub("1"), "balance": rub("100012.5"), "open_positions": [],
+            "_links": {"run": {"href": f"/api/v1/history/{run_id}"}}})
+        assert runs.queue.run(run_id)["_links"]["report"] == {"href": f"/api/v1/history/{run_id}/report"}
 
     def test_failed_process_start_frees_slot(self, runs):
         class Broken(FakeProcess):
@@ -162,7 +187,7 @@ class TestQueue:
         runs.queue._process_factory = Broken
         run_id = runs.queue.submit(_request())[1]["id"]
         runs.queue._fill()
-        run = runs.queue.contour(run_id)
+        run = runs.queue.run(run_id)
         assert run["state"] == RUN_FAILED and "OSError" in run["reason"]
         assert runs.queue.limits()["running"] == 0
 
@@ -170,22 +195,22 @@ class TestQueue:
         run_id = runs.queue.submit(_request())[1]["id"]
 
         def prepare(provider):
-            runs.store.update_history_run(run_id, stop_requested=True, state=RUN_STOPPING)
+            runs.store.update_history_run(_key(run_id), stop_requested=True, state=RUN_STOPPING)
             return MarketDataSync(), None, "импорт не подтверждён"
 
         runs.queue._prepare = prepare
         runs.queue._fill()
-        assert FakeProcess.started == [] and runs.store.history_run(run_id).state == RUN_CANCELLED
+        assert FakeProcess.started == [] and runs.store.history_run(_key(run_id)).state == RUN_CANCELLED
 
     def test_queue_thread_starts_runs(self, runs):
         runs.queue.start()
         try:
             run_id = runs.queue.submit(_request())[1]["id"]
             for _ in range(200):
-                if runs.store.history_run(run_id).state == RUN_RUNNING:
+                if runs.store.history_run(_key(run_id)).state == RUN_RUNNING:
                     break
                 threading.Event().wait(0.01)
-            assert runs.store.history_run(run_id).state == RUN_RUNNING
+            assert runs.store.history_run(_key(run_id)).state == RUN_RUNNING
         finally:
             runs.queue.close()
 
@@ -194,7 +219,7 @@ class TestStop:
     def test_queued_run_is_cancelled(self, runs):
         run_id = runs.queue.submit(_request())[1]["id"]
         status, payload = runs.queue.stop(run_id)
-        assert status == 200 and payload["contour"]["state"] == RUN_CANCELLED
+        assert status == 202 and payload["state"] == RUN_CANCELLED and payload["_actions"] == []
         runs.queue._fill()
         assert FakeProcess.started == []
 
@@ -202,21 +227,23 @@ class TestStop:
         run_id = runs.queue.submit(_request())[1]["id"]
         runs.queue._fill()
         status, payload = runs.queue.stop(run_id)
-        assert status == 200 and payload["contour"]["state"] == RUN_STOPPING
-        assert FakeProcess.started[0].stop_requested and read_history_stop(runs.store.path, run_id)
+        assert status == 202 and payload["state"] == RUN_STOPPING
+        assert FakeProcess.started[0].stop_requested and read_history_stop(runs.store.path, _key(run_id))
+        status, payload = runs.queue.stop(run_id)
+        assert status == 200 and payload["state"] == RUN_STOPPING
 
     def test_finished_and_unknown(self, runs):
         run_id = runs.queue.submit(_request())[1]["id"]
         runs.queue._fill()
         FakeProcess.started[0].exit(0)
         assert runs.queue.stop(run_id)[0] == 409 and runs.queue.stop(run_id)[1]["code"] == "NOT_RUNNING"
-        assert runs.queue.stop("history-none")[0] == 404
+        assert runs.queue.stop("20260101-000000")[0] == 404
 
     def test_robot_stop_cancels_queue_and_stops_runs(self, runs):
         ids = [runs.queue.submit(_request())[1]["id"] for _ in range(3)]
         runs.queue._fill()
         runs.queue.close()
-        states = [runs.store.history_run(run_id) for run_id in ids]
+        states = [runs.store.history_run(_key(run_id)) for run_id in ids]
         assert [run.state for run in states] == [RUN_STOPPED, RUN_STOPPED, RUN_CANCELLED]
         assert states[2].reason == "робот остановлен"
 

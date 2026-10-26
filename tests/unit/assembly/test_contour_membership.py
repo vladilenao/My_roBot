@@ -1,4 +1,4 @@
-"""Команды состава контура: разбор, ожидание главного потока, обработка ядром (add-contour-membership)."""
+"""Команды состава эмуляции: разбор, ожидание главного потока, обработка ядром (add-contour-membership, rework-contour-api)."""
 
 import threading
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ import pytest
 from src.assembly import core as core_module
 from src.assembly.core_state import CoreStateStore
 from src.bot.launch import Chosen, Rejection, Resolution, SOURCE_API
-from src.bot.launch_control import BadCommand, LaunchControl, MembershipCommand, parse_membership
+from src.bot.launch_control import BadCommand, LaunchControl, MembershipCommand, parse_add, parse_remove
 from src.portfolio.models import ContractMeta
 
 SBER = ("SBER", "SBER", "share", "SBER")
@@ -17,18 +17,21 @@ NG = ("NG-12.26", "NGZ6", "future", "NG-12.26")
 
 class TestParseMembership:
     def test_add_and_remove_with_default_mode(self):
-        assert parse_membership({"add": ["NG", "NG", " SBER "]}).add == ("NG", "SBER")
-        command = parse_membership({"remove": ["SBER"]})
-        assert (command.remove, command.mode) == (("SBER",), "no_entries")
-        assert parse_membership({"remove": ["NG"], "mode": "close_all"}).mode == "close_all"
+        assert parse_add({"instruments": ["NG-12.26", "NG-12.26", " SBER "]}).add == ("NG-12.26", "SBER")
+        command = parse_remove({"instruments": ["SBER", "NG-12.26"]}, expected=3)
+        assert (command.remove, command.mode, command.expected) == (("SBER", "NG-12.26"), "no_entries", 3)
+        assert parse_remove({"instruments": ["NG-12.26"], "mode": "close_all"}).mode == "close_all"
 
-    @pytest.mark.parametrize("body", [
-        None, [], {}, {"add": []}, {"add": ["NG"], "remove": ["SBER"]}, {"add": ["NG"], "mode": "close_all"},
-        {"remove": ["SBER"], "mode": "pause"}, {"add": [""]}, {"add": "NG"}, {"remove": ["SBER"], "extra": 1},
+    @pytest.mark.parametrize("parse, body", [
+        (parse_add, None), (parse_add, []), (parse_add, {}), (parse_add, {"instruments": []}),
+        (parse_add, {"instruments": ["NG"], "mode": "close_all"}), (parse_add, {"instruments": [""]}),
+        (parse_add, {"instruments": "NG"}), (parse_add, {"add": ["NG"]}),
+        (parse_remove, {"instruments": ["SBER"], "mode": "pause"}), (parse_remove, {"instruments": ["SBER"], "extra": 1}),
+        (parse_remove, {"mode": "close_all"}), (parse_remove, {"remove": ["SBER"]}),
     ])
-    def test_bad_bodies(self, body):
+    def test_bad_bodies(self, parse, body):
         with pytest.raises(BadCommand):
-            parse_membership(body)
+            parse(body)
 
 
 @pytest.fixture
@@ -49,7 +52,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_module, "_pattern_pairs", lambda instruments: tuple((item, "1h") for item in instruments))
     added = []
     poller = SimpleNamespace(add_instruments=added.extend)
-    resolutions = {"NG": Resolution([NG], [Chosen("NG", "NG-12.26", "future", 52, "NG", True)]),
+    resolutions = {"NG-12.26": Resolution([NG], [Chosen("NG-12.26", "NG-12.26", "future", 52, "NG")]),
                    "AFLT": Resolution([], [], [Rejection("AFLT", "У инструмента нет привязок в robot.toml.")])}
 
     def run(command):
@@ -60,14 +63,15 @@ def env(tmp_path, monkeypatch):
 
 
 def test_add_records_member_with_contract_and_extends_core(env):
-    status, payload = env.run(MembershipCommand(add=("NG",)))
-    assert status == 202 and payload["generation"] == 2
+    status, payload = env.run(MembershipCommand(add=("NG-12.26",)))
+    assert status == 202 and payload == {"revision": 2}
     member = env.store.desired("emulation").members[1]
-    assert (member.key, member.chosen["token"], member.contract["NGZ6"]["price_step"]) == ("NGZ6", "NG", 0.001)
+    assert (member.key, member.chosen["token"], member.contract["NGZ6"]["price_step"]) == ("NGZ6", "NG-12.26", 0.001)
     assert [item.ticker for item in env.added] == ["NGZ6"] and env.pairs[0][1] == "1h"
-    assert [item["name"] for item in payload["contour"]["instruments"]] == ["SBER", "NG-12.26"]
-    assert payload["contour"]["members"][1] == {"name": "NG-12.26", "instrument_type": "future", "desired": "active",
-                                                "remove_mode": None, "actual": None}
+    items = env.control.emulation()["instruments"]
+    assert [item["name"] for item in items] == ["SBER", "NG-12.26"]
+    assert {key: items[1][key] for key in ("instrument_type", "days_to_expiry", "target", "remove_mode", "current")} \
+        == {"instrument_type": "future", "days_to_expiry": 52, "target": "active", "remove_mode": None, "current": None}
 
 
 def test_rejected_add_changes_nothing(env):
@@ -84,33 +88,58 @@ def test_remove_repeat_and_conflict(env):
     assert status == 409 and payload["code"] == "MODE_CONFLICT"
 
 
-def test_remove_unknown_is_rejected(env):
-    status, payload = env.run(MembershipCommand(remove=("GAZP",)))
-    assert status == 422 and payload["rejections"] == [{"token": "GAZP", "reason": "Инструмента нет в составе контура."}]
+def test_remove_unknown_is_rejected_and_nothing_is_removed(env):
+    status, payload = env.run(MembershipCommand(remove=("SBER", "GAZP")))
+    assert status == 422 and payload["rejections"] == [{"token": "GAZP", "reason": "Инструмента нет в составе эмуляции."}]
+    assert env.store.desired("emulation").members[0].active
+
+
+def test_remove_by_family_code_is_not_matched(env):
+    env.run(MembershipCommand(add=("NG-12.26",)))
+    status, payload = env.run(MembershipCommand(remove=("NG",)))
+    assert status == 422 and payload["rejections"][0]["token"] == "NG"
+
+
+def test_remove_two_at_once_raises_revision_once(env):
+    env.run(MembershipCommand(add=("NG-12.26",)))
+    status, payload = env.run(MembershipCommand(remove=("NG-12.26", "SBER"), mode="close_all"))
+    desired = env.store.desired("emulation")
+    assert (status, payload["revision"], desired.generation) == (202, 3, 3)
+    assert [(member.active, member.remove_mode) for member in desired.members] == [(False, "close_all")] * 2
+
+
+def test_stale_if_match_is_conflict(env):
+    status, payload = env.run(MembershipCommand(remove=("SBER",), expected=7))
+    assert status == 412 and payload["code"] == "REVISION_CHANGED"
+    assert env.store.desired("emulation").generation == 1 and env.store.commands()[0]["outcome"] == "conflict"
 
 
 class TestChangeMembership:
     def test_answer_from_main_thread(self, env):
         def main():
             command = env.control.next_membership(2)
-            env.control.answer_membership(command, 202, {"generation": 7, "contour": {}})
+            env.control.answer_membership(command, 202, {"revision": 7})
         threading.Thread(target=main, daemon=True).start()
-        assert env.control.change_membership("emulation", MembershipCommand(add=("NG",))) == (
-            202, {"generation": 7, "contour": {}})
+        status, payload = env.control.change_membership(MembershipCommand(add=("NG-12.26",)))
+        assert status == 202 and payload["revision"] == 7 and payload["items"][0]["name"] == "SBER"
 
     def test_slow_main_thread_points_to_state(self, env):
         env.control._reply_timeout = 0.05
-        status, payload = env.control.change_membership("emulation", MembershipCommand(add=("NG",)))
-        assert status == 202 and payload["generation"] is None
+        status, payload = env.control.change_membership(MembershipCommand(add=("NG-12.26",)))
+        assert status == 202 and payload["revision"] is None
 
     def test_conflicts(self, env):
-        assert env.control.change_membership("account", MembershipCommand(add=("NG",)))[0] == 404
         env.store.record_stop("emulation", "no_entries")
-        status, payload = env.control.change_membership("emulation", MembershipCommand(add=("NG",)))
+        status, payload = env.control.change_membership(MembershipCommand(add=("NG-12.26",)))
         assert status == 409 and payload["code"] == "STOPPING"
         env.control.mark_exited(0)
-        status, payload = env.control.change_membership("emulation", MembershipCommand(add=("NG",)))
+        status, payload = env.control.change_membership(MembershipCommand(add=("NG-12.26",)))
         assert status == 409 and payload["code"] == "NOT_RUNNING"
+
+    def test_stale_if_match_is_refused_before_main_thread(self, env):
+        status, payload = env.control.change_membership(MembershipCommand(add=("NG-12.26",), expected=5))
+        assert status == 412 and payload["code"] == "REVISION_CHANGED"
+        assert env.control.next_membership(0.01) is None
 
     def test_supervise_dispatches_membership_commands(self, env):
         process = SimpleNamespace(running=True)
@@ -118,12 +147,12 @@ class TestChangeMembership:
 
         def membership(command):
             handled.append(command.add)
-            env.control.answer_membership(command, 202, {"generation": 2, "contour": {}})
+            env.control.answer_membership(command, 202, {"revision": 2})
             process.running = False
 
         live = core_module.LiveCore.__new__(core_module.LiveCore)
         live.market_store = SimpleNamespace(consumer_checkpoint=lambda consumer: None)
-        threading.Thread(target=lambda: env.control.change_membership("emulation", MembershipCommand(add=("NG",))),
+        threading.Thread(target=lambda: env.control.change_membership(MembershipCommand(add=("NG-12.26",))),
                          daemon=True).start()
         live._supervise(process, kind="emulation", control=env.control, poll_secs=0.05, membership=membership)
-        assert handled == [("NG",)]
+        assert handled == [("NG-12.26",)]
