@@ -93,7 +93,7 @@
 
 #### Контракт: PatternEvent v1
 
-Поля Redis Stream являются строками; `payload` передаётся JSON-строкой и после декодирования является объектом. `payload` обязательно содержит число `body_overlap_ratio` в диапазоне `[0, 1]`, а также объекты `previous_candle` и `current_candle` с числовыми `open`, `high`, `low`, `close`. Дополнительные поля внутри `payload` разрешены. Допустимы только пары `event_type=bullish_engulfing` с `direction=long` и `event_type=bearish_engulfing` с `direction=short`. Полная машиночитаемая AsyncAPI-схема хранится в `docs/market-events.asyncapi.yaml`.
+Поля Redis Stream являются строками; `payload` передаётся JSON-строкой и после декодирования является объектом. `payload` обязательно содержит число `body_overlap_ratio` в диапазоне `[0, 1]`, а также объекты `previous_candle` и `current_candle` с числовыми `open`, `high`, `low`, `close`. Дополнительные поля внутри `payload` разрешены. Допустимы только пары `event_type=bullish_engulfing` с `direction=long` и `event_type=bearish_engulfing` с `direction=short`. Полная машиночитаемая AsyncAPI-схема хранится в `docs/api/market-events.asyncapi.yaml`.
 
 ### Requirement: Consumer Groups и семантика восстановления
 
