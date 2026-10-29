@@ -11,6 +11,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -399,7 +400,7 @@ class MarketDataStore:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         label = label or f"before-schema-{SCHEMA_VERSION}"
         target = self.path.with_name(f"{self.path.name}.{label}-{stamp}.bak")
-        with sqlite3.connect(target) as backup:
+        with closing(sqlite3.connect(target)) as backup:
             conn.backup(backup)
 
     @staticmethod

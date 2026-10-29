@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -99,8 +100,9 @@ def migrate_journal(data_dir: Path, target: Path, *, version: str) -> bool:
         for name in JOURNAL_DATABASES:
             source = data_dir / name
             if source.exists():
-                with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30) as src, \
-                        sqlite3.connect(staging / name) as dst:
+                # closing: контекст sqlite3 не закрывает файл, а Windows не переносит открытый.
+                with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)) as src, \
+                        closing(sqlite3.connect(staging / name)) as dst:
                     src.backup(dst)
                 copied.append(name)
         for path in sorted(data_dir.glob("trade_decision_trace.log*")) + [data_dir / n for n in JOURNAL_FILES[:2]]:

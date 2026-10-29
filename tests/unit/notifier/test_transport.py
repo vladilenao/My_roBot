@@ -127,9 +127,10 @@ def test_refused_connection_is_unsent_and_log_has_no_secrets(caplog):
         result = instance.request("sendMessage", {"text": "x"})
 
     assert (result.ok, result.unsent, result.uncertain, result.retryable) == (False, True, False, True)
-    assert result.detail == "ConnectionError/NewConnectionError"
+    # Windows не отказывает в подключении сразу, а повторяет SYN до тайм-аута.
+    assert result.detail in {"ConnectionError/NewConnectionError", "ConnectTimeout/ConnectTimeoutError"}
     assert "secret" not in caplog.text and str(port) not in caplog.text
-    assert "ConnectionError/NewConnectionError" in caplog.text
+    assert result.detail in caplog.text
 
 
 def test_connection_closed_after_request_is_uncertain(caplog):

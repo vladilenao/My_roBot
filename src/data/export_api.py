@@ -107,6 +107,7 @@ class MarketDataExportServer:
 class _Handler(BaseHTTPRequestHandler):
     export_server: MarketDataExportServer
     server_version = "MyRobotMarketData/1.0"
+    _body = b""
 
     def log_message(self, fmt: str, *args) -> None:  # pragma: no cover - шум access log не нужен
         log.debug("Market data API: " + fmt, *args)
@@ -349,8 +350,15 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(status, payload, views.etag(payload.get("revision")) if status < 400 else None)
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length).decode("utf-8")) if length else None
+        return json.loads(self._body.decode("utf-8")) if self._body else None
+
+    def _read_body(self) -> None:
+        """Тело читается до любого ответа: недочитанное тело Windows обрывает у клиента (WinError 10053)."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        self._body = self.rfile.read(length) if length > 0 else b""
 
     def _reply(self, status: int, payload: dict, headers: dict | None = None) -> None:
         """Ответ управления: успех — JSON, ошибка — ``problem+json`` из ``{code, message, …}``."""
@@ -380,6 +388,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "application/hal+json; charset=utf-8")
 
     def do_PUT(self) -> None:  # noqa: N802
+        self._read_body()
         parsed = urlparse(self.path)
         if _is_control(parsed.path):
             if self._control_allowed():
@@ -398,8 +407,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Некорректный consumer_id.")
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self._body.decode("utf-8"))
             producer_id, change_id = body["producer_id"], body["change_id"]
             if not isinstance(producer_id, str) or isinstance(change_id, bool) or not isinstance(change_id, int):
                 raise ValueError
@@ -411,6 +419,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Требуются producer_id и целый change_id.")
 
     def do_POST(self) -> None:  # noqa: N802
+        self._read_body()
         parsed = urlparse(self.path)
         if not _is_control(parsed.path):
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -255,8 +256,8 @@ def copy_store(source: Path, target: Path) -> bool:
     if not source.is_file() or target.exists():
         return False
     try:
-        with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10) as src_conn, \
-                sqlite3.connect(target) as dst_conn:
+        with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10)) as src_conn, \
+                closing(sqlite3.connect(target)) as dst_conn:
             src_conn.backup(dst_conn)
     except sqlite3.Error:
         target.unlink(missing_ok=True)
