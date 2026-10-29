@@ -31,7 +31,8 @@ def _timing() -> ProbeTiming:
 
 
 def _probe(broker: FakeBroker, **settings) -> tuple[Probe, int]:
-    with SandboxGateway(TOKEN, client_factory=lambda token: FakeClient(broker, token)) as gateway:
+    with SandboxGateway(TOKEN, client_factory=lambda token: FakeClient(broker, token),
+                        sleep=lambda seconds: None) as gateway:
         probe = Probe(gateway, ProbeSettings(**settings), timing=_timing())
         code = probe.run()
     return probe, code
@@ -155,3 +156,19 @@ def test_probe_command_writes_report_without_secrets(tmp_path):
     for text in (report, records, log, "\n".join(lines)):
         assert TOKEN not in text
         assert ACCOUNT_ID not in text
+
+
+def test_rate_limit_on_market_buy_is_retried():
+    broker = _broker(prices=["3.000", "3.000", "2.990"], exhaust_market=2)
+    probe, _ = _probe(broker)
+    assert probe.results["П10"].outcome == YES
+    keys = [kwargs["order_id"] for name, kwargs in broker.calls
+            if name == "orders.post_order" and kwargs.get("order_type") == s.OrderType.ORDER_TYPE_MARKET]
+    assert len(keys) >= 3 and len(set(keys[:3])) == 1
+
+
+def test_rate_limit_exhausted_gives_no_share_hint():
+    broker = _broker(exhaust_market=10)
+    probe, _ = _probe(broker)
+    assert probe.results["П10"].outcome == NO
+    assert probe.results["П10"].detail == "отказ брокера RESOURCE_EXHAUSTED"

@@ -17,7 +17,8 @@ from tests.unit.sandbox.fakes import ACCOUNT_ID, NG_UID, TOKEN, FakeBroker, Fake
 
 def _factory(broker: FakeBroker):
     def make(token, recorder=None):
-        return SandboxGateway(token, client_factory=lambda value: FakeClient(broker, value), recorder=recorder)
+        return SandboxGateway(token, client_factory=lambda value: FakeClient(broker, value), recorder=recorder,
+                              sleep=lambda seconds: None)
     return make
 
 
@@ -98,11 +99,11 @@ def test_manual_buy_by_family_code(tmp_path):
     code, lines = _run(broker, ["buy", "ng", "1"], tmp_path)
     assert code == 0
     assert lines[0].startswith("NG → NG-12.26, до экспирации")
-    assert "исполнено 1 из 1" in lines[-1]
+    assert lines[-1] == "Заявка исполнена: исполнено 1 из 1, цена 3 ₽, комиссия 1.50 ₽"
     assert broker.positions == {NG_UID: 1}
     assert not any("NGZ6" in line for line in lines)
     code, lines = _run(broker, ["account"], tmp_path)
-    assert "  NG-12.26 1 лот, средняя 3" in lines
+    assert "  NG-12.26 1 лот, средняя 3 ₽" in lines
 
 
 def test_exchange_ticker_refused(tmp_path):

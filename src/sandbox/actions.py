@@ -50,6 +50,7 @@ def lots_word(lots: int) -> str:
 
 
 def rub(value: Decimal) -> str:
+    """Деньги брокера. У фьючерса брокер отдаёт цену в рублях за контракт, а не в пунктах."""
     text = f"{value:,.0f}" if value == value.to_integral_value() else f"{value:,.2f}"
     return text.replace(",", " ") + " ₽"
 
@@ -103,13 +104,13 @@ def show_account(gateway: SandboxGateway, account: RobotAccount, out: Out) -> No
     positions = open_positions(gateway, account)
     out("Позиции:" + ("" if positions else " нет"))
     for uid, lots, average in positions:
-        out(f"  {short_name_by_uid(gateway, uid, names)} {lots_word(lots)}, средняя {price(average)}")
+        out(f"  {short_name_by_uid(gateway, uid, names)} {lots_word(lots)}, средняя {rub(average)}")
     orders = active_orders(gateway, account)
     out("Заявки:" + ("" if orders else " нет"))
     for order in orders:
         left = order.lots_requested - order.lots_executed
         out(f"  {short_name_by_uid(gateway, order.instrument_uid, names)} {side_word(order.direction)} "
-            f"{lots_word(left)} по {price(money_to_decimal(order.initial_security_price))}, "
+            f"{lots_word(left)} по {rub(money_to_decimal(order.initial_security_price))}, "
             f"{STATUS_NAMES.get(order.execution_report_status, order.execution_report_status.name)}")
     stops = active_stop_orders(gateway, account)
     out("Стоп-заявки:" + ("" if stops else " нет"))
@@ -137,7 +138,7 @@ def describe_fill(response) -> str:
     status = STATUS_NAMES.get(response.execution_report_status, response.execution_report_status.name)
     text = f"Заявка {status}: исполнено {response.lots_executed} из {response.lots_requested}"
     if response.lots_executed:
-        text += f", цена {price(money_to_decimal(response.executed_order_price))}"
+        text += f", цена {rub(money_to_decimal(response.executed_order_price))}"
     commission = money_to_decimal(response.executed_commission) or money_to_decimal(response.initial_commission)
     if commission:
         text += f", комиссия {rub(commission)}"

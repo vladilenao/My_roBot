@@ -77,6 +77,9 @@ DEFAULT_INSTRUMENT = "NG"
 LIMIT_DISCOUNT = Decimal("0.05")
 STREAM_READY_SECS = 10
 STOP_TOUCH_GRACE = timedelta(minutes=1)
+# Отказ по существу заявки, а не сбой сети или лимит запросов: только тогда
+# имеет смысл подсказка повторить разведку на акции.
+REJECTION_CODES = frozenset({"INVALID_ARGUMENT", "FAILED_PRECONDITION", "PERMISSION_DENIED", "NOT_FOUND"})
 
 
 @dataclass
@@ -272,8 +275,9 @@ class Probe:
     def _check_max_lots(self) -> bool:
         response = self.gateway.call("orders.get_max_lots", GetMaxLotsRequest(
             account_id=self.account.account_id, instrument_id=self.instrument.uid))
-        lots = response.buy_limits.buy_max_lots
-        self._set("П4", YES, f"на покупку до {lots} лотов, по рынку до {response.buy_limits.buy_max_market_lots}")
+        cash, margin = response.buy_limits, response.buy_margin_limits
+        self._set("П4", YES, f"без плеча: до {cash.buy_max_lots} лотов, по рынку {cash.buy_max_market_lots}; "
+                             f"с плечом: до {margin.buy_max_lots}, по рынку {margin.buy_max_market_lots}")
         return True
 
     # --- П5: стрим -------------------------------------------------------
@@ -414,7 +418,7 @@ class Probe:
                 order_type=OrderType.ORDER_TYPE_MARKET, order_id=key)
         except BrokerCallError as exc:
             detail = f"отказ брокера {exc}"
-            if self.instrument.kind == "future":
+            if self.instrument.kind == "future" and exc.code in REJECTION_CODES:
                 detail += "; повторите разведку на акции: python -m src.sandbox probe SBER"
             self._set("П10", NO, detail)
             return False

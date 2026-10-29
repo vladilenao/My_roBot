@@ -27,6 +27,12 @@ log = get_logger(__name__)
 
 SANDBOX_TARGET = INVEST_GRPC_API_SANDBOX
 DEADLINE_SECS = 30
+# Песочница отвечает RESOURCE_EXHAUSTED и на частые заявки подряд, не только по
+# минутному лимиту (разведка 29.10: третья заявка за 200 мс). Повтор с тем же
+# ключом безопасен: отказ по лимиту приходит до приёма заявки.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SECS = (1, 2, 4)
+RATE_LIMIT_MAX_WAIT_SECS = 10
 
 
 class BrokerCallError(Exception):
@@ -56,6 +62,14 @@ def broker_error(method: str, exc: BaseException) -> BrokerCallError:
     return BrokerCallError(method, type(exc).__name__)
 
 
+def _rate_limit_wait(exc: BaseException, attempt: int) -> float:
+    """Пауза до повтора: подсказка брокера ``ratelimit_reset`` или нарастающая пауза."""
+    reset = getattr(getattr(exc, "metadata", None), "ratelimit_reset", None)
+    if isinstance(reset, int) and reset > 0:
+        return min(reset, RATE_LIMIT_MAX_WAIT_SECS)
+    return RATE_LIMIT_BACKOFF_SECS[min(attempt, len(RATE_LIMIT_BACKOFF_SECS) - 1)]
+
+
 def _default_client(token: str):
     disable_broker_telemetry()
     return SandboxClient(token, interceptors=[RpcDeadline(DEADLINE_SECS)])
@@ -65,7 +79,8 @@ class SandboxGateway:
     """Сервисы ``SandboxClient`` за вызовом ``call("orders.post_order", ...)``."""
 
     def __init__(self, token: str, *, client_factory: Callable[[str], Any] | None = None,
-                 recorder: CallRecorder | None = None, monotonic: Callable[[], float] = time.monotonic):
+                 recorder: CallRecorder | None = None, monotonic: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
         if not token:
             raise ValueError("Не задан TINKOFF_SANDBOX_TOKEN")
         self._token = token
@@ -74,6 +89,7 @@ class SandboxGateway:
         self._services = None
         self.recorder = recorder
         self._monotonic = monotonic
+        self._sleep = sleep
 
     def __enter__(self) -> "SandboxGateway":
         self._client = self._client_factory(self._token)
@@ -98,17 +114,26 @@ class SandboxGateway:
         return target
 
     def call(self, method: str, *args, **kwargs):
-        started = self._monotonic()
-        try:
-            response = self._method(method)(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — любой сбой вызова становится BrokerCallError
-            error = broker_error(method, exc)
-            self._record(method, args, kwargs, started, error=error)
-            log.warning("Песочница: %s — %s", method, error)
-            raise error from None
-        self._record(method, args, kwargs, started, response=response)
-        log.debug("Песочница: %s выполнен", method)
-        return response
+        """Вызов сервиса; ``RESOURCE_EXHAUSTED`` повторяется до ``RATE_LIMIT_RETRIES`` раз."""
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            started = self._monotonic()
+            try:
+                response = self._method(method)(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — любой сбой вызова становится BrokerCallError
+                error = broker_error(method, exc)
+                self._record(method, args, kwargs, started, error=error)
+                if error.code == "RESOURCE_EXHAUSTED" and attempt < RATE_LIMIT_RETRIES:
+                    delay = _rate_limit_wait(exc, attempt)
+                    log.warning("Песочница: %s — лимит запросов, повтор %d из %d через %g с",
+                                method, attempt + 1, RATE_LIMIT_RETRIES, delay)
+                    self._sleep(delay)
+                    continue
+                log.warning("Песочница: %s — %s", method, error)
+                raise error from None
+            self._record(method, args, kwargs, started, response=response)
+            log.debug("Песочница: %s выполнен", method)
+            return response
+        raise AssertionError("недостижимо")
 
     def stream(self, method: str, **kwargs) -> Iterator[Any]:
         """Сообщения стрима; каждое пишется в записи, сбой — ``BrokerCallError``."""

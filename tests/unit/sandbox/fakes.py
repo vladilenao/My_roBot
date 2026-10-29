@@ -44,6 +44,7 @@ class FakeBroker:
     repeat_key: str = "same"  # same | new | error
     margin_works: bool = True
     fail_operations: bool = False
+    exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
@@ -161,7 +162,8 @@ class _Api:
         return s.GetOrdersResponse(orders=list(self.b.orders.values()))
 
     def orders__get_max_lots(self, request):
-        return s.GetMaxLotsResponse(buy_limits=s.BuyLimitsView(buy_max_lots=40, buy_max_market_lots=38))
+        return s.GetMaxLotsResponse(buy_limits=s.BuyLimitsView(buy_max_lots=0, buy_max_market_lots=0),
+                                    buy_margin_limits=s.BuyLimitsView(buy_max_lots=160, buy_max_market_lots=158))
 
     def orders__post_order(self, *, instrument_id="", quantity=0, price=None, direction=None, account_id="",
                            order_type=None, order_id=""):
@@ -174,6 +176,9 @@ class _Api:
         if order_type == s.OrderType.ORDER_TYPE_MARKET:
             if self.b.reject_market:
                 raise broker_reject()
+            if self.b.exhaust_market > 0:
+                self.b.exhaust_market -= 1
+                raise RequestError(StatusCode.RESOURCE_EXHAUSTED, "", SimpleNamespace(message="", ratelimit_reset=None))
             return self._response(self.b.fill(instrument_id, quantity, direction, order_id))
         order = s.OrderState(
             order_id=self.b.next_id("ord"), order_request_id=order_id, instrument_uid=instrument_id,
