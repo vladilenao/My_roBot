@@ -25,6 +25,8 @@ load_dotenv()  # загружает переменные из .env
 
 # Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
+# Токен песочницы Т-Инвест: только команда песочницы и контур «Песочница» (add-sandbox-probe).
+TINKOFF_SANDBOX_TOKEN = os.getenv("TINKOFF_SANDBOX_TOKEN")
 MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 # Ключ управления запуском через локальный API (схема ControlToken); отдельно от экспортного.
 ROBOT_CONTROL_TOKEN = os.getenv("ROBOT_CONTROL_TOKEN")

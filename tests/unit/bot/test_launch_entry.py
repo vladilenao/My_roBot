@@ -99,6 +99,11 @@ def test_control_api_starts_before_market_data_with_control_key_only(monkeypatch
 def test_control_key_is_a_logging_secret():
     import inspect
 
+    import ast
+
     source = inspect.getsource(run)
-    assert "ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD)" in source
+    secrets = next(node.value for node in ast.parse(source).body
+                   if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "_SECRETS")
+    names = {item.id for item in secrets.elts}
+    assert {"ROBOT_CONTROL_TOKEN", "MARKET_STRUCTURE_REDIS_PASSWORD", "TINKOFF_SANDBOX_TOKEN"} <= names
     assert source.count("secrets=_SECRETS") >= 3
