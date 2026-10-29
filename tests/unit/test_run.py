@@ -336,6 +336,7 @@ class TestRuntimeComposition:
             storage,
             broker,
             initial_balance=contour.Decimal(str(contour.INITIAL_DEPOSIT)),
+            capital_provider=None,
             budget_observer=ANY,
             execution_observer=ANY,
             profiles_config=contour.TRADE_MANAGEMENT_PROFILES,

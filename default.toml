@@ -54,6 +54,10 @@ telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Песочница».
 telegram_channel_env = "TELEGRAM_SANDBOX_CHANNEL_ID"  # Имя переменной .env с id канала «Песочница».
 reconcile_every_min = 1  # Как часто сверять счёт песочницы с журналом контура, минут (1–60). Состав — только командами API.
+orders = true  # Торговать привязками заявками; false — только читать и сверять счёт.
+exit_offset_steps = 5  # Запас лимита выхода (стоп, сигнал, закрытие) в шагах цены, 0–100.
+exit_requote_secs = 15  # Сколько ждать исполнения лимита выхода до перевыставления, секунд (5–300).
+exit_requote_attempts = 3  # Перевыставлений до аварийного выхода по рынку (1–10).
 
 [instruments]
 fallback_type = "future"

@@ -140,6 +140,10 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_sandbox_telegram_bot_env": str,
     "contours_sandbox_telegram_channel_env": str,
     "contours_sandbox_reconcile_every_min": int,
+    "contours_sandbox_orders": bool,
+    "contours_sandbox_exit_offset_steps": int,
+    "contours_sandbox_exit_requote_secs": int,
+    "contours_sandbox_exit_requote_attempts": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -609,6 +613,12 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "contours_sandbox_reconcile_every_min" and (isinstance(value, bool) or not 1 <= value <= 60):
             raise ConfigError(f"{path}: [contours.sandbox] reconcile_every_min должен быть целым числом от 1 до 60, "
                               f"получено {value!r}")
+        # Выходы лимитом (add-tinvest-orders): запас в шагах, пауза и число перевыставлений.
+        if key in _SANDBOX_EXIT_RANGES:
+            low, high = _SANDBOX_EXIT_RANGES[key]
+            if isinstance(value, bool) or not low <= value <= high:
+                raise ConfigError(f"{path}: [contours.sandbox] {key.removeprefix('contours_sandbox_')} должен быть "
+                                  f"целым числом от {low} до {high}, получено {value!r}")
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
         if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
@@ -1036,7 +1046,13 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
 _CONTOUR_KEYS = {
     "emulation": {"telegram_channel_env"},
     # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
-    "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min"},
+    "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
+                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts"},
+}
+_SANDBOX_EXIT_RANGES = {
+    "contours_sandbox_exit_offset_steps": (0, 100),
+    "contours_sandbox_exit_requote_secs": (5, 300),
+    "contours_sandbox_exit_requote_attempts": (1, 10),
 }
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 

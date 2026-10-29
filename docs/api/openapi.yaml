@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.1.0
+  version: 2.2.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -1872,7 +1872,7 @@ components:
       type: object
       nullable: true
       additionalProperties: false
-      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason]
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link]
       description: Текущее состояние из `status.json` контура.
       properties:
         state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
@@ -1904,6 +1904,10 @@ components:
         account_link: {type: string, nullable: true, enum: [ok, lost, null]}
         core_link: {type: string, nullable: true, enum: [ok, lost, null]}
         reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
+        orders_enabled: {type: boolean, description: 'Режим заявок: `true` — контур торгует привязками, `false` — только читает счёт.'}
+        trades: {type: integer, minimum: 0, description: Открытые сделки журнала контура.}
+        orders_in_flight: {type: integer, minimum: 0, description: Незавершённые заявки журнала заявок брокера.}
+        stream_link: {type: string, nullable: true, enum: [ok, lost, null], description: Стрим исполнений OrderStateStream.}
     BindingCard:
       type: object
       additionalProperties: false
@@ -1920,16 +1924,21 @@ components:
     BindingMember:
       type: object
       additionalProperties: false
-      required: [id, instrument, strategy, timeframe, target, remove_mode, current, _actions]
+      required: [id, instrument, strategy, timeframe, target, remove_mode, current, reason, _actions]
       description: Участник состава песочницы — привязка.
       properties:
         id: {type: string}
-        instrument: {type: string}
+        instrument: {type: string, description: Короткое имя контракта, который ядро выбрало для привязки, иначе код из конфигурации.}
         strategy: {type: string}
         timeframe: {type: string}
         target: {type: string, enum: [active, removed]}
         remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
-        current: {type: string, nullable: true, enum: [watching, null], description: '`watching` — на этапе С2 привязка в составе, но не торгует.'}
+        current:
+          type: string
+          nullable: true
+          enum: [warming, trading, draining, closing, rejected, watching, null]
+          description: '`warming` — прогрев инструмента, `trading` — торгует, `draining` и `closing` — снята и доводит свои сделки, `rejected` — не торгует (см. `reason`), `watching` — контур только читает счёт.'
+        reason: {type: string, nullable: true, description: Почему привязка не торгует.}
         _actions: {$ref: '#/components/schemas/Actions'}
     BindingsView:
       type: object

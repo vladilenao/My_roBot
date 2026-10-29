@@ -65,10 +65,12 @@ class FakeBroker:
         return Decimal(str(value))
 
     def push(self, order: s.OrderState) -> None:
+        trades = [s.OrderTrade(date_time=stage.execution_time, price=quote(money_to_decimal(stage.price)),
+                               quantity=stage.quantity, trade_id=stage.trade_id) for stage in (order.stages if isinstance(order.stages, list) else ())]
         self.stream.put(s.OrderStateStreamResponse(order_state=s.OrderStateStreamOrderState(
             order_id=order.order_id, order_request_id=order.order_request_id,
             execution_report_status=order.execution_report_status, lots_executed=order.lots_executed,
-            lots_requested=order.lots_requested, instrument_uid=order.instrument_uid)))
+            lots_requested=order.lots_requested, instrument_uid=order.instrument_uid, trades=trades)))
 
     def fill(self, uid: str, lots: int, direction, key: str) -> s.OrderState:
         sign = 1 if direction == s.OrderDirection.ORDER_DIRECTION_BUY else -1
@@ -80,7 +82,9 @@ class FakeBroker:
             order_id=self.next_id("ord"), order_request_id=key, instrument_uid=uid, direction=direction,
             execution_report_status=s.OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL,
             lots_requested=lots, lots_executed=lots, initial_security_price=money(price),
-            executed_order_price=money(price), executed_commission=money("1.5"), initial_commission=money("1.5"))
+            executed_order_price=money(price), executed_commission=money("1.5"), initial_commission=money("1.5"),
+            stages=[s.OrderStage(price=money(price), quantity=lots, trade_id=self.next_id("trade"),
+                                 execution_time=NOW)])
         self.orders[order.order_id] = order
         kind = s.OperationType.OPERATION_TYPE_BUY if sign > 0 else s.OperationType.OPERATION_TYPE_SELL
         executed = s.OperationState.OPERATION_STATE_EXECUTED
@@ -177,6 +181,8 @@ class _Api:
                 raise RequestError(StatusCode.ALREADY_EXISTS, "30057", SimpleNamespace(message="Дубль ключа"))
             if self.b.repeat_key == "same":
                 return self._response(existing)
+        if price is not None and quotation_to_decimal(price) > Decimal("3.300"):
+            raise RequestError(StatusCode.INVALID_ARGUMENT, "30010", SimpleNamespace(message="Цена вне коридора"))
         if order_type == s.OrderType.ORDER_TYPE_MARKET:
             if self.b.reject_market:
                 raise broker_reject()
@@ -202,7 +208,10 @@ class _Api:
 
     def orders__get_order_state(self, account_id="", order_id="", order_id_type=None):
         if order_id_type == s.OrderIdType.ORDER_ID_TYPE_REQUEST:
-            return next(o for o in self.b.orders.values() if o.order_request_id == order_id)
+            found = next((o for o in self.b.orders.values() if o.order_request_id == order_id), None)
+            if found is None:
+                raise RequestError(StatusCode.NOT_FOUND, "50005", SimpleNamespace(message="Order not found"))
+            return found
         return self.b.orders[order_id]
 
     def orders__cancel_order(self, account_id="", order_id=""):

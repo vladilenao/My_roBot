@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.notifier.templates.holds import data_reason
+from src.notifier.templates.orders import order_line
 from src.events.visual import breaks_of, utc
 from src.trade_journal.reasons import REASON_LABELS
 
@@ -201,6 +202,8 @@ def render_broker_account(event) -> str:
                      f"стоп-заявок: {event.get('stop_orders', 0)}")
         lines.extend(escape(f"  {item['name']}: {item['lots']} лот.") for item in holdings)
         lines.append(f"Привязок в составе: {event.get('bindings', 0)} · ревизия {event.get('generation', '—')}")
+        if event.get("orders_enabled") is not None:
+            lines.append("Режим: заявки к брокеру" if event.get("orders_enabled") else "Режим: только чтение счёта")
     elif kind == "reconcile_alarm":
         lines = [f"<b>{title} · ТРЕВОГА · Сверка счёта</b>", f"Счёт {account}"]
         if event.get("reason"):
@@ -219,12 +222,23 @@ def render_broker_account(event) -> str:
         lines = [f"<b>{title} · Контур остановлен</b>", f"Счёт {account}"]
         if event.get("reason"):
             lines.append("Причина: " + escape(event.get("reason")))
+        if event.get("open_positions"):
+            lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} — "
+                         "до стоп-заявок у брокера стоп без контура не проверяется")
     return "\n".join(lines)
+
+
+def render_broker_order(event) -> str:
+    title = CONTOUR_TITLES.get(event.get("contour"), escape(str(event.get("contour"))).upper())
+    instrument = escape(event.instrument or "контракт не указан")
+    return f"<b>{title} · {instrument}</b>\n{escape(order_line(event))}"
 
 
 def render(event, *, root=False, tz_offset_hours=0):
     if event.type is EventType.BROKER_ACCOUNT:
         return render_broker_account(event)
+    if event.type is EventType.BROKER_ORDER:
+        return render_broker_order(event)
     visual = event.get("visual")
     instrument = escape(event.instrument or "контракт не указан")
     if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:

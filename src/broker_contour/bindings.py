@@ -23,8 +23,15 @@ def binding_catalog(share_strategies: dict, future_strategies: dict) -> dict[str
     return catalog
 
 
-def binding_member(card: dict) -> Member:
-    return Member(card["id"], dict(card))
+def binding_member(card: dict, instrument: dict | None = None, contract: dict | None = None) -> Member:
+    """Участник-привязка: карточка привязки и, если ядро определило, карточка инструмента и контракта
+    (add-tinvest-orders). Поля карточки инструмента дописываются к карточке привязки."""
+    return Member(card["id"], {**card, **(instrument or {})}, None, contract)
+
+
+def resolved(member: Member) -> bool:
+    """Инструмент привязки определён ядром: у карточки есть тикер."""
+    return bool((member.instrument or {}).get("ticker"))
 
 
 def unknown_bindings(ids, catalog: dict) -> list[tuple[str, str]]:

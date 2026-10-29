@@ -37,6 +37,8 @@ class EventType(StrEnum):
     MARKET_DATA_STATUS = "market_data_status"
     # Контур на брокере (add-sandbox-contour): старт, остановка, сверка счёта.
     BROKER_ACCOUNT = "broker_account"
+    # Заявка контура на брокере (add-tinvest-orders): отправлена, неизвестна, найдена, перевыставлена.
+    BROKER_ORDER = "broker_order"
     TICK_STARTED = "tick_started"
     TICK_FINISHED = "tick_finished"
 

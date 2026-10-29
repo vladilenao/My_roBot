@@ -17,7 +17,7 @@ from src.assembly.contour_control import STATUS_FILE, read_status
 from src.assembly.core_state import ACCEPTED, CLOSE_ALL, CONFLICT, NO_ENTRIES, STOP_MODES, RevisionChanged
 from src.bot import control_views as views
 from src.bot.launch_control import BadCommand, tail_lines
-from src.broker_contour.bindings import binding_catalog, binding_member, emulation_traded, unknown_bindings
+from src.broker_contour.bindings import binding_catalog, binding_member, emulation_traded, resolved, unknown_bindings
 from src.broker_contour.store import BROKER_DATABASE_FILE, read_last_report
 
 SOURCE_API = "api"
@@ -62,7 +62,7 @@ def parse_bindings(body, *, remove: bool) -> tuple[tuple[str, ...], str]:
 
 class SandboxControl:
     def __init__(self, *, kind: str, core_state, supervisor, share_strategies: dict, future_strategies: dict,
-                 emulation_members=lambda: (), log_file: str = "bot_debug.log") -> None:
+                 emulation_members=lambda: (), log_file: str = "bot_debug.log", resolve_binding=None) -> None:
         self.kind = kind
         self._core_state = core_state
         self._supervisor = supervisor
@@ -71,6 +71,8 @@ class SandboxControl:
         self._log_file = log_file
         self._lock = threading.Lock()
         self._rejections: list[dict] = []
+        # ``resolve_binding(card)`` → (карточка инструмента, карточки контракта) или причина отказа (add-tinvest-orders).
+        self._resolve = resolve_binding
 
     # --- чтение -----------------------------------------------------------
     @property
@@ -117,7 +119,9 @@ class SandboxControl:
             "orders": status.get("orders") or 0, "stop_orders": status.get("stop_orders") or 0,
             "frozen": status.get("frozen") or [], "last_reconcile_at": status.get("last_reconcile_at"),
             "account_link": status.get("account_link"), "core_link": status.get("core_link"),
-            "reason": status.get("reason"),
+            "reason": status.get("reason"), "orders_enabled": bool(status.get("orders_enabled")),
+            "trades": status.get("trades") or 0, "orders_in_flight": status.get("orders_in_flight") or 0,
+            "stream_link": status.get("stream_link"),
         }
 
     def _launch(self, desired, process) -> dict | None:
@@ -133,10 +137,13 @@ class SandboxControl:
 
     def _member_view(self, member, status, running: bool) -> dict:
         card = member.instrument
-        watched = running and status and any(item.get("key") == member.key for item in status.get("members") or ())
-        return {"id": member.key, "instrument": card.get("instrument"), "strategy": card.get("strategy"),
-                "timeframe": card.get("timeframe"), "target": "active" if member.active else "removed",
-                "remove_mode": member.remove_mode, "current": "watching" if watched and member.active else None,
+        current = next((item for item in (status or {}).get("members") or () if item.get("key") == member.key), None)
+        state = current.get("state") if running and current else None
+        return {"id": member.key, "instrument": card.get("short_name") or card.get("instrument"),
+                "strategy": card.get("strategy"), "timeframe": card.get("timeframe"),
+                "target": "active" if member.active else "removed", "remove_mode": member.remove_mode,
+                "current": state if state in views.BINDING_STATES else None,
+                "reason": current.get("reason") if running and current else None,
                 "_actions": views.binding_action_list(member.key, member.active)}
 
     def view(self) -> dict:
@@ -202,13 +209,32 @@ class SandboxControl:
     def _problem(status: HTTPStatus, code: str, message: str, **extra) -> tuple[int, dict]:
         return int(status), {"code": code, "message": message, **extra}
 
-    def _rejected(self, ids) -> tuple[int, dict] | None:
-        rejections = [{"binding": item, "reason": reason} for item, reason in unknown_bindings(ids, self._catalog)]
+    def _rejected(self, ids, extra=()) -> tuple[int, dict] | None:
+        rejections = [{"binding": item, "reason": reason}
+                      for item, reason in [*unknown_bindings(ids, self._catalog), *extra]]
         if not rejections:
             return None
         self._rejections = rejections
         return self._problem(HTTPStatus.UNPROCESSABLE_ENTITY, "BINDINGS_REJECTED", "Состав не изменён.",
                              rejections=rejections)
+
+    def _members_for(self, ids) -> tuple[list, list[tuple[str, str]]]:
+        """Участники-привязки с инструментом и контрактом, который выбрало ядро; отказы — (id, причина)."""
+        members, rejections = [], []
+        for item in ids:
+            card = self._catalog[item]
+            if self._resolve is None:
+                members.append(binding_member(card))
+                continue
+            try:
+                result = self._resolve(card)
+            except Exception as exc:  # noqa: BLE001 — сбой сети не должен оставлять API без ответа
+                result = f"Инструмент привязки не определён: {type(exc).__name__}."
+            if isinstance(result, str):
+                rejections.append((item, result))
+            else:
+                members.append(binding_member(card, *result))
+        return members, rejections
 
     def put_target(self, mode: str, bindings: tuple[str, ...] | None, expected: int | None) -> tuple[int, dict]:
         with self._lock:
@@ -236,11 +262,20 @@ class SandboxControl:
         if bindings is None:
             members = [member for member in (current.members if current else ()) if member.active]
             ids = [member.key for member in members]
+            # Привязки, сохранённые без инструмента (С2), получают его заново; неудача — отметка у контура.
+            stale = [member.key for member in members if not resolved(member) and member.key in self._catalog]
+            fresh, _ = self._members_for(stale)
+            by_key = {member.key: member for member in fresh}
+            members = [by_key.get(member.key, member) for member in members]
         else:
             rejected = self._rejected(bindings)
             if rejected is not None:
                 return rejected
-            ids, members = list(bindings), [binding_member(self._catalog[item]) for item in bindings]
+            members, problems = self._members_for(bindings)
+            rejected = self._rejected((), problems)
+            if rejected is not None:
+                return rejected
+            ids = list(bindings)
         request = {"mode": views.MODE_ON, "bindings": ids}
         self._rejections = []
         self._core_state.record_launch(self.kind, self.kind, [], source=SOURCE_API,
@@ -262,6 +297,12 @@ class SandboxControl:
             rejected = self._rejected(ids)
             if rejected is not None:
                 return rejected
+            added = []
+            if not remove:
+                added, problems = self._members_for(ids)
+                rejected = self._rejected((), problems)
+                if rejected is not None:
+                    return rejected
             if remove:
                 desired = self._desired()
                 present = {member.key for member in (desired.members if desired else ())}
@@ -272,7 +313,7 @@ class SandboxControl:
                                          rejections=rejections)
             try:
                 outcome = self._core_state.record_bindings(
-                    self.kind, self.kind, add=() if remove else [binding_member(self._catalog[item]) for item in ids],
+                    self.kind, self.kind, add=() if remove else added,
                     remove=ids if remove else (), mode=mode, expected=expected)
             except RevisionChanged as exc:
                 return self._problem(HTTPStatus.PRECONDITION_FAILED, "REVISION_CHANGED", str(exc))

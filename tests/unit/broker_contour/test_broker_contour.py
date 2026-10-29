@@ -269,3 +269,99 @@ def test_process_refuses_foreign_fingerprint_with_alarm(tmp_path):
     assert contour.run() == 2
     assert "…09c3" in _status(tmp_path)["reason"]
     assert collector.kinds() == ["reconcile_alarm"] and "Контур не стартует" in collector.events[0].get("reason")
+
+
+# --- торговля привязками (add-tinvest-orders) -----------------------------------
+
+class FakeManager:
+    def __init__(self):
+        self.consumed, self.frozen, self.dispatched = [], None, 0
+
+    def consume(self, event):
+        self.consumed.append(event)
+
+    def dispatch(self, now):
+        self.dispatched += 1
+
+    def contour_remainder(self, key=None, *, assignment_id=None):
+        return (0, 0)
+
+    def freeze_instruments(self, keys):
+        self.frozen = set(keys)
+
+    def hold_entries(self, held):
+        pass
+
+    def stop_contour(self, mode):
+        pass
+
+    def stop_assignment(self, assignment_id, mode):
+        pass
+
+
+class FakeTradingPart:
+    """Торговая часть без бота: строит брокера через подстановку и крутит один опрос до остановки."""
+
+    def __init__(self, trading, control, strategies, stop):
+        import sqlite3
+        from types import SimpleNamespace
+
+        self.trading, self.control, self.stop = trading, control, stop
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        connection.executescript("CREATE TABLE fills(execution_id TEXT); CREATE TABLE events(event_id TEXT);")
+        self.storage = SimpleNamespace(connection=connection)
+        self.manager = FakeManager()
+        self.runtime = None
+
+    def build(self):
+        from types import SimpleNamespace
+
+        broker = self.trading.broker_factory(self.storage)
+        self.runtime = SimpleNamespace(trade_manager=self.manager, broker=broker)
+
+    def waiter(self):
+        return None
+
+    def run(self, waiter):
+        self.control.start(self.manager, None)
+        while not self.stop.requested.wait(0.02):
+            self.trading.poll()
+            self.control.after_tick()
+
+    def close(self):
+        pass
+
+
+def test_process_with_orders_recovers_reconciles_and_stops(tmp_path):
+    broker = FakeBroker(rub=Decimal(1_000_000))
+    robot_account(broker)
+    store = _launch(tmp_path)
+    collector, stop = Collector(), Stop()
+    collector.supported_types = frozenset({EventType.BROKER_ACCOUNT, EventType.BROKER_ORDER})
+    bus = EventBus()
+    bus.subscribe(collector)
+    parts = []
+
+    def factory(trading, control, strategies):
+        parts.append(FakeTradingPart(trading, control, strategies, stop))
+        return parts[-1]
+
+    contour = BrokerContour(_settings(tmp_path, orders=True), gateway_factory=_gateway(broker), bus=bus, stop=stop,
+                            pid=4242, trading_factory=factory)
+    thread, result = _run_in_thread(contour)
+    assert _wait(lambda: (tmp_path / "contours/sandbox/status.json").exists()
+                 and _status(tmp_path).get("stream_link") == "ok" and _status(tmp_path).get("members"))
+    status = _status(tmp_path)
+    assert status["orders_enabled"] is True and status["trades"] == 0 and status["orders_in_flight"] == 0
+    assert status["members"][0]["state"] == "rejected", "привязка С2 без инструмента не торгует"
+    assert parts[0].manager.frozen == set() and parts[0].manager.dispatched > 0
+    started = next(event for event in collector.events if event.get("kind") == "started")
+    assert started.get("orders_enabled") is True
+    store.record_stop("sandbox", "no_entries")
+    thread.join(timeout=5)
+    assert result["code"] == 0 and _status(tmp_path)["state"] == "stopped"
+    assert collector.kinds()[-1] == "stopped" and collector.events[-1].get("open_positions") == 0
+    assert not TRADING_CALLS & {name for name, _ in broker.calls}
+    assert "orders_stream.order_state_stream" in {name for name, _ in broker.calls}
+    text = (tmp_path / "contours/sandbox/status.json").read_text(encoding="utf-8")
+    assert ACCOUNT_ID not in text and TOKEN not in text

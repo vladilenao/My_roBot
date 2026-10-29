@@ -362,7 +362,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.1.0"
+        assert SPEC["info"]["version"] == "2.2.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -397,7 +397,7 @@ class TestContract:
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.1.0" in response.read().decode("utf-8")
+            assert "version: 2.2.0" in response.read().decode("utf-8")
 
 
 # ── Остановка, повторный запуск, журнал, состав ──

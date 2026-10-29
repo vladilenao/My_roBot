@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.holds import UNKNOWN_SCHEDULE, data_reason
+from src.notifier.templates.orders import order_line
 from src.trade_journal.reasons import reason_label
 
 COLORS = {"buy": "\x1b[32m", "sell": "\x1b[35m", "warning": "\x1b[33m",
@@ -394,6 +395,14 @@ def _broker_account(event: Event, stamp: str) -> Block:
                  role="muted")
 
 
+def _broker_order(event: Event, stamp: str) -> Block:
+    """Заявка контура на брокере (add-tinvest-orders): одна строка в консоли."""
+    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    alarm = event.get("kind") in {"exit_rejected", "emergency_market"}
+    return Block(stamp, label, f"{_name(event)} · " + order_line(event).replace("⚠️ ", ""),
+                 role="warning" if alarm else "muted")
+
+
 def status_row(event: Event, anchor: datetime) -> str:
     state = event.get("data_state")
     value = _name(event)
@@ -462,6 +471,8 @@ def render(event: Event, *, now: datetime | None = None,
     stamp = when(event, now)
     if event.type is EventType.BROKER_ACCOUNT:
         return _broker_account(event, stamp).render(width=width, color=color)
+    if event.type is EventType.BROKER_ORDER:
+        return _broker_order(event, stamp).render(width=width, color=color)
     if event.type is EventType.DECISION:
         block = _decision(event, stamp)
     elif event.type is EventType.SIGNAL:

@@ -22,7 +22,9 @@ UNREACHABLE_ALARM_AFTER = 3
 
 @dataclass(frozen=True)
 class JournalView:
-    """Что контур сам держит на счёте. На С2 своих сделок нет — журнал пуст."""
+    """Что контур сам держит на счёте: знаковые лоты открытых сделок, заявки в работе, стоп-заявки.
+
+    При ``orders = false`` своих сделок нет — журнал пуст."""
 
     holdings: tuple[tuple[str, int], ...] = ()
     orders: tuple[str, ...] = ()
@@ -61,31 +63,41 @@ class Reconciler:
     def due(self, now: datetime) -> bool:
         return self.last_at is None or (now - self.last_at).total_seconds() >= self._every
 
-    def run(self, now: datetime, snapshot: AccountSnapshot | None, journal: JournalView = JournalView()) -> dict:
-        """Одна сверка; ``snapshot=None`` — счёт не прочитан, сверка пропущена."""
+    def run(self, now: datetime, snapshot: AccountSnapshot | None, journal: JournalView = JournalView(),
+            in_flight=frozenset()) -> dict:
+        """Одна сверка; ``snapshot=None`` — счёт не прочитан, сверка пропущена.
+
+        Инструменты ``in_flight`` (заявка «в пути» или непроведённое исполнение) в этой сверке не
+        сравниваются: брокер уже исполнил, а журнал ещё не провёл — это не расхождение.
+        """
+        in_flight = sorted(set(in_flight))
         self.last_at = now
         stamp = now.isoformat().replace("+00:00", "Z")
         if snapshot is None:
             self.skipped_in_row += 1
             report = {"at": stamp, "account": self._account, "result": SKIPPED, "items": [],
-                      "frozen": list(self.frozen), "skipped_in_row": self.skipped_in_row}
+                      "in_flight": in_flight, "frozen": list(self.frozen), "skipped_in_row": self.skipped_in_row}
             if self.skipped_in_row == UNREACHABLE_ALARM_AFTER:
                 self._notifier.alarm([], self.frozen, reason="Счёт недоступен: три сверки подряд пропущены.")
             self._store.add_report(report)
             return report
         self.skipped_in_row = 0
-        items = compare(snapshot, journal)
-        frozen = tuple(sorted({item["instrument"] for item in items}))
-        signature = tuple((item["instrument"], item["what"], item["account"], item["journal"]) for item in items)
+        items = [item for item in compare(snapshot, journal) if item["instrument"] not in in_flight]
+        # Заморозка инструмента «в пути» остаётся как была: его сверит следующая сверка.
+        frozen = tuple(sorted({item["instrument"] for item in items} | (set(self.frozen) & set(in_flight))))
+        # Расхождение инструмента «в пути» помнится как было: ни тревоги, ни «устранено» до следующей сверки.
+        kept = tuple(entry for entry in (self._signature or ()) if entry[0] in in_flight)
+        signature = tuple(sorted(kept + tuple((item["instrument"], item["what"], item["account"], item["journal"])
+                                              for item in items)))
         if signature != self._signature:
             if items:
                 log.warning("Сверка счёта: расхождение по %s", ", ".join(frozen))
                 self._notifier.alarm(items, frozen)
-            else:
+            elif not kept:
                 log.info("Сверка счёта: расхождение устранено, разморожены %s", ", ".join(self.frozen) or "—")
-                self._notifier.cleared(self.frozen)
+                self._notifier.cleared(sorted(set(self.frozen) - set(frozen)))
         self._signature, self.frozen = signature, frozen
         report = {"at": stamp, "account": self._account, "result": MISMATCH if items else OK, "items": items,
-                  "frozen": list(frozen), "skipped_in_row": 0}
+                  "in_flight": in_flight, "frozen": list(frozen), "skipped_in_row": 0}
         self._store.add_report(report)
         return report

@@ -73,6 +73,11 @@ INSTRUMENT_REMOVING = "instrument-removing"   # отказ новому вход
 INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и закрытие позиции инструмента
 # Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
 CORE_LOST = "core-lost"
+# Контур на брокере (add-tinvest-orders): снятие привязки, заморозка сверкой, капитал не прочитан.
+BINDING_REMOVING = "binding-removing"
+BINDING_REMOVE = "binding-remove"
+INSTRUMENT_FROZEN = "instrument-frozen"
+ACCOUNT_UNAVAILABLE = "счёт недоступен"
 
 
 def _check_stop_mode(mode) -> None:
@@ -285,6 +290,7 @@ class TradeManager:
         intraday_settings: IntradaySettings | None = None,
         session_calendar: Callable[[object, datetime], object] | None = None,
         protection_timeframe: str = "1m",
+        capital_provider: Callable[[], Decimal | None] | None = None,
     ) -> None:
         self._storage = storage
         self._broker = broker
@@ -345,6 +351,11 @@ class TradeManager:
         self._instrument_stops: dict[str, str] = {}
         # Запрет входов без связи с ядром (add-contour-recovery).
         self._core_lost = False
+        # Контур на брокере (add-tinvest-orders): капитал со счёта вместо журнала, снятие привязок,
+        # инструменты, замороженные сверщиком. У эмуляции источника капитала нет.
+        self._capital = capital_provider
+        self._assignment_stops: dict[str, str] = {}
+        self._frozen: frozenset[str] = frozenset()
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -714,8 +725,8 @@ class TradeManager:
             return False
         if isinstance(action, AddToTrade):
             row = self._storage.connection.execute(
-                "SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
-            blocked = self._entry_block(row[0] if row else "")
+                "SELECT instrument_id, assignment_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            blocked = self._entry_block(row[0] if row else "", row[1] if row else None)
             if blocked is not None:
                 log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(blocked))
                 self._traces.record(self._contour_stop_trace("AddToTrade", TraceLinks(trade_id=action.trade_id),
@@ -1206,7 +1217,7 @@ class TradeManager:
             if owned is not None:
                 actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
                 return SignalAdmission(actions=actions)
-            blocked = self._entry_block(instrument_key(instrument))
+            blocked = self._entry_block(instrument_key(instrument), assignment.id)
             if blocked is not None:
                 log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, rejection_message(blocked))
                 self._traces.record(self._contour_stop_trace(
@@ -1509,6 +1520,24 @@ class TradeManager:
         self._instrument_stops[key] = mode
         return self._stop_trades(mode, INSTRUMENT_REMOVE, key)
 
+    def stop_assignment(self, assignment_id: str, mode: str | None) -> tuple[TradeAction, ...]:
+        """Снятие привязки из состава контура на брокере: те же правила, только сделки этой привязки."""
+        _check_stop_mode(mode)
+        if mode != self._assignment_stops.get(assignment_id):
+            log.info("Снятие привязки %s: режим %s", assignment_id, mode or "снято")
+        if mode is None:
+            self._assignment_stops.pop(assignment_id, None)
+            return ()
+        self._assignment_stops[assignment_id] = mode
+        return self._stop_trades(mode, BINDING_REMOVE, None, assignment_id=assignment_id)
+
+    def freeze_instruments(self, keys) -> None:
+        """Инструменты, замороженные сверщиком: новые входы и доборы запрещены, выходы работают."""
+        frozen = frozenset(keys)
+        if frozen != self._frozen:
+            log.info("Заморозка сверкой: %s", ", ".join(sorted(frozen)) or "снята")
+        self._frozen = frozen
+
     def hold_entries(self, held: bool) -> None:
         """Запрет входов и доборов без связи с ядром; неисполненные входы и закрытия не трогаются."""
         held = bool(held)
@@ -1527,11 +1556,14 @@ class TradeManager:
             algorithm_version="contour-recovery",
         ))
 
-    def _stop_trades(self, mode: str, reason: str, key: str | None) -> tuple[TradeAction, ...]:
+    def _stop_trades(self, mode: str, reason: str, key: str | None, *,
+                     assignment_id: str | None = None) -> tuple[TradeAction, ...]:
         submitted: list[TradeAction] = []
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
             if key is not None and plan.instrument_id != key:
+                continue
+            if assignment_id is not None and plan.assignment_id != assignment_id:
                 continue
             links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
             if state.phase is TradePhase.ENTRY_PENDING:
@@ -1554,11 +1586,13 @@ class TradeManager:
                 submitted.append(action)
         return tuple(submitted)
 
-    def contour_remainder(self, key: str | None = None) -> tuple[int, int]:
-        """Открытые позиции и неисполненные входы контура или одного инструмента."""
+    def contour_remainder(self, key: str | None = None, *, assignment_id: str | None = None) -> tuple[int, int]:
+        """Открытые позиции и неисполненные входы контура, одного инструмента или одной привязки."""
         positions = entries = 0
         for recovered in self.restore():
             if key is not None and recovered.plan.instrument_id != key:
+                continue
+            if assignment_id is not None and recovered.plan.assignment_id != assignment_id:
                 continue
             state = recovered.state
             if state.phase is TradePhase.ENTRY_PENDING:
@@ -1567,12 +1601,17 @@ class TradeManager:
                 positions += 1
         return positions, entries
 
-    def _entry_block(self, key: str) -> str | None:
-        """Причина отказа новому входу или добору: остановка контура, снятие инструмента, нет связи с ядром."""
+    def _entry_block(self, key: str, assignment_id: str | None = None) -> str | None:
+        """Причина отказа новому входу или добору: остановка контура, снятие инструмента или привязки,
+        заморозка сверкой, нет связи с ядром."""
         if self._contour_stop is not None:
             return CONTOUR_STOPPING
         if key in self._instrument_stops:
             return INSTRUMENT_REMOVING
+        if assignment_id is not None and assignment_id in self._assignment_stops:
+            return BINDING_REMOVING
+        if key in self._frozen:
+            return INSTRUMENT_FROZEN
         if self._core_lost:
             return CORE_LOST
         return None
@@ -2253,7 +2292,7 @@ class TradeManager:
         state = self._budget_state(self._storage.connection)
         budget = state.base
         go = Decimal(str(meta.go_buy if plan.side == "BUY" else meta.go_sell))
-        used_risk, used_margin = state.used_risk, state.used_margin
+        used_risk, used_margin = state.used_risk, self._margin_in_use(state)
         risk_budget = state.limit
         free_risk = risk_budget - used_risk
         free_margin = budget - used_margin
@@ -2331,7 +2370,19 @@ class TradeManager:
             used_margin, candidate_margin, margin_budget,
         )
 
+    def _margin_in_use(self, state) -> Decimal:
+        """Занятое ГО: у капитала со счёта — только неисполненные входы, открытое брокер уже учёл в деньгах."""
+        return state.pending_margin if self._capital is not None else state.used_margin
+
+    def _account_capital(self) -> Decimal:
+        capital = self._capital()
+        if capital is None or not Decimal(capital).is_finite():
+            raise RiskStateUnknown(ACCOUNT_UNAVAILABLE)
+        return max(Decimal(0), Decimal(capital))
+
     def _budget_base(self) -> Decimal:
+        if self._capital is not None:
+            return self._account_capital()
         row = self._storage.connection.execute(
             "SELECT balance, equity FROM account WHERE account_id = 1"
         ).fetchone()
@@ -2348,8 +2399,11 @@ class TradeManager:
     def _known_budget_state(self, connection) -> _BudgetState:
         if self._equity_unknown:
             raise RiskStateUnknown("нет полной текущей переоценки счёта")
-        capital = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
-        base = max(Decimal(0), min(Decimal(capital[0]), Decimal(capital[1]))) if capital else max(Decimal(0), self._initial_balance)
+        if self._capital is not None:
+            base = self._account_capital()
+        else:
+            capital = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
+            base = max(Decimal(0), min(Decimal(capital[0]), Decimal(capital[1]))) if capital else max(Decimal(0), self._initial_balance)
         pending_risk, pending_margin = self._active_reservation_totals(connection)
         if not base.is_finite() or not all(value.is_finite() and value >= 0 for value in (pending_risk, pending_margin)):
             raise RiskStateUnknown("некорректные суммы счёта/резервов")
@@ -2474,13 +2528,13 @@ class TradeManager:
         def risk_allowed(q):
             return self._budget_policy.portfolio_pct > 0 and budget.used_risk <= budget.limit and budget.used_risk+delta(q) <= budget.limit
         def allowed(q):
-            return risk_allowed(q) and budget.used_margin+go*q <= budget.base
+            return risk_allowed(q) and self._margin_in_use(budget)+go*q <= budget.base
         quantity = self._largest_allowed(allowed, maximum)
         if quantity <= 0:
             code = "risk-budget" if self._largest_allowed(risk_allowed, maximum) == 0 else "margin-committed-by-pending-orders" if budget.pending_margin > 0 else "margin-budget"
             raise ReservationRejected(code, used_risk=budget.used_risk, candidate_risk=delta(1), risk_budget=budget.limit,
                                       used_margin=budget.used_margin, candidate_margin=go, margin_budget=budget.base)
-        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if budget.used_margin+go*(quantity+1) > budget.base else
+        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if self._margin_in_use(budget)+go*(quantity+1) > budget.base else
                       "max-quantity" if current.quantity+quantity >= self._max_qty else action.limiting_constraint or "profile")
         selected = replace(action, quantity=quantity, requested_quantity=requested, limiting_constraint=constraint)
         self._traces.record_in_transaction(connection, calculation_trace(
@@ -2696,7 +2750,7 @@ class TradeManager:
         if risk_budget is None or margin_budget is None:
             raise ValueError("reservation requires risk and margin budgets")
         state = self._budget_state(connection)
-        used_risk, used_margin = state.used_risk, state.used_margin
+        used_risk, used_margin = state.used_risk, self._margin_in_use(state)
         risk_budget = min(risk_budget, state.limit)
         margin_budget = min(margin_budget, state.base)
         if used_risk + candidate.risk_amount > risk_budget:

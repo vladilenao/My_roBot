@@ -8,7 +8,8 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Iterable
 
 from src.events.event import Event
@@ -20,6 +21,7 @@ from src.notifier.telegram_delivery import DeliveryRepository, markup, namespace
 from src.notifier.telegram_html import split_html
 from src.notifier.telegram_navigation import event_navigation, message_link, register_confirmed
 from src.notifier.telegram_templates import render
+from src.notifier.templates.orders import order_line
 from src.notifier.telegram_transport import ApiResult, TelegramTransport
 
 log = get_logger(__name__)
@@ -56,8 +58,10 @@ class TelegramChannel(Channel):
 
     def __init__(self, *, bot_token="", channel_id="", cloudflare_url="", tz_offset_hours=0.0,
                  supported_types: Iterable[EventType] | None = None, queue_size=QUEUE_SIZE,
-                 request_timeout=10.0, max_transport_attempts=1, delivery_path=None):
+                 request_timeout=10.0, max_transport_attempts=1, delivery_path=None, title=None):
         super().__init__(supported_types=supported_types)
+        # Метка контура в заголовке карточки (add-tinvest-orders): «ПЕСОЧНИЦА», «СЧЁТ».
+        self._title = title
         self.bot_token, self.channel_id, self.cloudflare_url = bot_token, channel_id, cloudflare_url
         self._tz_offset_hours = tz_offset_hours
         self._enabled = bool(bot_token and channel_id and cloudflare_url)
@@ -340,6 +344,34 @@ class TelegramChannel(Channel):
         repository.finish_operation(operation_id, response)
         return response
 
+    def _titled(self, event, text):
+        """Метка контура в первой строке карточки; у событий контура на брокере она уже есть."""
+        if not self._title or event.type in {EventType.BROKER_ACCOUNT, EventType.BROKER_ORDER}:
+            return text
+        if text.startswith("<b>"):
+            return f"<b>{escape(self._title)} · " + text[3:]
+        return f"<b>{escape(self._title)}</b> · " + text
+
+    def _note(self, event, root, repository, key):
+        """Строка жизни заявки дописывается в корневую карточку сделки правкой сообщения."""
+        trade_id = event.get("trade_id")
+        stamp = ""
+        if event.bar_time is not None:
+            moment = event.bar_time if event.bar_time.tzinfo else event.bar_time.replace(tzinfo=timezone.utc)
+            stamp = moment.astimezone(timezone(timedelta(hours=self._tz_offset_hours))).strftime("%H:%M:%S") + " "
+        line = escape(stamp + order_line(event))
+        if line not in repository.notes(trade_id):
+            repository.add_note(trade_id, line)
+        limit = CAPTION_LIMIT if root[1] == "photo" else MESSAGE_LIMIT
+        buttons = [{"text": role, "url": link} for role, stage_id in repository.stages(trade_id)
+                   if (link := self._link(stage_id))]
+        method = "editMessageCaption" if root[1] == "photo" else "editMessageText"
+        field = "caption" if root[1] == "photo" else "text"
+        self._operation(repository, key + ":note", method,
+                        {"message_id": root[0], field: _with_notes(root[2] or "", repository.notes(trade_id), limit),
+                         "parse_mode": "HTML", "reply_markup": markup(buttons)},
+                        trade_id=trade_id, event_key=key)
+
     def _deliver(self, event, repository, resume=False):
         visual = event.get("visual")
         trade_id = event.get("trade_id") or (visual["trade_id"] if visual else "")
@@ -352,12 +384,15 @@ class TelegramChannel(Channel):
         if not resume and not repository.claim_event(trade_id, event_key, sequence, revision):
             return
         root = repository.root(trade_id) if trade_id else None
+        if root and event.type in _ROOT_NOTE_TYPES:
+            self._note(event, root, repository, f"{trade_id}:{event_key}")
+            return
         buttons = []
         if root:
             link = self._link(root[0])
             if link:
                 buttons.append({"text": "↗ Открыть сделку", "url": link})
-        text = render(event, tz_offset_hours=self._tz_offset_hours)
+        text = self._titled(event, render(event, tz_offset_hours=self._tz_offset_hours))
         key = f"{trade_id}:{event_key}"
         # Продолжение отложенного события: основной пост уже сохранён, график не
         # перерисовывается — _operation возьмёт сохранённые материалы.
@@ -408,8 +443,10 @@ class TelegramChannel(Channel):
                             {"text": continuation, "parse_mode": "HTML", "reply_markup": markup(continuation_buttons)},
                             trade_id=trade_id, event_key=event_key)
         if root and visual and event.type is not EventType.SIGNAL:
-            caption_parts = split_html(render(event, root=True, tz_offset_hours=self._tz_offset_hours),
-                                       CAPTION_LIMIT if root[1] == "photo" else MESSAGE_LIMIT)
+            limit = CAPTION_LIMIT if root[1] == "photo" else MESSAGE_LIMIT
+            caption_parts = split_html(self._titled(event, render(event, root=True, tz_offset_hours=self._tz_offset_hours)),
+                                       limit)
+            noted = _with_notes(caption_parts[0], repository.notes(trade_id), limit)
             root_buttons = []
             for role, stage_id in repository.stages(trade_id):
                 link = self._link(stage_id)
@@ -418,7 +455,7 @@ class TelegramChannel(Channel):
             edit_method = "editMessageCaption" if root[1] == "photo" else "editMessageText"
             field = "caption" if root[1] == "photo" else "text"
             result = self._operation(repository, key + ":root", edit_method,
-                                     {"message_id": root[0], field: caption_parts[0], "parse_mode": "HTML", "reply_markup": markup(root_buttons)},
+                                     {"message_id": root[0], field: noted, "parse_mode": "HTML", "reply_markup": markup(root_buttons)},
                                      trade_id=trade_id, event_key=event_key)
             if result and result.ok:
                 repository.update_root_text(trade_id, caption_parts[0])
@@ -426,6 +463,19 @@ class TelegramChannel(Channel):
                     self._operation(repository, f"{key}:root-detail:{i}", "sendMessage",
                                     {"text": detail, "parse_mode": "HTML", "reply_markup": markup(continuation_buttons)},
                                     trade_id=trade_id, event_key=event_key)
+
+
+_ROOT_NOTE_TYPES = frozenset({EventType.BROKER_ORDER, EventType.ORDER_ACCEPTED})
+
+
+def _with_notes(text, notes, limit):
+    """Корневая карточка и строки жизни заявок под ней — сколько помещается в лимит."""
+    for line in notes:
+        candidate = f"{text}\n{line}"
+        if len(candidate) > limit:
+            break
+        text = candidate
+    return text
 
 
 def _plural(count, forms):

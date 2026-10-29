@@ -1,4 +1,4 @@
-"""Разведка песочницы: проверки П1–П15 на одном инструменте и отчёт.
+"""Разведка песочницы: проверки П1–П18 на одном инструменте и отчёт.
 
 Каждая проверка получает итог «да», «нет», «не проверено» или «ошибка».
 «Нет» — это ответ разведки, а не сбой: проверки, которые от неё не зависят,
@@ -72,6 +72,10 @@ CHECKS = (
     ("П12", "Операции"),
     ("П13", "Стоп-заявка ставится"),
     ("П14", "Стоп-заявка исполняется"),
+    # С3 (add-tinvest-orders): допущения TInvestBroker.
+    ("П16", "Сделки исполнения в стриме и stages"),
+    ("П17", "Лимит вне коридора"),
+    ("П18", "Поиск незнакомого ключа"),
     ("П15", "Песочница убрана"),
 )
 DEFAULT_INSTRUMENT = "NG"
@@ -151,6 +155,7 @@ class Probe:
         self._limit_key = self._limit_id = ""
         self._stop_id = ""
         self._stop_price = Decimal(0)
+        self._market_key = self._market_id = ""
 
     # --- итоги -----------------------------------------------------------
     def _set(self, code: str, outcome: str, detail: str = "") -> None:
@@ -206,15 +211,19 @@ class Probe:
             self._step("П9", self._cancel_limit)
         else:
             self._skip(["П7", "П8", "П9"], "лимитной заявки нет")
+        self._step("П18", self._unknown_key)
         if not self._step("П10", self._market_buy):
-            self._skip(["П11", "П12", "П13", "П14"], "позиции нет")
+            self._skip(["П11", "П12", "П13", "П14", "П16"], "позиции нет")
+            self._step("П17", self._limit_out_of_band)
             return
+        self._step("П16", self._check_trades)
         self._step("П11", self._check_position)
         self._step("П12", self._check_operations)
         if self._step("П13", self._place_stop):
             self._step("П14", self._wait_stop)
         else:
             self._skip(["П14"], "стоп-заявки нет")
+        self._step("П17", self._limit_out_of_band)
 
     # --- П1–П4 -----------------------------------------------------------
     def _check_account(self) -> bool:
@@ -424,6 +433,7 @@ class Probe:
             self._set("П10", NO, detail)
             return False
         self._placed = True
+        self._market_key, self._market_id = key, response.order_id
         filled = response.lots_executed >= 1
         if not filled:
             for _ in range(int(self.timing.event_wait_secs // max(self.timing.poll_secs, 1)) + 1):
@@ -490,6 +500,61 @@ class Probe:
                 return False
             self.timing.sleep(self.timing.poll_secs)
             waited += self.timing.poll_secs
+
+    # --- П16–П18: допущения TInvestBroker (add-tinvest-orders) ----------------
+    def _check_trades(self) -> bool:
+        """Сделки биржи рыночной покупки: номера и цена в стриме (котировка) и в ``GetOrderState.stages``."""
+        event = self._wait_event(lambda item: item.order_id == self._market_id and bool(getattr(item, "trades", None)))
+        stream = list(getattr(event, "trades", ()) or ()) if event is not None else []
+        state = self.gateway.call("orders.get_order_state", account_id=self.account.account_id,
+                                  order_id=self._market_key, order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST)
+        stages = list(state.stages)
+        parts = [f"стрим: сделок {len(stream)}" + (
+            f", цена {price(quotation_to_decimal(stream[0].price))}, количество {stream[0].quantity}" if stream else "")]
+        if stages:
+            parts.append(f"stages: сделок {len(stages)}, цена {money_to_decimal(stages[0].price)} "
+                         f"({stages[0].price.currency or 'без валюты'}), количество {stages[0].quantity}")
+        else:
+            parts.append("stages: пусто")
+        if stream and stages and {t.trade_id for t in stream} == {stage.trade_id for stage in stages}:
+            parts.append("номера сделок совпадают")
+        ok = bool(stream) and all(trade.trade_id for trade in stream)
+        self._set("П16", YES if ok else NO, "; ".join(parts))
+        return ok
+
+    def _limit_out_of_band(self) -> bool:
+        """Лимит на покупку выше ``limit_up``: отказ брокера — «да»; принят — снимается сразу."""
+        book = self.gateway.call("market_data.get_order_book", instrument_id=self.instrument.uid, depth=1)
+        high = quotation_to_decimal(book.limit_up)
+        if high <= 0:
+            self._set("П17", SKIPPED, "коридор у инструмента не задан")
+            return False
+        target = high + self.instrument.price_step * 10
+        try:
+            response = self.gateway.call(
+                "orders.post_order", instrument_id=self.instrument.uid, quantity=1,
+                price=decimal_to_quotation(target), direction=OrderDirection.ORDER_DIRECTION_BUY,
+                account_id=self.account.account_id, order_type=OrderType.ORDER_TYPE_LIMIT, order_id=new_key())
+        except BrokerCallError as exc:
+            self._set("П17", YES, f"цена {price(target)} выше коридора {price(high)}: отказ {exc}")
+            return True
+        self._placed = True
+        if response.execution_report_status in ACTIVE_STATUSES:
+            self.gateway.call("orders.cancel_order", account_id=self.account.account_id, order_id=response.order_id)
+        self._set("П17", NO, f"песочница приняла лимит {price(target)} выше коридора {price(high)}; заявка снята")
+        return False
+
+    def _unknown_key(self) -> bool:
+        """``GetOrderState`` по случайному ключу: ``TInvestBroker`` считает «не найдена» по коду NOT_FOUND."""
+        try:
+            self.gateway.call("orders.get_order_state", account_id=self.account.account_id, order_id=new_key(),
+                              order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST)
+        except BrokerCallError as exc:
+            ok = exc.code == "NOT_FOUND"
+            self._set("П18", YES if ok else NO, f"код {exc}" + ("" if ok else " — ожидался NOT_FOUND"))
+            return ok
+        self._set("П18", NO, "по случайному ключу брокер вернул заявку")
+        return False
 
     # --- П13–П14: стоп-заявка --------------------------------------------
     def _place_stop(self) -> bool:

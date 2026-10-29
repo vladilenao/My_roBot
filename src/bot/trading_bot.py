@@ -107,15 +107,19 @@ class TradingBot:
         contract_lifecycle=None,
         market_data_settings=None,
         live_data_waiter=None,
+        poll=None,
     ) -> None:
         self._bus = bus
+        # Работа между тиками (add-tinvest-orders): исполнения брокера разбираются не реже опроса.
+        self._poll = poll
         self._strategy_map = strategy_map
         self._data_cache = data_cache
         self._timeline = timeline
         self._run = run if run is not None else LiveRunSession()
         self._strategy_factory = strategy_factory
-        self._share_strategies = share_strategies or {}
-        self._future_strategies = future_strategies or {}
+        # Тот же объект словаря: контур на брокере дополняет его привязками на ходу (add-tinvest-orders).
+        self._share_strategies = share_strategies if share_strategies is not None else {}
+        self._future_strategies = future_strategies if future_strategies is not None else {}
         self._heartbeat_every = heartbeat_every_ticks or 0
         self._tick_poll_secs = tick_poll_secs
         self._tick_timeout_secs = tick_timeout_secs
@@ -203,6 +207,11 @@ class TradingBot:
                     if getattr(exc, "fatal_execution", False):
                         raise
                     self._report_error(exc, "обработка live-пар")
+                if self._poll is not None:
+                    try:
+                        self._poll()
+                    except Exception as exc:
+                        self._report_error(exc, "работа контура между тиками")
                 waiter = (lambda timeout: changed(generation, timeout)) if callable(changed) and generation is not None else None
                 self._timeline.wait_live_poll(self._tick_poll_secs, data_waiter=waiter, wake_at=live.next_wakeup())
         except KeyboardInterrupt:
@@ -817,21 +826,22 @@ class TradingBot:
     # ── ленивое построение стратегий по парам (имя, ТФ): один раз, доступно с первого тика ──
     @property
     def _strategy_cache(self) -> dict[tuple, object]:
+        # Дополняется при обращении: привязка контура на брокере, добавленная на ходу
+        # (add-tinvest-orders), приносит новую пару «стратегия + таймфрейм».
         cache = getattr(self, "_strategy_cache_internal", None)
         if cache is None:
-            cache = {}
-            for items in (
-                *self._share_strategies.values(),
-                *self._future_strategies.values(),
-            ):
-                for assignment in items:
-                    key = (assignment.strategy, assignment.timeframe)
-                    if key not in cache and assignment.strategy in self._strategy_map:
-                        cache[key] = self._strategy_factory(
-                            assignment.strategy,
-                            config=self._strategy_map[assignment.strategy],
-                        )
-            self._strategy_cache_internal = cache
+            cache = self._strategy_cache_internal = {}
+        for items in (
+            *self._share_strategies.values(),
+            *self._future_strategies.values(),
+        ):
+            for assignment in items:
+                key = (assignment.strategy, assignment.timeframe)
+                if key not in cache and assignment.strategy in self._strategy_map:
+                    cache[key] = self._strategy_factory(
+                        assignment.strategy,
+                        config=self._strategy_map[assignment.strategy],
+                    )
         return cache
 
     # ── диагностика ──

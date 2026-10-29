@@ -105,6 +105,10 @@ _DEFAULTS = {
     "contours_sandbox_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
     "contours_sandbox_telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
     "contours_sandbox_reconcile_every_min": 1,
+    "contours_sandbox_orders": True,
+    "contours_sandbox_exit_offset_steps": 5,
+    "contours_sandbox_exit_requote_secs": 15,
+    "contours_sandbox_exit_requote_attempts": 3,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -187,6 +191,11 @@ CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_ch
 CONTOUR_SANDBOX_TELEGRAM_BOT_ENV = _CONFIG["contours_sandbox_telegram_bot_env"]
 CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_sandbox_telegram_channel_env"]
 CONTOUR_SANDBOX_RECONCILE_EVERY_MIN = _CONFIG["contours_sandbox_reconcile_every_min"]
+# Торговля привязками заявками и выходы лимитом с перевыставлением (add-tinvest-orders).
+CONTOUR_SANDBOX_ORDERS = _CONFIG["contours_sandbox_orders"]
+CONTOUR_SANDBOX_EXIT_OFFSET_STEPS = _CONFIG["contours_sandbox_exit_offset_steps"]
+CONTOUR_SANDBOX_EXIT_REQUOTE_SECS = _CONFIG["contours_sandbox_exit_requote_secs"]
+CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_sandbox_exit_requote_attempts"]
 
 
 def telegram_channel_id() -> str | None:

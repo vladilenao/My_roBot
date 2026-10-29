@@ -119,7 +119,7 @@ def test_current_state_from_status_and_reconcile(tmp_path):
         "pid": 9021, "state": "running", "applied_generation": 1, "account": "…09c3",
         "capital": {"rub": "1000000.00", "liquid_portfolio": None}, "positions": [{"name": "NG-11.26", "lots": 1}],
         "orders": 0, "stop_orders": 0, "frozen": ["NG-11.26"], "last_reconcile_at": "2026-10-30T09:15:00Z",
-        "account_link": "ok", "core_link": "ok", "reason": None, "members": [{"key": "future-ng-macd"}]})
+        "account_link": "ok", "core_link": "ok", "reason": None, "members": [{"key": "future-ng-macd", "state": "watching"}]})
     BrokerStore(supervisor.directory / BROKER_DATABASE_FILE).add_report(
         {"at": "2026-10-30T09:15:00Z", "account": "…09c3", "result": "mismatch",
          "items": [{"instrument": "NG-11.26", "what": "position", "account": 1, "journal": 0}],
@@ -178,3 +178,45 @@ def test_if_match_conflict(sandbox_server):
     status, payload, headers = _call(srv, "POST", "/api/v1/sandbox/bindings", CONTROL_KEY,
                                      {"bindings": ["share-sber-ma"]}, if_match='"5"')
     _problem(status, payload, headers, "REVISION_CHANGED")
+
+
+# --- контракт привязки (add-tinvest-orders) ---------------------------------------
+
+NG_PAYLOAD = {"label": "NG (Природный газ) — NG-12.26", "ticker": "NGZ6", "instrument_type": "future",
+              "short_name": "NG-12.26", "uid": None, "family": "NG"}
+
+
+def test_binding_instrument_resolved_or_rejected(tmp_path):
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    supervisor = FakeSupervisor(tmp_path / "contours" / "sandbox")
+    asked = []
+
+    def resolve(card):
+        asked.append(card["id"])
+        return (NG_PAYLOAD, {"NGZ6": {"ticker": "NGZ6"}}) if card["instrument"] == "NG" else \
+            "Нет торгуемого контракта семейства с экспирацией позже чем через 2 дня."
+
+    control = SandboxControl(kind="sandbox", core_state=store, supervisor=supervisor, share_strategies=SHARES,
+                             future_strategies=FUTURES, resolve_binding=resolve)
+    status, payload = control.change_bindings(("share-sber-ma",), remove=False, mode="no_entries", expected=None)
+    assert status == 422 and payload["rejections"][0]["reason"].startswith("Нет торгуемого контракта")
+    assert store.desired("sandbox") is None
+    assert control.put_target("on", ("future-ng-macd",), None)[0] == 202
+    member = store.desired("sandbox").members[0]
+    assert member.instrument["ticker"] == "NGZ6" and member.instrument["strategy"] == "macd_rsi_stoch"
+    assert member.contract == {"NGZ6": {"ticker": "NGZ6"}}
+    assert control.view()["bindings"][0]["instrument"] == "NG-12.26"
+
+
+def test_current_shows_orders_mode_and_binding_states(tmp_path):
+    control, _, supervisor = _control(tmp_path)
+    control.put_target("on", ("future-ng-macd",), None)
+    supervisor.directory.mkdir(parents=True, exist_ok=True)
+    write_status(supervisor.directory / "status.json", {
+        "pid": 9021, "state": "running", "applied_generation": 1, "orders_enabled": True, "trades": 1,
+        "orders_in_flight": 2, "stream_link": "lost",
+        "members": [{"key": "future-ng-macd", "state": "rejected", "reason": "Инструмент привязки не определён."}]})
+    view = control.view()
+    assert (view["current"]["orders_enabled"], view["current"]["trades"], view["current"]["orders_in_flight"],
+            view["current"]["stream_link"]) == (True, 1, 2, "lost")
+    assert view["bindings"][0]["current"] == "rejected" and view["bindings"][0]["reason"].startswith("Инструмент")

@@ -108,10 +108,19 @@ class BrokerContourSupervisor:
     def _start(self, desired, *, recovery: str | None) -> int:
         import os
 
+        active = [member for member in desired.members if member.active]
+        instruments, contracts = {}, {}
+        for member in active:
+            card = member.instrument or {}
+            if card.get("ticker"):
+                # Карточка инструмента привязки (add-tinvest-orders): поля instrument_payload.
+                instruments.setdefault(card.get("uid") or card["ticker"], {
+                    key: card.get(key) for key in ("label", "ticker", "instrument_type", "short_name", "uid", "family")})
+            contracts.update(member.contract or {})
         write_launch(self.directory, {
             "contour_id": self.kind, "kind": self.kind, "core_pid": os.getpid(), "core_version": self._version,
-            "generation": desired.generation,
-            "bindings": [member.key for member in desired.members if member.active],
+            "generation": desired.generation, "bindings": [member.key for member in active],
+            "instruments": list(instruments.values()), "contracts": contracts,
         })
         self.recovery, self.exit_code, self.exited_at = recovery, None, None
         self.started_at = _now().isoformat().replace("+00:00", "Z")

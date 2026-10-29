@@ -201,7 +201,10 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
-             update_obligations=None, after_tick=None, control=None, forget=None) -> None:
+             update_obligations=None, after_tick=None, control=None, forget=None, strategies=None,
+             poll=None) -> None:
+    share_strategies, future_strategies = strategies or (SHARE_STRATEGIES, FUTURE_STRATEGIES)
+
     def post_tick(ready_tfs):
         # Желаемое ядра применяется на границе тика, до сопровождения и исполнения (add-control-api).
         if control is not None:
@@ -225,8 +228,8 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         strategy_map=_strategy_map(),
         data_cache=data_cache,
         timeline=timeline,
-        share_strategies=SHARE_STRATEGIES,
-        future_strategies=FUTURE_STRATEGIES,
+        share_strategies=share_strategies,
+        future_strategies=future_strategies,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
@@ -244,6 +247,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
+        poll=poll,
     )
     if control is not None:
         control.start(runtime.trade_manager, _Roster(bot, runtime, data_cache, forget))
@@ -324,6 +328,7 @@ class _Runtime:
         # Финансовая часть (add-contour-membership): список допуска доставки и приём карточек контрактов.
         self.instruments = None
         self.on_contracts = None
+        self.broker = None
 
     def add_instrument(self, instrument, contracts=None) -> None:
         """Инструмент вошёл в состав на ходу: карточки, жизненный цикл, исполнение, алиасы."""
@@ -353,9 +358,23 @@ class _Runtime:
         return [target for index, target in enumerate(lists) if all(target is not other for other in lists[:index])]
 
 
+@dataclass(frozen=True)
+class BrokerTrading:
+    """Подстановки торговой части контура на брокере (add-tinvest-orders); у эмуляции и истории их нет.
+
+    ``broker_factory(storage)`` — брокер вместо симулятора; ``capital`` — капитал со счёта для допуска;
+    ``initial_deposit`` — стартовый счёт журнала; ``poll`` — работа между тиками (исполнения, сверка).
+    """
+
+    broker_factory: object
+    capital: object
+    initial_deposit: Decimal
+    poll: object = None
+
+
 def _build_runtime(
     instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None,
-    contracts=None,
+    contracts=None, broker_trading: BrokerTrading | None = None,
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -368,7 +387,7 @@ def _build_runtime(
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
     ]
     historical = isinstance(clock, HistoricalClock)
-    if not trading_enabled() and not historical:
+    if not trading_enabled() and not historical and broker_trading is None:
         log.info("Торговый режим выключен — NotifyOnly.")
         return _Runtime()
 
@@ -377,6 +396,7 @@ def _build_runtime(
     from src.trade_management.manager import TradeManager
     from src.trade_management.notification import stop_move_fields
 
+    deposit = INITIAL_DEPOSIT if broker_trading is None else broker_trading.initial_deposit
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         storage = Storage(
@@ -386,16 +406,20 @@ def _build_runtime(
             audit_path=state_dir / AUDIT_FILE,
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
-            initial_deposit=str(INITIAL_DEPOSIT),
+            initial_deposit=str(deposit),
             clock=clock,
         )
-        broker = create_addressable_journal_broker(
-            INITIAL_DEPOSIT,
-            CLEARING_TIMES,
-            contract_names=_instrument_names(instruments),
-        )
+        if broker_trading is not None:
+            broker = broker_trading.broker_factory(storage)
+            broker.set_names(_instrument_names(instruments))
+        else:
+            broker = create_addressable_journal_broker(
+                INITIAL_DEPOSIT,
+                CLEARING_TIMES,
+                contract_names=_instrument_names(instruments),
+            )
     except Exception as exc:
-        if historical:
+        if historical or broker_trading is not None:
             raise RuntimeError(f"Не удалось создать исторический симулятор/журнал: {exc}") from exc
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime()
@@ -437,7 +461,8 @@ def _build_runtime(
     trade_manager = TradeManager(
         storage,
         broker,
-        initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+        initial_balance=Decimal(str(deposit)),
+        capital_provider=None if broker_trading is None else broker_trading.capital,
         budget_observer=lambda details: bus.publish(Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", **details)),
         execution_observer=publish_execution,
         profiles_config=TRADE_MANAGEMENT_PROFILES,
@@ -653,6 +678,7 @@ def _build_runtime(
         contract_lifecycle=lifecycle,
     )
     runtime.instruments = instruments
+    runtime.broker = broker
 
     def accept_contracts(metas):
         # Тот же словарь видит исполнение по барам: карточка нового контракта — сразу в работе.
@@ -865,6 +891,11 @@ class ContourSettings:
     contracts: dict | None = None
     # Желаемое состояние ядра (add-control-api); None — процесс без управления (история).
     control: object = None
+    # Контур на брокере (add-tinvest-orders): стратегии привязок и подстановки торговой части.
+    strategies: tuple | None = None
+    broker_trading: BrokerTrading | None = None
+    # Готовая шина со своими каналами (контур на брокере); None — каналы эмуляции по настройкам.
+    bus: object = None
 
 
 class TradingContour:
@@ -886,16 +917,19 @@ class TradingContour:
         # Отметки исполнения в рыночной базе пишутся под ключом контура.
         if hasattr(services.data_cache, "contour_id"):
             services.data_cache.contour_id = settings.kind
-        self.channels = build_channels(settings.channel_names, state_dir=settings.state_dir)
-        self.bus = EventBus()
-        self.bus.subscribe_all(self.channels)
+        if settings.bus is not None:
+            self.bus = settings.bus
+        else:
+            self.channels = build_channels(settings.channel_names, state_dir=settings.state_dir)
+            self.bus = EventBus()
+            self.bus.subscribe_all(self.channels)
         htf_provider = HtfFrameProvider(cache=services.data_cache, timeline=services.timeline)
         PROFILES["triple_screen"] = TripleScreenFilter(provider=htf_provider, params=TRIPLE_SCREEN_PARAMS)
         cluster_gate = services.cluster_gate(settings.state_dir)
         self.runtime = _build_runtime(
             settings.instruments, services.data_cache, self.bus, settings.state_dir, clock=settings.clock,
             session=settings.session, client_provider=settings.client_provider, cluster_gate=cluster_gate,
-            contracts=settings.contracts,
+            contracts=settings.contracts, broker_trading=settings.broker_trading,
         )
         return self
 
@@ -908,7 +942,8 @@ class TradingContour:
                  session=self.settings.session, live_waiter=live_waiter,
                  update_obligations=services.update_obligations if services.tracks_obligations else None,
                  after_tick=services.acknowledge_tick, control=self.settings.control,
-                 forget=getattr(services, "forget_instrument", None))
+                 forget=getattr(services, "forget_instrument", None), strategies=self.settings.strategies,
+                 poll=None if self.settings.broker_trading is None else self.settings.broker_trading.poll)
 
     def finish(self) -> None:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""

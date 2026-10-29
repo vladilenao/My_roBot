@@ -28,6 +28,8 @@ SANDBOX_BINDINGS = SANDBOX + "/bindings"
 SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
 SANDBOX_RECONCILE = SANDBOX + "/reconcile"
 SANDBOX_LOG = SANDBOX + "/log"
+# Состояние привязки в процессе контура на брокере (add-tinvest-orders); watching — режим только чтения.
+BINDING_STATES = ("warming", "trading", "draining", "closing", "rejected", "watching")
 
 MODE_ON = "on"
 NO_ENTRIES = "no_entries"
