@@ -1,0 +1,2546 @@
+openapi: 3.0.3
+info:
+  title: My Robot — локальный API
+  version: 2.1.0
+  description: |
+    Локальный API робота: управление контурами, состояние ядра, экспорт
+    рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
+    контрактов — `docs/api/README.md`, решения и таблица «было → станет» —
+    `docs/api/v2-decisions.md`.
+
+    Главное отличие от 1.8: вместо общей оболочки `/api/v1/contours` у
+    каждого контура свой ресурс со своей схемой и своим жизненным циклом.
+    Маршруты `/api/v1/contours…` удалены без периода `deprecated` и
+    отвечают `404 NOT_FOUND`.
+
+    * `/api/v1/emulation` — эмуляция: один контур, живёт долго, состав
+      меняется на ходу.
+    * `/api/v1/history` — прогоны истории: много, очередь, каждый
+      выполняется до конца.
+    * `/api/v1/sandbox` — контур на брокере в песочнице Т-Инвест (2.1.0):
+      один, состав из привязок, на этапе С2 только читает счёт и сверяет его.
+
+    Общие части (целевое и текущее состояние, процесс, участник
+    состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
+    них же.
+
+    **Ответы.** `application/json` со строгими схемами. В ответе:
+    * `_links` — куда можно перейти (`self`, `log`, `instruments`, …);
+    * `_actions` — что можно сделать **сейчас**: метод, адрес и готовое
+      тело. UI рисует кнопки по `_actions`, а не по своей таблице
+      состояний; сервер всё равно перепроверяет каждую команду.
+
+    **Ошибки.** `application/problem+json` (RFC 9457) с полем `code` — те же
+    коды, что в 1.8 (`CORE_NOT_READY`, `INSTRUMENTS_REJECTED`, …).
+
+    **Рыночные данные и отчёт кластеров не меняются.** Маршруты под
+    `ExportToken` перенесены из 1.8 как есть — с `producer_id`/`after_id`,
+    ошибками `{code, message}` и прежними схемами. Их читает Historical
+    Broker API Emulator, а экспорт уже вышел в релизе; переделка курсора —
+    отдельное изменение вместе с эмулятором, если понадобится.
+
+    **Целевое и текущее состояние.** Команда эмуляции и боевого контура не
+    выполняется в момент ответа: она меняет целевое состояние (`target`) и получает
+    новый номер ревизии (`revision`). Контур — отдельный процесс — применяет
+    целевое состояние на ближайшей границе тика и сообщает в `current.applied_revision`,
+    до какой ревизии дошёл. Команда выполнена, когда
+    `current.applied_revision` догнал `target.revision`. Пример:
+
+    | Что сделали | `target.revision` | `current.applied_revision` |
+    |---|---|---|
+    | запуск NG и SBER | 1 | — (процесс стартует) |
+    | | 1 | 1 — торгует |
+    | добавить BR | 2 | 1 — про BR ещё не знает |
+    | | 2 | 2 — BR в составе |
+    | `mode: no_entries` | 3 | 2 — торгует как раньше |
+    | | 3 | 3 — новых входов нет |
+
+    Ревизия отдаётся как `ETag`; `If-Match` защищает от двух команд
+    одновременно. Внутри робота это `desired`/`actual`/`generation` в
+    `core.sqlite3` и `status.json`.
+
+    **Ключи.** `ControlToken` (`ROBOT_CONTROL_TOKEN`) — контуры и ядро.
+    `ExportToken` (`MARKET_DATA_EXPORT_TOKEN`) — рыночные
+    данные и отчёт кластеров. Только заголовок `Authorization: Bearer`.
+servers:
+  - url: /
+    description: Робот; по умолчанию слушает только loopback.
+tags:
+  - name: Навигация
+    description: Точка входа — состояние робота и ссылки на разделы.
+  - name: Ядро
+    description: Приём рыночных данных, пульс, запросы к брокеру.
+  - name: Эмуляция
+    description: Контур эмуляции — один, живёт долго, состав меняется на ходу.
+  - name: История
+    description: Прогоны истории — очередь, выполнение до конца, отчёт.
+  - name: Песочница
+    description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
+  - name: Рыночные данные
+    description: Лента изменений для Historical Broker API Emulator. Как в 1.8, без изменений.
+  - name: Кластеры
+    description: Отчёт кластерного фильтра входа. Как в 1.8, без изменений.
+  - name: Служебное
+    description: Сам контракт и Swagger UI.
+
+paths:
+  # ---------------------------------------------------------------- навигация
+  /api/v1:
+    get:
+      tags: [Навигация]
+      summary: Точка входа
+      description: |
+        Короткая сводка робота и ссылки на разделы. Набор ссылок зависит от
+        ключа: `ControlToken` видит ядро и контуры, `ExportToken` —
+        рыночные данные и отчёт кластеров. Заменяет общий список
+        `GET /api/v1/contours` как место, где «всё видно одним запросом».
+        С ключом управления действует и проверка `Host`.
+      operationId: getHome
+      security:
+        - ControlToken: []
+        - ExportToken: []
+      responses:
+        '200':
+          description: Сводка и ссылки.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Home'}
+              examples:
+                control:
+                  summary: Ключ управления
+                  value:
+                    version: 7.2.0
+                    core: {state: ready}
+                    emulation: {state: running, instruments: 2, open_positions: 1}
+                    history: {running: 1, queued: 0, max: 2}
+                    live: null
+                    _links:
+                      self: {href: /api/v1}
+                      core: {href: /api/v1/core}
+                      emulation: {href: /api/v1/emulation}
+                      history: {href: /api/v1/history}
+                      docs: {href: /docs}
+                export:
+                  summary: Ключ экспорта
+                  value:
+                    version: 7.2.0
+                    core: {state: ready}
+                    emulation: null
+                    history: null
+                    live: null
+                    _links:
+                      self: {href: /api/v1}
+                      market-data: {href: /api/v1/market-data/source}
+                      clusters-report: {href: /api/v1/clusters/report}
+                      docs: {href: /docs}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # -------------------------------------------------------------------- ядро
+  /api/v1/core:
+    get:
+      tags: [Ядро]
+      summary: Состояние ядра
+      description: |
+        Как в 1.8: старт ядра (`starting`, `ready`, `retrying`, `failed`),
+        пульс, готовность живых пар, запросы к брокеру за минуту. Отвечает
+        при любом состоянии ядра — API поднимается раньше него.
+      operationId: getCore
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состояние ядра.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Core'}
+              example:
+                state: retrying
+                error: 'ConnectError: брокер недоступен'
+                attempts: 2
+                next_retry_at: '2026-10-24T09:02:30Z'
+                version: 7.2.0
+                pid: 4242
+                started_at: '2026-10-24T09:00:00Z'
+                heartbeat: {beat_at: '2026-10-24T09:01:35Z', interval_secs: 5}
+                market_data: null
+                quotas: {}
+                _links:
+                  self: {href: /api/v1/core}
+                  home: {href: /api/v1}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # --------------------------------------------------------------- эмуляция
+  /api/v1/emulation:
+    get:
+      tags: [Эмуляция]
+      summary: Контур эмуляции
+      description: |
+        Один объект: общее, целевое и текущее состояние, процесс,
+        состав и действия, доступные сейчас. Заголовок `ETag` — ревизия
+        целевого состояния; его можно передать в `If-Match` команды.
+      operationId: getEmulation
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур эмуляции.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Emulation'}
+              examples:
+                waiting:
+                  summary: Робот ждёт команду, ядро готово
+                  value:
+                    state: waiting_command
+                    target: null
+                    current: null
+                    launch: null
+                    process: null
+                    instruments: []
+                    _links:
+                      self: {href: /api/v1/emulation}
+                      target: {href: /api/v1/emulation/target}
+                      instruments: {href: /api/v1/emulation/instruments}
+                      log: {href: /api/v1/emulation/log}
+                    _actions:
+                      - name: start
+                        title: Запустить эмуляцию
+                        method: PUT
+                        href: /api/v1/emulation/target
+                        body: {mode: 'on'}
+                running:
+                  summary: Торгует
+                  value:
+                    state: running
+                    target: {mode: 'on', revision: 3}
+                    current:
+                      state: running
+                      applied_revision: 3
+                      open_positions: 1
+                      pending_entries: 0
+                      last_tick_at: '2026-10-24T11:02:00Z'
+                      core_link: ok
+                    launch:
+                      source: api
+                      recovery: null
+                      started_at: '2026-10-24T10:15:00Z'
+                      request: {mode: 'on', instruments: [NG-12.26, SBER]}
+                      rejections: []
+                    process: {pid: 81412, exit_code: null, exited_at: null, dir: contours/emulation}
+                    instruments:
+                      - name: NG-12.26
+                        instrument_type: future
+                        days_to_expiry: 52
+                        target: active
+                        remove_mode: null
+                        current: trading
+                        _links:
+                          self: {href: /api/v1/emulation/instruments/NG-12.26}
+                        _actions:
+                          - {name: remove, title: 'Убрать, сделки доживают', method: POST, href: /api/v1/emulation/instruments/remove, body: {instruments: [NG-12.26], mode: no_entries}}
+                          - {name: remove-close-all, title: 'Убрать и закрыть позиции', method: POST, href: /api/v1/emulation/instruments/remove, body: {instruments: [NG-12.26], mode: close_all}}
+                    _links:
+                      self: {href: /api/v1/emulation}
+                      target: {href: /api/v1/emulation/target}
+                      instruments: {href: /api/v1/emulation/instruments}
+                      log: {href: /api/v1/emulation/log}
+                    _actions:
+                      - {name: stop, title: 'Остановить, сделки доживают', method: PUT, href: /api/v1/emulation/target, body: {mode: no_entries}}
+                      - {name: stop-close-all, title: 'Остановить и закрыть всё', method: PUT, href: /api/v1/emulation/target, body: {mode: close_all}}
+                      - {name: add-instruments, title: 'Добавить инструменты', method: POST, href: /api/v1/emulation/instruments, body: {instruments: []}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/emulation/target:
+    get:
+      tags: [Эмуляция]
+      summary: Целевое состояние эмуляции
+      operationId: getEmulationTarget
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Целевое состояние (в `core.sqlite3` — `desired`).
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradingTarget'}
+              example: {mode: 'on', revision: 3}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404':
+          description: Эмуляцию ни разу не запускали — целевого состояния нет (`NOT_FOUND`).
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+    put:
+      tags: [Эмуляция]
+      summary: Запустить или остановить эмуляцию
+      description: |
+        Одна команда на все режимы торговли: она задаёт целевое состояние эмуляции.
+
+        **Торговать** `{"mode": "on", "instruments": [...]}`. Работает, когда
+        эмуляция ждёт команду, остановлена или упала, и ядро готово.
+        `instruments` — тикеры акций (`SBER`) и короткие имена контрактов
+        (`NG-12.26`), те же имена, что в составе и в удалении. Код семейства
+        (`NG`) и биржевой тикер (`NGZ6`) не принимаются: отказ подскажет
+        короткое имя ближайшего допустимого контракта. Без поля или `all` — все инструменты с привязками, у
+        семейств — ближайший контракт за порогом `contract_expiry_block_days`.
+        Отказ строгий: хотя бы один инструмент отклонён — запуска нет (`422`). Если
+        проверка у брокера не уложилась в 60 секунд — `202`, итог в
+        `launch.rejections`.
+
+        **Без новых входов** `{"mode": "no_entries"}` — неисполненные входы
+        снимаются, позиции доживают; после последней процесс завершается.
+        **Закрыть всё** `{"mode": "close_all"}` — позиции закрываются на
+        открытии следующего бара, затем процесс завершается. `close_all` поверх
+        `no_entries` принимается, обратно — `409 MODE_CONFLICT`.
+
+        Повтор той же остановки — `200`, ревизия прежняя. `on`, когда
+        эмуляция уже запускается или торгует, — `409 ALREADY_RUNNING`:
+        состав меняется через `/api/v1/emulation/instruments`.
+      operationId: putEmulationTarget
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmulationTargetRequest'}
+            examples:
+              start:
+                summary: Запустить газ и Сбер
+                value: {mode: 'on', instruments: [NG-12.26, SBER]}
+              startAll:
+                summary: Запустить всё с привязками
+                value: {mode: 'on'}
+              stop:
+                summary: Остановить, сделки доживают
+                value: {mode: no_entries}
+              stopCloseAll:
+                summary: Остановить и закрыть всё
+                value: {mode: close_all}
+      responses:
+        '202':
+          description: Целевое состояние записано новой ревизией; следить — `GET /api/v1/emulation`.
+          headers:
+            Location: {$ref: '#/components/headers/EmulationLocation'}
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Emulation'}
+        '200':
+          description: Повтор той же остановки; ревизия прежняя.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Emulation'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: |
+            `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING` (остановка, когда
+            процесса нет), `MODE_CONFLICT`, `CORE_NOT_READY` (в `core` —
+            состояние ядра), `CONTOUR_DIR_BUSY` (в `pid` — чужой процесс).
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example:
+                type: 'urn:my-robot:problem:core-not-ready'
+                title: Ядро не готово
+                status: 409
+                code: CORE_NOT_READY
+                detail: Ядро повторяет старт; следующая попытка в 09:02:30 UTC.
+                core: {state: retrying, attempts: 2, next_retry_at: '2026-10-24T09:02:30Z'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/InstrumentsRejected'}
+
+  /api/v1/emulation/instruments:
+    get:
+      tags: [Эмуляция]
+      summary: Состав эмуляции
+      description: Все инструменты целевого состава, включая убираемые, с текущим состоянием.
+      operationId: listEmulationInstruments
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состав.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Эмуляция]
+      summary: Добавить инструменты на ходу
+      description: |
+        Тикеры акций и короткие имена контрактов — те же имена, которыми
+        инструменты потом видны в составе и убираются. Код семейства не
+        принимается (`422` с подсказкой ближайшего контракта). Отказ строгий:
+        хотя бы один инструмент отклонён — состав не меняется (`422`). Новый инструмент прогревается
+        (`warming`), проходит стартовый обзор и торгует. Добавление
+        убираемого инструмента возвращает его в торговлю. Повтор — `200`.
+      operationId: addEmulationInstruments
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InstrumentsAddRequest'}
+            example: {instruments: [NG-12.26, SBER]}
+      responses:
+        '202':
+          description: Изменение записано новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '200':
+          description: Повтор — состав уже такой.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`NOT_RUNNING` — процесса эмуляции нет; `STOPPING` — эмуляция останавливается.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/InstrumentsRejected'}
+
+  /api/v1/emulation/instruments/remove:
+    post:
+      tags: [Эмуляция]
+      summary: Убрать инструменты из состава
+      description: |
+        Пакетная команда (паттерн batch delete): тело — список инструментов и
+        режим. `DELETE` с телом не используется: у тела `DELETE` в HTTP нет
+        определённого смысла, часть клиентов его отбрасывает.
+
+        * `no_entries` (по умолчанию) — новых входов нет, неисполненные входы
+          снимаются, позиции доживают;
+        * `close_all` — позиции закрываются на открытии следующего бара.
+
+        Без сделок инструмент выходит из состава. Отказ строгий: если хотя
+        бы одного инструмента нет в составе — ничего не меняется (`422`).
+        Повтор — `200`; `no_entries` поверх `close_all` — `409 MODE_CONFLICT`.
+      operationId: removeEmulationInstruments
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InstrumentsRemoveRequest'}
+            examples:
+              drain:
+                summary: Убрать газ и Сбер, сделки доживают
+                value: {instruments: [NG-12.26, SBER]}
+              closeAll:
+                summary: Убрать газ и закрыть его позиции
+                value: {instruments: [NG-12.26], mode: close_all}
+      responses:
+        '202':
+          description: Удаление записано новой ревизией; участники в состоянии `draining` или `closing`.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '200':
+          description: Повтор — удаление уже записано.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`NOT_RUNNING`, `STOPPING`, `MODE_CONFLICT`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422':
+          description: Хотя бы одного инструмента нет в составе; ничего не изменено (`INSTRUMENTS_REJECTED`).
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example:
+                type: 'urn:my-robot:problem:instruments-rejected'
+                title: Инструменты отклонены
+                status: 422
+                code: INSTRUMENTS_REJECTED
+                detail: Состав не изменён.
+                rejections:
+                  - {instrument: GAZP, reason: Инструмента нет в составе эмуляции.}
+
+  /api/v1/emulation/instruments/{name}:
+    parameters:
+      - $ref: '#/components/parameters/MemberName'
+    get:
+      tags: [Эмуляция]
+      summary: Один участник состава
+      operationId: getEmulationInstrument
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Участник состава.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/emulation/log:
+    get:
+      tags: [Эмуляция]
+      summary: Последние строки журнала эмуляции
+      operationId: getEmulationLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  # -------------------------------------------------------------- песочница
+  /api/v1/sandbox:
+    get:
+      tags: [Песочница]
+      summary: Контур «Песочница»
+      description: |
+        Контур на брокере в песочнице Т-Инвест: общее, целевое и текущее
+        состояние, запуск, процесс, состав из привязок и действия, доступные
+        сейчас. На этапе С2 контур только читает счёт и сверяет его с журналом:
+        заявок нет. `ETag` — ревизия целевого состояния.
+      operationId: getSandbox
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур «Песочница».
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+              examples:
+                alarm:
+                  summary: Работает, на счёте ручная позиция
+                  value:
+                    state: running
+                    target: {mode: 'on', revision: 2}
+                    current:
+                      state: running
+                      applied_revision: 2
+                      account: '…09c3'
+                      capital: {rub: '976039.46', liquid_portfolio: '1023916.40'}
+                      positions: [{name: NG-11.26, lots: 1}]
+                      orders: 0
+                      stop_orders: 0
+                      frozen: [NG-11.26]
+                      last_reconcile_at: '2026-10-30T09:15:00Z'
+                      account_link: ok
+                      core_link: ok
+                      reason: null
+                    launch:
+                      source: api
+                      recovery: null
+                      started_at: '2026-10-30T09:10:02Z'
+                      request: {mode: 'on', bindings: [future-ng-macd]}
+                      rejections: []
+                    process: {pid: 90211, exit_code: null, exited_at: null, dir: contours/sandbox}
+                    bindings:
+                      - id: future-ng-macd
+                        instrument: NG
+                        strategy: macd_rsi_stoch
+                        timeframe: 15m
+                        target: active
+                        remove_mode: null
+                        current: watching
+                        _actions:
+                          - {name: remove, title: Убрать из песочницы, method: POST, href: /api/v1/sandbox/bindings/remove, body: {bindings: [future-ng-macd], mode: no_entries}}
+                    _links:
+                      self: {href: /api/v1/sandbox}
+                      target: {href: /api/v1/sandbox/target}
+                      bindings: {href: /api/v1/sandbox/bindings}
+                      reconcile: {href: /api/v1/sandbox/reconcile}
+                      log: {href: /api/v1/sandbox/log}
+                    _actions:
+                      - {name: stop, title: Остановить, method: PUT, href: /api/v1/sandbox/target, body: {mode: no_entries}}
+                      - {name: add-bindings, title: Добавить привязки, method: POST, href: /api/v1/sandbox/bindings, body: {bindings: []}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/sandbox/target:
+    get:
+      tags: [Песочница]
+      summary: Целевое состояние песочницы
+      operationId: getSandboxTarget
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Целевое состояние; `null` — контур ни разу не запускали.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradingTarget'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    put:
+      tags: [Песочница]
+      summary: Запустить или остановить песочницу
+      description: |
+        **Запустить** `{"mode": "on", "bindings": [...]}` — `bindings` это `id`
+        привязок из `[strategies.*]`; без поля — с текущим составом (может
+        быть пустым). Неизвестный `id` — `422 BINDINGS_REJECTED`, запуска нет.
+
+        **Остановить** `{"mode": "no_entries"}` или `{"mode": "close_all"}`.
+        На этапе С2 у контура нет своих сделок: оба режима завершают процесс на
+        ближайшем шаге, а `close_all` ручные позиции на счёте не трогает.
+
+        `confirm` не нужен: денег в песочнице нет.
+      operationId: putSandboxTarget
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SandboxTargetRequest'}
+            examples:
+              start:
+                summary: Запустить с одной привязкой газа
+                value: {mode: 'on', bindings: [future-ng-macd]}
+              stop:
+                summary: Остановить
+                value: {mode: no_entries}
+      responses:
+        '202':
+          description: Целевое состояние записано новой ревизией; следить — `GET /api/v1/sandbox`.
+          headers:
+            Location: {$ref: '#/components/headers/SandboxLocation'}
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+        '200':
+          description: Повтор той же остановки; ревизия прежняя.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY` — как у эмуляции.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/bindings:
+    get:
+      tags: [Песочница]
+      summary: Состав песочницы и все привязки конфигурации
+      description: |
+        `members` — состав песочницы. `available` — все привязки
+        `[strategies.*]` с `trades_in`: где каждая сейчас торгует
+        (`emulation` — инструмент привязки в составе эмуляции, `sandbox` —
+        привязка в составе песочницы). По этому списку выбирают, что
+        переводить дальше.
+      operationId: getSandboxBindings
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состав и привязки.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Песочница]
+      summary: Добавить привязки в песочницу
+      description: |
+        Принимается и тогда, когда процесс не запущен: меняет состав для
+        следующего запуска. Уже в составе — `200` без новой ревизии.
+      operationId: addSandboxBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsAddRequest'}
+            example: {bindings: [future-ng-macd]}
+      responses:
+        '202':
+          description: Состав изменён новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/bindings/remove:
+    post:
+      tags: [Песочница]
+      summary: Убрать привязки из песочницы
+      operationId: removeSandboxBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsRemoveRequest'}
+            example: {bindings: [future-ng-macd], mode: no_entries}
+      responses:
+        '202':
+          description: Состав изменён новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений — привязки уже сняты.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/reconcile:
+    get:
+      tags: [Песочница]
+      summary: Последний отчёт сверщика
+      description: |
+        Сверка счёта песочницы с журналом контура: при старте и раз в
+        `reconcile_every_min`. На этапе С2 журнал пуст, поэтому всё, что есть
+        на счёте, — расхождение «на счёте есть, в журнале нет».
+      operationId: getSandboxReconcile
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Отчёт; `null` — сверки ещё не было.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconcileReport'}
+              example:
+                at: '2026-10-30T09:15:00Z'
+                account: '…09c3'
+                result: mismatch
+                items: [{instrument: NG-11.26, what: position, account: 1, journal: 0}]
+                frozen: [NG-11.26]
+                skipped_in_row: 0
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/sandbox/log:
+    get:
+      tags: [Песочница]
+      summary: Последние строки журнала песочницы
+      operationId: getSandboxLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  # ---------------------------------------------------------------- история
+  /api/v1/history:
+    get:
+      tags: [История]
+      summary: Прогоны истории
+      description: |
+        Идущие и ждущие прогоны и `limit` последних завершённых, новые
+        первыми. `limits` — сколько прогонов может идти сразу, сколько идёт и
+        сколько ждёт.
+      operationId: listHistoryRuns
+      security:
+        - ControlToken: []
+      parameters:
+        - name: state
+          in: query
+          required: false
+          description: '`active` — только в очереди и в работе; `finished` — только завершённые.'
+          schema: {type: string, enum: [active, finished]}
+        - name: limit
+          in: query
+          required: false
+          description: Сколько завершённых прогонов показать.
+          schema: {type: integer, minimum: 1, maximum: 200, default: 20}
+      responses:
+        '200':
+          description: Прогоны.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryRunList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [История]
+      summary: Поставить прогон в очередь
+      description: |
+        Принимается всегда — без эмуляции и до готовности ядра: свечи прогону
+        даёт эмулятор данных. Одновременно идут не больше
+        `[contours] max_history_runs`, остальные ждут (`queued`). До ответа
+        проверяются форма и привязки. В истории, в отличие от эмуляции, код
+        семейства (`NG`) принимается и означает другое — автоматическую
+        цепочку контрактов на весь диапазон; контракт (`NG-12.26`) —
+        фиксированный; семейство вместе со своим контрактом — конфликт. Контракты у эмулятора и покрытие свечей
+        проверяет процесс прогона; отказ виден как `failed` с причиной.
+        Инструмент, названный и в истории, и в эмуляции, торгуется по одним
+        привязкам `robot.toml`.
+      operationId: createHistoryRun
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/HistoryRunRequest'}
+            example: {from: '2026-06-01 00:00', to: '2026-06-05 00:00', pause: 0, instruments: [BR]}
+      responses:
+        '202':
+          description: Прогон в очереди; `Location` — его адрес.
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/history/20261024-101500}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryRun'}
+              example:
+                id: '20261024-101500'
+                state: queued
+                request: {from: '2026-06-01 00:00', to: '2026-06-05 00:00', pause: 0, instruments: [BR]}
+                accepted_at: '2026-10-24T10:15:00Z'
+                started_at: null
+                finished_at: null
+                queue_position: 1
+                reason: null
+                market_data_sync: null
+                progress: null
+                process: null
+                _links:
+                  self: {href: /api/v1/history/20261024-101500}
+                  log: {href: /api/v1/history/20261024-101500/log}
+                _actions:
+                  - {name: cancel, title: 'Убрать из очереди', method: POST, href: /api/v1/history/20261024-101500/stop}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '422': {$ref: '#/components/responses/InstrumentsRejected'}
+
+  /api/v1/history/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [История]
+      summary: Один прогон
+      operationId: getHistoryRun
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Прогон.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryRun'}
+              example:
+                id: '20261024-101500'
+                state: running
+                request: {from: '2026-09-01 10:00', to: '2026-09-08 10:00', pause: 0, instruments: [NG]}
+                accepted_at: '2026-10-24T10:15:00Z'
+                started_at: '2026-10-24T10:15:02Z'
+                finished_at: null
+                queue_position: null
+                reason: null
+                market_data_sync: {status: synchronized, snapshot_generation: 41}
+                progress:
+                  phase: running
+                  start: '2026-09-01T10:00:00Z'
+                  end: '2026-09-08T10:00:00Z'
+                  market_now: '2026-09-04T12:00:00Z'
+                  ticks: 4440
+                  fraction: 0.4405
+                process: {pid: 90311, exit_code: null, exited_at: null, dir: contours/history/20261024-101500}
+                _links:
+                  self: {href: /api/v1/history/20261024-101500}
+                  log: {href: /api/v1/history/20261024-101500/log}
+                  collection: {href: /api/v1/history}
+                _actions:
+                  - {name: stop, title: 'Остановить с отчётом', method: POST, href: /api/v1/history/20261024-101500/stop}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/history/{run_id}/stop:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [История]
+      summary: Остановить или убрать из очереди
+      description: |
+        Прогон — задание, которое идёт до конца, а не целевое состояние торговли,
+        поэтому здесь команда (паттерн «отмена долгой операции»), а не
+        `PUT target`. Тела нет. Ждущий прогон убирается (`cancelled`),
+        идущий останавливается после тика и пишет отчёт «остановлено
+        оператором» (`stopping` → `stopped`). Повтор — `200`.
+      operationId: stopHistoryRun
+      security:
+        - ControlToken: []
+      responses:
+        '202':
+          description: Остановка принята; прогон в `stopping` или уже `cancelled`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryRun'}
+        '200':
+          description: Повтор — остановка уже запрошена.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryRun'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: '`NOT_RUNNING` — прогон уже завершён.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
+  /api/v1/history/{run_id}/report:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [История]
+      summary: Итог прогона
+      description: |
+        Сводка из `report.json`. Вынесена из прогона: она есть только у
+        завершённого, а у идущего вместо неё `progress`.
+      operationId: getHistoryRunReport
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Итог.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryReport'}
+              example:
+                covered: true
+                stop_reason: диапазон [2026-09-01 10:00 — 2026-09-08 10:00) обработан полностью
+                trades: 7
+                net_pnl: {amount: '1234.50', currency: RUB}
+                fees: {amount: '56.00', currency: RUB}
+                balance: {amount: '101234.50', currency: RUB}
+                open_positions: []
+                _links:
+                  run: {href: /api/v1/history/20261024-101500}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404':
+          description: '`NOT_FOUND` — прогона нет; `REPORT_NOT_READY` — прогон ещё не завершён или отчёт не записан.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
+  /api/v1/history/{run_id}/log:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [История]
+      summary: Последние строки журнала прогона
+      operationId: getHistoryRunLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # Перенесено из docs/openapi.yaml 1.8 без изменений (вариант А): экспорт
+  # уже в релизе, его читает Historical Broker API Emulator.
+  /api/v1/market-data/source:
+    get:
+      tags: [Рыночные данные]
+      summary: Идентичность источника и доступный диапазон курсора
+      operationId: getMarketDataSource
+      responses:
+        '200':
+          description: Идентичность локальной БД и допустимая начальная позиция.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceInfo'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                schema_version: 1
+                min_after_id: 0
+                max_change_id: 42
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401':
+          $ref: '#/components/responses/ExportUnauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/changes:
+    get:
+      tags: [Рыночные данные]
+      summary: Следующая страница изменений после курсора
+      operationId: getMarketDataChanges
+      parameters:
+        - name: producer_id
+          in: query
+          required: true
+          description: Идентичность источника, полученная от GET /source.
+          schema:
+            type: string
+            format: uuid
+        - name: after_id
+          in: query
+          required: true
+          description: Последний долговечно сохранённый change_id; минимум min_after_id.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: Максимум изменений в странице.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 500
+      responses:
+        '200':
+          description: Изменения отсортированы по возрастанию change_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePage'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                next_after_id: 42
+                has_more: false
+                changes:
+                  - change_id: 42
+                    kind: candle_upsert
+                    recorded_at: '2026-10-09T09:02:03Z'
+                    candle:
+                      source: tbank_exchange
+                      instrument_uid: e6123145-6bd5-43d9-8e7d-33b1a331ce43
+                      interval: 1m
+                      open_time_utc: '2026-10-09T09:01:00Z'
+                      open: '301.50'
+                      high: '302.00'
+                      low: '301.25'
+                      close: '301.75'
+                      volume: 412
+                      is_complete: true
+                      revision: 1
+                      received_at: '2026-10-09T09:02:03Z'
+        '400':
+          $ref: '#/components/responses/ExportBadRequest'
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401':
+          $ref: '#/components/responses/ExportUnauthorized'
+        '409':
+          $ref: '#/components/responses/ProducerMismatch'
+        '410':
+          $ref: '#/components/responses/CursorExpired'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/consumers/{consumer_id}/checkpoint:
+    put:
+      tags: [Рыночные данные]
+      summary: Подтвердить уже сохранённые потребителем изменения
+      operationId: putMarketDataCheckpoint
+      description: |
+        Потребитель вызывает после commit своей БД. Повтор и меньший
+        change_id не откатывают ранее подтверждённый курсор.
+
+        Имена с префиксом `contour-` заняты курсорами торговых контуров
+        робота: контур читает ленту напрямую из базы, и его курсор так же
+        удерживает очистку ленты. Такое имя в запросе отклоняется с `400`.
+      parameters:
+        - name: consumer_id
+          in: path
+          required: true
+          description: |
+            Стабильное имя потребителя, например historical-emulator.
+            Префикс `contour-` зарезервирован за торговыми контурами робота (400).
+          schema:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckpointRequest'
+            example:
+              producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+              change_id: 42
+      responses:
+        '200':
+          description: Последний подтверждённый курсор потребителя.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointResponse'
+              example:
+                producer_id: 4b5f0d70-ef95-4929-b723-47030ec90165
+                consumer_id: historical-emulator
+                acknowledged_through: 42
+        '400':
+          $ref: '#/components/responses/ExportBadRequest'
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401':
+          $ref: '#/components/responses/ExportUnauthorized'
+        '409':
+          $ref: '#/components/responses/ProducerMismatch'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /api/v1/market-data/trading-schedules:
+    get:
+      tags: [Рыночные данные]
+      summary: Следующая страница изменений расписаний
+      operationId: getTradingScheduleChanges
+      parameters:
+        - name: producer_id
+          in: query
+          required: true
+          schema: {type: string, format: uuid}
+        - name: after_id
+          in: query
+          required: true
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
+      responses:
+        '200':
+          description: Изменения расписаний с независимым schedule_change_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleChangePage'
+        '400': {$ref: '#/components/responses/ExportBadRequest'}
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401': {$ref: '#/components/responses/ExportUnauthorized'}
+        '409': {$ref: '#/components/responses/ProducerMismatch'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/market-data/consumers/{consumer_id}/trading-schedules-checkpoint:
+    put:
+      tags: [Рыночные данные]
+      summary: Подтвердить страницу отдельной ленты расписаний
+      operationId: putTradingScheduleCheckpoint
+      parameters:
+        - name: consumer_id
+          in: path
+          required: true
+          description: Имя потребителя; префикс `contour-` зарезервирован за торговыми контурами робота (400).
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckpointRequest'}
+      responses:
+        '200':
+          description: Последний подтверждённый schedule_change_id.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckpointResponse'}
+        '400': {$ref: '#/components/responses/ExportBadRequest'}
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401': {$ref: '#/components/responses/ExportUnauthorized'}
+        '409': {$ref: '#/components/responses/ProducerMismatch'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/v1/clusters/report:
+    get:
+      tags: [Кластеры]
+      summary: Отчёт кластерного фильтра за день или период
+      description: |
+        Отчёт по вердиктам кластерного фильтра для сигналов стратегий за период
+        из `period` календарных дней, который заканчивается днём `date`
+        включительно (день — по времени закрытия бара сигнала, МСК). Без
+        `period` — отчёт за один день `date`.
+
+        Группы вердиктов (`veto_strong`, `veto`, `confirm`, `neutral`,
+        `unknown`) показывают число сигналов, сколько из них стали сделками,
+        чистый итог этих сделок и движение цены через 15 и 60 минут после
+        сигнала по всем сигналам группы, в том числе не ставшим сделками.
+        `veto_effect` — что изменил бы запрет. `signals` — каждый сигнал
+        периода с той же причиной, что была в консоли.
+
+        Движение цены — в базисных пунктах (1 б.п. = 0,01 %) со знаком
+        направления сигнала: плюс — цена пошла в сторону сигнала. Сигнал, у
+        которого горизонт ещё не наступил, есть в `signals`, но не входит в
+        статистику движения (`price_move.*.n` меньше `signals`).
+
+        Ответ — `application/hal+json`: ссылки `_links.previous` и
+        `_links.next` ведут на соседние периоды той же длины; клиент берёт их
+        из ответа, а не собирает адрес сам.
+      operationId: getClustersReport
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Последний день периода.
+          schema:
+            type: string
+            format: date
+          example: '2026-10-15'
+        - name: period
+          in: query
+          required: false
+          description: Длина периода в календарных днях, заканчивая `date` включительно.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 366
+            default: 1
+      responses:
+        '200':
+          description: Отчёт за период.
+          content:
+            application/hal+json:
+              schema:
+                $ref: '#/components/schemas/ClustersReport'
+              example:
+                period: {from: '2026-10-15', to: '2026-10-15', days: 1}
+                mode: shadow
+                generated_at: '2026-10-15T21:00:00Z'
+                horizons_min: [15, 60]
+                groups:
+                  - verdict: veto
+                    signals: 1
+                    trades: 1
+                    trades_net_pnl: {amount: '-1455.94', currency: RUB}
+                    trades_won: 0
+                    trades_lost: 1
+                    price_move:
+                      '15': {n: 1, mean_bps: '-39.11', median_bps: '-39.11', hit_rate: '0.00'}
+                      '60': {n: 1, mean_bps: '-74.27', median_bps: '-74.27', hit_rate: '0.00'}
+                veto_effect:
+                  includes: [veto_strong, veto]
+                  trades_removed: 1
+                  winners_removed: 0
+                  winners_net_pnl: {amount: '0.00', currency: RUB}
+                  losers_removed: 1
+                  losers_net_pnl: {amount: '-1455.94', currency: RUB}
+                  net_effect: {amount: '1455.94', currency: RUB}
+                signals:
+                  - signal_id: 'future-br-macd:BRX6:5m:2026-10-15T13:50:00:SELL'
+                    bar_close: '2026-10-15T13:50:00Z'
+                    instrument: BRX6
+                    assignment_id: future-br-macd
+                    strategy: macd_rsi_stoch
+                    timeframe: 5m
+                    side: SELL
+                    price: '104.63'
+                    verdict: veto
+                    reason: climax
+                    message: 'Вход на кульминации: ход до входа +2,16σ (порог 1,5σ) · середина 2ч диапазона · 16:40 всплеск продаж ×9,6 после хода +2,45σ'
+                    trade:
+                      trade_id: 'future-br-macd:BRX6:5m:2026-10-15T13:50:00:SELL'
+                      net_pnl: {amount: '-1455.94', currency: RUB}
+                    price_move:
+                      '15': {status: final, move_bps: '-39.11'}
+                      '60': {status: final, move_bps: '-74.27'}
+                _links:
+                  self: {href: '/api/v1/clusters/report?date=2026-10-15&period=1'}
+                  previous: {href: '/api/v1/clusters/report?date=2026-10-14&period=1'}
+        '400':
+          description: Неверная дата или длина периода.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: BAD_PERIOD
+                message: Дата отчёта позже сегодняшней.
+        '404': {$ref: '#/components/responses/ExportDisabled'}
+        '401': {$ref: '#/components/responses/ExportUnauthorized'}
+        '503':
+          description: |
+            База сделок или кластерных событий робота временно недоступна;
+            `MARKET_DATA_NOT_READY` — ядро ещё не открыло рыночную базу.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  # --------------------------------------------------------------- служебное
+  /openapi.yaml:
+    get:
+      tags: [Служебное]
+      summary: Машиночитаемый контракт
+      operationId: getOpenApi
+      security: []
+      responses:
+        '200':
+          description: Действующая спецификация.
+          content:
+            application/yaml:
+              schema: {type: string}
+  /docs:
+    get:
+      tags: [Служебное]
+      summary: Swagger UI
+      operationId: getSwaggerUi
+      security: []
+      responses:
+        '200':
+          description: Интерактивная документация.
+          content:
+            text/html:
+              schema: {type: string}
+
+components:
+  securitySchemes:
+    ControlToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: '`ROBOT_CONTROL_TOKEN` — контуры и ядро.'
+    ExportToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: '`MARKET_DATA_EXPORT_TOKEN` — рыночные данные и отчёт кластеров.'
+
+  headers:
+    RevisionETag:
+      description: Ревизия целевого состояния в кавычках, например `"3"`.
+      schema: {type: string, example: '"3"'}
+    EmulationLocation:
+      description: Адрес контура эмуляции.
+      schema: {type: string, example: /api/v1/emulation}
+    SandboxLocation:
+      description: Адрес контура «Песочница».
+      schema: {type: string, example: /api/v1/sandbox}
+
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        `ETag` из последнего ответа. Если целевое состояние за это
+        время сменило ревизию, команда отклоняется `412 REVISION_CHANGED`. Без
+        заголовка команда применяется к текущему целевому состоянию.
+      schema: {type: string, example: '"3"'}
+    MemberName:
+      name: name
+      in: path
+      required: true
+      description: Тикер акции (`SBER`) или короткое имя контракта (`NG-12.26`).
+      schema: {type: string, minLength: 1}
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      description: |
+        Время приёма прогона `ГГГГММДД-ЧЧММСС[-N]`, совпадает с именем его
+        папки `data/contours/history/<run_id>/`. Префикс `history-` из 1.8
+        не нужен: вид контура уже задан адресом.
+      schema: {type: string, pattern: '^[0-9]{8}-[0-9]{6}(-[0-9]+)?$', example: '20261024-101500'}
+    Tail:
+      name: tail
+      in: query
+      required: false
+      description: Сколько последних строк вернуть.
+      schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+  responses:
+    BadRequest:
+      description: Неверное тело или параметр (`INVALID_REQUEST`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:invalid-request'
+            title: Неверный запрос
+            status: 400
+            code: INVALID_REQUEST
+            detail: Начало диапазона (2026-09-08 10:00) должно быть раньше конца (2026-09-01 10:00).
+    Unauthorized:
+      description: Ключ отсутствует или не подходит (`UNAUTHORIZED`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    ForbiddenHost:
+      description: '`Host` не loopback-адрес сервера (`FORBIDDEN_HOST`).'
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: Ресурса нет (`NOT_FOUND`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    RevisionChanged:
+      description: '`If-Match` не совпал с текущей ревизией (`REVISION_CHANGED`); перечитайте контур.'
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:revision-changed'
+            title: Целевое состояние уже изменилось
+            status: 412
+            code: REVISION_CHANGED
+            detail: 'Ожидалась ревизия 3, текущая 4.'
+    InstrumentsRejected:
+      description: Хотя бы один инструмент отклонён; ничего не изменено (`INSTRUMENTS_REJECTED`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:instruments-rejected'
+            title: Инструменты отклонены
+            status: 422
+            code: INSTRUMENTS_REJECTED
+            detail: Торговля не запущена.
+            rejections:
+              - {instrument: AFLT, reason: У инструмента нет привязок в robot.toml.}
+              - {instrument: NG, reason: 'Код семейства не принимается — укажите контракт; ближайший допустимый — NG-12.26.'}
+    BindingsRejected:
+      description: Хотя бы одна привязка отклонена; ничего не изменено (`BINDINGS_REJECTED`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:bindings-rejected'
+            title: Привязки отклонены
+            status: 422
+            code: BINDINGS_REJECTED
+            detail: Состав не изменён.
+            rejections:
+              - {binding: share-xxx, reason: Привязки нет в конфигурации.}
+    ExportDisabled:
+      description: 'Экспорт выключен: `[market_data] export_enabled = false`.'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ApiError'}
+          example: {code: EXPORT_DISABLED, message: 'Экспорт выключен: [market_data] export_enabled = false.'}
+    ExportBadRequest:
+      description: Неверный параметр или идентификатор вне допустимого диапазона.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    ExportUnauthorized:
+      description: Токен отсутствует или неверен.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    ProducerMismatch:
+      description: Курсор относится к другой локальной БД My Robot.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: PRODUCER_MISMATCH
+            message: Запрошенный producer_id не совпадает с текущим.
+    CursorExpired:
+      description: Курсор старше сохранённого диапазона; требуется сверка.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: CURSOR_EXPIRED
+            message: Часть журнала изменений недоступна; выполните сверку.
+    Unavailable:
+      description: |
+        Локальное рыночное хранилище временно недоступно или ядро ещё не
+        открыло его (`MARKET_DATA_NOT_READY`: робот запущен, ядро стартует
+        или повторяет старт — см. `GET /api/v1/core`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    LogTail:
+      description: Последние строки журнала; секреты уже заменены на `[скрыто]`. Нет журнала — пустой ответ.
+      content:
+        text/plain:
+          schema: {type: string}
+
+  schemas:
+    # ------------------------------------------------------ гипермедиа и ошибки
+    Link:
+      type: object
+      additionalProperties: false
+      required: [href]
+      properties:
+        href: {type: string, description: Относительный адрес.}
+        title: {type: string}
+    Links:
+      type: object
+      description: Ссылки по имени связи (`self`, `log`, `instruments`, …).
+      additionalProperties: {$ref: '#/components/schemas/Link'}
+    Action:
+      type: object
+      additionalProperties: false
+      required: [name, method, href]
+      description: Действие, доступное сейчас. UI показывает кнопку только для действий из ответа.
+      properties:
+        name: {type: string, example: stop}
+        title: {type: string, example: 'Остановить, сделки доживают'}
+        method: {type: string, enum: [GET, POST, PUT, DELETE]}
+        href: {type: string}
+        body:
+          type: object
+          description: Готовое тело запроса; поля-списки клиент заполняет сам.
+    Actions:
+      type: array
+      items: {$ref: '#/components/schemas/Action'}
+    Problem:
+      type: object
+      description: RFC 9457 и поле `code`. Дополнительные поля — только у кодов, где они названы.
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, example: 'urn:my-robot:problem:core-not-ready'}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code:
+          type: string
+          enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
+                 ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
+                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, HISTORY_UNAVAILABLE,
+                 INTERNAL]
+        rejections:
+          type: array
+          description: Только у `INSTRUMENTS_REJECTED`.
+          items: {$ref: '#/components/schemas/Rejection'}
+        core:
+          type: object
+          description: Только у `CORE_NOT_READY` — кратко из `GET /api/v1/core`.
+          properties:
+            state: {type: string}
+            attempts: {type: integer}
+            next_retry_at: {type: string, format: date-time, nullable: true}
+        pid: {type: integer, description: Только у `CONTOUR_DIR_BUSY`.}
+    Rejection:
+      type: object
+      additionalProperties: false
+      required: [instrument, reason]
+      properties:
+        instrument: {type: string, description: Имя из запроса как есть.}
+        reason: {type: string}
+
+    # ------------------------------------------------------------- навигация
+    Home:
+      type: object
+      additionalProperties: false
+      required: [version, core, emulation, history, sandbox, live, _links]
+      properties:
+        version: {type: string}
+        core:
+          type: object
+          required: [state]
+          properties:
+            state: {type: string, enum: [starting, ready, retrying, failed]}
+        emulation:
+          type: object
+          nullable: true
+          description: null — у ключа нет права на контуры.
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            instruments: {type: integer, minimum: 0}
+            open_positions: {type: integer, minimum: 0, nullable: true}
+        history:
+          type: object
+          nullable: true
+          properties:
+            running: {type: integer, minimum: 0}
+            queued: {type: integer, minimum: 0}
+            max: {type: integer, minimum: 1}
+        sandbox:
+          type: object
+          nullable: true
+          description: null — у ключа нет права на контуры.
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            bindings: {type: integer, minimum: 0}
+            frozen: {type: integer, minimum: 0}
+            reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
+        live:
+          type: object
+          nullable: true
+          description: Пока всегда null — контур «Счёт» не реализован.
+        _links: {$ref: '#/components/schemas/Links'}
+
+    # ------------------------------------------------------------------- ядро
+    Core:
+      type: object
+      required: [state, error, attempts, next_retry_at, version, pid, started_at, heartbeat, market_data, quotas, _links]
+      description: Поля — как `CoreState` в 1.8, и `_links`.
+      properties:
+        state: {type: string, enum: [starting, ready, retrying, failed]}
+        error: {type: string, nullable: true}
+        attempts: {type: integer, minimum: 0}
+        next_retry_at: {type: string, format: date-time, nullable: true}
+        version: {type: string}
+        pid: {type: integer}
+        started_at: {type: string, format: date-time, nullable: true}
+        heartbeat:
+          type: object
+          nullable: true
+          properties:
+            beat_at: {type: string, format: date-time, nullable: true}
+            interval_secs: {type: integer, minimum: 1}
+        market_data:
+          type: object
+          nullable: true
+          properties:
+            producer_id: {type: string}
+            pairs:
+              type: object
+              properties:
+                total: {type: integer, minimum: 0}
+                by_status:
+                  type: object
+                  additionalProperties: {type: integer, minimum: 0}
+        quotas:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              per_minute: {type: integer, minimum: 0}
+              ceiling: {type: integer, nullable: true}
+              lanes: {type: object, additionalProperties: {type: integer, minimum: 0}}
+              retry_after: {type: string, format: date-time, nullable: true}
+        _links: {$ref: '#/components/schemas/Links'}
+
+    # ------------------------------ общие части торговых контуров (эмуляция, счёт)
+    TradingState:
+      type: string
+      enum: [waiting_command, starting, running, stopping_no_entries, stopping_close_all, stopped, failed]
+      description: |
+        Сводное состояние для человека. `starting` — процесс запущен, но ещё
+        не подтвердил курсор ленты; `stopping_*` — процесс жив, целевое состояние —
+        остановка; `stopped` — завершился штатно; `failed` — с ошибкой или
+        не запустился.
+    TradingMode:
+      type: string
+      enum: ['on', no_entries, close_all]
+      description: |
+        Режим торговли. `on` — торговать; `no_entries` — новых входов нет,
+        сделки доживают, после последней процесс завершается; `close_all` —
+        закрыть всё на открытии следующего бара и завершиться. `close_all`
+        поверх `no_entries` принимается, обратно — `409 MODE_CONFLICT`.
+    TradingTarget:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [mode, revision]
+      description: Целевое состояние торгового контура (в `core.sqlite3` — `desired`).
+      properties:
+        mode: {$ref: '#/components/schemas/TradingMode'}
+        revision: {type: integer, minimum: 1, description: 'Номер ревизии целевого состояния; растёт с каждой командой, которая что-то меняет.'}
+    TradingCurrent:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [state, applied_revision, open_positions, pending_entries, last_tick_at, core_link]
+      description: Текущее состояние из `status.json` контура (там — `actual`).
+      properties:
+        state: {type: string, nullable: true, enum: [running, stopping_no_entries, stopping_close_all, stopped, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        open_positions: {type: integer, minimum: 0, nullable: true}
+        pending_entries: {type: integer, minimum: 0, nullable: true}
+        last_tick_at: {type: string, format: date-time, nullable: true}
+        core_link: {type: string, nullable: true, enum: [ok, lost, null]}
+    TradingLaunch:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [source, recovery, started_at, request, rejections]
+      description: Как появился текущий процесс.
+      properties:
+        source: {type: string, nullable: true, enum: [api, cli, menu, null], description: '`cli` и `menu` — только у целевого состояния прежних версий.'}
+        recovery:
+          type: string
+          nullable: true
+          enum: [autostart, adopted, null]
+          description: '`autostart` — поднят по целевому состоянию после рестарта; `adopted` — подхвачен живым.'
+        started_at: {type: string, format: date-time, nullable: true}
+        request:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [mode]
+          properties:
+            mode: {type: string, enum: ['on']}
+            instruments:
+              type: array
+              items: {type: string}
+            bindings:
+              type: array
+              items: {type: string}
+              description: Только у контура на брокере — `id` привязок.
+          description: |
+            Эквивалентная команда запуска — объектом, а не JSON строкой, как в 1.8.
+            null — команда записана прежней версией в другом виде.
+        rejections:
+          type: array
+          description: Отказы последней отклонённой команды.
+          items: {$ref: '#/components/schemas/Rejection'}
+    ContourProcess:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [pid, exit_code, exited_at, dir]
+      description: Процесс контура. Общая часть всех видов.
+      properties:
+        pid: {type: integer, nullable: true}
+        exit_code: {type: integer, nullable: true}
+        exited_at: {type: string, format: date-time, nullable: true}
+        dir: {type: string, description: Папка контура относительно папки данных.}
+    Member:
+      type: object
+      additionalProperties: false
+      required: [name, instrument_type, days_to_expiry, target, remove_mode, current, _links, _actions]
+      description: Участник состава торгового контура.
+      properties:
+        name: {type: string, description: 'Короткое имя контракта или тикер акции — то же, что в командах.'}
+        instrument_type: {type: string, nullable: true, enum: [share, future, null]}
+        days_to_expiry: {type: integer, nullable: true}
+        target: {type: string, enum: [active, removed]}
+        remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
+        current:
+          type: string
+          nullable: true
+          enum: [warming, trading, draining, closing, null]
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    MemberList:
+      type: object
+      additionalProperties: false
+      required: [revision, items, _links, _actions]
+      properties:
+        revision: {type: integer, minimum: 1, nullable: true, description: Ревизия целевого состояния; null — проверка инструментов у брокера ещё идёт.}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Member'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    TradingContour:
+      type: object
+      required: [state, target, current, launch, process, instruments, _links, _actions]
+      description: Общая схема долгоживущего торгового контура — эмуляции и будущего «Счёта».
+      properties:
+        state: {$ref: '#/components/schemas/TradingState'}
+        target:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingTarget'}]
+          nullable: true
+          description: null — контур ни разу не запускали.
+        current:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingCurrent'}]
+          nullable: true
+        launch:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingLaunch'}]
+          nullable: true
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        instruments:
+          type: array
+          items: {$ref: '#/components/schemas/Member'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+
+    # ------------------------------------------------------------- песочница
+    Sandbox:
+      type: object
+      additionalProperties: false
+      required: [state, target, current, launch, process, bindings, _links, _actions]
+      description: |
+        Контур «Песочница» на общих частях торгового контура. Отличия от
+        эмуляции: участник состава — привязка, текущее состояние говорит о
+        счёте брокера.
+      properties:
+        state: {$ref: '#/components/schemas/TradingState'}
+        target:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingTarget'}]
+          nullable: true
+        current:
+          type: object
+          allOf: [{$ref: '#/components/schemas/SandboxCurrent'}]
+          nullable: true
+        launch:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingLaunch'}]
+          nullable: true
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        bindings:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    SandboxCurrent:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason]
+      description: Текущее состояние из `status.json` контура.
+      properties:
+        state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        account: {type: string, nullable: true, description: 'Последние четыре символа номера счёта, например `…09c3`.'}
+        capital:
+          type: object
+          nullable: true
+          additionalProperties: false
+          properties:
+            rub: {type: string, description: Рубли на счёте из GetPositions, десятичная строка.}
+            liquid_portfolio: {type: string, nullable: true, description: Из GetMarginAttributes; показывается рядом.}
+        positions:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, lots]
+            properties:
+              name: {type: string, description: Короткое имя контракта или тикер акции.}
+              lots: {type: integer}
+        orders: {type: integer, minimum: 0}
+        stop_orders: {type: integer, minimum: 0}
+        frozen:
+          type: array
+          items: {type: string}
+          description: Замороженные сверщиком инструменты коротким именем.
+        last_reconcile_at: {type: string, format: date-time, nullable: true}
+        account_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        core_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
+    BindingCard:
+      type: object
+      additionalProperties: false
+      required: [id, instrument, strategy, timeframe]
+      properties:
+        id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
+        instrument: {type: string, description: Тикер акции или код семейства фьючерса.}
+        strategy: {type: string}
+        timeframe: {type: string}
+    BindingMember:
+      allOf:
+        - {$ref: '#/components/schemas/BindingCard'}
+        - type: object
+          required: [target, remove_mode, current, _actions]
+          properties:
+            target: {type: string, enum: [active, removed]}
+            remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
+            current: {type: string, nullable: true, enum: [watching, null], description: '`watching` — на этапе С2 привязка в составе, но не торгует.'}
+            _actions: {$ref: '#/components/schemas/Actions'}
+    BindingsView:
+      type: object
+      additionalProperties: false
+      required: [revision, members, available, _links, _actions]
+      properties:
+        revision: {type: integer, minimum: 1, nullable: true}
+        members:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        available:
+          type: array
+          items:
+            allOf:
+              - {$ref: '#/components/schemas/BindingCard'}
+              - type: object
+                required: [trades_in]
+                properties:
+                  trades_in:
+                    type: array
+                    items: {type: string, enum: [emulation, sandbox]}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    SandboxStartRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: ['on']}
+        bindings:
+          type: array
+          items: {type: string, minLength: 1}
+          description: '`id` привязок; без поля — текущий состав.'
+    SandboxTargetRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/SandboxStartRequest'}
+        - {$ref: '#/components/schemas/StopRequest'}
+    BindingsAddRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+    BindingsRemoveRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings, mode]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        mode: {type: string, enum: [no_entries, close_all]}
+    ReconcileReport:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [at, account, result, items, frozen, skipped_in_row]
+      properties:
+        at: {type: string, format: date-time}
+        account: {type: string, description: Последние четыре символа номера счёта.}
+        result: {type: string, enum: [ok, mismatch, skipped]}
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [instrument, what, account, journal]
+            properties:
+              instrument: {type: string, description: Короткое имя.}
+              what: {type: string, enum: [position, order, stop_order]}
+              account: {type: integer, description: 'Лоты позиции или число заявок на счёте.'}
+              journal: {type: integer, description: То же по журналу контура.}
+        frozen:
+          type: array
+          items: {type: string}
+        skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
+
+    # ------------------------------------------------------------- эмуляция
+    Emulation:
+      allOf:
+        - {$ref: '#/components/schemas/TradingContour'}
+      description: Контур эмуляции. Своих полей сверх общей схемы пока нет.
+    StartRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: ['on']}
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Тикеры акций и короткие имена контрактов; без поля — `all`.
+    StopRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [no_entries, close_all]}
+    EmulationTargetRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/StartRequest'}
+        - {$ref: '#/components/schemas/StopRequest'}
+    InstrumentsAddRequest:
+      type: object
+      additionalProperties: false
+      required: [instruments]
+      properties:
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Тикеры акций и короткие имена контрактов.
+    InstrumentsRemoveRequest:
+      type: object
+      additionalProperties: false
+      required: [instruments]
+      properties:
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Тикеры акций и короткие имена контрактов из состава.
+        mode: {type: string, enum: [no_entries, close_all], default: no_entries}
+
+    # --------------------------------------------------------------- история
+    HistoryRunRequest:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from: {type: string, example: '2026-09-01 10:00', description: 'ГГГГ-ММ-ДД ЧЧ:ММ; без зоны — UTC.'}
+        to: {type: string, example: '2026-09-08 10:00', description: 'Конец, не входит в прогон.'}
+        pause: {type: number, minimum: 0, default: 1, description: 'Пауза между тиками, секунд.'}
+        instruments:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+          description: Тикеры акций, коды семейств (автоматическая цепочка) и короткие имена контрактов (фиксированный); без поля — `all`.
+    HistoryRunState:
+      type: string
+      enum: [queued, starting, running, stopping, finished, stopped, failed, cancelled, interrupted]
+    HistoryRun:
+      type: object
+      additionalProperties: false
+      required: [id, state, request, accepted_at, started_at, finished_at, queue_position, reason,
+                 market_data_sync, progress, process, _links, _actions]
+      properties:
+        id: {type: string, example: '20261024-101500'}
+        state: {$ref: '#/components/schemas/HistoryRunState'}
+        request: {$ref: '#/components/schemas/HistoryRunRequest'}
+        accepted_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time, nullable: true}
+        finished_at: {type: string, format: date-time, nullable: true}
+        queue_position: {type: integer, minimum: 1, nullable: true}
+        reason: {type: string, nullable: true, description: 'Причина отказа, отмены или сбоя.'}
+        market_data_sync:
+          type: object
+          nullable: true
+          properties:
+            status: {type: string, nullable: true}
+            snapshot_generation: {type: integer, nullable: true}
+        progress:
+          type: object
+          nullable: true
+          description: Ход по рыночному времени из `status.json`; переименован из `actual`, чтобы не путать с `current` торговых контуров торговых контуров.
+          properties:
+            phase: {type: string, nullable: true, enum: [checking, running, finishing, null]}
+            start: {type: string, format: date-time, nullable: true}
+            end: {type: string, format: date-time, nullable: true}
+            market_now: {type: string, format: date-time, nullable: true}
+            ticks: {type: integer, nullable: true}
+            fraction: {type: number, nullable: true, minimum: 0, maximum: 1}
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    HistoryRunList:
+      type: object
+      additionalProperties: false
+      required: [limits, items, _links]
+      properties:
+        limits:
+          type: object
+          required: [max, running, queued]
+          properties:
+            max: {type: integer, minimum: 0, description: '`[contours] max_history_runs`.'}
+            running: {type: integer, minimum: 0}
+            queued: {type: integer, minimum: 0}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/HistoryRun'}
+        _links: {$ref: '#/components/schemas/Links'}
+    HistoryReport:
+      type: object
+      additionalProperties: false
+      required: [covered, stop_reason, trades, net_pnl, fees, balance, open_positions, _links]
+      properties:
+        covered: {type: boolean}
+        stop_reason: {type: string}
+        trades: {type: integer, minimum: 0}
+        net_pnl: {$ref: '#/components/schemas/Money'}
+        fees: {$ref: '#/components/schemas/Money'}
+        balance: {$ref: '#/components/schemas/Money'}
+        open_positions:
+          type: array
+          items: {type: string}
+        _links: {$ref: '#/components/schemas/Links'}
+
+    # ------------------------------------- рыночные данные и кластеры (как в 1.8)
+    SourceInfo:
+      type: object
+      additionalProperties: false
+      required: [producer_id, schema_version, min_after_id, max_change_id]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+          description: Постоянен до пересоздания локальной БД.
+        schema_version:
+          type: integer
+          minimum: 1
+        min_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Наименьший курсор, с которого доступна полная выдача. Растёт по
+            правилу хранения ленты ([market_data] changes_retention_days), но
+            не дальше наименьшего подтверждённого курсора потребителей;
+            курсор меньше него получает 410.
+        max_change_id:
+          type: integer
+          format: int64
+          minimum: 0
+    ChangePage:
+      type: object
+      additionalProperties: false
+      required: [producer_id, next_after_id, has_more, changes]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        next_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Последний change_id страницы либо исходный after_id при пустом ответе.
+        has_more:
+          type: boolean
+        changes:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/CandleChange'
+              - $ref: '#/components/schemas/IntervalStatusChange'
+    ScheduleChangePage:
+      type: object
+      additionalProperties: false
+      required: [producer_id, next_after_id, has_more, changes]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        next_after_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Последний change_id страницы (schedule_change_id) либо исходный after_id при пустом ответе.
+        has_more:
+          type: boolean
+        changes:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/ScheduleDayChange'
+              - $ref: '#/components/schemas/ScheduleBindingChange'
+    ScheduleDayChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, source, exchange, observed_at, day]
+      properties:
+        change_id: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [schedule_day]}
+        source: {type: string, example: tbank}
+        exchange:
+          type: string
+          description: Код режима торгов в нижнем регистре.
+          example: moex_mrng_evng_e_wknd_dlr
+        observed_at: {type: string, format: date-time}
+        day:
+          type: object
+          additionalProperties: false
+          required: [trading_date, version, raw_json, is_trading_day, last_confirmed_at]
+          properties:
+            trading_date: {type: string, format: date, description: Торговая дата по МСК.}
+            version: {type: string, description: sha256 канонического JSON исходного TradingDay.}
+            raw_json: {type: string, description: Канонический JSON исходного TradingDay (UTC ISO).}
+            is_trading_day: {type: boolean}
+            last_confirmed_at: {type: string, format: date-time}
+    ScheduleBindingChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, source, exchange, instrument_uid, observed_at]
+      properties:
+        change_id: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [schedule_binding]}
+        source: {type: string, example: tbank}
+        exchange: {type: string, description: Код режима торгов в нижнем регистре.}
+        instrument_uid: {type: string}
+        observed_at: {type: string, format: date-time}
+    CandleChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, recorded_at, candle]
+      properties:
+        change_id:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum: [candle_upsert]
+        recorded_at:
+          type: string
+          format: date-time
+        candle:
+          $ref: '#/components/schemas/CompleteCandle'
+    IntervalStatusChange:
+      type: object
+      additionalProperties: false
+      required: [change_id, kind, recorded_at, interval_status]
+      properties:
+        change_id:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum: [interval_status]
+        recorded_at:
+          type: string
+          format: date-time
+        interval_status:
+          $ref: '#/components/schemas/IntervalStatus'
+    CompleteCandle:
+      type: object
+      additionalProperties: false
+      required: [source, instrument_uid, interval, open_time_utc, open, high, low, close, volume, is_complete, revision, received_at]
+      properties:
+        source:
+          type: string
+          description: Идентификатор брокерского источника и типа свечи.
+        instrument_uid:
+          type: string
+          minLength: 1
+        interval:
+          type: string
+          minLength: 1
+          example: 1m
+        open_time_utc:
+          type: string
+          format: date-time
+        open:
+          $ref: '#/components/schemas/DecimalPrice'
+        high:
+          $ref: '#/components/schemas/DecimalPrice'
+        low:
+          $ref: '#/components/schemas/DecimalPrice'
+        close:
+          $ref: '#/components/schemas/DecimalPrice'
+        volume:
+          type: integer
+          format: int64
+          minimum: 0
+        is_complete:
+          type: boolean
+          enum: [true]
+        revision:
+          type: integer
+          minimum: 1
+        received_at:
+          type: string
+          format: date-time
+    DecimalPrice:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]+)?$'
+      description: Десятичное число строкой для сохранения точности.
+      example: '301.75'
+    IntervalStatus:
+      type: object
+      additionalProperties: false
+      required: [source, instrument_uid, interval, open_time_utc, state, observed_at, evidence]
+      properties:
+        source:
+          type: string
+        instrument_uid:
+          type: string
+          minLength: 1
+        interval:
+          type: string
+          example: 1m
+        open_time_utc:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [received, scheduled_closed, confirmed_no_trade, pending, unresolved]
+        observed_at:
+          type: string
+          format: date-time
+        evidence:
+          type: string
+          minLength: 1
+          description: Источник и основание классификации интервала.
+    CheckpointRequest:
+      type: object
+      additionalProperties: false
+      required: [producer_id, change_id]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        change_id:
+          type: integer
+          format: int64
+          minimum: 0
+    CheckpointResponse:
+      type: object
+      additionalProperties: false
+      required: [producer_id, consumer_id, acknowledged_through]
+      properties:
+        producer_id:
+          type: string
+          format: uuid
+        consumer_id:
+          type: string
+        acknowledged_through:
+          type: integer
+          format: int64
+          minimum: 0
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: CURSOR_EXPIRED
+        message:
+          type: string
+    Decimal:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]+)?$'
+      description: Десятичное число строкой.
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount: {$ref: '#/components/schemas/Decimal'}
+        currency: {type: string, example: RUB}
+    HalLink:
+      type: object
+      additionalProperties: false
+      required: [href]
+      properties:
+        href:
+          type: string
+          description: Относительный адрес ресурса.
+    ClusterVerdict:
+      type: string
+      enum: [veto_strong, veto, confirm, neutral, unknown]
+      description: |
+        veto_strong — запрет и цена у края 2ч диапазона по направлению входа;
+        veto — запрет; confirm — подтверждение; neutral — без влияния;
+        unknown — кластерных данных нет, вход пропущен как без фильтра.
+    ClusterVerdictReason:
+      type: string
+      enum: [climax, initiative, no_evidence, no_coverage, contract_mismatch, data_degraded, consumer_lag, no_sigma_history, candles_missing]
+    PriceMoveStats:
+      type: object
+      additionalProperties: false
+      required: [n]
+      properties:
+        n:
+          type: integer
+          minimum: 0
+          description: Сигналов, у которых горизонт уже наступил.
+        mean_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+        median_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+        hit_rate:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+          description: Доля сигналов, после которых цена пошла в их сторону (0..1).
+    PriceMove:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [pending, final, no_data]
+        move_bps:
+          allOf: [{$ref: '#/components/schemas/Decimal'}]
+          nullable: true
+    ClustersReportGroup:
+      type: object
+      additionalProperties: false
+      required: [verdict, signals, trades, trades_net_pnl, trades_won, trades_lost, price_move]
+      properties:
+        verdict: {$ref: '#/components/schemas/ClusterVerdict'}
+        signals: {type: integer, minimum: 0}
+        trades:
+          type: integer
+          minimum: 0
+          description: Сколько сигналов группы стали сделкой (есть исполнение).
+        trades_net_pnl: {$ref: '#/components/schemas/Money'}
+        trades_won: {type: integer, minimum: 0}
+        trades_lost: {type: integer, minimum: 0}
+        price_move:
+          type: object
+          description: Ключ — горизонт в минутах из horizons_min.
+          additionalProperties: {$ref: '#/components/schemas/PriceMoveStats'}
+    ClustersReportSignal:
+      type: object
+      additionalProperties: false
+      required: [signal_id, bar_close, instrument, assignment_id, strategy, timeframe, side, price, verdict, reason, message, trade, price_move]
+      properties:
+        signal_id:
+          type: string
+          description: Идентификатор входного события стратегии; по нему вердикт связан со сделкой.
+        bar_close: {type: string, format: date-time}
+        instrument:
+          type: string
+          description: Тикер контракта или акции (BRX6, SBER).
+        assignment_id: {type: string}
+        strategy: {type: string}
+        timeframe: {type: string, example: 5m}
+        side:
+          type: string
+          enum: [BUY, SELL]
+        price: {$ref: '#/components/schemas/Decimal'}
+        verdict: {$ref: '#/components/schemas/ClusterVerdict'}
+        reason: {$ref: '#/components/schemas/ClusterVerdictReason'}
+        message:
+          type: string
+          description: Тот же текст, что был в консоли в строке «Кластеры».
+        trade:
+          type: object
+          nullable: true
+          description: null — сигнал не стал сделкой.
+          additionalProperties: false
+          required: [trade_id, net_pnl]
+          properties:
+            trade_id: {type: string}
+            net_pnl:
+              allOf: [{$ref: '#/components/schemas/Money'}]
+              nullable: true
+              description: null — сделка ещё открыта.
+        price_move:
+          type: object
+          additionalProperties: {$ref: '#/components/schemas/PriceMove'}
+    ClustersReport:
+      type: object
+      additionalProperties: false
+      required: [period, mode, generated_at, horizons_min, groups, veto_effect, signals, _links]
+      properties:
+        period:
+          type: object
+          additionalProperties: false
+          required: [from, to, days]
+          properties:
+            from: {type: string, format: date}
+            to: {type: string, format: date}
+            days: {type: integer, minimum: 1}
+        mode:
+          type: string
+          enum: [off, shadow, enforce, mixed]
+          description: Режим фильтра у привязок в периоде; mixed — режимы различались.
+        generated_at: {type: string, format: date-time}
+        horizons_min:
+          type: array
+          items: {type: integer}
+        groups:
+          type: array
+          description: Только группы, в которых есть хотя бы один сигнал.
+          items: {$ref: '#/components/schemas/ClustersReportGroup'}
+        veto_effect:
+          type: object
+          additionalProperties: false
+          required: [includes, trades_removed, winners_removed, winners_net_pnl, losers_removed, losers_net_pnl, net_effect]
+          properties:
+            includes:
+              type: array
+              items: {$ref: '#/components/schemas/ClusterVerdict'}
+            trades_removed: {type: integer, minimum: 0}
+            winners_removed: {type: integer, minimum: 0}
+            winners_net_pnl: {$ref: '#/components/schemas/Money'}
+            losers_removed: {type: integer, minimum: 0}
+            losers_net_pnl: {$ref: '#/components/schemas/Money'}
+            net_effect:
+              allOf: [{$ref: '#/components/schemas/Money'}]
+              description: Плюс — запрет улучшил бы результат.
+        signals:
+          type: array
+          description: Все сигналы периода по возрастанию bar_close.
+          items: {$ref: '#/components/schemas/ClustersReportSignal'}
+        _links:
+          type: object
+          additionalProperties: false
+          required: [self]
+          properties:
+            self: {$ref: '#/components/schemas/HalLink'}
+            previous:
+              allOf: [{$ref: '#/components/schemas/HalLink'}]
+              description: Предыдущий период той же длины.
+            next:
+              allOf: [{$ref: '#/components/schemas/HalLink'}]
+              description: Следующий период той же длины; нет, если он целиком в будущем.
+security:
+  - ExportToken: []
