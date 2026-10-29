@@ -57,3 +57,29 @@ def test_missing_channel_disables_telegram_with_warning(monkeypatch, capsys):
 
     assert "Telegram контура выключен: в .env не задан TELEGRAM_EMULATION_CHANNEL_ID" in capsys.readouterr().out
     assert not channels[0]._enabled
+
+
+def test_sandbox_section_defaults():
+    from src import config
+
+    assert config._DEFAULTS["contours_sandbox_telegram_bot_env"] == "TELEGRAM_ACCOUNT_BOT_TOKEN"
+    assert config._DEFAULTS["contours_sandbox_telegram_channel_env"] == "TELEGRAM_SANDBOX_CHANNEL_ID"
+    assert config._DEFAULTS["contours_sandbox_reconcile_every_min"] == 1
+
+
+def test_sandbox_section_values(tmp_path):
+    config = _load(tmp_path, '[contours.sandbox]\ntelegram_channel_env = "SANDBOX_CHANNEL"\nreconcile_every_min = 5\n')
+    assert config["contours_sandbox_telegram_channel_env"] == "SANDBOX_CHANNEL"
+    assert config["contours_sandbox_reconcile_every_min"] == 5
+
+
+def test_sandbox_bindings_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="PUT /api/v1/sandbox/target"):
+        _load(tmp_path, '[contours.sandbox]\nbindings = ["future-ng-macd"]\n')
+
+
+@pytest.mark.parametrize("text", ["reconcile_every_min = 0", "reconcile_every_min = 61", "telegram_bot_env = \"bot-token\"",
+                                  "orders = true"])
+def test_sandbox_bad_values(tmp_path, text):
+    with pytest.raises(ConfigError, match="contours.sandbox"):
+        _load(tmp_path, f"[contours.sandbox]\n{text}\n")

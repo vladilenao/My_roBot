@@ -174,7 +174,57 @@ def _history(visual, step, unit, offset):
     return lines
 
 
+CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
+WHAT_LABELS = {"position": "позиция", "order": "заявки", "stop_order": "стоп-заявки"}
+
+
+def _money(value) -> str:
+    amount = Decimal(str(value))
+    text = f"{amount:,.0f}" if amount == amount.to_integral_value() else f"{amount:,.2f}"
+    return text.replace(",", " ") + " ₽"
+
+
+def render_broker_account(event) -> str:
+    """Сообщение контура на брокере (add-sandbox-contour): старт, сверка, остановка."""
+    title = CONTOUR_TITLES.get(event.get("contour"), escape(str(event.get("contour"))).upper())
+    kind = event.get("kind")
+    account = escape(str(event.get("account")))
+    if kind == "started":
+        lines = [f"<b>{title} · Контур запущен</b>", f"Счёт {account}"]
+        if event.get("rub") is not None:
+            money = "Рубли: " + _money(event.get("rub"))
+            if event.get("liquid_portfolio") is not None:
+                money += " · ликвидный портфель " + _money(event.get("liquid_portfolio"))
+            lines.append(money)
+        holdings = event.get("holdings") or ()
+        lines.append(f"Позиций: {len(holdings)} · заявок: {event.get('orders', 0)} · "
+                     f"стоп-заявок: {event.get('stop_orders', 0)}")
+        lines.extend(escape(f"  {item['name']}: {item['lots']} лот.") for item in holdings)
+        lines.append(f"Привязок в составе: {event.get('bindings', 0)} · ревизия {event.get('generation', '—')}")
+    elif kind == "reconcile_alarm":
+        lines = [f"<b>{title} · ТРЕВОГА · Сверка счёта</b>", f"Счёт {account}"]
+        if event.get("reason"):
+            lines.append(escape(event.get("reason")))
+        for item in event.get("mismatches") or ():
+            lines.append(escape(f"{item['instrument']}: {WHAT_LABELS.get(item['what'], item['what'])} — "
+                                f"на счёте {item['account']}, по журналу {item['journal']}"))
+        if event.get("frozen"):
+            lines.append("Заморожены: " + escape(", ".join(event.get("frozen"))))
+        lines.append("Снять заморозку: выровнять счёт и дождаться следующей сверки.")
+    elif kind == "reconcile_cleared":
+        lines = [f"<b>{title} · Расхождение устранено</b>", f"Счёт {account} совпадает с журналом контура."]
+        if event.get("unfrozen"):
+            lines.append("Разморожены: " + escape(", ".join(event.get("unfrozen"))))
+    else:
+        lines = [f"<b>{title} · Контур остановлен</b>", f"Счёт {account}"]
+        if event.get("reason"):
+            lines.append("Причина: " + escape(event.get("reason")))
+    return "\n".join(lines)
+
+
 def render(event, *, root=False, tz_offset_hours=0):
+    if event.type is EventType.BROKER_ACCOUNT:
+        return render_broker_account(event)
     visual = event.get("visual")
     instrument = escape(event.instrument or "контракт не указан")
     if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:

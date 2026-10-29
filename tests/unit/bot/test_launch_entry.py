@@ -45,7 +45,12 @@ class TestMain:
 
     def test_unknown_contour_kind(self, capsys):
         assert run.main(["--contour", "account"]) == 2
-        assert "emulation и history" in capsys.readouterr().out
+        assert "emulation, history и sandbox" in capsys.readouterr().out
+
+    @patch("run._run_broker_contour", return_value=0)
+    def test_sandbox_contour_entry(self, run_broker_contour):
+        assert run.main(["--contour", "sandbox"]) == 0
+        run_broker_contour.assert_called_once_with("sandbox")
 
 
 def test_waits_for_command_until_accepted(capsys):
@@ -104,6 +109,7 @@ def test_control_key_is_a_logging_secret():
     source = inspect.getsource(run)
     secrets = next(node.value for node in ast.parse(source).body
                    if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "_SECRETS")
-    names = {item.id for item in secrets.elts}
-    assert {"ROBOT_CONTROL_TOKEN", "MARKET_STRUCTURE_REDIS_PASSWORD", "TINKOFF_SANDBOX_TOKEN"} <= names
+    names = {item.func.id if isinstance(item, ast.Call) else item.id for item in secrets.elts}
+    assert {"ROBOT_CONTROL_TOKEN", "MARKET_STRUCTURE_REDIS_PASSWORD", "TINKOFF_SANDBOX_TOKEN",
+            "sandbox_bot_token"} <= names
     assert source.count("secrets=_SECRETS") >= 3

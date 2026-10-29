@@ -2,7 +2,7 @@
 
 | Файл | Что описывает |
 |---|---|
-| [openapi.yaml](openapi.yaml) | HTTP API робота, версия 2.0.0: точка входа, ядро, эмуляция, история, экспорт рыночных данных, отчёт кластеров |
+| [openapi.yaml](openapi.yaml) | HTTP API робота, версия 2.1.0: точка входа, ядро, эмуляция, история, песочница, экспорт рыночных данных, отчёт кластеров |
 | [market-events.asyncapi.yaml](market-events.asyncapi.yaml) | События рыночной структуры в Redis Stream |
 | [v2-decisions.md](v2-decisions.md) | Решения API 2.0, таблица «было → станет», план «Счёта» и справочника |
 
@@ -13,7 +13,7 @@
 
 | Ключ | Переменная `.env` | Что открывает |
 |---|---|---|
-| `ControlToken` | `ROBOT_CONTROL_TOKEN` | `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`; только с `Host` 127.0.0.1, localhost или [::1] |
+| `ControlToken` | `ROBOT_CONTROL_TOKEN` | `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`, `/api/v1/sandbox…`; только с `Host` 127.0.0.1, localhost или [::1] |
 | `ExportToken` | `MARKET_DATA_EXPORT_TOKEN` | `/api/v1/market-data/…`, `/api/v1/clusters/report` |
 
 Точка входа `GET /api/v1` принимает любой из двух ключей и показывает
@@ -27,6 +27,7 @@ flowchart LR
     home["GET /api/v1"] --> core["/core"]
     home --> emu["/emulation"]
     home --> hist["/history"]
+    home --> sbx["/sandbox"]
     home --> md["/market-data/…"]
     home --> cl["/clusters/report"]
     emu --> target["/target — режим: on, no_entries, close_all"]
@@ -35,7 +36,16 @@ flowchart LR
     hist --> run["/{run_id}"] --> stop["/stop"]
     run --> report["/report"]
     run --> rlog["/log"]
+    sbx --> starget["/target — on, no_entries, close_all"]
+    sbx --> bindings["/bindings — состав из привязок, /remove — убрать"]
+    sbx --> rec["/reconcile — последний отчёт сверщика"]
+    sbx --> slog["/log"]
 ```
+
+**Песочница (2.1.0, add-sandbox-contour).** Контур на брокере в песочнице
+Т-Инвест. Состав — привязки (`id` из `[strategies.*]`), а не инструменты;
+меняется командами и без запущенного процесса. На этапе С2 контур только
+читает счёт и сверяет его с журналом: заявок нет, `confirm` не нужен.
 
 ## Форматы
 

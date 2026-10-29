@@ -21,6 +21,13 @@ EMULATION_INSTRUMENTS = EMULATION + "/instruments"
 EMULATION_REMOVE = EMULATION_INSTRUMENTS + "/remove"
 EMULATION_LOG = EMULATION + "/log"
 HISTORY = "/api/v1/history"
+# Контур «Песочница» (add-sandbox-contour): состав — привязки, а не инструменты.
+SANDBOX = "/api/v1/sandbox"
+SANDBOX_TARGET = SANDBOX + "/target"
+SANDBOX_BINDINGS = SANDBOX + "/bindings"
+SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
+SANDBOX_RECONCILE = SANDBOX + "/reconcile"
+SANDBOX_LOG = SANDBOX + "/log"
 
 MODE_ON = "on"
 NO_ENTRIES = "no_entries"
@@ -41,6 +48,7 @@ PROBLEM_TITLES = {
     "CONTOUR_DIR_BUSY": "Папка контура занята",
     "REVISION_CHANGED": "Целевое состояние уже изменилось",
     "INSTRUMENTS_REJECTED": "Инструменты отклонены",
+    "BINDINGS_REJECTED": "Привязки отклонены",
     "HISTORY_UNAVAILABLE": "Очередь истории недоступна",
     "INTERNAL": "Внутренняя ошибка",
 }
@@ -122,6 +130,32 @@ def member_action_list(name: str, names) -> list[dict]:
     return [_action(action, *table[action]) for action in names]
 
 
+def sandbox_actions(*, alive: bool, mode: str | None, can_start: bool) -> tuple[str, ...]:
+    """Команды песочницы, которые сервер примет сейчас; состав меняется и без процесса."""
+    if alive:
+        if mode in (None, MODE_ON):
+            return ("stop", "stop-close-all", "add-bindings")
+        return ("stop-close-all", "add-bindings") if mode == NO_ENTRIES else ("add-bindings",)
+    return ("start", "add-bindings") if can_start else ("add-bindings",)
+
+
+def sandbox_action_list(names) -> list[dict]:
+    table = {
+        "start": ("Запустить песочницу", "PUT", SANDBOX_TARGET, {"mode": MODE_ON}),
+        "stop": ("Остановить", "PUT", SANDBOX_TARGET, {"mode": NO_ENTRIES}),
+        "stop-close-all": ("Остановить, закрыть свои сделки", "PUT", SANDBOX_TARGET, {"mode": CLOSE_ALL}),
+        "add-bindings": ("Добавить привязки", "POST", SANDBOX_BINDINGS, {"bindings": []}),
+    }
+    return [_action(name, *table[name]) for name in names]
+
+
+def binding_action_list(binding: str, active: bool) -> list[dict]:
+    if active:
+        return [_action("remove", "Убрать из песочницы", "POST", SANDBOX_REMOVE,
+                        {"bindings": [binding], "mode": NO_ENTRIES})]
+    return [_action("restore", "Вернуть в песочницу", "POST", SANDBOX_BINDINGS, {"bindings": [binding]})]
+
+
 def run_action_list(run_id: str, names) -> list[dict]:
     table = {"cancel": "Убрать из очереди", "stop": "Остановить с отчётом"}
     return [_action(name, table[name], "POST", run_href(run_id) + "/stop") for name in names]
@@ -135,7 +169,8 @@ def problem(status: int, code: str, detail: str, extra: dict | None = None) -> d
             "status": int(status), "code": code, "detail": detail}
     extra = extra or {}
     if extra.get("rejections") is not None:
-        body["rejections"] = [{"instrument": item.get("instrument", item.get("token")), "reason": item.get("reason")}
+        body["rejections"] = [{"binding": item["binding"], "reason": item.get("reason")} if "binding" in item else
+                              {"instrument": item.get("instrument", item.get("token")), "reason": item.get("reason")}
                               for item in extra["rejections"]]
     if isinstance(extra.get("core"), dict):
         body["core"] = {name: extra["core"].get(name) for name in _CORE_BRIEF}

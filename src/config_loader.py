@@ -137,6 +137,9 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_queue_maxsize": int,
     "market_structure_retention_days": int,
     "contours_emulation_telegram_channel_env": str,
+    "contours_sandbox_telegram_bot_env": str,
+    "contours_sandbox_telegram_channel_env": str,
+    "contours_sandbox_reconcile_every_min": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -596,11 +599,16 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [market_structure] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
-        if key == "contours_emulation_telegram_channel_env" and not _ENV_NAME.fullmatch(value):
+        if key in ("contours_emulation_telegram_channel_env", "contours_sandbox_telegram_bot_env",
+                   "contours_sandbox_telegram_channel_env") and not _ENV_NAME.fullmatch(value):
+            kind, option = key.removeprefix("contours_").split("_", 1)
             raise ConfigError(
-                f"{path}: [contours.emulation] telegram_channel_env — имя переменной окружения "
+                f"{path}: [contours.{kind}] {option} — имя переменной окружения "
                 f"(заглавные латинские буквы, цифры и _), получено {value!r}"
             )
+        if key == "contours_sandbox_reconcile_every_min" and (isinstance(value, bool) or not 1 <= value <= 60):
+            raise ConfigError(f"{path}: [contours.sandbox] reconcile_every_min должен быть целым числом от 1 до 60, "
+                              f"получено {value!r}")
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
         if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
@@ -954,9 +962,10 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
                     f"{path}: [contours] market_feed удалён — контур эмуляции всегда читает ленту ядра "
                     f"отдельным процессом (add-contour-process); удалите эту строку"
                 )
-            emulation = mapping.pop("emulation", None)
-            if emulation is not None:
-                flat.update(_parse_contour_section("emulation", emulation, path))
+            for kind in _CONTOUR_KEYS:
+                contour = mapping.pop(kind, None)
+                if contour is not None:
+                    flat.update(_parse_contour_section(kind, contour, path))
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):
@@ -1024,7 +1033,11 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
                 raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
 
 
-_CONTOUR_KEYS = {"telegram_channel_env"}
+_CONTOUR_KEYS = {
+    "emulation": {"telegram_channel_env"},
+    # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
+    "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min"},
+}
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -1032,10 +1045,16 @@ def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
     """Секция ``[contours.<вид>]``: строгие ключи, плоские имена ``contours_<вид>_<ключ>``."""
     if not isinstance(value, dict):
         raise ConfigError(f"{path}: [contours.{kind}] должна быть таблицей")
-    unknown = set(value) - _CONTOUR_KEYS
+    if kind == "sandbox" and "bindings" in value:
+        raise ConfigError(
+            f"{path}: [contours.sandbox] bindings не задаётся в конфиге — состав песочницы задаётся командой "
+            f"PUT /api/v1/sandbox/target или POST /api/v1/sandbox/bindings"
+        )
+    allowed = _CONTOUR_KEYS[kind]
+    unknown = set(value) - allowed
     if unknown:
         raise ConfigError(
-            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(_CONTOUR_KEYS)}"
+            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(allowed)}"
         )
     return {f"contours_{kind}_{key}": item for key, item in value.items()}
 

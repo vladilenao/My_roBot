@@ -379,6 +379,21 @@ def _system(event: Event, stamp: str) -> Block | None:
     return None
 
 
+def _broker_account(event: Event, stamp: str) -> Block:
+    """Контур на брокере (add-sandbox-contour): одна строка в консоли ядра."""
+    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    kind = event.get("kind")
+    if kind == "reconcile_alarm":
+        frozen = ", ".join(event.get("frozen") or ()) or "—"
+        return Block(stamp, label, f"Сверка: расхождение · заморожены {frozen}", role="warning")
+    if kind == "reconcile_cleared":
+        return Block(stamp, label, "Сверка: расхождение устранено", role="muted")
+    if kind == "started":
+        return Block(stamp, label, f"Контур запущен · счёт {event.get('account')}", role="muted")
+    return Block(stamp, label, "Контур остановлен" + (f" · {event.get('reason')}" if event.get("reason") else ""),
+                 role="muted")
+
+
 def status_row(event: Event, anchor: datetime) -> str:
     state = event.get("data_state")
     value = _name(event)
@@ -445,6 +460,8 @@ def render(event: Event, *, now: datetime | None = None,
     if event.type is EventType.MARKET_DATA_STATUS:
         return render_status_group((event,), width=width, color=color)
     stamp = when(event, now)
+    if event.type is EventType.BROKER_ACCOUNT:
+        return _broker_account(event, stamp).render(width=width, color=color)
     if event.type is EventType.DECISION:
         block = _decision(event, stamp)
     elif event.type is EventType.SIGNAL:

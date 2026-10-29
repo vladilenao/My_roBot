@@ -102,6 +102,9 @@ _DEFAULTS = {
     # Одновременных прогонов истории, остальные ждут в очереди (add-history-contour).
     "contours_max_history_runs": 2,
     "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
+    "contours_sandbox_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
+    "contours_sandbox_telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
+    "contours_sandbox_reconcile_every_min": 1,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -180,11 +183,25 @@ CONTOURS_HEARTBEAT_TIMEOUT_SECS = _CONFIG["contours_heartbeat_timeout_secs"]
 CONTOURS_AUTOSTART = _CONFIG["contours_autostart"]
 CONTOURS_MAX_HISTORY_RUNS = _CONFIG["contours_max_history_runs"]
 CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_channel_env"]
+# Контур «Песочница» (add-sandbox-contour): имена переменных .env бота и канала, частота сверки.
+CONTOUR_SANDBOX_TELEGRAM_BOT_ENV = _CONFIG["contours_sandbox_telegram_bot_env"]
+CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_sandbox_telegram_channel_env"]
+CONTOUR_SANDBOX_RECONCILE_EVERY_MIN = _CONFIG["contours_sandbox_reconcile_every_min"]
 
 
 def telegram_channel_id() -> str | None:
     """Id канала Telegram контура эмуляции из переменной, названной в ``[contours.emulation]``."""
     return os.getenv(CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV) or None
+
+
+def sandbox_bot_token() -> str | None:
+    """Токен бота контура «Песочница» из переменной, названной в ``[contours.sandbox]`` (секрет)."""
+    return os.getenv(CONTOUR_SANDBOX_TELEGRAM_BOT_ENV) or None
+
+
+def sandbox_channel_id() -> str | None:
+    """Id канала контура «Песочница» из переменной, названной в ``[contours.sandbox]``."""
+    return os.getenv(CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV) or None
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
 MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]
