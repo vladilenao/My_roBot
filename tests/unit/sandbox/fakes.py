@@ -83,8 +83,12 @@ class FakeBroker:
             executed_order_price=money(price), executed_commission=money("1.5"), initial_commission=money("1.5"))
         self.orders[order.order_id] = order
         kind = s.OperationType.OPERATION_TYPE_BUY if sign > 0 else s.OperationType.OPERATION_TYPE_SELL
-        self.operations.append(s.OperationItem(type=kind, instrument_uid=uid, commission=money("1.5"),
-                                               payment=money(-price)))
+        executed = s.OperationState.OPERATION_STATE_EXECUTED
+        self.operations.append(s.OperationItem(type=kind, state=executed, instrument_uid=uid,
+                                               commission=money("-1.5"), payment=money(-price)))
+        self.operations.append(s.OperationItem(type=s.OperationType.OPERATION_TYPE_BROKER_FEE, state=executed,
+                                               instrument_uid=uid, commission=s.MoneyValue(currency="", units=0, nano=0),
+                                               payment=money("-1.5")))
         self.push(order)
         return order
 

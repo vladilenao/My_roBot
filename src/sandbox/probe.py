@@ -21,6 +21,7 @@ from pathlib import Path
 from t_tech.invest.schemas import (
     GetMaxLotsRequest,
     GetOperationsByCursorRequest,
+    OperationState,
     OperationType,
     OrderDirection,
     OrderExecutionReportStatus,
@@ -224,8 +225,8 @@ class Probe:
             return False
         balance = rub_balance(self.gateway, self.account)
         detail = f"счёт {self.account.masked}" + (", открыт сейчас" if self.account.opened else "")
-        if balance < self.settings.min_rub:
-            amount = Decimal(self.settings.min_rub) - balance
+        amount = (Decimal(self.settings.min_rub) - balance).quantize(Decimal("0.01"))
+        if amount > 0:
             self.gateway.call("sandbox.sandbox_pay_in", account_id=self.account.account_id,
                               amount=decimal_to_money(amount, "rub"))
             detail += f", пополнен на {rub(amount)} до {rub(Decimal(self.settings.min_rub))}"
@@ -471,12 +472,17 @@ class Probe:
             items = self.gateway.call("operations.get_operations_by_cursor", GetOperationsByCursorRequest(
                 account_id=self.account.account_id, instrument_id=self.instrument.uid,
                 from_=self.started_at - timedelta(minutes=1), to=self.timing.clock() + timedelta(minutes=1))).items
-            buys = [item for item in items if item.type == OperationType.OPERATION_TYPE_BUY]
+            done = [item for item in items if item.state == OperationState.OPERATION_STATE_EXECUTED]
+            buys = [item for item in done if item.type == OperationType.OPERATION_TYPE_BUY]
             if buys:
-                fees = [money_to_decimal(item.commission) for item in buys if money_to_decimal(item.commission)]
-                fees += [abs(money_to_decimal(item.payment)) for item in items
-                         if item.type == OperationType.OPERATION_TYPE_BROKER_FEE]
-                fee = f"комиссия {rub(sum(fees, Decimal(0)))}" if fees else "комиссии в операциях нет"
+                # Песочница отдаёт комиссию дважды: полем покупки (с минусом) и
+                # отдельной операцией «комиссия брокера». Берётся одно из двух.
+                fees = [abs(money_to_decimal(item.payment)) for item in done
+                        if item.type == OperationType.OPERATION_TYPE_BROKER_FEE]
+                if not fees:
+                    fees = [abs(money_to_decimal(item.commission)) for item in buys if item.commission.currency]
+                total = sum(fees, Decimal(0))
+                fee = f"комиссия {rub(total)}" if total else "комиссии в операциях нет"
                 self._set("П12", YES, f"покупка видна через {waited:g} с, {fee}")
                 return True
             if waited >= self.timing.operations_wait_secs:

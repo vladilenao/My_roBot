@@ -59,6 +59,7 @@ def test_everything_works_stop_executed():
     assert set(_outcomes(probe).values()) == {YES}, probe.report_lines()
     assert "NG → NG-12.26" in probe.results["П3"].detail
     assert "брокер вернул ту же заявку" in probe.results["П8"].detail
+    assert probe.results["П12"].detail == "покупка видна через 0 с, комиссия 1.50 ₽"
     assert broker.positions == {}
 
 
