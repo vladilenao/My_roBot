@@ -155,7 +155,10 @@ class TestCore:
                                 members=[Member(ng.key, ng.instrument, ng.chosen, stored), sber])
         desired = env.store.desired("emulation")
         started = []
-        factory = lambda kind, on_exit: SimpleNamespace(start=lambda: started.append(kind) or 777)
+
+        def factory(kind, on_exit):
+            return SimpleNamespace(start=lambda: started.append(kind) or 777)
+
         live._start_contour_process(recovery.RecoveryPlan(recovery.AUTOSTART, members=desired.members).instruments(),
                                     kind="emulation", control=None, source="", command="",
                                     core_state=env.store, process_factory=factory, desired=desired)
