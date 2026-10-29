@@ -292,6 +292,22 @@ def test_reconnect_requires_new_ack_and_old_epoch_does_not_close_candles(tmp_pat
     assert supervisor.pairs[UID, "1m"]["status"] == "acknowledged"
 
 
+def test_ack_for_retired_pair_completes_handoff_when_pair_is_requested_again(tmp_path):
+    """Старт ядра: пару сохранённого состава сняли до ACK, контур запросил её снова (fix-stream-handoff-retired-pair)."""
+    cache, _, worker, supervisor, _, _, _ = setup(tmp_path)
+    supervisor.set_roster({(UID, "1m")})
+    supervisor.epoch = 1
+    supervisor._subscribe(FakeSession(), 1)
+    cache.unregister_live_pair(UID, "1m")   # контур ещё не заявил спрос
+    supervisor._receive(ack("1m"), epoch=1)
+    assert supervisor.pairs[UID, "1m"]["status"] == "acknowledged"
+    cache.register_live_pair(ITEM, UID, "1m")
+    cache.mark_live_history(UID, "1m", done=True)
+    worker.run_until_idle()
+    assert supervisor.pairs[UID, "1m"]["status"] == "ready"
+    assert cache.pair_status(ITEM, "1m")["state"] == "READY"
+
+
 def test_restart_with_cached_frame_is_not_ready_without_ack_and_handoff(tmp_path):
     cache, store, worker, supervisor, _, _, _ = setup(tmp_path)
     cache.accept_rpc_frame(UID, "1m", pd.DataFrame({"datetime": [pd.Timestamp("2026-10-12 12:00")], "open": 100,
