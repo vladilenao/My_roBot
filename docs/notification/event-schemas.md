@@ -1277,6 +1277,57 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 }
 ```
 
+## Контур на брокере
+
+### `broker_account`
+
+Событие контура на брокере (add-sandbox-contour): контур «Песочница», позже —
+«Счёт». `kind`: `started` — допуск пройден; `reconcile_alarm` — сверщик нашёл
+расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
+нет; `stopped` — штатный выход. `account` — только последние четыре символа
+номера счёта. Деньги — десятичные строки. Инструменты — короткие имена.
+Доставляется в канал своего контура, каналам эмуляции не отправляется.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload broker_account",
+  "type": "object",
+  "required": ["kind", "contour", "account", "event_id"],
+  "properties": {
+    "kind": {"type": "string"},
+    "contour": {"type": "string"},
+    "account": {"type": "string"},
+    "event_id": {"type": "string"},
+    "rub": {"type": "string"},
+    "liquid_portfolio": {"type": "string"},
+    "holdings": {"type": "array", "items": {
+      "type": "object",
+      "required": ["name", "lots"],
+      "properties": {"name": {"type": "string"}, "lots": {"type": "number"}},
+      "additionalProperties": false
+    }},
+    "orders": {"type": "number"},
+    "stop_orders": {"type": "number"},
+    "bindings": {"type": "number"},
+    "generation": {"type": "number"},
+    "mismatches": {"type": "array", "items": {
+      "type": "object",
+      "required": ["instrument", "what", "account", "journal"],
+      "properties": {
+        "instrument": {"type": "string"}, "what": {"type": "string"},
+        "account": {"type": "number"}, "journal": {"type": "number"}
+      },
+      "additionalProperties": false
+    }},
+    "frozen": {"type": "array", "items": {"type": "string"}},
+    "unfrozen": {"type": "array", "items": {"type": "string"}},
+    "reason": {"type": "string"}
+  },
+  "additionalProperties": false
+}
+```
+
 ## Служебные события
 
 Служебные события не относятся к конкретной сделке: у них пустой `trade_id`.

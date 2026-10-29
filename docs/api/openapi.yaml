@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.0.0
+  version: 2.1.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -17,6 +17,8 @@ info:
       меняется на ходу.
     * `/api/v1/history` — прогоны истории: много, очередь, каждый
       выполняется до конца.
+    * `/api/v1/sandbox` — контур на брокере в песочнице Т-Инвест (2.1.0):
+      один, состав из привязок, на этапе С2 только читает счёт и сверяет его.
 
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
@@ -72,6 +74,8 @@ tags:
     description: Контур эмуляции — один, живёт долго, состав меняется на ходу.
   - name: История
     description: Прогоны истории — очередь, выполнение до конца, отчёт.
+  - name: Песочница
+    description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
   - name: Рыночные данные
     description: Лента изменений для Historical Broker API Emulator. Как в 1.8, без изменений.
   - name: Кластеры
@@ -514,6 +518,284 @@ paths:
       tags: [Эмуляция]
       summary: Последние строки журнала эмуляции
       operationId: getEmulationLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  # -------------------------------------------------------------- песочница
+  /api/v1/sandbox:
+    get:
+      tags: [Песочница]
+      summary: Контур «Песочница»
+      description: |
+        Контур на брокере в песочнице Т-Инвест: общее, целевое и текущее
+        состояние, запуск, процесс, состав из привязок и действия, доступные
+        сейчас. На этапе С2 контур только читает счёт и сверяет его с журналом:
+        заявок нет. `ETag` — ревизия целевого состояния.
+      operationId: getSandbox
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур «Песочница».
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+              examples:
+                alarm:
+                  summary: Работает, на счёте ручная позиция
+                  value:
+                    state: running
+                    target: {mode: 'on', revision: 2}
+                    current:
+                      state: running
+                      applied_revision: 2
+                      account: '…09c3'
+                      capital: {rub: '976039.46', liquid_portfolio: '1023916.40'}
+                      positions: [{name: NG-11.26, lots: 1}]
+                      orders: 0
+                      stop_orders: 0
+                      frozen: [NG-11.26]
+                      last_reconcile_at: '2026-10-30T09:15:00Z'
+                      account_link: ok
+                      core_link: ok
+                      reason: null
+                    launch:
+                      source: api
+                      recovery: null
+                      started_at: '2026-10-30T09:10:02Z'
+                      request: {mode: 'on', bindings: [future-ng-macd]}
+                      rejections: []
+                    process: {pid: 90211, exit_code: null, exited_at: null, dir: contours/sandbox}
+                    bindings:
+                      - id: future-ng-macd
+                        instrument: NG
+                        strategy: macd_rsi_stoch
+                        timeframe: 15m
+                        target: active
+                        remove_mode: null
+                        current: watching
+                        _actions:
+                          - {name: remove, title: Убрать из песочницы, method: POST, href: /api/v1/sandbox/bindings/remove, body: {bindings: [future-ng-macd], mode: no_entries}}
+                    _links:
+                      self: {href: /api/v1/sandbox}
+                      target: {href: /api/v1/sandbox/target}
+                      bindings: {href: /api/v1/sandbox/bindings}
+                      reconcile: {href: /api/v1/sandbox/reconcile}
+                      log: {href: /api/v1/sandbox/log}
+                    _actions:
+                      - {name: stop, title: Остановить, method: PUT, href: /api/v1/sandbox/target, body: {mode: no_entries}}
+                      - {name: add-bindings, title: Добавить привязки, method: POST, href: /api/v1/sandbox/bindings, body: {bindings: []}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/sandbox/target:
+    get:
+      tags: [Песочница]
+      summary: Целевое состояние песочницы
+      operationId: getSandboxTarget
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Целевое состояние; `null` — контур ни разу не запускали.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradingTarget'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    put:
+      tags: [Песочница]
+      summary: Запустить или остановить песочницу
+      description: |
+        **Запустить** `{"mode": "on", "bindings": [...]}` — `bindings` это `id`
+        привязок из `[strategies.*]`; без поля — с текущим составом (может
+        быть пустым). Неизвестный `id` — `422 BINDINGS_REJECTED`, запуска нет.
+
+        **Остановить** `{"mode": "no_entries"}` или `{"mode": "close_all"}`.
+        На этапе С2 у контура нет своих сделок: оба режима завершают процесс на
+        ближайшем шаге, а `close_all` ручные позиции на счёте не трогает.
+
+        `confirm` не нужен: денег в песочнице нет.
+      operationId: putSandboxTarget
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SandboxTargetRequest'}
+            examples:
+              start:
+                summary: Запустить с одной привязкой газа
+                value: {mode: 'on', bindings: [future-ng-macd]}
+              stop:
+                summary: Остановить
+                value: {mode: no_entries}
+      responses:
+        '202':
+          description: Целевое состояние записано новой ревизией; следить — `GET /api/v1/sandbox`.
+          headers:
+            Location: {$ref: '#/components/headers/SandboxLocation'}
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+        '200':
+          description: Повтор той же остановки; ревизия прежняя.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY` — как у эмуляции.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/bindings:
+    get:
+      tags: [Песочница]
+      summary: Состав песочницы и все привязки конфигурации
+      description: |
+        `members` — состав песочницы. `available` — все привязки
+        `[strategies.*]` с `trades_in`: где каждая сейчас торгует
+        (`emulation` — инструмент привязки в составе эмуляции, `sandbox` —
+        привязка в составе песочницы). По этому списку выбирают, что
+        переводить дальше.
+      operationId: getSandboxBindings
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состав и привязки.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Песочница]
+      summary: Добавить привязки в песочницу
+      description: |
+        Принимается и тогда, когда процесс не запущен: меняет состав для
+        следующего запуска. Уже в составе — `200` без новой ревизии.
+      operationId: addSandboxBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsAddRequest'}
+            example: {bindings: [future-ng-macd]}
+      responses:
+        '202':
+          description: Состав изменён новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/bindings/remove:
+    post:
+      tags: [Песочница]
+      summary: Убрать привязки из песочницы
+      operationId: removeSandboxBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsRemoveRequest'}
+            example: {bindings: [future-ng-macd], mode: no_entries}
+      responses:
+        '202':
+          description: Состав изменён новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений — привязки уже сняты.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/reconcile:
+    get:
+      tags: [Песочница]
+      summary: Последний отчёт сверщика
+      description: |
+        Сверка счёта песочницы с журналом контура: при старте и раз в
+        `reconcile_every_min`. На этапе С2 журнал пуст, поэтому всё, что есть
+        на счёте, — расхождение «на счёте есть, в журнале нет».
+      operationId: getSandboxReconcile
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Отчёт; `null` — сверки ещё не было.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconcileReport'}
+              example:
+                at: '2026-10-30T09:15:00Z'
+                account: '…09c3'
+                result: mismatch
+                items: [{instrument: NG-11.26, what: position, account: 1, journal: 0}]
+                frozen: [NG-11.26]
+                skipped_in_row: 0
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/sandbox/log:
+    get:
+      tags: [Песочница]
+      summary: Последние строки журнала песочницы
+      operationId: getSandboxLog
       security:
         - ControlToken: []
       parameters:
@@ -1103,6 +1385,9 @@ components:
     EmulationLocation:
       description: Адрес контура эмуляции.
       schema: {type: string, example: /api/v1/emulation}
+    SandboxLocation:
+      description: Адрес контура «Песочница».
+      schema: {type: string, example: /api/v1/sandbox}
 
   parameters:
     IfMatch:
@@ -1187,6 +1472,19 @@ components:
             rejections:
               - {instrument: AFLT, reason: У инструмента нет привязок в robot.toml.}
               - {instrument: NG, reason: 'Код семейства не принимается — укажите контракт; ближайший допустимый — NG-12.26.'}
+    BindingsRejected:
+      description: Хотя бы одна привязка отклонена; ничего не изменено (`BINDINGS_REJECTED`).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:bindings-rejected'
+            title: Привязки отклонены
+            status: 422
+            code: BINDINGS_REJECTED
+            detail: Состав не изменён.
+            rejections:
+              - {binding: share-xxx, reason: Привязки нет в конфигурации.}
     ExportDisabled:
       description: 'Экспорт выключен: `[market_data] export_enabled = false`.'
       content:
@@ -1280,12 +1578,15 @@ components:
           type: string
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
-                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, HISTORY_UNAVAILABLE,
-                 INTERNAL]
+                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
+                 HISTORY_UNAVAILABLE, INTERNAL]
         rejections:
           type: array
-          description: Только у `INSTRUMENTS_REJECTED`.
-          items: {$ref: '#/components/schemas/Rejection'}
+          description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
+          items:
+            oneOf:
+              - {$ref: '#/components/schemas/Rejection'}
+              - {$ref: '#/components/schemas/BindingRejection'}
         core:
           type: object
           description: Только у `CORE_NOT_READY` — кратко из `GET /api/v1/core`.
@@ -1301,12 +1602,19 @@ components:
       properties:
         instrument: {type: string, description: Имя из запроса как есть.}
         reason: {type: string}
+    BindingRejection:
+      type: object
+      additionalProperties: false
+      required: [binding, reason]
+      properties:
+        binding: {type: string, description: '`id` привязки из запроса как есть.'}
+        reason: {type: string}
 
     # ------------------------------------------------------------- навигация
     Home:
       type: object
       additionalProperties: false
-      required: [version, core, emulation, history, live, _links]
+      required: [version, core, emulation, history, sandbox, live, _links]
       properties:
         version: {type: string}
         core:
@@ -1329,6 +1637,15 @@ components:
             running: {type: integer, minimum: 0}
             queued: {type: integer, minimum: 0}
             max: {type: integer, minimum: 1}
+        sandbox:
+          type: object
+          nullable: true
+          description: null — у ключа нет права на контуры.
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            bindings: {type: integer, minimum: 0}
+            frozen: {type: integer, minimum: 0}
+            reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
         live:
           type: object
           nullable: true
@@ -1440,6 +1757,10 @@ components:
             instruments:
               type: array
               items: {type: string}
+            bindings:
+              type: array
+              items: {type: string}
+              description: Только у контура на брокере — `id` привязок.
           description: |
             Эквивалентная команда запуска — объектом, а не JSON строкой, как в 1.8.
             null — команда записана прежней версией в другом виде.
@@ -1514,6 +1835,173 @@ components:
           items: {$ref: '#/components/schemas/Member'}
         _links: {$ref: '#/components/schemas/Links'}
         _actions: {$ref: '#/components/schemas/Actions'}
+
+    # ------------------------------------------------------------- песочница
+    Sandbox:
+      type: object
+      additionalProperties: false
+      required: [state, target, current, launch, process, bindings, _links, _actions]
+      description: |
+        Контур «Песочница» на общих частях торгового контура. Отличия от
+        эмуляции: участник состава — привязка, текущее состояние говорит о
+        счёте брокера.
+      properties:
+        state: {$ref: '#/components/schemas/TradingState'}
+        target:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingTarget'}]
+          nullable: true
+        current:
+          type: object
+          allOf: [{$ref: '#/components/schemas/SandboxCurrent'}]
+          nullable: true
+        launch:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingLaunch'}]
+          nullable: true
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        bindings:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    SandboxCurrent:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason]
+      description: Текущее состояние из `status.json` контура.
+      properties:
+        state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        account: {type: string, nullable: true, description: 'Последние четыре символа номера счёта, например `…09c3`.'}
+        capital:
+          type: object
+          nullable: true
+          additionalProperties: false
+          properties:
+            rub: {type: string, description: Рубли на счёте из GetPositions, десятичная строка.}
+            liquid_portfolio: {type: string, nullable: true, description: Из GetMarginAttributes; показывается рядом.}
+        positions:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, lots]
+            properties:
+              name: {type: string, description: Короткое имя контракта или тикер акции.}
+              lots: {type: integer}
+        orders: {type: integer, minimum: 0}
+        stop_orders: {type: integer, minimum: 0}
+        frozen:
+          type: array
+          items: {type: string}
+          description: Замороженные сверщиком инструменты коротким именем.
+        last_reconcile_at: {type: string, format: date-time, nullable: true}
+        account_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        core_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
+    BindingCard:
+      type: object
+      additionalProperties: false
+      required: [id, instrument, strategy, timeframe, trades_in]
+      description: Привязка конфигурации и где она сейчас торгует.
+      properties:
+        id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
+        instrument: {type: string, description: Тикер акции или код семейства фьючерса.}
+        strategy: {type: string}
+        timeframe: {type: string}
+        trades_in:
+          type: array
+          items: {type: string, enum: [emulation, sandbox]}
+    BindingMember:
+      type: object
+      additionalProperties: false
+      required: [id, instrument, strategy, timeframe, target, remove_mode, current, _actions]
+      description: Участник состава песочницы — привязка.
+      properties:
+        id: {type: string}
+        instrument: {type: string}
+        strategy: {type: string}
+        timeframe: {type: string}
+        target: {type: string, enum: [active, removed]}
+        remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
+        current: {type: string, nullable: true, enum: [watching, null], description: '`watching` — на этапе С2 привязка в составе, но не торгует.'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    BindingsView:
+      type: object
+      additionalProperties: false
+      required: [revision, members, available, _links, _actions]
+      properties:
+        revision: {type: integer, minimum: 1, nullable: true}
+        members:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        available:
+          type: array
+          items: {$ref: '#/components/schemas/BindingCard'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    SandboxStartRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: ['on']}
+        bindings:
+          type: array
+          items: {type: string, minLength: 1}
+          description: '`id` привязок; без поля — текущий состав.'
+    SandboxTargetRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/SandboxStartRequest'}
+        - {$ref: '#/components/schemas/StopRequest'}
+    BindingsAddRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+    BindingsRemoveRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings, mode]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        mode: {type: string, enum: [no_entries, close_all]}
+    ReconcileReport:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [at, account, result, items, frozen, skipped_in_row]
+      properties:
+        at: {type: string, format: date-time}
+        account: {type: string, description: Последние четыре символа номера счёта.}
+        result: {type: string, enum: [ok, mismatch, skipped]}
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [instrument, what, account, journal]
+            properties:
+              instrument: {type: string, description: Короткое имя.}
+              what: {type: string, enum: [position, order, stop_order]}
+              account: {type: integer, description: 'Лоты позиции или число заявок на счёте.'}
+              journal: {type: integer, description: То же по журналу контура.}
+        frozen:
+          type: array
+          items: {type: string}
+        skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
 
     # ------------------------------------------------------------- эмуляция
     Emulation:

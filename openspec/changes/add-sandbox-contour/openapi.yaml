@@ -1578,12 +1578,15 @@ components:
           type: string
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
-                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, HISTORY_UNAVAILABLE,
-                 INTERNAL]
+                 CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
+                 HISTORY_UNAVAILABLE, INTERNAL]
         rejections:
           type: array
-          description: Только у `INSTRUMENTS_REJECTED`.
-          items: {$ref: '#/components/schemas/Rejection'}
+          description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
+          items:
+            oneOf:
+              - {$ref: '#/components/schemas/Rejection'}
+              - {$ref: '#/components/schemas/BindingRejection'}
         core:
           type: object
           description: Только у `CORE_NOT_READY` — кратко из `GET /api/v1/core`.
@@ -1598,6 +1601,13 @@ components:
       required: [instrument, reason]
       properties:
         instrument: {type: string, description: Имя из запроса как есть.}
+        reason: {type: string}
+    BindingRejection:
+      type: object
+      additionalProperties: false
+      required: [binding, reason]
+      properties:
+        binding: {type: string, description: '`id` привязки из запроса как есть.'}
         reason: {type: string}
 
     # ------------------------------------------------------------- навигация
@@ -1897,22 +1907,30 @@ components:
     BindingCard:
       type: object
       additionalProperties: false
-      required: [id, instrument, strategy, timeframe]
+      required: [id, instrument, strategy, timeframe, trades_in]
+      description: Привязка конфигурации и где она сейчас торгует.
       properties:
         id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
         instrument: {type: string, description: Тикер акции или код семейства фьючерса.}
         strategy: {type: string}
         timeframe: {type: string}
+        trades_in:
+          type: array
+          items: {type: string, enum: [emulation, sandbox]}
     BindingMember:
-      allOf:
-        - {$ref: '#/components/schemas/BindingCard'}
-        - type: object
-          required: [target, remove_mode, current, _actions]
-          properties:
-            target: {type: string, enum: [active, removed]}
-            remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
-            current: {type: string, nullable: true, enum: [watching, null], description: '`watching` — на этапе С2 привязка в составе, но не торгует.'}
-            _actions: {$ref: '#/components/schemas/Actions'}
+      type: object
+      additionalProperties: false
+      required: [id, instrument, strategy, timeframe, target, remove_mode, current, _actions]
+      description: Участник состава песочницы — привязка.
+      properties:
+        id: {type: string}
+        instrument: {type: string}
+        strategy: {type: string}
+        timeframe: {type: string}
+        target: {type: string, enum: [active, removed]}
+        remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
+        current: {type: string, nullable: true, enum: [watching, null], description: '`watching` — на этапе С2 привязка в составе, но не торгует.'}
+        _actions: {$ref: '#/components/schemas/Actions'}
     BindingsView:
       type: object
       additionalProperties: false
@@ -1924,15 +1942,7 @@ components:
           items: {$ref: '#/components/schemas/BindingMember'}
         available:
           type: array
-          items:
-            allOf:
-              - {$ref: '#/components/schemas/BindingCard'}
-              - type: object
-                required: [trades_in]
-                properties:
-                  trades_in:
-                    type: array
-                    items: {type: string, enum: [emulation, sandbox]}
+          items: {$ref: '#/components/schemas/BindingCard'}
         _links: {$ref: '#/components/schemas/Links'}
         _actions: {$ref: '#/components/schemas/Actions'}
     SandboxStartRequest:

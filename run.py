@@ -23,6 +23,11 @@ from src.config import (
     SHARE_STRATEGIES,
     TINKOFF_TOKEN,
     TINKOFF_SANDBOX_TOKEN,
+    sandbox_bot_token,
+    sandbox_channel_id,
+    CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
+    CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
+    CONTOUR_SANDBOX_RECONCILE_EVERY_MIN,
     LOGGING_SERVICE_UID,
     LOGGING_FILE,
     LOGGING_LEVEL,
@@ -81,7 +86,7 @@ log = get_logger(__name__)
 
 _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD,
-            TINKOFF_SANDBOX_TOKEN)
+            TINKOFF_SANDBOX_TOKEN, sandbox_bot_token())
 
 
 def main(argv=None):
@@ -111,10 +116,14 @@ def _run_contour(kind: str, args=()) -> int:
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
+    from src.broker_contour import SANDBOX
+
     if kind == MODE_HISTORY:
         return _run_history_contour(args[0] if args else "")
+    if kind == SANDBOX:
+        return _run_broker_contour(kind)
     if kind != MODE_EMULATION:
-        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION} и {MODE_HISTORY}.")
+        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION}, {MODE_HISTORY} и {SANDBOX}.")
         return 2
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -170,6 +179,64 @@ def _run_contour(kind: str, args=()) -> int:
         contour.close()
     log.info("Контур %s остановлен: %s", kind, stop.reason or "цикл завершён")
     return 0
+
+
+def _run_broker_contour(kind: str) -> int:
+    """Процесс контура на брокере (add-sandbox-contour): на С2 — песочница, только чтение счёта."""
+    import signal
+
+    from src.assembly.process import LaunchFileError, StdinStop, read_launch
+    from src.assembly.pulse import CorePulse
+    from src.broker_contour.notify import build_channels
+    from src.broker_contour.process import BrokerContour, BrokerContourSettings
+    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
+    from src.events.bus import EventBus
+    from src.notifier.factory import close_channels
+    from src.sandbox.gateway import SandboxGateway
+
+    data_dir = runtime_dir()
+    directory = contour_dir(data_dir, kind)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        acquire_runtime_lock(directory)
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
+    setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE), secrets=_SECRETS,
+                  **_log_settings(False, None))
+    log.info("Контур %s v%s запущен", kind, __version__)
+    try:
+        read_launch(directory, kind)
+    except LaunchFileError as exc:
+        log.error("%s", exc)
+        print(str(exc))
+        return 2
+    stop = StdinStop()
+    stop.start()
+    signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    settings = BrokerContourSettings(
+        contour_id=kind, broker=kind, directory=directory, core_db=data_dir / CORE_DATABASE_FILE,
+        version=__version__, token=TINKOFF_SANDBOX_TOKEN, token_env="TINKOFF_SANDBOX_TOKEN",
+        bot_token=sandbox_bot_token(), bot_env=CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
+        channel_id=sandbox_channel_id(), channel_env=CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
+        reconcile_every_secs=CONTOUR_SANDBOX_RECONCILE_EVERY_MIN * 60)
+    bus, channels = EventBus(), []
+    if settings.bot_token and settings.channel_id:
+        channels = build_channels(bot_token=settings.bot_token, channel_id=settings.channel_id, directory=directory,
+                                  cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
+                                  request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
+                                  max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS)
+        bus.subscribe_all(channels)
+    contour = BrokerContour(settings, gateway_factory=SandboxGateway, bus=bus, stop=stop, pid=os.getpid())
+    pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
+                      timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
+    pulse.start()
+    try:
+        return contour.run()
+    finally:
+        pulse.close()
+        close_channels(channels)
 
 
 def _run_history_contour(name: str) -> int:
@@ -261,6 +328,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     core.starter = CoreStarter(core, token_required=client_provider is None)
     control.core_status = core.core_snapshot
     control.contour_busy = lambda: _contour_busy(state_dir)
+    sandbox = _sandbox_supervisor(state_dir, core_state)
     try:
         server = core.start_control_api(control)
     except OSError as exc:
@@ -268,12 +336,15 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
              f"({type(exc).__name__}) — порт занят другим процессом?")
         pulse.stop()
         return 2
+    server.sandbox = _sandbox_control(sandbox, core_state)
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
     history.start()
     code = 0
     try:
         if core.starter.run():
+            # Контур на брокере — раньше эмуляции (add-sandbox-contour): после рестарта он поднимается первым.
+            sandbox.recover()
             code = _serve_emulation(state_dir, core, core_state, control, client_provider)
         else:
             _wait_for_ctrl_c()
@@ -283,8 +354,31 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         # «Остановлено» в пульсе — раньше ожидания прогонов: подхваченные прогоны узнают об остановке из него.
         pulse.stop()
         history.close()
+        sandbox.stop()
         core.close()
     return code
+
+
+def _sandbox_supervisor(state_dir, core_state):
+    """Надзиратель контура «Песочница»: свой поток ядра рядом с эмуляцией (add-sandbox-contour)."""
+    from src.assembly.broker_supervisor import BrokerContourSupervisor
+    from src.broker_contour import SANDBOX
+
+    return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
+                                   autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
+                                   heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _sandbox_control(supervisor, core_state):
+    from src.bot.sandbox_control import SandboxControl
+
+    def emulation_members():
+        desired = core_state.desired(MODE_EMULATION)
+        return () if desired is None else desired.members
+
+    return SandboxControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
+                          share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
+                          emulation_members=emulation_members, log_file=LOGGING_FILE)
 
 
 def _wait_for_ctrl_c() -> None:

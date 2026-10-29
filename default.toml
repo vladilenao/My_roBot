@@ -50,6 +50,11 @@ max_history_runs = 2  # Сколько прогонов истории идёт 
 [contours.emulation]
 telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env с id канала Telegram контура (сам id — только в .env).
 
+[contours.sandbox]
+telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Песочница».
+telegram_channel_env = "TELEGRAM_SANDBOX_CHANNEL_ID"  # Имя переменной .env с id канала «Песочница».
+reconcile_every_min = 1  # Как часто сверять счёт песочницы с журналом контура, минут (1–60). Состав — только командами API.
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"

@@ -315,6 +315,14 @@ class Event:
         )
 
     @classmethod
+    def broker_account(cls, kind: str, *, contour: str, account: str, event_id: str, **fields: Any) -> "Event":
+        """Событие контура на брокере (add-sandbox-contour): ``started``, ``reconcile_alarm``,
+        ``reconcile_cleared``, ``stopped``. ``account`` — только последние символа номера."""
+        return cls._make(EventType.BROKER_ACCOUNT,
+                         payload={"kind": kind, "contour": contour, "account": account, "event_id": event_id,
+                                  **{key: value for key, value in fields.items() if value is not None}})
+
+    @classmethod
     def clearing_done(cls, *, balance: Any = None, positions: int = 0, bar_time: Any = None) -> "Event":
         """Сверка счёта завершена: снимок баланса и число открытых позиций."""
         return cls._make(

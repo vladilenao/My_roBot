@@ -102,6 +102,11 @@ def _samples() -> dict[EventType, Event]:
             }]),
         EventType.MARKET_DATA_STATUS: Event.market_data_status("SBER", timeframe="1h", session="unknown",
             data_state="waiting_bar", observed_at=datetime(2026, 10, 12)),
+        EventType.BROKER_ACCOUNT: Event.broker_account(
+            "reconcile_alarm", contour="sandbox", account="…09c3", event_id="e-1", rub=Decimal("1000000"),
+            holdings=[{"name": "NG-11.26", "lots": 1}], orders=0, stop_orders=0, bindings=1, generation=2,
+            mismatches=[{"instrument": "NG-11.26", "what": "position", "account": 1, "journal": 0}],
+            frozen=["NG-11.26"], unfrozen=[], liquid_portfolio=Decimal("1023916.4"), reason=""),
         EventType.DECISION: Event.decision("NG-10.26", outcome="signal_buy", side="BUY"),
         EventType.SIGNAL: Event.signal("NG-10.26", side="BUY", quantity=1, entry=1, stop=2),
         EventType.REJECTED: Event.rejected("NG-10.26", reason="мало"),
