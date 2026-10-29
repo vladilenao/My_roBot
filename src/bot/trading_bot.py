@@ -8,19 +8,22 @@ from uuid import uuid4
 
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
-from src.config import BAR_TIME_TZ_OFFSET_HOURS
+from src.config import BAR_TIME_TZ_OFFSET_HOURS, TIMEFRAMES
 from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
 from src.events.event import Event
+from src.events.visual import CANDLE_LIMIT
 from src.trade_management.notification import signal_snapshot
 from src.logging_setup import correlation_id_var, get_logger
+from src.market_context.lazy import LazyMarketContext
 from src.notifier.errors import is_rate_limit
 from src.scheduler.clock import as_aware
 from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
 from src.history.contract_lifecycle import ConstantContractLifecycle, ContractLifecycleError
+from src.history.warmup import obligation_requirements
 
 log = get_logger(__name__)
 
@@ -59,6 +62,17 @@ class _EntryCandidate:
             instrument_key(self.instrument),
             self.decision.event_id or "",
         )
+
+
+def assignments_for(instrument: Instrument, share_strategies, future_strategies) -> list[Assignment]:
+    """Привязки инструмента: акция — по тикеру, фьючерс — по семейству."""
+    if instrument.instrument_type == "future":
+        if isinstance(instrument.family, str):
+            from src.instruments.futures import FAMILIES
+            return future_strategies.get(instrument.family,
+                future_strategies.get(FAMILIES[instrument.family][0], []))
+        return future_strategies.get(instrument.ticker[:2].upper(), [])
+    return share_strategies.get(instrument.ticker, [])
 
 
 class TradingBot:
@@ -116,6 +130,8 @@ class TradingBot:
         self._trade_manager = trade_manager
         self._action_executor = action_executor
         self._protection_timeframe = protection_timeframe
+        # Последний переданный менеджеру кадр графика по паре: (бар, длина).
+        self._remembered_markets: dict[tuple[str, str], tuple] = {}
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)
@@ -124,6 +140,8 @@ class TradingBot:
         self._contract_lifecycle = contract_lifecycle or ConstantContractLifecycle(self._instruments)
         self._tick_count = 0
         self._errors_in_period = 0
+        # Живой анализ — для изменения состава контура на ходу (add-contour-membership).
+        self._live_analysis = None
         self._heartbeat_countdown = self._heartbeat_every
 
     # ── ПУНКТ 1: запуск ──
@@ -171,6 +189,7 @@ class TradingBot:
     def _loop_live(self):
         from src.bot.live_analysis import LiveAnalysis
         live = LiveAnalysis(self)
+        self._live_analysis = live
         try:
             live.bootstrap()
             changed = getattr(self._data_cache, "wait_for_data_change", None)
@@ -303,6 +322,14 @@ class TradingBot:
             self._bus.publish(Event.tick_finished(tick_id=tick_id, completed=completed))
             correlation_id_var.set(None)
 
+    def _lazy_context(self, instrument: Instrument, tf: str, frame) -> LazyMarketContext:
+        """Контекст ТФ считается, только если его прочтут фильтр или сопровождение."""
+        name = self._display_name(instrument)
+        return LazyMarketContext(
+            lambda: self._context_cache.get_context(instrument, tf, frame),
+            on_load=lambda context: log.debug("%s %s | контекст: %s", name, tf, context),
+        )
+
     def _take_data_gap(self):
         """Забирает найденный кэшем разрыв в данных (одноразово, ``None`` — разрыва нет)."""
         take = getattr(self._data_cache, "take_pending_gap", None)
@@ -326,7 +353,14 @@ class TradingBot:
     ) -> None:
         assignments = self._strategies_for(instrument)
         assigned_tfs = {assignment.timeframe for assignment in assignments}
-        management_tfs = {self._protection_timeframe} if self._trade_manager is not None else set()
+        # Защитный 1m нужен действиям, не связанным с баром (таймаут входа,
+        # экспирация); профиль на нём не считается — менеджер сопровождает
+        # сделку только кадром таймфрейма её плана.
+        management_needs = set(self._management_needs(instrument)) if self._trade_manager is not None else set()
+        management_tfs = (
+            {self._protection_timeframe} | management_needs
+            if self._trade_manager is not None else set()
+        )
         for tf in sorted(
             (assigned_tfs | management_tfs) & ready_tfs,
             key=lambda timeframe: (timeframe != self._protection_timeframe, timeframe),
@@ -335,7 +369,7 @@ class TradingBot:
             if frame.empty:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
-            context = self._context_cache.get_context(instrument, tf) if self._context_cache else None
+            context = self._lazy_context(instrument, tf, frame) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
             log.debug(
                 "%s %s | получено свечей=%d, последний бар O=%.4f H=%.4f L=%.4f C=%.4f",
@@ -343,8 +377,8 @@ class TradingBot:
                 frame["open"].iloc[-1], frame["high"].iloc[-1],
                 frame["low"].iloc[-1], frame["close"].iloc[-1],
             )
-            if context is not None:
-                log.debug("%s %s | контекст: %s", self._display_name(instrument), tf, context)
+            if tf_assignments or tf in management_needs:
+                self._remember_market(instrument, tf, frame)
             self._manage(instrument, tf_assignments, frame, context, tf)
             if tf_assignments:
                 self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
@@ -359,9 +393,6 @@ class TradingBot:
         tf: str = "",
         entry_candidates: list[_EntryCandidate] | None = None,
     ) -> None:
-        remember_market = getattr(self._trade_manager, "remember_market", None)
-        if callable(remember_market):
-            remember_market(instrument, tf, frame, self._timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]))
         summaries = []
         for assignment in assignments:
             name = assignment.strategy
@@ -466,6 +497,9 @@ class TradingBot:
             candidate.context,
             timeframe=candidate.timeframe,
         )
+        stats = getattr(self._run, "admission_stats", None)
+        if stats is not None:
+            stats.record(candidate.assignment, candidate.timeframe, candidate.decision, admission)
         diagnostics = dict(admission.diagnostics)
         if admission.rejections and not diagnostics:
             provider = getattr(self._trade_manager, "portfolio_diagnostics", None)
@@ -473,6 +507,9 @@ class TradingBot:
                 details = provider()
                 if isinstance(details, Mapping):
                     diagnostics = dict(details)
+        # Кластерный вердикт: строка «Кластеры» в блоке ПЛАН или ОТКЛОНЕНО.
+        cluster = getattr(admission, "cluster", None)
+        clusters = cluster.payload() if cluster is not None else None
         if admission.plan is not None:
             quantity = admission.actions[0].quantity if admission.actions else 0
             self._publish_signal(
@@ -483,6 +520,7 @@ class TradingBot:
                 diagnostics=diagnostics,
                 frame=candidate.frame,
                 as_of=candidate.decision.bar_time,
+                clusters=clusters,
             )
         self._dispatch_management_actions(
             admission.actions,
@@ -501,6 +539,7 @@ class TradingBot:
                 diagnostics=diagnostics,
                 filter_profile=candidate.assignment.filter_profile,
                 timeframe=candidate.timeframe,
+                clusters=clusters,
             )
 
     def _manage(self, instrument: Instrument, assignments: list[Assignment], frame, context, tf: str) -> None:
@@ -615,6 +654,42 @@ class TradingBot:
             )
         )
 
+    def _remember_market(self, instrument, timeframe, frame) -> None:
+        """Свечи пары для графиков исполнений — общий вход тикового и live-цикла.
+
+        Перенос стопа и закрытие сделки рисуются по этому кадру менеджера;
+        без него сообщение уходит текстом. Повтор того же кадра (тот же
+        последний бар и длина) не пересчитывает снимок и разрывы. Сбой
+        графика не мешает торговле.
+        """
+        remember = getattr(self._trade_manager, "remember_market", None)
+        if not callable(remember) or frame is None or frame.empty or not timeframe:
+            return
+        last = frame["datetime"].iloc[-1]
+        key, signature = (instrument_key(instrument), timeframe), (last, len(frame))
+        if self._remembered_markets.get(key) == signature:
+            return
+        try:
+            remember(instrument, timeframe, frame, self._timeline.grid(timeframe).bar_close(last),
+                     breaks=self._chart_breaks(instrument, timeframe, frame))
+        except Exception as exc:
+            log.warning("График: свечи %s %s не переданы (%s).",
+                        self._display_name(instrument), timeframe, type(exc).__name__)
+            return
+        self._remembered_markets[key] = signature
+
+    def _chart_breaks(self, instrument, timeframe, frame):
+        """Вид разрывов окна графика от слоя данных; сбой не мешает торговле."""
+        classify = getattr(self._data_cache, "chart_breaks", None)
+        if not callable(classify) or frame is None or len(frame) == 0 or not timeframe:
+            return None
+        try:
+            breaks = classify(instrument, timeframe, frame.tail(CANDLE_LIMIT + 1))
+        except Exception as exc:
+            log.warning("График: разрывы окна не классифицированы (%s).", type(exc).__name__)
+            return None
+        return breaks if isinstance(breaks, Mapping) else None
+
     def _publish_signal(
         self,
         plan,
@@ -625,12 +700,14 @@ class TradingBot:
         diagnostics=None,
         frame=None,
         as_of=None,
+        clusters=None,
     ) -> None:
         """Publish the admitted plan: it is queued, not yet executed."""
         economics = plan.economics
         contract_for = getattr(getattr(self._trade_manager, "_broker", None), "contract_for", None)
         meta = contract_for(instrument_key(instrument)) if callable(contract_for) else None
-        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics)
+        visual = signal_snapshot(plan, quantity, instrument, frame, as_of, meta, diagnostics,
+                                 self._chart_breaks(instrument, plan.timeframe, frame))
         self._bus.publish(
             Event.signal(
                 self._display_name(instrument),
@@ -655,6 +732,7 @@ class TradingBot:
                 event_id=plan.signal_id,
                 bar_time=as_of,
                 visual=visual,
+                clusters=clusters,
             )
         )
 
@@ -668,6 +746,7 @@ class TradingBot:
         diagnostics=None,
         filter_profile: str = "",
         timeframe: str = "",
+        clusters=None,
     ) -> None:
         """Publish why the plan was not admitted."""
         self._bus.publish(
@@ -683,18 +762,28 @@ class TradingBot:
                 bar_time=decision.bar_time,
                 timeframe=timeframe,
                 event_id=decision.event_id or "",
+                clusters=clusters,
             )
         )
 
     # ── диспетчеризация привязок по типу инструмента ──
     def _strategies_for(self, instrument: Instrument) -> list[Assignment]:
-        if instrument.instrument_type == "future":
-            if isinstance(instrument.family, str):
-                from src.instruments.futures import FAMILIES
-                return self._future_strategies.get(instrument.family,
-                    self._future_strategies.get(FAMILIES[instrument.family][0], []))
-            return self._future_strategies.get(instrument.ticker[:2].upper(), [])
-        return self._share_strategies.get(instrument.ticker, [])
+        return assignments_for(instrument, self._share_strategies, self._future_strategies)
+
+    # ── ТФ и прогрев сопровождения незавершённых сделок инструмента ──
+    def _management_needs(self, instrument: Instrument) -> dict[str, int]:
+        """Таймфреймы планов незавершённых сделок с прогревом их профилей.
+
+        Сделка сопровождается на таймфрейме своего плана, даже если привязок
+        на нём в конфигурации не осталось; служебный 1m из требований не
+        считается таймфреймом сопровождения, если на нём нет самой сделки.
+        """
+        obligations = getattr(self._trade_manager, "management_obligations", None)
+        if not callable(obligations):
+            return {}
+        trades = obligations(instrument_key(instrument))
+        planned = {trade.plan.timeframe for trade in trades if trade.plan.timeframe in TIMEFRAMES}
+        return {tf: count for tf, count in obligation_requirements(trades).items() if tf in planned}
 
     # ── ТФ, задействованные привязками инструмента ──
     def _assigned_timeframes(self, instrument: Instrument) -> set[str]:
@@ -756,10 +845,12 @@ class TradingBot:
         self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
+        lag = getattr(self._data_cache, "feed_lag", None)
         self._bus.publish(
             Event.heartbeat(
                 tick_count=self._tick_count,
                 error_count=self._errors_in_period,
+                feed_lag=lag() if callable(lag) else None,
             )
         )
         self._errors_in_period = 0

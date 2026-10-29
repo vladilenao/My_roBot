@@ -47,3 +47,41 @@ def validate_release(version: str, tag: str, changelog: str) -> str:
     if tag != expected_tag:
         raise ReleaseMetadataError(f"Тег {tag!r} не совпадает с версией {expected_tag!r}")
     return release_notes(changelog, version)
+
+
+# Пакеты, которых нет на PyPI: CI ставит их из wheel в vendor/wheels/,
+# потому что tbank-индекс с GitHub Actions недоступен.
+VENDORED_PACKAGES = ("t-tech-investments",)
+_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--trusted-host", "-i ")
+
+
+def _wheel_name(package: str) -> str:
+    return re.sub(r"[-_.]+", "_", package).lower()
+
+
+def offline_requirements(requirements: str, wheels_dir: Path) -> str:
+    """Убирает внешние индексы и проверяет, что vendored-пакеты есть в wheels_dir.
+
+    Каждый пакет из ``VENDORED_PACKAGES`` должен быть закреплён ``==`` и иметь
+    wheel той же версии; иначе сборка остановится до установки зависимостей.
+    """
+    lines = [
+        line for line in requirements.splitlines()
+        if not line.strip().startswith(_INDEX_OPTIONS)
+    ]
+    for package in VENDORED_PACKAGES:
+        pins = [
+            match.group(1)
+            for line in lines
+            if (match := re.fullmatch(rf"\s*{re.escape(package)}\s*==\s*(\S+)\s*", line))
+        ]
+        if len(pins) != 1:
+            raise ReleaseMetadataError(
+                f"{package} должен быть закреплён в requirements.txt как {package}==X.Y.Z"
+            )
+        pattern = f"{_wheel_name(package)}-{pins[0]}-*.whl"
+        if not any(wheels_dir.glob(pattern)):
+            raise ReleaseMetadataError(
+                f"Нет wheel {package}=={pins[0]} в {wheels_dir} (ожидается {pattern})"
+            )
+    return "\n".join(lines) + "\n"

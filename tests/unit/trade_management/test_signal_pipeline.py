@@ -233,7 +233,7 @@ def test_manage_queues_signal_exit_from_ma_cloud(tmp_path):
     plan = TradePlan(
         "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("92"),
         (TargetPlan("tp-1", Decimal("103"), Decimal("1")),),
-        ProfileSnapshot("ma_cloud", "1", {"buffer_ticks": 1}), NOW,
+        ProfileSnapshot("ma_cloud", "1", {"buffer_ticks": 1}), NOW, timeframe="1m",
     )
     broker = _FillBroker()
     with Storage(tmp_path / "trades.sqlite3") as storage:
@@ -256,6 +256,7 @@ def test_manage_does_not_propose_adds_without_entry_price(tmp_path):
         "trade-1", "assignment-1", "NGV6", "BUY", "signal-1", Decimal("100"), Decimal("96"),
         (TargetPlan("tp-1", Decimal("104"), Decimal("0.5")), TargetPlan("tp-2", Decimal("108"), Decimal("0.5"))),
         ProfileSnapshot("levels_rr", "1", {"buffer_ticks": 1, "max_adds": 1, "add_fraction": "0.5"}), NOW,
+        timeframe="1m",
     )
     with Storage(tmp_path / "trades.sqlite3") as storage:
         manager = TradeManager(storage, _FillBroker(), initial_balance=Decimal("100000"),

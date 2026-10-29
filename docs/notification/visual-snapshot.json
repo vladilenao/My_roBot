@@ -17,6 +17,7 @@
     "unit": {"type": "string", "enum": ["lot", "contract"]},
     "lot_size": {"type": "integer", "minimum": 0},
     "price_step": {"type": "string"},
+    "step_cost": {"type": "string"},
     "plan": {
       "type": "object", "additionalProperties": false,
       "required": ["entry", "stop", "quantity", "targets", "trailing_quantity", "algorithm_version"],
@@ -45,7 +46,7 @@
     },
     "fills": {"type": "array", "maxItems": 64, "items": {
       "type": "object", "additionalProperties": false, "required": ["key", "time", "role", "side", "quantity", "price"],
-      "properties": {"key": {"type": "string"}, "time": {"type": "string"}, "role": {"type": "string"}, "side": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "price": {"type": "string"}}
+      "properties": {"key": {"type": "string"}, "time": {"type": "string"}, "role": {"type": "string"}, "side": {"type": "string"}, "quantity": {"type": "integer", "minimum": 0}, "price": {"type": "string"}, "reason": {"type": "string"}}
     }},
     "fill_groups": {"type": "array", "items": {
       "type": "object", "additionalProperties": false, "required": ["role", "side", "start", "end", "quantity", "price", "count"],
@@ -62,6 +63,12 @@
         "candles": {"type": "array", "maxItems": 80, "items": {
           "type": "object", "additionalProperties": false, "required": ["time", "open", "high", "low", "close"],
           "properties": {"time": {"type": "string"}, "open": {"type": "string"}, "high": {"type": "string"}, "low": {"type": "string"}, "close": {"type": "string"}}
+        }},
+        "breaks": {"type": "array", "maxItems": 80, "items": {
+          "type": "object", "additionalProperties": false, "required": ["after", "before", "kind", "missing"],
+          "properties": {"after": {"type": "string"}, "before": {"type": "string"},
+                         "kind": {"type": "string", "enum": ["closed", "no_trade", "schedule_unavailable", "missing"]},
+                         "missing": {"type": "integer", "minimum": 1}}
         }},
         "limited": {"type": "boolean"}, "gaps": {"type": "boolean"}, "history_limited": {"type": "boolean"},
         "stop_history_limited": {"type": "boolean"}, "boundary_stop": {"type": "string"}

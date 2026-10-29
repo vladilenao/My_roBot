@@ -6,6 +6,17 @@
 экспортный API реализованы отдельно от `trades.sqlite3`; БД хранит версии
 свечей, покрытие минут и курсоры безопасного последовательного анализа.
 
+Кластерный фильтр входа хранит события ClusterSource в отдельной базе
+`cluster-events.sqlite3` (WAL, `user_version = 1`, `src/clusters/store.py`):
+таблица `cluster_events` — запись потока `cluster.events` как есть
+(`fields_json`) и выделенные `event_id` (ключ), `stream_id`, `category`,
+`event_type`, `secid`, `source_ticker`, `direction`, `signal_id`,
+`timestamp`, `published_at`, `received_at`; таблица `consumer_state` —
+`last_stream_id` и `last_read_at`. Это внешние факты, а не торговое
+состояние. Исторический прогон работает со своей копией в каталоге прогона.
+Вердикты кластерного фильтра в `trades.sqlite3` — трассы `filter.cluster`
+в `calculations`, схема сделок не меняется.
+
 Каноническая схема живёт в `src/trade_journal/schema.py` (текущая версия —
 `SCHEMA_VERSION = 10`). Данный файл — ER-описание той же схемы: обзорная
 карта связей и диаграммы по предметным областям с колонками и типами, а также

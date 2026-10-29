@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from io import BytesIO
 
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from src.logging_setup import get_logger
 
@@ -18,6 +19,27 @@ class ApiResult:
     # True только для транспортных исключений (таймаут, обрыв): исход неизвестен,
     # запрос можно повторить. Разобранный ответ (включая ok=false) не повторяется.
     retryable: bool = False
+    # True, только если запрос гарантированно не ушёл (соединение не установлено):
+    # Telegram его не получал, повтор не может создать дубль.
+    unsent: bool = False
+    # Безопасная причина: только имена классов исключения, без текста и URL.
+    detail: str = ""
+
+
+def _failure(exc):
+    """Исход транспортного исключения: (unsent, безопасная причина).
+
+    requests/urllib3 оборачивают ошибку установки соединения в
+    MaxRetryError(reason=NewConnectionError | NameResolutionError) или
+    ConnectTimeout. Ошибка после отправки (ProtocolError, ReadTimeout, TLS)
+    остаётся неопределённой: Telegram мог принять запрос.
+    """
+    cause = exc.args[0] if exc.args else None
+    reason = getattr(cause, "reason", None) if isinstance(cause, MaxRetryError) else cause
+    detail = type(exc).__name__ + (f"/{type(reason).__name__}" if isinstance(reason, BaseException) else "")
+    unsent = isinstance(exc, requests.ConnectTimeout) or (
+        isinstance(exc, requests.ConnectionError) and isinstance(reason, NewConnectionError))
+    return unsent, detail
 
 
 class TelegramTransport:
@@ -50,8 +72,12 @@ class TelegramTransport:
                 raise ValueError("invalid response")
         except Exception as exc:
             # requests exceptions may embed the entire URL/token; never log them.
-            log.warning("Telegram %s: ошибка транспорта (%s).", method, type(exc).__name__)
-            return ApiResult(False, uncertain=True, retryable=True)
+            unsent, detail = _failure(exc)
+            if unsent:
+                log.warning("Telegram %s: запрос не ушёл (%s).", method, detail)
+                return ApiResult(False, retryable=True, unsent=True, detail=detail)
+            log.warning("Telegram %s: ошибка транспорта (%s), исход неизвестен.", method, detail)
+            return ApiResult(False, uncertain=True, retryable=True, detail=detail)
         description = str(body.get("description", ""))
         if method.startswith("edit") and "message is not modified" in description.lower():
             return ApiResult(True)
@@ -61,10 +87,10 @@ class TelegramTransport:
                     not isinstance(result, dict) or not isinstance(result.get("message_id"), int)
                     or isinstance(result.get("message_id"), bool) or result["message_id"] <= 0):
                 log.warning("Telegram %s: отсутствует подтверждённый message_id.", method)
-                return ApiResult(False, uncertain=True)
+                return ApiResult(False, uncertain=True, detail="no-message-id")
             return ApiResult(True, result)
         parameters = body.get("parameters") or {}
         log.warning("Telegram %s: HTTP %s, ok=false, retry_after=%s, запрос не повторяется. %s",
                     method, response.status_code, parameters.get("retry_after") if isinstance(parameters, dict) else None,
                     description.replace(self._token, "[скрыто]").replace(self._base, "[адрес скрыт]")[:300])
-        return ApiResult(False)
+        return ApiResult(False, detail=f"HTTP {response.status_code}")

@@ -2,10 +2,8 @@
 __pycache__/
 *.pyc
 logs/
-data/
-!/src/data/
-!/src/data/*.py
-!/tests/snapshot/data/
+# Рабочий каталог состояния робота в корне; src/data и tests/*/data — код и тесты.
+/data/
 /tests/snapshot/data/*
 !/tests/snapshot/data/NG_15m/
 /tests/snapshot/data/NG_15m/*

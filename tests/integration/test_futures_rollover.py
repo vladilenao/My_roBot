@@ -30,6 +30,8 @@ from src.bot.run_session import HistoricalRunSession
 from src.events.bus import EventBus
 from src.market_context.models import MarketContext, SRLevel, SRType, TrendResult, TrendDirection
 from src.strategies.contracts import Assignment, Decision, SignalType
+from src.trade_management.intraday_settings import IntradaySettings
+from src.assembly import contour
 
 D = Decimal
 START = datetime(2026, 1, 1, 10)
@@ -268,7 +270,6 @@ def test_deadline_with_unclosed_position_does_not_activate_next(tmp_path):
 
 @pytest.mark.parametrize("pause", [0, .5])
 def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_path, monkeypatch, pause):
-    import run
 
     clock = HistoricalClock(START, END, timedelta(minutes=1), pause, sleeper=lambda _: None)
     timeline = MultiTimeframeScheduler(["1m"], clock=clock)
@@ -279,17 +280,19 @@ def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_pat
         selection = replace(selection, catalog=selection.catalog[::-1]).planned(START, END, {}, 2)
     session.contract_selection = selection
     bindings = {"NG": [Assignment("binding", "macd_rsi_stoch", "levels_rr", "raw", timeframe="1m")]}
-    monkeypatch.setattr(run, "_family_warmup", lambda family: {"1m": 2})
-    monkeypatch.setattr(run, "FUTURE_STRATEGIES", bindings)
-    monkeypatch.setattr(run, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
-    monkeypatch.setattr(run, "TRADE_MANAGEMENT_PROFILES", {"levels_rr": {
+    monkeypatch.setattr(contour, "_family_warmup", lambda family: {"1m": 2})
+    monkeypatch.setattr(contour, "FUTURE_STRATEGIES", bindings)
+    monkeypatch.setattr(contour, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    # Проверяется переход контрактов без расписания торгов: сессионная защита выключена.
+    monkeypatch.setattr(contour, "INTRADAY_SETTINGS", IntradaySettings(enabled=False))
+    monkeypatch.setattr(contour, "TRADE_MANAGEMENT_PROFILES", {"levels_rr": {
         "target_R": [3, 4], "shares": [.5, .5], "min_stop_atr": 0,
         "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}})
-    monkeypatch.setattr(run, "trading_enabled", lambda: False)  # Уточнение пользователя: история всё равно симулирует.
-    monkeypatch.setattr(run, "_token_client_context", lambda: pytest.fail("История обратилась к боевому API"))
+    monkeypatch.setattr(contour, "trading_enabled", lambda: False)  # Уточнение пользователя: история всё равно симулирует.
+    monkeypatch.setattr(contour, "_token_client_context", lambda: pytest.fail("История обратилась к боевому API"))
     monkeypatch.setattr("src.scheduler.clock.system_now", lambda: datetime(2040, 1, 1))
     bus = EventBus()
-    runtime = run._build_runtime(selection.instruments, cache, bus, tmp_path, clock=clock, session=session)
+    runtime = contour._build_runtime(selection.instruments, cache, bus, tmp_path, clock=clock, session=session)
 
     class EntryStrategy:
         def compute(self, frame):
@@ -300,7 +303,7 @@ def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_pat
                             bar_time=frame["datetime"].iloc[-1])
 
     class Context:
-        def get_context(self, instrument, timeframe):
+        def get_context(self, instrument, timeframe, frame=None):
             base = 100+(int(instrument.uid[-1])-1)*50
             return MarketContext(TrendResult(TrendDirection.UP, .8),
                                  [SRLevel(base-4, SRType.SUPPORT, 3, "support")], base)
@@ -523,7 +526,6 @@ def test_rejected_close_is_retried_without_duplicate_active_command(tmp_path, mo
 
 
 def test_interruption_during_rollover_reports_open_residue(tmp_path):
-    import run
 
     clock, cache, storage, broker, manager, lifecycle, metadata, _ = setup(tmp_path)
     try:
@@ -539,7 +541,7 @@ def test_interruption_during_rollover_reports_open_residue(tmp_path):
         lifecycle.after_execution(clock.now())
         session = HistoricalRunSession(clock)
         session.contract_lifecycle = lifecycle
-        run._finish_history(storage, session, cache, cache._timeline, tmp_path)
+        contour._finish_history(storage, session, cache, cache._timeline, tmp_path)
         result = json.loads((tmp_path / "report.json").read_text())
         assert result["crashed"] and not result["covered"]
         assert result["rollover"]["transitions"][0]["status"] == "incomplete"

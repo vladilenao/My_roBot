@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 import io
@@ -11,6 +11,7 @@ from src.bot import TradingBot
 from src.bot.live_analysis import LiveAnalysis
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
+from src.data.ingestion_settings import MarketDataSettings
 from src.data.request_budget import RequestBudget
 from src.data.reconciliation import SessionCalendar
 from src.data.reconciliation import MarketDataReconciler
@@ -23,6 +24,9 @@ from src.notifier.templates import render
 from src.notifier.telegram_templates import render as telegram_render
 from src.scheduler.timing import MultiTimeframeScheduler
 from src.strategies.contracts import Assignment, Decision, SignalType
+
+# Прежняя общая очередь — откат при independent_lanes = false.
+LEGACY_QUEUE = MarketDataSettings(independent_lanes=False)
 
 
 def frame(end, tf="1h", count=100):
@@ -49,7 +53,8 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
     store = MarketDataStore(Path(tempfile.mkdtemp()) / "market.sqlite3")
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=cutover)
-    worker = IngestionWorker(cache)
+    cache.contour_id = "emulation"
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     events = []
     class Channel:
         supported_types = ALL_EVENT_TYPES
@@ -72,13 +77,14 @@ def setup(now=datetime(2026, 10, 12, 6, 30), *, end="2026-10-09 19:00", manager=
 
 def test_friday_overview_is_immediate_dated_and_read_only():
     manager = Mock()
+    manager.management_obligations.return_value = ()
     live, cache, data, events, clock = setup(manager=manager)
     live.bootstrap()
     reviews = [event for event in events if event.type is EventType.STARTUP_ANALYSIS]
     assert len(reviews) == 4
     assert all(event.get("results")[0]["outcome"] == "BUY" for event in reviews)
     assert reviews[0].bar_time.date() == datetime(2026, 10, 9).date()
-    assert render(reviews[0], 3) is None
+    assert render(reviews[0]) is None
     assert "09.10.2026" in telegram_render(reviews[0], tz_offset_hours=3)
     assert "Стартовый обзор" in telegram_render(reviews[0], tz_offset_hours=3)
     manager.actions_for_signal.assert_not_called()
@@ -111,7 +117,9 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
     decisions = [e for e in events[before:] if e.type is EventType.DECISION and e.instrument == "SBER" and e.timeframe == "1h"]
     # Текущий бар ждёт непрерывную базовую 1m UID и не теряется (задача 6.3).
     assert [e.bar_time.hour for e in decisions] == [8, 9]
-    assert "базовая 1m" in live.states["SBER", "1h"].reason
+    held = live.states["SBER", "1h"]
+    assert held.reason == ""
+    assert held.hold == {"kind": "execution_barrier", "through": datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)}
     data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
     clock[0] += timedelta(seconds=5)
     live.worker.run_until_idle()
@@ -132,6 +140,7 @@ def test_three_new_bars_are_analyzed_independently_without_replay_or_duplicates(
 
 def test_live_decision_is_published_once_right_before_its_admission():
     manager = Mock()
+    manager.management_obligations.return_value = ()
     manager.manage.return_value = ()
     manager.actions_for_signal.return_value = SignalAdmission(
         rejections=(RejectionReason(code="zero-quantity", message="Размер позиции ниже минимального"),))
@@ -152,6 +161,47 @@ def test_live_decision_is_published_once_right_before_its_admission():
     index = trading.index(live_decisions[0])
     assert trading[index + 1].type is EventType.REJECTED
     assert trading[index + 1].get("event_id") == live_decisions[0].get("event_id") != ""
+
+
+def test_live_admission_receives_raw_signal_and_filter_reason_reaches_console():
+    from dataclasses import replace
+
+    manager = Mock()
+    manager.management_obligations.return_value = ()
+    manager.manage.return_value = ()
+    manager.actions_for_signal.return_value = SignalAdmission(
+        rejections=(RejectionReason(code="filter-rejected", message="покупка против нисходящего тренда"),))
+    live, cache, data, events, clock = setup(now=datetime(2026, 10, 12, 10, 1), end="2026-10-12 06:00",
+                                             cutover=datetime(2026, 10, 12, 6, 0), manager=manager)
+    signal_filter = Mock()
+    signal_filter.apply.side_effect = lambda decision, ctx, **kw: replace(decision, signal_type=SignalType.HOLD)
+    live.bot._signal_filter = signal_filter
+    live.bot._context_cache = Mock()
+    live.bootstrap()
+    data["SBER", "1h"] = frame("2026-10-12 09:00")
+    data["SBER", "1m"] = frame("2026-10-12 09:59", "1m", count=300)
+    clock[0] += timedelta(seconds=5)
+    live.worker.run_until_idle()
+    before = len(events)
+    live.step()
+
+    admitted = [call.args[1] for call in manager.actions_for_signal.call_args_list
+                if call.args[0].id == "SBER-1h"]
+    assert [decision.signal_type for decision in admitted] == [SignalType.BUY]
+    sber = [e for e in events[before:] if e.instrument == "SBER" and e.timeframe == "1h"
+            and e.type in {EventType.DECISION, EventType.REJECTED}]
+    live_decision = next(e for e in sber if e.type is EventType.DECISION and e.get("analysis_mode") == "live")
+    assert live_decision.get("filtered_out") is False and live_decision.get("side") == "BUY"
+    # Информационные старые бары по-прежнему показывают результат фильтра.
+    assert all(e.get("filtered_out") for e in sber if e.type is EventType.DECISION and e.get("analysis_mode") == "historical")
+    rejection = sber[sber.index(live_decision) + 1]
+    assert rejection.type is EventType.REJECTED and rejection.get("code") == "filter-rejected"
+    stream = io.StringIO()
+    console = ConsoleChannel(stream=stream)
+    console.handle(live_decision)
+    console.handle(rejection)
+    assert "Покупка против нисходящего тренда" in stream.getvalue()
+    assert "ОТКЛОНЕНО ФИЛЬТРОМ" not in stream.getvalue()
 
 
 def test_state_messages_continue_without_successful_analysis_and_do_not_spam():
@@ -196,7 +246,7 @@ def test_informational_events_show_only_useful_overviews_in_console():
     live, _, _, events, _ = setup()
     live.bootstrap()
     stream = io.StringIO()
-    console = ConsoleChannel(stream=stream, tz_offset_hours=3)
+    console = ConsoleChannel(stream=stream)
     for event in events:
         console.handle(event)
     text = stream.getvalue()
@@ -216,10 +266,11 @@ def test_incomplete_warmup_expands_finitely_and_reports_available_count(tmp_path
         return frame("2026-10-09 19:00", count=3), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: now, 0),
                             market_store=MarketDataStore(tmp_path / "market.sqlite3"))
+    cache.contour_id = "emulation"
     instrument = Instrument("SBER", "SBER", "share", "SBER", "uid")
     assert cache.prepare_live_history(instrument, "1h", 100).empty  # торговое чтение без сети
     assert calls == []
-    IngestionWorker(cache).run_until_idle()
+    IngestionWorker(cache, settings=LEGACY_QUEUE).run_until_idle()
     result = cache.prepare_live_history(instrument, "1h", 100)
     assert len(result) == 3
     # Начальные 30 дней и одно расширение: 60 дней не дали более ранних свечей,
@@ -253,6 +304,7 @@ def test_entry_market_uses_calendar_phase_and_publication_deadline():
     timeline = MultiTimeframeScheduler(["1m"], clock=lambda: now)
     item = Instrument("SBER", "SBER", "share", "SBER", "uid")
     cache = MarketDataCache(lambda **kwargs: (frame("2026-10-12 10:00", "1m", 1), "uid"), timeline)
+    cache.contour_id = "emulation"
     cache.calendar_expectation = lambda *args, **kwargs: SimpleNamespace(
         phase=SimpleNamespace(value="break"), last_due=None,
     )
@@ -315,7 +367,8 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
         return source[keep].reset_index(drop=True), "uid"
     cache = MarketDataCache(loader, timeline, request_budget=budget, market_store=store,
                            market_reconciler=rec, recovery_retry_seconds=65)
-    worker = IngestionWorker(cache)
+    cache.contour_id = "emulation"
+    worker = IngestionWorker(cache, settings=LEGACY_QUEUE)
     store.set_interval_state(source="tbank_exchange", instrument_uid="uid", interval="1m",
         open_time="2026-09-11 21:00", state="unresolved", evidence="empty_recovery_response")
     events, operations = [], []
@@ -326,6 +379,7 @@ def test_end_to_end_session_open_delay_recovery_while_old_gap_stays_empty(tmp_pa
     bus = EventBus()
     bus.subscribe(Channel())
     manager = Mock()
+    manager.management_obligations.return_value = ()
     manager.manage.side_effect = lambda *args, **kw: operations.append("manage") or ()
     manager.actions_for_signal.side_effect = lambda *args, **kw: operations.append("admit") or SignalAdmission()
     bot = TradingBot([instrument], bus, {"macd_rsi_stoch": object()}, cache, timeline,
@@ -391,7 +445,7 @@ def test_old_market_store_migration_preserves_candles_coverage_cursors_and_analy
     source, uid, interval = "tbank_exchange", "uid", "1m"
     store.record_candles(source=source, instrument_uid=uid, interval=interval,
         candles=frame("2026-10-09 19:59", interval, 3))
-    store.mark_processed(source=source, instrument_uid=uid, interval=interval, open_time="2026-10-09 19:59")
+    store.mark_processed(source=source, instrument_uid=uid, interval=interval, open_time="2026-10-09 19:59", contour="emulation")
     before = store.source_info()
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE recovery_attempts")
@@ -400,6 +454,28 @@ def test_old_market_store_migration_preserves_candles_coverage_cursors_and_analy
     assert reopened.source_info() == before
     assert len(reopened.current_frame(source=source, instrument_uid=uid, interval=interval)) == 3
     assert reopened.cursors(source=source, instrument_uid=uid, interval=interval)["processed_through"] == "2026-10-09T19:59:00Z"
-    reopened.mark_analyzed(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", open_time="2026-10-09 19:00")
+    reopened.mark_analyzed(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", open_time="2026-10-09 19:00", contour="emulation")
     again = MarketDataStore(path)
-    assert again.analysis_cursor(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy") == pd.Timestamp("2026-10-09 19:00")
+    assert again.analysis_cursor(source=source, instrument_uid=uid, interval="1h", assignment_id="strategy", contour="emulation") == pd.Timestamp("2026-10-09 19:00")
+
+
+def test_holds_are_structured_utc_moments_without_phrases():
+    from types import SimpleNamespace
+    from src.bot.live_analysis import LiveAnalysis
+
+    live = LiveAnalysis.__new__(LiveAnalysis)
+    live.bot = SimpleNamespace(_protection_timeframe="1m")
+    live.current = lambda *args: False
+    utc = timezone.utc
+    assert live._hold(None, "15m", {"data_hold": "INTEGRITY_HOLD",
+                                    "incident": {"open_time": "2026-10-15T07:42:00"}}, None) == {
+        "kind": "integrity", "minute": datetime(2026, 10, 15, 7, 42, tzinfo=utc)}
+    assert live._hold(None, "15m", {"data_hold": "CONFLICT_HOLD"}, None) == {"kind": "conflict"}
+    assert live._hold(None, "15m", {"data_hold": "RECONCILING"}, None) == {"kind": "reconciling"}
+    assert live._hold(None, "15m", {"data_hold": "GAP_HOLD", "gap": {
+        "lower": "2026-10-15T07:00:00+00:00", "upper": "2026-10-15T07:15:00+00:00", "state": "active"}}, None) == {
+        "kind": "gap", "state": "active", "lower": datetime(2026, 10, 15, 7, tzinfo=utc),
+        "upper": datetime(2026, 10, 15, 7, 15, tzinfo=utc)}
+    assert live._hold(None, "15m", {"data_hold": "INTEGRITY_HOLD", "incident": {}}, None) == {
+        "kind": "integrity", "minute": None}
+    assert live._hold(None, "15m", {"data_hold": "READY"}, datetime(2026, 10, 15, 8)) is None

@@ -9,7 +9,7 @@ import sqlite3
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.api.market_data_stream import StreamCandle
 from src.data.cache import MarketDataCache
 from src.data.live_state import StreamClosureEvidence
@@ -34,6 +34,7 @@ def live_cache(tmp_path, *timeframes):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), UID), timeline,
                             request_budget=RequestBudget(lambda: clock[0], 0), market_store=store)
+    cache.contour_id = "emulation"
     for tf in timeframes or ("1m",):
         cache.register_live_pair(ITEM, UID, tf)
         cache.mark_live_history(UID, tf, done=True)
@@ -50,7 +51,7 @@ def trades_storage(timeframe="15m"):
 def test_dispatch_evidence_reflects_owner_readiness_and_intent_age(tmp_path):
     cache, _, _ = live_cache(tmp_path, "1m", "15m")
     since = [datetime(2026, 10, 12, 12, 3, tzinfo=timezone.utc)]
-    inspect = run._dispatch_evidence(cache, [ITEM], trades_storage(), since)
+    inspect = contour._dispatch_evidence(cache, [ITEM], trades_storage(), since)
     fresh = SimpleNamespace(trade_id="t", created_at=datetime(2026, 10, 12, 12, 3, 10, tzinfo=timezone.utc))
     held = SimpleNamespace(trade_id="t", created_at=datetime(2026, 10, 12, 11, 0, tzinfo=timezone.utc))
     evidence = inspect(UID, None, fresh)
@@ -68,12 +69,12 @@ def runtime_for(cache, tmp_path):
     storage = MagicMock()
     storage.load_trades.return_value = ()
     storage.execution_bar_boundaries.side_effect = lambda: {UID: (datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc), True)}
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([ITEM], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([ITEM], cache, MagicMock(), tmp_path)
     return runtime, broker
 
 
@@ -252,10 +253,18 @@ def test_market_data_status_carries_ingestion_diagnostics_and_hold_reason(tmp_pa
     ingestion = status.get("ingestion")
     assert ingestion["transport"] == "polling" and ingestion["data_hold"] == "GAP_HOLD"
     assert ingestion["gap"]["state"] == "parked" and ingestion.get("processed_through") is None
-    assert "не восстановлен" in status.get("reason")
-    assert "не восстановлен" in " ".join(render(status, 3).split())
-    assert "Источник данных" not in render(status, 3)
-    assert "удержание: пропуск" in telegram_render(status, tz_offset_hours=3)
+    hold = status.get("hold")
+    assert hold["kind"] == "gap" and hold["state"] == "parked"
+    assert hold["lower"] == datetime(2026, 10, 12, 12, 1, tzinfo=timezone.utc)
+    assert hold["next_retry_at"] == datetime(2026, 10, 12, 12, 10, tzinfo=timezone.utc)
+    assert "не восстановлен" not in status.get("reason")
+    console = " ".join(render(status).split())
+    assert "Пропуск 15:01–15:02 не восстановлен; следующая проверка 15:10" in console
+    assert "UTC" not in console and "T12:" not in console
+    assert "Источник данных" not in render(status)
+    telegram = telegram_render(status, tz_offset_hours=3)
+    assert "удержание: пропуск" in telegram
+    assert "следующая проверка 12.10.2026 15:10:00 МСК" in telegram
     assert "token" not in str(status.to_dict()).lower()
 
 
@@ -273,3 +282,52 @@ def test_status_line_shows_unconfirmed_gaps_before_start():
     from src.notifier.templates.events import ingestion_summary
     line = ingestion_summary({"transport": "polling", "data_hold": "READY", "pre_cutover_gaps": 2})
     assert line == "Источник данных: опрос · готово · пробелов до запуска без подтверждения: 2"
+
+
+def runtime_with_manager(cache, tmp_path):
+    manager = MagicMock()
+    manager._clock.now.return_value = datetime(2026, 10, 14, 4, 26, 39, tzinfo=timezone.utc)
+    broker = MagicMock()
+    broker.drain_events.return_value = []
+    broker.drain_addressed_events.return_value = []
+    storage = MagicMock()
+    storage.load_trades.return_value = ()
+    storage.execution_bar_boundaries.return_value = {}
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
+        "src.trade_journal.storage.Storage", return_value=storage
+    ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
+        "src.trade_management.manager.TradeManager", return_value=manager
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([ITEM], cache, MagicMock(), tmp_path)
+    return runtime, manager
+
+
+def test_first_live_step_cancels_undelivered_increases_before_bar_without_ready_data(tmp_path):
+    """cancel-stale-undelivered-entries: снятие в начале шага, не дожидаясь данных инструмента."""
+    cache, _, _ = live_cache(tmp_path, "1m")
+    cache.set_live_gap(UID, "1m", {"state": "active"})           # минутные данные не подтверждены
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.cancel_undelivered_increases.assert_called_once_with(datetime(2026, 10, 14, 4, 26, 39, tzinfo=timezone.utc))
+
+
+def test_cancellation_failure_does_not_stop_the_step(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+    manager.cancel_undelivered_increases.side_effect = RuntimeError("database is locked")
+
+    runtime.post_tick({"1m"})                                    # исключение не выходит наружу
+
+    manager.cancel_undelivered_increases.assert_called_once()
+
+
+def test_without_live_session_undelivered_increases_are_not_cancelled(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    cache.live_session_enabled = False                            # как в историческом прогоне
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.cancel_undelivered_increases.assert_not_called()

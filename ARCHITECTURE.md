@@ -14,7 +14,7 @@
 
 - **Один пакет — одна сквозная ответственность.** Внутренности модулей не смешиваются;
   каждая папка в `src/` закрывает свою область.
-- **Композиция через конструктор.** Зависимости собираются в `run.py` без DI-фреймворка.
+- **Композиция через конструктор.** Зависимости собираются без DI-фреймворка: `run.py` выбирает режим и инструменты, `src/assembly/` собирает рыночные службы и торговый контур поверх них.
   `TradingBot` не знает конкретных реализаций — получает интерфейсы (`execution`,
   `data_cache`, `context_cache`, `signal_filter`, `trade_manager`, `risk_manager`).
 - **Стратегии — только вход.** Стратегия выдаёт детерминированное входное событие
@@ -44,6 +44,7 @@
 | `strategies` | `*_strategy.py`, `base_strategy.py`, `registry.py`, `signals.py`, `contracts.py`, `names.py`, `indicators/` | Входные стратегии. `Decision` — входное событие (BUY/SELL/HOLD + ориентир входа и время доступности); контракты `Assignment` несут `id`/`management`/`priority`. |
 | `trade_management` | `models.py`, `actions.py`, `manager.py`, `state.py`, `audit.py`, `profiles/`, `opposite_signals.py` | **Управление сделкой**: `TradePlan`/`TradeState`/`TargetPlan`, адресные команды, `TradeManager` (фазы, маршрутизация, допуск), чистые переходы фаз, `CalculationTrace`, четыре профиля (`levels_rr`, `atr_trend`, `ma_cloud`, `pattern_targets`). |
 | `decision` | `filter.py`, `filters/` | Пост-фильтр **входных** кандидатов (`raw`, `basic_levels`, `triple_screen`); выходы и сокращения фильтр не проходят. |
+| `clusters` | `settings.py`, `store.py`, `consumer.py`, `verdict.py`, `gate.py`, `report.py` | Кластерный фильтр входа «Кластеры»: чтение Redis Stream `cluster.events` ClusterSource в `cluster-events.sqlite3`, вердикт `clusters-v1` по 1m свечам для кандидата нового входа (трасса `filter.cluster`, режимы `off`/`shadow`/`enforce`), отчёт `GET /api/v1/clusters/report`. |
 | `portfolio` | `models.py`, `account.py`, `manager.py`, `risk.py` | Позиции/счёт/резервы и чистая математика портфельного риска: `PortfolioRiskManager` (лимиты сделки/инструмента/групп/портфеля, максимальный дополнительный объём, направленное SHORT-расстояние), `RiskLimits`, `RiskTrade`. |
 | `broker` | `port.py`, `events.py`, `journal_broker.py` | Контракт `BrokerPort`/`ExecutionEvent`, структурный `BrokerEvent` для уведомлений и адресный свечной симулятор (`fill`/`partial`/`ack`/`reject`/`cancel`, защита, перенос стопов, идемпотентность). |
 | `trade_journal` | `schema.py`, `storage.py`, `reducer.py`, `export.py` | SQLite (`user_version`, FK, WAL, единый unit-of-work), транзакционный `ExecutionReducer` (позиции/счёт/резервы/цели/события), `CsvExporter` (атомарный экспорт двух CSV с `export_revision`) и `AuditExporter` (ротируемый `trade_audit.log`). |
@@ -54,8 +55,19 @@
 | `config_loader.py` | — | Загрузка и валидация TOML: приоритет внешний `robot.toml` → вшитый `default.toml` → дефолты; явные связки (`id`/`management`/`priority`), четыре профиля, лимиты, `database_file`/`audit_file`; неизвестные ключи/несовместимости → `ConfigError` с файлом и ключом. |
 | `logging_setup.py` | — | Технический журнал (`bot_debug.log`, ротация, `service_uid`/`correlation_id`) и независимый аудит `trade_audit.log`. |
 | `bot` | `trading_bot.py` | **Оркестратор**: сопровождение открытых сделок, сбор входных кандидатов всего тика, пакетный допуск. |
+| `assembly` | `services.py`, `core.py`, `history.py`, `contour.py` | **Сборка процесса.** Порт рыночных служб `MarketServices` и потребности контура `ContourDemand`; ядро эмуляции `LiveCore` (рыночная база, арбитр, календарь, полосы, приём и поток, локальный API, кластерный поток, паттерны); `HistoricalMarketServices` для прогона истории; торговый контур `TradingContour` (каналы, кластерный вердикт, торговая часть, оркестратор, отчёт истории). Контур получает данные только через порт и сам передаёт службам свои обязательства; службы не читают его финансовую базу и не импортируют контур. |
 
 ## Поток данных
+
+Сборка процесса (`docs/architecture/core-contours.md`, этап П2):
+
+```
+run.py: параметры / меню / команда API → инструменты → (история: план цепочки, предпроверка)
+   ├─ эмуляция: LiveCore — ранний сбор и API до выбора, данные после
+   └─ история:  HistoricalMarketServices — эмулятор и виртуальные часы
+TradingContour(settings, services).build() → services.serve(contour.demand()) → contour.run()
+остановка: services.close() → (история: contour.finish()) → contour.close()
+```
 
 ```
 run.py  (композиция зависимостей)
@@ -164,6 +176,7 @@ PnL, баланс и идентификатор заявки. Журнал со�
 - `tests/` — автотесты: `tests/unit/` (быстрые), `tests/integration/` (SQLite,
   автоэкспорт, outbox, резервы, жизненный цикл четырёх политик), `tests/snapshot/`
   (единый параметризованный раннер стратегий с эталонами в `tests/snapshot/data/`).
+- `docs/architecture/core-contours.md` — целевая архитектура «ядро и торговые контуры»: переходный план и этапы П1–П7.
 - `docs/trade-management/` — пользовательская документация: профили (с четырьмя
   SVG-графиками), хранилище/CSV/аудит.
 - `tools/visualize_signals.py` — рендер SVG-картинок сигналов для спецификаций.

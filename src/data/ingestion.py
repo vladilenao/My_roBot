@@ -20,6 +20,7 @@ import pandas as pd
 from t_tech.invest.schemas import TradeSourceType
 
 from src.data.ingestion_settings import MarketDataSettings
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.request_budget import RequestDeferred
 from src.data.loader import _client_context
 from src.data.timeutil import to_aware_utc, to_naive
@@ -134,13 +135,73 @@ class IngestionWorker:
         self._execution_lock = Lock()
         self._execution_obligations = {}
         self._execution_cursor = 0
+        # Независимые полосы (add-independent-market-data-lanes): живая полоса
+        # не ведёт восстановление и календарь, потеря доставки уходит полосе
+        # доказательств.
+        self.lanes_enabled = bool(getattr(self.settings, "independent_lanes", False))
+        self.evidence = None
+        # Полоса полноты просыпается при изменении обязательств исполнения.
+        self.completeness = None
+        # Состав пар сохраняется для раннего старта следующего запуска.
+        self.roster_dirty = False
+        # Пары, снятые главным потоком как незапрошенные: при пересохранении
+        # они становятся прошлыми, даже если были обязательствами.
+        self._roster_lock = Lock()
+        self._retired_roster = set()
 
     def set_execution_obligations(self, boundaries):
-        """Main-thread snapshot of unfinished financial work, never a DB read here."""
+        """Main-thread snapshot of unfinished financial work, never a DB read here.
+
+        Ключ — UID рыночной пары. Изменение набора будит полосу полноты: окно и
+        очерёдность пар пересчитываются сразу, а не через период пересчёта.
+        """
         snapshot = {key: (_naive(stamp), bool(inclusive))
                     for key, (stamp, inclusive) in boundaries.items() if stamp is not None}
         with self._execution_lock:
+            changed = snapshot != self._execution_obligations
             self._execution_obligations = snapshot
+        if changed:
+            self.roster_dirty = True
+            if self.completeness is not None:
+                self.completeness.wake()
+
+    def retire_roster_pairs(self, pairs):
+        """Снятые запуском пары (UID, ТФ) станут прошлыми при пересохранении состава."""
+        with self._roster_lock:
+            self._retired_roster.update(pairs)
+        self.roster_dirty = True
+
+    def persist_roster(self):
+        """Текущие пары владельца — сохранённый состав для раннего старта."""
+        self.roster_dirty = False
+        with self._roster_lock:
+            retired, self._retired_roster = self._retired_roster, set()
+        live = self._cache.live_pairs()
+        entries = []
+        for pair in live:
+            instrument = pair["instrument"]
+            entries.append({
+                "instrument_uid": pair["uid"], "interval": pair["timeframe"], "ticker": instrument.ticker,
+                "instrument_type": instrument.instrument_type, "short_name": getattr(instrument, "short_name", None),
+                "origin": "obligation" if self.execution_boundary(pair["uid"]) is not None else "selected",
+                "requirements": {"min_bars": int(pair["min_bars"] or 1)},
+            })
+        # Пара, которую снова запросили после снятия, остаётся в составе.
+        retired -= {(pair["uid"], pair["timeframe"]) for pair in live}
+        try:
+            self._store.save_roster(source=self._source, entries=entries)
+            if retired:
+                self._store.mark_roster_previous(source=self._source, pairs=sorted(retired))
+        except Exception as exc:
+            self.roster_dirty = True
+            with self._roster_lock:
+                self._retired_roster |= retired
+            log.warning("Состав пар не сохранён: %s", exc)
+
+    def execution_boundary(self, uid):
+        """Граница исполнения незавершённой сделки пары с этим UID: (момент, включительно) или None."""
+        with self._execution_lock:
+            return self._execution_obligations.get(uid)
 
     # ── вход supervisor ──
     def set_stream_pairs(self, pairs, *, held=()):
@@ -164,6 +225,9 @@ class IngestionWorker:
 
     def note_loss(self, uid, timeframe, since, *, reason="delivery_loss"):
         """Известный обрыв/переполнение: range recovery без ожидания deadline."""
+        if self.lanes_enabled and self.evidence is not None:
+            self.evidence.note_loss(uid, timeframe, since)
+            return
         now = _naive(self._timeline.now())
         key = self._pair_key(uid, timeframe)
         if key is None:
@@ -185,6 +249,15 @@ class IngestionWorker:
         return all(pair["history"] == "done" or (pair["uid"], pair["timeframe"]) in self._attempted
                    for pair in self._cache.live_pairs())
 
+    def startup_pending(self):
+        """Чего ждёт ``startup_complete``: (UID или адрес, ТФ) → причина."""
+        pending = {(key[0], key[2]): "потребность не обслужена"
+                   for key, _, _ in self._cache.live_needs() if key not in self._need_attempts}
+        for pair in self._cache.live_pairs():
+            if pair["history"] != "done" and (pair["uid"], pair["timeframe"]) not in self._attempted:
+                pending[pair["uid"], pair["timeframe"]] = "нет прогрева"
+        return pending
+
     # ── одна единица работы ──
     def step(self, now=None):
         now = _naive(now or self._timeline.now())
@@ -193,6 +266,12 @@ class IngestionWorker:
         try:
             if self._service_need(now):
                 return True
+            if self.lanes_enabled:
+                if self.roster_dirty:
+                    self.persist_roster()
+                # Живая полоса: восстановление, сверку и календарь ведут свои полосы.
+                return (self._service_handoff(now) or self._service_fresh(now)
+                        or bool(self._service_conflicts(now)))
             # Расписание — вход детектора, сверки и срока публикации: без него
             # всё UNKNOWN. Не больше одного дешёвого RPC сервиса инструментов
             # за шаг, поэтому не ждёт своей очереди среди recovery и сверки.
@@ -247,6 +326,7 @@ class IngestionWorker:
                 if uid is None:
                     self._need_retry_at[key] = now + self._backoff(self._need_attempts[key])
                     continue
+            known = (uid, timeframe) in self._cache._live_members
             try:
                 self._cache.register_live_pair(instrument, uid, timeframe, min_bars)
             except ValueError as exc:
@@ -258,6 +338,8 @@ class IngestionWorker:
                 log.warning("Live-пара %s удержана: %s", key, exc)
                 continue
             self._need_attempts.setdefault(key, 0)
+            if not known:
+                self.roster_dirty = True
             pair = self._pair(uid, timeframe)
             if pair["closed"] >= min_bars and pair["history"] == "done":
                 self._cache.finish_live_need(key, min_bars)
@@ -456,7 +538,7 @@ class IngestionWorker:
                                   end_date=gap + period, wait_for_budget=False)
                 after = self._store.coverage_state(source=self._source, instrument_uid=pair["uid"],
                                                    interval="1m", open_time=gap)
-                if after not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if after not in RESOLVED_INTERVAL_STATES:
                     if self._reconciler is not None:
                         self._reconciler.record_empty_recovery(
                             instrument_uid=pair["uid"], interval="1m", open_time=gap)
@@ -577,7 +659,7 @@ class IngestionWorker:
                 state = self._store.coverage_state(
                     source=self._source, instrument_uid=pair["uid"], interval=pair["timeframe"], open_time=due.open
                 )
-                if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state in RESOLVED_INTERVAL_STATES:
                     continue
                 stamps = [due.open]
                 start, end = due.open, due.close
@@ -642,7 +724,8 @@ class IngestionWorker:
         shifted = now - timedelta(seconds=self.settings.candle_publication_timeout_secs)
         return self._cache.expected_live_open(pair["key"], shifted)
 
-    def _first_missing(self, pair, now, lower=None, horizon=None):
+    def _first_missing(self, pair, now, lower=None, horizon=None, floor=True):
+        """Первый недоказанный интервал от ``lower``; ``floor`` — не раньше запуска."""
         uid, timeframe = pair["uid"], pair["timeframe"]
         horizon = horizon if horizon is not None else self._horizon(pair, now)
         if horizon is None:
@@ -658,7 +741,7 @@ class IngestionWorker:
                 if not state.get("coverage_lower"):
                     return None, horizon
                 lower = _naive(state["coverage_lower"])
-        floor = self._cache.live_floor(uid, timeframe)
+        floor = self._cache.live_floor(uid, timeframe) if floor else None
         if floor is not None:
             lower = max(_naive(lower), floor)  # вариант «б»: не раньше запуска
         probe, steps = _naive(lower), 0
@@ -839,14 +922,15 @@ class IngestionWorker:
         traded = [_naive(trade.time) for trade in trades]
         frame = self._cache._closed_member_frame(self._cache._live_members[uid, timeframe], timeframe)
         received = set(frame["datetime"]) if not frame.empty else set()
-        confirmed, probe = 0, lower
+        rows, probe = [], lower
         while probe < end:
             close = _naive(grid.bar_close(probe))
             if probe not in received and not any(probe <= stamp < close for stamp in traded):
-                self._store.set_interval_state(source=self._source, instrument_uid=uid, interval=timeframe,
-                    open_time=probe, state="confirmed_no_trade", evidence="last_trades_empty", observed_at=now)
-                confirmed += 1
+                rows.append((probe, "confirmed_no_trade", "last_trades_empty"))
             probe = close
+        # Одна транзакция и один пересчёт префикса на весь ответ.
+        confirmed = self._store.set_interval_states(source=self._source, instrument_uid=uid, interval=timeframe,
+                                                    rows=rows, observed_at=now) if rows else 0
         if confirmed:
             self._cache.refresh_live_coverage(uid, timeframe)
         return bool(confirmed)

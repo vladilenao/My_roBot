@@ -42,7 +42,23 @@ _LIMITS: dict[str, tuple[str, float | None, float | None, bool]] = {
     "schedule_refresh_interval_secs": ("number", 0, None, False),
     "schedule_max_age_secs": ("number", 0, None, False),
     "schedule_horizon_days": ("int", 0, None, True),
+    "instrument_requests_per_minute": ("int", 1, 200, True),
+    "evidence_window_secs": ("number", 0, 3600, False),
+    "completeness_rescan_interval_secs": ("number", 0, None, False),
+    "lane_status_log_interval_secs": ("number", 0, None, False),
+    "startup_wait_timeout_secs": ("number", 0, None, False),
+    "changes_retention_days": ("int", 0, None, True),
 }
+
+# Полосы и сервисы источника (add-independent-market-data-lanes, design 2).
+QUOTE_LANES = ("live", "evidence", "completeness")
+INSTRUMENT_LANES = ("interactive", "calendar")
+_SHARE_KEYS = {"quote_lane_shares": QUOTE_LANES, "instrument_lane_shares": INSTRUMENT_LANES}
+_SCHEDULE_KEYS = ("evidence_retry_secs", "completeness_recheck_secs")
+# Параметры прежнего раунда восстановления: при независимых полосах не
+# используются, но старые конфиги с ними принимаются.
+DEPRECATED_WITH_LANES = ("recovery_round_timeout_secs", "recovery_max_attempts",
+                         "recovery_backoff_max_secs", "recovery_recheck_interval_secs")
 
 
 @dataclass(frozen=True)
@@ -62,7 +78,7 @@ class MarketDataSettings:
     stream_reconnect_max_secs: float = 30
     stream_reconnect_jitter_pct: float = 20
     stream_control_cooldown_secs: float = 60
-    unary_requests_per_minute: int = 120
+    unary_requests_per_minute: int = 300
     recovery_round_timeout_secs: float = 900
     recovery_max_attempts: int = 5
     recovery_backoff_max_secs: float = 300
@@ -76,17 +92,56 @@ class MarketDataSettings:
     schedule_horizon_days: int = 7
     calendar_evidence: bool = True
     candle_publication_timeout_by_tf: dict[str, float] = field(default_factory=dict)
+    # Независимые полосы получения данных. Числа — инженерные гипотезы:
+    # половина квоты брокера остаётся другим приложениям пользователя.
+    independent_lanes: bool = True
+    instrument_requests_per_minute: int = 150
+    quote_lane_shares: dict[str, float] = field(
+        default_factory=lambda: {"live": 50, "evidence": 25, "completeness": 25})
+    instrument_lane_shares: dict[str, float] = field(
+        default_factory=lambda: {"interactive": 50, "calendar": 50})
+    evidence_window_secs: float = 3300
+    evidence_retry_secs: tuple[float, ...] = (60, 180, 600)
+    completeness_recheck_secs: tuple[float, ...] = (3600, 86400)
+    completeness_rescan_interval_secs: float = 3600
+    lane_status_log_interval_secs: float = 300
+    # Предел ожидания прогрева перед стартовым обзором: неготовые пары
+    # выходят в обзор с причиной и догружаются в фоне.
+    startup_wait_timeout_secs: float = 600
+    # Срок хранения ленты /changes рыночной базы в сутках; 0 — не очищать.
+    # Неподтверждённое потребителями не удаляется независимо от срока.
+    changes_retention_days: int = 7
 
     def __post_init__(self):
         for name in setting_names():
             validate_setting(name, getattr(self, name))
+        for name in _SCHEDULE_KEYS:  # TOML отдаёт список, профиль хранит кортеж
+            object.__setattr__(self, name, tuple(getattr(self, name)))
         validate_combination(asdict(self))
+
+    def lane_shares(self) -> dict[str, dict[str, float]]:
+        """Доли полос для арбитра: сервис → полоса → процент."""
+        return {"quotes": dict(self.quote_lane_shares), "instruments": dict(self.instrument_lane_shares)}
+
+    def deprecated_overrides(self) -> tuple[str, ...]:
+        """Заданные в конфиге или изменённые параметры прежнего раунда, которые полосы не используют."""
+        if not self.independent_lanes:
+            return ()
+        defaults = MarketDataSettings.__dataclass_fields__
+        given = getattr(self, "_given", frozenset())
+        return tuple(name for name in DEPRECATED_WITH_LANES
+                     if name in given or getattr(self, name) != defaults[name].default)
 
     @classmethod
     def from_flat(cls, flat: Mapping[str, Any]) -> "MarketDataSettings":
         """Эффективные значения из плоских ключей ``market_data_<имя>``."""
         values = {name: flat[f"market_data_{name}"] for name in setting_names() if f"market_data_{name}" in flat}
-        return cls(**values)
+        settings = cls(**values)
+        # Ключи, заданные в файлах конфигурации (а не профилем по умолчанию), —
+        # для предупреждения об устаревших параметрах.
+        given = flat.get("market_data_explicit_keys") or ()
+        object.__setattr__(settings, "_given", frozenset(key.removeprefix("market_data_") for key in given))
+        return settings
 
     def as_dict(self) -> dict[str, Any]:
         """Эффективный профиль для диагностики; секретов здесь нет."""
@@ -110,10 +165,30 @@ def validate_setting(name: str, value: Any) -> Any:
         if not isinstance(value, bool):
             raise SettingError("stream_fallback_polling должен быть логическим значением")
         return value
-    if name == "calendar_evidence":
+    if name in ("calendar_evidence", "independent_lanes"):
         if not isinstance(value, bool):
-            raise SettingError("calendar_evidence должен быть логическим значением")
+            raise SettingError(f"{name} должен быть логическим значением")
         return value
+    if name in _SHARE_KEYS:
+        lanes = _SHARE_KEYS[name]
+        if not isinstance(value, Mapping) or set(value) != set(lanes):
+            raise SettingError(f"{name} должен задавать доли полос {', '.join(lanes)}")
+        for lane, pct in value.items():
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not isfinite(pct) or not 0 <= pct <= 100:
+                raise SettingError(f"{name}[{lane!r}] должен быть процентом 0..100")
+        if abs(sum(value.values()) - 100) > 1e-9:
+            raise SettingError(f"Сумма {name} должна быть 100")
+        return value
+    if name in _SCHEDULE_KEYS:
+        if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+            raise SettingError(f"{name} должен быть списком секунд")
+        items = list(value)
+        if not items or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not isfinite(item) or item <= 0
+                            for item in items):
+            raise SettingError(f"{name} должен содержать хотя бы одно конечное число секунд > 0")
+        if any(later <= earlier for earlier, later in zip(items, items[1:])):
+            raise SettingError(f"{name} должен строго возрастать")
+        return tuple(items)
     if name == "candle_publication_timeout_by_tf":
         if not isinstance(value, dict):
             raise SettingError("candle_publication_timeout_by_tf должен быть отображением")

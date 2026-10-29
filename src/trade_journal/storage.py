@@ -480,6 +480,34 @@ class Storage:
                 ((sent_at or self._now()).isoformat(), command_id),
             ).rowcount)
 
+    def undelivered_increases(self) -> tuple[tuple[OutboxCommand, str], ...]:
+        """Входы и доборы, о которых брокер не знает: не отправлены, без событий.
+
+        Возвращает пары (команда, статус outbox). ``UNDELIVERED`` — прерванное
+        снятие, его локальную отмену нужно дочистить.
+        """
+        rows = self.connection.execute(
+            "SELECT b.command_id, b.trade_id, b.payload_json, b.created_at, b.status FROM orders o "
+            "JOIN outbox b ON b.command_id = o.command_id "
+            "WHERE o.action_type IN ('OPEN', 'ADD') AND o.status = 'PENDING' "
+            "AND b.status IN ('PENDING', 'UNDELIVERED') "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.command_id = o.command_id) "
+            "ORDER BY b.created_at, b.command_id"
+        ).fetchall()
+        return tuple((OutboxCommand(row[0], row[1], json.loads(row[2]), datetime.fromisoformat(row[3])), row[4])
+                     for row in rows)
+
+    def mark_outbox_undelivered(self, command_ids) -> tuple[str, ...]:
+        """PENDING → UNDELIVERED под guard доставки: взятая доставкой команда не снимается."""
+        marked = []
+        with self.outbox_delivery_guard():
+            with self.transaction() as connection:
+                for command_id in command_ids:
+                    if connection.execute("UPDATE outbox SET status = 'UNDELIVERED' "
+                                          "WHERE command_id = ? AND status = 'PENDING'", (command_id,)).rowcount:
+                        marked.append(command_id)
+        return tuple(marked)
+
     def requeue_claimed_outbox(self) -> int:
         """Make unconfirmed delivery attempts retryable after a process restart."""
         with self.transaction() as connection:

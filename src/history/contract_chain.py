@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from src.instruments.futures import FuturesCard, family_key, family_for
 from src.data.timeutil import to_naive
+from src.market_calendar.expiry import CUTOFF_SCHEDULE_UNKNOWN, ExpiryCutoff
 
 
 class ContractChainError(ValueError):
@@ -22,11 +23,19 @@ class ChainSegment:
     deadline: datetime
     deadline_source: str
     lead_days: int
+    # Календарный рубеж deadline − N суток и происхождение эффективного cutoff
+    # (calendar / session-end / schedule-unknown); session_end — конец сессии сдвига.
+    calendar_cutoff: datetime | None = None
+    cutoff_source: str = CUTOFF_SCHEDULE_UNKNOWN
+    session_end: datetime | None = None
 
     def payload(self):
         return {"contract": self.card.short_name, "uid": self.card.uid,
                 "family": self.card.family, "start": self.start.isoformat()+"Z",
                 "end": self.end.isoformat()+"Z", "cutoff": self.cutoff.isoformat()+"Z",
+                "calendar_cutoff": (self.calendar_cutoff or self.cutoff).isoformat()+"Z",
+                "cutoff_source": self.cutoff_source,
+                "session_end": None if self.session_end is None else self.session_end.isoformat()+"Z",
                 "deadline": self.deadline.isoformat()+"Z", "deadline_source": self.deadline_source,
                 "lead_days": self.lead_days}
 
@@ -36,6 +45,13 @@ def contract_deadline(card: FuturesCard) -> tuple[datetime, str]:
         raise ContractChainError(f"{card.short_name or 'контракт не указан'}: отсутствует expiration_date")
     boundaries = [(card.expiration_date, "expiration_only")]
     if card.last_trade_date is not None:
+        # Tinkoff отдаёт expiration_date полуночью дня экспирации — это метка дня,
+        # а не момент окончания торгов. Если в тот же день есть last_trade_date,
+        # полночь отсекла бы последнюю сессию: при экспирации в понедельник
+        # (BR-6.25, 2025-06-02) окно выхода целиком попадало на выходные.
+        expiration = card.expiration_date
+        if expiration.time() == time(0) and card.last_trade_date.date() == expiration.date():
+            boundaries = []
         boundaries.append((card.last_trade_date, "last_trade_date"))
     if card.first_notice_date is not None:
         boundaries.append((card.first_notice_date, "first_notice_date"))
@@ -45,7 +61,8 @@ def contract_deadline(card: FuturesCard) -> tuple[datetime, str]:
     return moment, source
 
 
-def build_chain(cards, family: str, start, end, lead_days: int) -> tuple[ChainSegment, ...]:
+def build_chain(cards, family: str, start, end, lead_days: int, cutoff_for=None) -> tuple[ChainSegment, ...]:
+    """Цепочка семейства; ``cutoff_for(card, calendar_cutoff) -> ExpiryCutoff`` уточняет рубеж по расписанию."""
     family = family_key(family)
     start, end = to_naive(start).to_pydatetime(), to_naive(end).to_pydatetime()
     if start >= end:
@@ -75,10 +92,14 @@ def build_chain(cards, family: str, start, end, lead_days: int) -> tuple[ChainSe
     schedule = []
     for card in candidates:
         deadline, source = contract_deadline(card)
-        cutoff = deadline - timedelta(days=lead_days)
-        schedule.append((card, cutoff, deadline, source))
+        calendar_cutoff = deadline - timedelta(days=lead_days)
+        effective = (ExpiryCutoff(calendar_cutoff, calendar_cutoff, CUTOFF_SCHEDULE_UNKNOWN) if cutoff_for is None
+                     else cutoff_for(card, calendar_cutoff))
+        if effective.at > calendar_cutoff:
+            raise ContractChainError(f"{card.short_name}: рубеж экспирации позже календарного")
+        schedule.append((card, effective.at, deadline, source, effective))
     initial = None
-    for i, (card, cutoff, _, _) in enumerate(schedule):
+    for i, (card, cutoff, *_) in enumerate(schedule):
         if cutoff <= start:
             continue
         if card.first_trade_date is None:
@@ -92,7 +113,7 @@ def build_chain(cards, family: str, start, end, lead_days: int) -> tuple[ChainSe
         raise ContractChainError(f"{family}: нет допустимого контракта на {start.isoformat()}")
     segments = []
     current = start
-    for card, cutoff, deadline, source in schedule[initial:]:
+    for card, cutoff, deadline, source, effective in schedule[initial:]:
         if card.problems():
             raise ContractChainError(f"{card.short_name or 'контракт не указан'}: {'; '.join(card.problems())}")
         if card.first_trade_date >= cutoff:
@@ -100,7 +121,8 @@ def build_chain(cards, family: str, start, end, lead_days: int) -> tuple[ChainSe
         if not card.first_trade_date <= current < cutoff:
             raise ContractChainError(f"{card.short_name}: следующий контракт недопустим на {current.isoformat()}")
         segment_end = min(cutoff, end)
-        segments.append(ChainSegment(card, current, segment_end, cutoff, deadline, source, lead_days))
+        segments.append(ChainSegment(card, current, segment_end, cutoff, deadline, source, lead_days,
+                                     effective.calendar_at, effective.source, effective.session_end))
         current = segment_end
         if current == end:
             return tuple(segments)

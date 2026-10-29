@@ -56,6 +56,20 @@ class LiveRunSession(RunSession):
         return False
 
 
+class StoppableRunSession(LiveRunSession):
+    """Процесс контура (add-contour-process): цикл до флага остановки, проверяемого на границе тика."""
+
+    def __init__(self, stop_event, clock=None) -> None:
+        super().__init__(clock)
+        self._stop_event = stop_event
+
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def stop_reason(self) -> str:
+        return "остановка контура" if self._stop_event.is_set() else ""
+
+
 class HistoricalRunSession(RunSession):
     """Исторический прогон: рыночное время виртуальное, у прогона есть конец."""
 
@@ -71,6 +85,11 @@ class HistoricalRunSession(RunSession):
         self.terminal_gap = None
         self._source_failed = False
         self._drivers_complete = True
+        # Стоп прогона командой или остановкой робота (add-history-contour): выход после тика с отчётом.
+        self._operator_stop = ""
+        # Сигналы и недопуски по привязкам — для отчёта прогона.
+        from src.history.admission_stats import SignalAdmissionStats
+        self.admission_stats = SignalAdmissionStats()
 
     def update_data_status(self, *, source_failed, drivers_complete):
         self._source_failed = source_failed
@@ -93,6 +112,11 @@ class HistoricalRunSession(RunSession):
 
     def mark_contract_failure(self, reason):
         self._contract_failure = reason
+
+    def request_stop(self, reason: str = "остановлено оператором") -> None:
+        """Остановить прогон на границе тика; отчёт пишется с этой причиной."""
+        if not self._operator_stop:
+            self._operator_stop = reason
 
     @property
     def start(self):
@@ -144,9 +168,12 @@ class HistoricalRunSession(RunSession):
         )
 
     def should_stop(self) -> bool:
-        return bool(self._contract_failure) or self._data_exhausted_at is not None or self._clock.finished
+        return (bool(self._operator_stop) or bool(self._contract_failure) or self._data_exhausted_at is not None
+                or self._clock.finished)
 
     def stop_reason(self) -> str:
+        if self._operator_stop:
+            return self._operator_stop
         if self._contract_failure:
             return f"незавершённый контрактный переход: {self._contract_failure}"
         if self._data_exhausted_at is not None:

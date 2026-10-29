@@ -216,6 +216,17 @@ def check_right_boundary(pair, *, start, boundary, load_candles, client_provider
         return replace(result, error=f"ошибка обязательного диагностического чтения: {exc}")
 
 
+def instrument_assignments(instrument, share_strategies: dict, future_strategies: dict) -> list:
+    """Привязки стратегий инструмента: фьючерс — по семейству, акция — по тикеру."""
+    if instrument.instrument_type == "future":
+        family = getattr(instrument, "family", None)
+        if isinstance(family, str):
+            from src.instruments.futures import FAMILIES
+            return list(future_strategies.get(family, future_strategies.get(FAMILIES[family][0], [])))
+        return list(future_strategies.get(instrument.ticker[:2].upper(), []))
+    return list(share_strategies.get(instrument.ticker, []))
+
+
 def active_pairs(
     instruments,
     share_strategies: dict,
@@ -225,15 +236,7 @@ def active_pairs(
     """Пары, которые реально будут грузиться: таймфреймы привязок плюс защита."""
     pairs: list[Pair] = []
     for instrument in instruments:
-        if instrument.instrument_type == "future":
-            family = getattr(instrument, "family", None)
-            if isinstance(family, str):
-                from src.instruments.futures import FAMILIES
-                assignments = future_strategies.get(family, future_strategies.get(FAMILIES[family][0], []))
-            else:
-                assignments = future_strategies.get(instrument.ticker[:2].upper(), [])
-        else:
-            assignments = share_strategies.get(instrument.ticker, [])
+        assignments = instrument_assignments(instrument, share_strategies, future_strategies)
         timeframes = {assignment.timeframe for assignment in assignments}
         timeframes.add(protection_timeframe)
         for timeframe in sorted(timeframes, key=lambda tf: _period(tf)):

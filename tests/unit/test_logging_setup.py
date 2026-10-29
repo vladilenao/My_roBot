@@ -1,4 +1,5 @@
 """Unit-тесты модуля logging_setup.py."""
+import datetime
 import logging
 import logging.handlers
 from pathlib import Path
@@ -10,6 +11,7 @@ from src.logging_setup import (
     ContextLoggerAdapter,
     correlation_id_var,
     get_logger,
+    log_rotation,
     service_uid_var,
     setup_logging,
 )
@@ -304,3 +306,163 @@ class TestRetryLogging:
         content = log_file.read_text(encoding="utf-8")
         assert "[svc-456]" in content
         assert "GetCandles" in content
+
+
+# Поддельные значения: настоящие секреты в тестах не используются.
+_FAKE_BOT_TOKEN = "123456789:" + "AAFakeTokenForTests_" + "x" * 15
+_FAKE_BROKER_TOKEN = "t.fake-broker-token-for-tests-0123456789"
+_FAKE_PROXY = "https://fake-proxy.example.workers.dev"
+
+
+@pytest.fixture
+def clean_secrets():
+    from src import logging_setup
+
+    saved = set(logging_setup._secrets)
+    logging_setup._secrets.clear()
+    yield
+    logging_setup._secrets.clear()
+    logging_setup._secrets.update(saved)
+
+
+def _read_log(log_file: Path) -> str:
+    for h in logging.getLogger().handlers:
+        h.flush()
+    return log_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.usefixtures("clean_secrets")
+class TestSecretRedaction:
+    """Секреты не попадают в файл лога ни из своих, ни из сторонних логгеров."""
+
+    def test_urllib3_request_line_hides_token_and_proxy(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file),
+                      secrets=(_FAKE_BOT_TOKEN, _FAKE_PROXY))
+        foreign = logging.getLogger("urllib3.connectionpool")  # без адаптера, как в бою
+        foreign.setLevel(logging.DEBUG)
+        foreign.debug("Starting new HTTPS connection (%d): %s:%s", 1, "fake-proxy.example.workers.dev", 443)
+        foreign.debug('%s://%s:%s "%s %s %s" %s %s', "https", "fake-proxy.example.workers.dev", 443,
+                      "POST", f"/bot{_FAKE_BOT_TOKEN}/sendMessage", "HTTP/1.1", 200, None)
+
+        content = _read_log(log_file)
+        assert _FAKE_BOT_TOKEN not in content
+        assert "fake-proxy.example.workers.dev" not in content
+        assert "/bot[скрыто]/sendMessage" in content
+
+    def test_unregistered_telegram_token_is_hidden_by_format(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file))
+        get_logger("test_secret").warning("POST /bot%s/getChat", _FAKE_BOT_TOKEN)
+
+        content = _read_log(log_file)
+        assert _FAKE_BOT_TOKEN not in content
+        assert "/bot[скрыто]/getChat" in content
+
+    def test_registered_value_hidden_in_message_and_traceback(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file), secrets=(_FAKE_BROKER_TOKEN, None, ""))
+        logger = get_logger("test_secret")
+        logger.info("token=%s", _FAKE_BROKER_TOKEN)
+        try:
+            raise RuntimeError(f"Authorization: Bearer {_FAKE_BROKER_TOKEN}")
+        except RuntimeError:
+            logger.exception("Сбой запроса")
+
+        content = _read_log(log_file)
+        assert _FAKE_BROKER_TOKEN not in content
+        assert "token=[скрыто]" in content
+        assert "Bearer [скрыто]" in content
+
+    def test_short_values_and_ordinary_text_untouched(self, tmp_path: Path) -> None:
+        from src.logging_setup import redact, register_secrets
+
+        register_secrets(("abc",))
+        text = "Свеча 2026-10-15T10:00:00 abc, цена 1.1238, заявка 12345:ok"
+        assert redact(text) == text
+
+
+class _MarketClock:
+    """Подставные рыночные часы прогона."""
+
+    def __init__(self, now: datetime.datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime.datetime:
+        return self.now
+
+
+def _flush_root() -> None:
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+
+class TestHistoryDebugWindow:
+    def test_debug_written_only_inside_market_window(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        clock = _MarketClock(datetime.datetime(2025, 8, 7, 10, 0))
+        window = (datetime.datetime(2025, 8, 7, 11, 0), datetime.datetime(2025, 8, 7, 12, 0))
+        setup_logging(service_uid="svc", log_file=str(log_file), level="INFO", clock=clock, debug_window=window)
+        logger = get_logger("test_window")
+
+        logger.debug("до окна")
+        logger.info("инфо до окна")
+        clock.now = datetime.datetime(2025, 8, 7, 11, 30)
+        logger.debug("внутри окна")
+        clock.now = datetime.datetime(2025, 8, 7, 12, 0)
+        logger.debug("после окна")
+        _flush_root()
+
+        content = log_file.read_text(encoding="utf-8")
+        assert "внутри окна" in content
+        assert "инфо до окна" in content
+        assert "до окна" not in content.replace("инфо до окна", "")
+        assert "после окна" not in content
+
+    def test_without_window_root_keeps_base_level(self, tmp_path: Path) -> None:
+        setup_logging(service_uid="svc", log_file=str(tmp_path / "test.log"), level="INFO",
+                      clock=_MarketClock(datetime.datetime(2025, 8, 7)))
+
+        assert logging.getLogger().level == logging.INFO
+
+
+class TestLogRotation:
+    def test_no_rotation_when_max_bytes_zero(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "test.log"
+        setup_logging(service_uid="svc", log_file=str(log_file), level="INFO", max_bytes=0, backup_count=0)
+        for index in range(500):
+            get_logger("test_rotation").info("строка %d %s", index, "x" * 100)
+
+        rotation = log_rotation()
+        assert rotation.rollovers == 0 and rotation.complete
+        assert not (tmp_path / "test.log.1").exists()
+
+    def test_rotation_within_backups_keeps_log_complete(self, tmp_path: Path) -> None:
+        setup_logging(service_uid="svc", log_file=str(tmp_path / "test.log"), level="INFO",
+                      max_bytes=2000, backup_count=50)
+        for index in range(100):
+            get_logger("test_rotation").info("строка %d %s", index, "x" * 100)
+
+        rotation = log_rotation()
+        assert rotation.rollovers > 0
+        assert rotation.complete and rotation.retained_from is None
+
+    def test_lost_start_reports_market_moment_of_oldest_kept_part(self, tmp_path: Path) -> None:
+        clock = _MarketClock(datetime.datetime(2025, 3, 10, 12, 0))
+        setup_logging(service_uid="svc", log_file=str(tmp_path / "test.log"), level="INFO",
+                      max_bytes=2000, backup_count=2, clock=clock)
+        logger = get_logger("test_rotation")
+        moments = []
+        for index in range(200):
+            clock.now = datetime.datetime(2025, 3, 10, 12, 0) + datetime.timedelta(minutes=index)
+            before = log_rotation().rollovers
+            logger.info("строка %d %s", index, "x" * 100)
+            if log_rotation().rollovers > before:
+                moments.append(clock.now)
+
+        rotation = log_rotation()
+        assert rotation.rollovers == len(moments) > 2
+        assert not rotation.complete
+        # Сохранены текущий файл и две копии: начало — после ротации №(N-2).
+        assert rotation.retained_from == moments[len(moments) - 3]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["test.log", "test.log.1", "test.log.2"]

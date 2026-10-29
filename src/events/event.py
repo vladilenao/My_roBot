@@ -19,7 +19,7 @@ from src.events.schema import DIAGNOSTIC_PAYLOAD_FIELDS
 from src.events.visual import VisualSnapshot, freeze
 
 _EXECUTION_AMOUNTS = frozenset(
-    {"price", "stop", "take_profit", "pnl", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
+    {"price", "stop", "previous_stop", "take_profit", "pnl", "pnl_at_stop", "fee", "balance", "gross_pnl", "net_pnl", "fees_total",
      "budget_base", "portfolio_pct", "risk_budget", "open_risk", "pending_risk", "free_risk", "risk_excess"}
 )
 
@@ -139,7 +139,8 @@ class Event:
                            analysis_mode: str = "", expected_bar: Any = None,
                            publication_deadline: Any = None, next_open: Any = None,
                            available_bars: int = 0, required_bars: int = 0,
-                           coverage_complete: bool = False, ingestion: dict | None = None) -> "Event":
+                           coverage_complete: bool = False, ingestion: dict | None = None,
+                           hold: dict | None = None) -> "Event":
         return cls._make(EventType.MARKET_DATA_STATUS, instrument=instrument, timeframe=timeframe,
                           payload={"session": session, "phase": phase, "break_kind": break_kind,
                                    "last_due": last_due, "next_event": next_event, "schedule": schedule,
@@ -149,7 +150,8 @@ class Event:
                                   "analysis_mode": analysis_mode, "expected_bar": expected_bar,
                                   "publication_deadline": publication_deadline, "next_open": next_open,
                                   "available_bars": available_bars, "required_bars": required_bars,
-                                  "coverage_complete": coverage_complete, "ingestion": ingestion})
+                                  "coverage_complete": coverage_complete, "ingestion": ingestion,
+                                  "hold": hold})
 
     @classmethod
     def decision(
@@ -212,6 +214,7 @@ class Event:
         trade_id: str = "",
         visual: VisualSnapshot | Mapping | None = None,
         event_id: str = "",
+        clusters: Mapping[str, str] | None = None,
     ) -> "Event":
         """Рекомендация: план допущен и уйдёт в заявку, но ещё не исполнен."""
         return cls._make(
@@ -240,6 +243,7 @@ class Event:
                 "trade_id": trade_id,
                 "visual": visual,
                 "event_id": event_id,
+                **({"clusters": dict(clusters)} if clusters else {}),
             },
         )
 
@@ -258,6 +262,7 @@ class Event:
         bar_time: Any = None,
         timeframe: str = "",
         event_id: str = "",
+        clusters: Mapping[str, str] | None = None,
     ) -> "Event":
         """Недопуск сделки на допуске."""
         return cls._make(
@@ -274,6 +279,7 @@ class Event:
                 "filter_profile": filter_profile,
                 "event_id": event_id,
                 **_diagnostics_payload(diagnostics, economics=True),
+                **({"clusters": dict(clusters)} if clusters else {}),
             },
         )
 
@@ -318,12 +324,12 @@ class Event:
         )
 
     @classmethod
-    def heartbeat(cls, *, tick_count: int, error_count: int) -> "Event":
-        """Пульс робота по окончании тика."""
-        return cls._make(
-            EventType.HEARTBEAT,
-            payload={"tick_count": tick_count, "error_count": error_count},
-        )
+    def heartbeat(cls, *, tick_count: int, error_count: int, feed_lag: int | None = None) -> "Event":
+        """Пульс робота по окончании тика; ``feed_lag`` — неприменённые изменения ленты ядра."""
+        payload = {"tick_count": tick_count, "error_count": error_count}
+        if feed_lag is not None:
+            payload["feed_lag"] = feed_lag
+        return cls._make(EventType.HEARTBEAT, payload=payload)
 
     @classmethod
     def tick_started(cls, *, tick_id: str) -> "Event":

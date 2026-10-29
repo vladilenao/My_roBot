@@ -1,16 +1,65 @@
 """Семантическая сцена и headless PNG: импорт графики только в renderer."""
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import timedelta
 from io import BytesIO
+from math import ceil
 
 from src.events.types import EventType
-from src.events.visual import serializable, utc
-from src.notifier.telegram_templates import money, price, quantity, terminal, timeframe_label
-from src.scheduler.timing import tf_period_minutes
+from src.events.visual import breaks_of, serializable, utc
+from src.notifier.telegram_templates import chart_notes, money, price, quantity, terminal, timeframe_label
+from src.scheduler.timing import CandleScheduler
 
 GREEN, RED, BLUE = "#36d399", "#ff7185", "#73baff"
 BACKGROUND = "#101827"
+GRID, MUTED = "#3a4558", "#8794a7"
+MAX_DAY_SEPARATORS = 10
+
+
+class CandleAxis:
+    """Ось по номерам свечей окна: время между свечами места не занимает.
+
+    Свеча ``i`` занимает [i − 0.5, i + 0.5); момент внутри свечи — пропорционально,
+    момент в разрыве — на границе разрыва, момент после последней свечи
+    продолжает время её периодами (правое поле графика).
+    """
+
+    def __init__(self, candles, timeframe):
+        grid = CandleScheduler(timeframe)
+        self.opens = [utc(candle["time"]) for candle in candles]
+        self.closes = [grid.bar_close(opened) for opened in self.opens]
+
+    def index(self, stamp):
+        return self.opens.index(utc(stamp))
+
+    def position(self, stamp):
+        moment = utc(stamp)
+        i = bisect_right(self.opens, moment) - 1
+        if i < 0:
+            return -.5
+        opened, closed = self.opens[i], self.closes[i]
+        if moment < closed:
+            return i - .5 + (moment - opened) / (closed - opened)
+        if i == len(self.opens) - 1:
+            return i + .5 + (moment - closed) / (closed - opened)
+        return i + .5
+
+    def day_starts(self, offset):
+        local = [(opened + offset).date() for opened in self.opens]
+        return [i for i in range(1, len(local)) if local[i] != local[i - 1]]
+
+    def ticks(self, offset, *, most=8):
+        """Номера подписанных свечей: начало дня и равномерный шаг между ними."""
+        count = len(self.opens)
+        step = max(1, ceil(count / most))
+        starts = self.day_starts(offset)
+        if len(starts) > most:
+            return list(range(0, count, step)), set(range(count))
+        # Первая свеча подписывается датой, если рядом нет начала дня.
+        anchors = starts if starts and starts[0] < step / 2 else [0] + starts
+        regular = [i for i in range(0, count, step) if all(abs(i - anchor) >= step / 2 for anchor in anchors)]
+        return sorted(set(anchors) | set(regular)), set(anchors)
 
 
 def compact_png(photo: bytes, max_bytes: int) -> bytes:
@@ -104,7 +153,8 @@ def build_scene(event, tz_offset_hours=0):
                          "as_of": visual["as_of"], "candles": candles, "levels": levels,
                          "original_stop": plan["stop"], "markers": markers, "before_window": before_window,
                          "stop_steps": stops, "result": result, "financial": financial,
-                         "limited": any(visual["market"].get(k, False) for k in ("limited", "gaps", "history_limited", "stop_history_limited"))})
+                         "breaks": breaks_of(visual["market"], visual["timeframe"]),
+                         "notes": chart_notes(visual, tz_offset_hours)})
 
 
 def render_png(scene):
@@ -114,7 +164,7 @@ def render_png(scene):
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
-    from matplotlib import dates
+    from matplotlib.ticker import FixedLocator, FuncFormatter
     from matplotlib.font_manager import FontProperties
 
     def font(size=12, weight="normal"):
@@ -127,20 +177,19 @@ def render_png(scene):
     try:
         ax = figure.add_subplot(111, facecolor=BACKGROUND)
         offset = timedelta(hours=scene["tz_offset_hours"])
-        def x(stamp):
-            return dates.date2num(utc(stamp) + offset)
-        period = tf_period_minutes(scene["timeframe"]) / 1440
         candles = scene["candles"]
-        left = x(candles[0]["time"])
-        last = max(x(candles[-1]["time"]), x(scene["as_of"]))
+        axis = CandleAxis(candles, scene["timeframe"])
+        x = axis.position
+        period = 1
+        left = 0
+        last = max(len(candles) - 1, x(scene["as_of"]))
         right = last + period * 9
         prices = [float(c[k]) for c in candles for k in ("low", "high")]
         prices += [float(level["price"]) for level in scene["levels"]]
         prices += [float(m["price"]) for m in scene["markers"]]
         prices += [float(scene["original_stop"])] + [float(s["price"]) for s in scene["stop_steps"]]
         span = max(max(prices) - min(prices), max(prices) * .001)
-        for candle in candles:
-            stamp = x(candle["time"])
+        for stamp, candle in enumerate(candles):
             opening, close, high, low = (float(candle[k]) for k in ("open", "close", "high", "low"))
             color = GREEN if close >= opening else RED
             ax.plot([stamp, stamp], [low, high], color=color, linewidth=1.4)
@@ -192,14 +241,39 @@ def render_png(scene):
                     bbox={"facecolor": "#20364b", "edgecolor": "none", "boxstyle": "round,pad=.6"})
         ax.set_xlim(left - period, right + period * .2)
         ax.set_ylim(min(prices) - span * .12, max(max(prices) + span * .18, labels[-1] + span * .1))
-        ax.xaxis.set_major_locator(dates.AutoDateLocator(minticks=3, maxticks=10))
-        ax.xaxis.set_major_formatter(dates.DateFormatter("%d.%m\n%H:%M"))
+        starts = axis.day_starts(offset)
+        if len(starts) <= MAX_DAY_SEPARATORS:
+            for start in starts:
+                ax.axvline(start - .5, color=MUTED, linewidth=1, alpha=.55)
+        unavailable_labelled = False
+        for gap in scene["breaks"]:
+            boundary = axis.index(gap["after"]) + .5
+            if gap["kind"] == "missing":
+                ax.axvspan(boundary - .15, boundary + .15, color=RED, alpha=.35, linewidth=0)
+                ax.text(boundary, .985, f"пропуск {gap['missing']}", transform=ax.get_xaxis_transform(), ha="center",
+                        va="top", color=RED, fontproperties=font(10, "bold"))
+            elif gap["kind"] == "schedule_unavailable":
+                ax.axvline(boundary, color=MUTED, linestyle="--", linewidth=1, alpha=.85)
+                if not unavailable_labelled:
+                    ax.text(boundary, .985, "расписание недоступно", transform=ax.get_xaxis_transform(), ha="center",
+                            va="top", color=MUTED, fontproperties=font(10))
+                    unavailable_labelled = True
+        ticks, dated = axis.ticks(offset)
+
+        def tick_label(value, _):
+            i = round(value)
+            if not 0 <= i < len(candles) or abs(value - i) > 1e-6:
+                return ""
+            return (axis.opens[i] + offset).strftime("%d.%m\n%H:%M" if i in dated else "%H:%M")
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.xaxis.set_major_formatter(FuncFormatter(tick_label))
         ax.tick_params(colors="#b9c4d5", labelsize=11)
-        ax.grid(color="#3a4558", alpha=.28)
+        ax.grid(color=GRID, alpha=.28)
         for spine in ax.spines.values():
-            spine.set_color("#3a4558")
-        ax.set_xlabel(f"Время UTC{scene['tz_offset_hours']:+g}", color="#b9c4d5", fontproperties=font(12))
-        note = "Ограниченное окно / неполная история" if scene["limited"] else "План и подтверждённые исполнения"
+            spine.set_color(GRID)
+        ax.set_xlabel(f"Время UTC{scene['tz_offset_hours']:+g} · неторговое время скрыто", color="#b9c4d5", fontproperties=font(12))
+        note = (" · ".join(scene["notes"]) or "План и подтверждённые исполнения")
+        note = note[:1].upper() + note[1:]
         if scene["before_window"]:
             note += f" · исполнений раньше окна: {len(scene['before_window'])} (цены и время — в подписи)"
         figure.text(.08, .025, note, color="#8794a7", fontproperties=font(10))
@@ -219,7 +293,8 @@ def smoke():
              "levels": [{"price": "100", "label": "Вход · 1 лот", "kind": "entry"},
                         {"price": "99", "label": "СТОП 99", "kind": "stop"},
                         {"price": "103", "label": "ЦЕЛЬ1 103", "kind": "target"}],
-             "markers": [], "before_window": [], "stop_steps": [], "result": None, "financial": {}, "limited": False}
+             "markers": [], "before_window": [], "stop_steps": [], "result": None, "financial": {},
+             "breaks": [], "notes": []}
     png = render_png(scene)
     if not png.startswith(b"\x89PNG\r\n\x1a\n"):
         raise RuntimeError("PNG недоступен")

@@ -4,7 +4,7 @@
 > `durable-live-market-data-and-emulator-export`. Потребитель Historical
 > Broker API Emulator должен быть реализован в его отдельном репозитории.
 
-Контракт описан в [OpenAPI 3.0.3](openapi.yaml). При реализации My Robot
+Контракт описан в едином [OpenAPI 3.0.3](../api/openapi.yaml) проекта. При реализации My Robot
 публикует его также по `/openapi.yaml` и предоставляет Swagger UI по `/docs`.
 Ниже предполагается локальный адрес `http://127.0.0.1:<порт>`; порт задаётся
 конфигурацией при реализации. Для доступа нужен отдельный токен экспорта.
@@ -14,8 +14,9 @@
 
 ## Порядок подключения
 
-1. В `robot.toml` включить `[market_data] export_enabled = true`, а в
-   окружении процесса задать `MARKET_DATA_EXPORT_TOKEN`. Запустить My Robot.
+1. Убедиться, что `[market_data] export_enabled = true` (значение по
+   умолчанию), и задать в окружении процесса `MARKET_DATA_EXPORT_TOKEN`.
+   Запустить My Robot.
 2. Запросить `GET /api/v1/market-data/source`. Сохранить `producer_id` и
    `min_after_id`. Если у этого `producer_id` уже есть сохранённый курсор,
    продолжить с него; новый потребитель начинает с `min_after_id`.

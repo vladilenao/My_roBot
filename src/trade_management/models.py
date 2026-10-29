@@ -377,6 +377,8 @@ class SignalAdmission:
     rejections: tuple[RejectionReason, ...] = ()
     plan: TradePlan | None = None
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    # Кластерный вердикт кандидата нового входа (src.clusters.verdict.ClusterVerdict).
+    cluster: object | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "diagnostics", _freeze(self.diagnostics))
@@ -397,6 +399,7 @@ _REJECTION_MESSAGES = {
     "unknown-profile": "Неизвестный профиль управления",
     "zero-quantity": "Размер позиции ниже минимального",
     "duplicate-signal": "дублирующий сигнал, сделка не взята в работу",
+    "opposite-exposure": "по инструменту уже есть встречная позиция или заявка",
     "admission-error": "Ошибка при допуске сигнала",
     "risk-or-margin-budget": "не хватает лимитов риска или гарантийного обеспечения",
     "risk-budget": "не хватает лимита риска для входа",
@@ -415,6 +418,16 @@ _REJECTION_MESSAGES = {
     "target-not-ahead": "Цель не впереди входа",
     "gap-entry": "вход по цене, ушедшей от сигнальной",
     "direction-not-allowed": "направление не разрешено для этого типа инструмента",
+    "filter-rejected": "сигнал отклонён фильтром привязки",
+    "cluster-climax": "Кластеры: вход на кульминации",
+    "intraday-session-closed": "внутридневной вход вне разрешённой торговой сессии",
+    "intraday-close-near": "внутридневной вход слишком близко к концу торговой сессии",
+    "session-schedule-unknown": "расписание торгов неизвестно, внутридневной вход запрещён",
+    "contour-stopping": "контур останавливается командой, новые входы запрещены",
+    "contour-stop": "остановка контура командой",
+    "instrument-removing": "инструмент убирается из состава контура, новые входы запрещены",
+    "instrument-remove": "снятие инструмента из состава контура",
+    "core-lost": "нет связи с ядром робота, новые входы запрещены",
 }
 
 

@@ -16,12 +16,15 @@ import os
 import re
 import sys
 import tomllib
+from datetime import datetime, timezone
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.data.ingestion_settings import SettingError, setting_names, validate_combination, validate_setting
+from src.clusters.settings import ClusterSettings, check_mode
+from src.trade_management.intraday_settings import IntradaySettings
 from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
@@ -50,11 +53,31 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "export_port": "market_data_export_port",
         **{name: f"market_data_{name}" for name in setting_names()},
     },
+    "market_structure": {
+        "patterns_enabled": "market_structure_patterns_enabled",
+        "redis_host": "market_structure_redis_host",
+        "redis_port": "market_structure_redis_port",
+        "redis_db": "market_structure_redis_db",
+        "queue_maxsize": "market_structure_queue_maxsize",
+        "retention_days": "market_structure_retention_days",
+    },
+    "contours": {
+        "feed_poll_secs": "contours_feed_poll_secs",
+        "demand_release_secs": "contours_demand_release_secs",
+        "heartbeat_secs": "contours_heartbeat_secs",
+        "heartbeat_timeout_secs": "contours_heartbeat_timeout_secs",
+        "autostart": "contours_autostart",
+        "max_history_runs": "contours_max_history_runs",
+    },
     "instruments": {
         "fallback_type": "instrument_type",
         "fallback_ticker": "ticker",
     },
-    "historical": {"rollover": "historical_rollover"},
+    "historical": {
+        "rollover": "historical_rollover",
+        "logging": "historical_logging",
+        "schedule": "historical_schedule",
+    },
     "notifier": {
         "channels": "notifier_channels",
         "channel": "notifier",
@@ -66,6 +89,8 @@ _SECTIONS: dict[str, dict[str, str]] = {
     "strategies.filter": {
         "triple_screen": "triple_screen_params",
     },
+    # Секция целиком — одна таблица параметров кластерного фильтра.
+    "clusters": {},
     "logging": {
         "service_uid": "logging_service_uid",
         "file": "logging_file",
@@ -85,7 +110,9 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "database_file": "database_file",
         "risk_limits": "risk_limits",
         "directions": "directions",
+        "intraday": "intraday",
         "contract_expiry_block_days": "contract_expiry_block_days",
+        "contract_expiry_close_before_end_min": "contract_expiry_close_before_end_min",
     },
     "trade_management": {
         "profiles": "trade_management_profiles",
@@ -103,6 +130,19 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_data_export_enabled": bool,
     "market_data_export_host": str,
     "market_data_export_port": int,
+    "market_structure_patterns_enabled": bool,
+    "market_structure_redis_host": str,
+    "market_structure_redis_port": int,
+    "market_structure_redis_db": int,
+    "market_structure_queue_maxsize": int,
+    "market_structure_retention_days": int,
+    "contours_emulation_telegram_channel_env": str,
+    "contours_feed_poll_secs": int,
+    "contours_demand_release_secs": int,
+    "contours_heartbeat_secs": int,
+    "contours_heartbeat_timeout_secs": int,
+    "contours_autostart": bool,
+    "contours_max_history_runs": int,
     "instrument_type": str,
     "ticker": str,
     "data_dir": str,
@@ -114,6 +154,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "share_strategies": dict,
     "future_strategies": dict,
     "triple_screen_params": dict,
+    "clusters_params": dict,
     "logging_service_uid": str,
     "logging_file": str,
     "logging_level": str,
@@ -130,12 +171,17 @@ _EXPECTED_TYPES: dict[str, type] = {
     "audit_backup_count": int,
     "risk_limits": dict,
     "directions": dict,
+    "intraday": dict,
     "trade_management_profiles": dict,
     "contract_expiry_block_days": int,
+    "contract_expiry_close_before_end_min": int,
     "historical_rollover": dict,
+    "historical_logging": dict,
+    "historical_schedule": dict,
 }
 
 _INGESTION_KEYS = frozenset(f"market_data_{name}" for name in setting_names())
+EXPLICIT_INGESTION_KEYS = "market_data_explicit_keys"
 
 _ALLOWED_NOTIFIER_VALUES = {"telegram", "console"}
 _NOTIFIER_CHANNELS_KEYS = {"notifier_channels"}
@@ -147,7 +193,7 @@ _NOTIFIER_TELEGRAM_EXTRA_KEYS = {"request_timeout", "max_transport_attempts"}
 
 # Таблица тикера в [strategies.*]: явные инлайн-привязки с устойчивым ID.
 _STRATEGY_TABLE_KEYS = {"strategies", "timeframe"}
-_STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority"}
+_STRATEGY_ENTRY_KEYS = {"id", "name", "management", "filter", "tf", "priority", "clusters"}
 _STOP_GEOMETRY_KEYS = frozenset(
     {"min_stop_atr", "min_stop_ticks", "stop_beyond_bar", "max_stop_atr"}
 )
@@ -232,6 +278,11 @@ def _validate_strategy_entry(item: Any, ticker: str, path: Path) -> None:
             f"{path}: привязка стратегии для {ticker!r}: ключ 'tf' "
             f"должен быть строкой"
         )
+    if "clusters" in item:
+        try:
+            check_mode(item["clusters"])
+        except ValueError as exc:
+            raise ConfigError(f"{path}: привязка {item['id']!r}: {exc}") from None
 
 
 def _validate_strategies(value: dict, key: str, path: Path) -> dict[str, dict]:
@@ -533,8 +584,47 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [notifier.telegram] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
+        if key == "market_structure_redis_host" and not value.strip():
+            raise ConfigError(f"{path}: [market_structure] redis_host не должен быть пустым")
+        if key in {
+            "market_structure_redis_port",
+            "market_structure_queue_maxsize",
+            "market_structure_retention_days",
+        } and (isinstance(value, bool) or value < 1):
+            option = key.removeprefix("market_structure_")
+            raise ConfigError(
+                f"{path}: [market_structure] {option} должен быть целым числом > 0, "
+                f"получено {value!r}"
+            )
+        if key == "contours_emulation_telegram_channel_env" and not _ENV_NAME.fullmatch(value):
+            raise ConfigError(
+                f"{path}: [contours.emulation] telegram_channel_env — имя переменной окружения "
+                f"(заглавные латинские буквы, цифры и _), получено {value!r}"
+            )
+        if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
+        if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
+                isinstance(value, bool) or value < 1):
+            raise ConfigError(f"{path}: [contours] {key.removeprefix('contours_')} должен быть целым числом > 0, "
+                              f"получено {value!r}")
+        if key == "contours_max_history_runs" and (isinstance(value, bool) or not 1 <= value <= 8):
+            raise ConfigError(f"{path}: [contours] max_history_runs должен быть целым числом от 1 до 8, получено {value!r}")
+        if key == "market_structure_redis_port" and value > 65535:
+            raise ConfigError(f"{path}: [market_structure] redis_port не может быть больше 65535")
+        if key == "market_structure_redis_db" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [market_structure] redis_db должен быть целым числом >= 0, "
+                f"получено {value!r}"
+            )
         if key == "triple_screen_params":
             cleaned[key] = _validate_triple_screen_params(value, path)
+            continue
+        if key == "clusters_params":
+            try:
+                ClusterSettings.from_config(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}: [clusters] {exc}") from None
+            cleaned[key] = dict(value)
             continue
         if key == "trade_management_profiles":
             cleaned[key] = _validate_trade_management_profiles(value, path)
@@ -545,8 +635,20 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key == "directions":
             cleaned[key] = _validate_directions(value, path)
             continue
+        if key == "intraday":
+            try:
+                cleaned[key] = IntradaySettings.from_config(value).as_config()
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}: [trading.intraday] {exc}") from None
+            continue
         if key == "historical_rollover":
             cleaned[key] = _validate_rollover(value, path)
+            continue
+        if key == "historical_logging":
+            cleaned[key] = validate_history_logging(value, path)
+            continue
+        if key == "historical_schedule":
+            cleaned[key] = validate_history_schedule(value, path)
             continue
         if key == "initial_deposit":
             if isinstance(value, bool):
@@ -584,6 +686,10 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             raise ConfigError(
                 f"{path}: [trading] contract_expiry_block_days должен быть неотрицательным целым числом"
             )
+        if key == "contract_expiry_close_before_end_min" and (isinstance(value, bool) or value < 0):
+            raise ConfigError(
+                f"{path}: [trading] contract_expiry_close_before_end_min должен быть неотрицательным целым числом"
+            )
         if expected is dict:
             value = _validate_strategies(value, key, path)
         cleaned[key] = value
@@ -614,6 +720,83 @@ def _validate_rollover(value: dict, path: Path) -> dict:
             raise ConfigError(f"{prefix} lead_days должен быть целым числом >= 0")
         normalized[canonical] = dict(settings)
     return {"policy": "calendar", "families": normalized}
+
+
+HISTORY_SCHEDULE_DEFAULTS = {"use_reconstructed": True}
+
+
+def validate_history_schedule(value: dict, path: Path | str) -> dict:
+    """Секция ``[historical.schedule]``: восстановленное расписание эмулятора."""
+    where = f"{path}: [historical.schedule]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} должна быть таблицей")
+    unknown = set(value) - set(HISTORY_SCHEDULE_DEFAULTS)
+    if unknown:
+        raise ConfigError(f"{where} незнакомые ключи {sorted(unknown)}")
+    merged = {**HISTORY_SCHEDULE_DEFAULTS, **value}
+    if type(merged["use_reconstructed"]) is not bool:
+        raise ConfigError(
+            f"{where} historical.schedule.use_reconstructed должен быть логическим значением, "
+            f"получено {merged['use_reconstructed']!r}"
+        )
+    return merged
+
+
+HISTORY_LOGGING_DEFAULTS = {
+    "level": "INFO",
+    "max_bytes": 0,
+    "backup_count": 0,
+    "debug_from": None,
+    "debug_to": None,
+}
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+def validate_history_logging(value: dict, path: Path | str) -> dict:
+    """Секция ``[historical.logging]``: лог прогона и окно DEBUG по рыночному времени.
+
+    ``debug_from``/``debug_to`` — моменты в формате ГГГГ-ММ-ДД ЧЧ:ММ; без зоны
+    это UTC (как границы прогона), с зоной (``+03:00``) — приводятся к UTC.
+    """
+    where = f"{path}: [historical.logging]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} должна быть таблицей")
+    unknown = set(value) - set(HISTORY_LOGGING_DEFAULTS)
+    if unknown:
+        raise ConfigError(f"{where} незнакомые ключи {sorted(unknown)}")
+    merged = {**HISTORY_LOGGING_DEFAULTS, **value}
+    level = merged["level"]
+    if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
+        raise ConfigError(f"{where} level должен быть одним из {sorted(_LOG_LEVELS)}")
+    merged["level"] = level.upper()
+    for key in ("max_bytes", "backup_count"):
+        if type(merged[key]) is not int or merged[key] < 0:
+            raise ConfigError(f"{where} {key} должен быть целым числом >= 0")
+    for key in ("debug_from", "debug_to"):
+        merged[key] = _history_moment(merged[key], f"{where} {key}")
+    bounds = merged["debug_from"], merged["debug_to"]
+    if (bounds[0] is None) != (bounds[1] is None):
+        raise ConfigError(f"{where} debug_from и debug_to задаются вместе")
+    if bounds[0] is not None and bounds[0] >= bounds[1]:
+        raise ConfigError(f"{where} debug_to должен быть позже debug_from")
+    return merged
+
+
+def _history_moment(value: Any, where: str) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value.strip())
+        except ValueError:
+            raise ConfigError(f"{where}: ожидается ГГГГ-ММ-ДД ЧЧ:ММ, получено {value!r}") from None
+    else:
+        raise ConfigError(f"{where}: ожидается строка ГГГГ-ММ-ДД ЧЧ:ММ, получено {value!r}")
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
 
 
 _CLEARING_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -761,6 +944,19 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
             )
         if not isinstance(mapping, dict):
             raise ConfigError(f"{path}: секция [{section}] должна быть таблицей")
+        if section == "clusters":
+            flat["clusters_params"] = dict(mapping)
+            continue
+        if section == "contours":
+            mapping = dict(mapping)
+            if "market_feed" in mapping:
+                raise ConfigError(
+                    f"{path}: [contours] market_feed удалён — контур эмуляции всегда читает ленту ядра "
+                    f"отдельным процессом (add-contour-process); удалите эту строку"
+                )
+            emulation = mapping.pop("emulation", None)
+            if emulation is not None:
+                flat.update(_parse_contour_section("emulation", emulation, path))
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):
@@ -789,6 +985,10 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
         validate_combination({key.removeprefix("market_data_"): value for key, value in config.items() if key in _INGESTION_KEYS})
     except SettingError as exc:
         raise ConfigError(f"{path}: [market_data] {exc}") from None
+    beat, timeout = config.get("contours_heartbeat_secs", 5), config.get("contours_heartbeat_timeout_secs", 30)
+    if timeout <= beat:
+        raise ConfigError(f"{path}: [contours] heartbeat_timeout_secs ({timeout}) должен быть больше "
+                          f"heartbeat_secs ({beat})")
     assignment_ids: set[str] = set()
     floor = config.get("contract_expiry_block_days", 2)
     for family, settings in config.get("historical_rollover", {}).get("families", {}).items():
@@ -822,6 +1022,22 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
         for key in ("journal_file", "positions_file", "audit_file"):
             if config.get(key) is not None and Path(config[key]).resolve() == Path(database_file).resolve():
                 raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
+
+
+_CONTOUR_KEYS = {"telegram_channel_env"}
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
+    """Секция ``[contours.<вид>]``: строгие ключи, плоские имена ``contours_<вид>_<ключ>``."""
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path}: [contours.{kind}] должна быть таблицей")
+    unknown = set(value) - _CONTOUR_KEYS
+    if unknown:
+        raise ConfigError(
+            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(_CONTOUR_KEYS)}"
+        )
+    return {f"contours_{kind}_{key}": item for key, item in value.items()}
 
 
 def _parse_triple_screen_section(value: Any, path: Path) -> dict[str, Any]:
@@ -858,10 +1074,6 @@ def _candidate_files(
         return files
 
     files: list[Path] = []
-    external = app_dir() / CONFIG_FILENAME
-    if external.is_file():
-        files.append(external)
-
     if getattr(sys, "frozen", False):
         bundled = Path(getattr(sys, "_MEIPASS", os.getcwd())) / BUNDLED_FILENAME
         if bundled.is_file():
@@ -870,6 +1082,10 @@ def _candidate_files(
         dev_default = _root_dir() / BUNDLED_FILENAME
         if dev_default.is_file():
             files.append(dev_default)
+
+    external = app_dir() / CONFIG_FILENAME
+    if external.is_file():
+        files.append(external)
 
     return files
 
@@ -885,9 +1101,15 @@ def load_config(
     ``config_file``/``bundled_file`` явно; иначе пути резолвятся автоматически.
     """
     result: dict[str, Any] = dict(defaults or {})
+    explicit: set[str] = set()
     for path in _candidate_files(config_file, bundled_file):
         if not path.is_file():
             continue
-        result.update(_parse(path, result))
+        parsed = _parse(path, result)
+        explicit.update(key for key in parsed if key in _INGESTION_KEYS)
+        result.update(parsed)
     _validate_combined_config(result, Path(config_file or CONFIG_FILENAME))
+    # Ключи [market_data], заданные в файлах, — для предупреждения об устаревших.
+    if explicit:
+        result[EXPLICIT_INGESTION_KEYS] = frozenset(explicit)
     return result

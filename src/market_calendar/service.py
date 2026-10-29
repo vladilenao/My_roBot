@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import OrderedDict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from typing import Protocol
@@ -30,6 +30,41 @@ def _utc_naive(value: object) -> datetime:
 
 def _aware_day(value: date) -> datetime:
     return datetime.combine(value, time.min, tzinfo=timezone.utc)
+
+
+# Предел длины одного запроса расписания у эмулятора.
+PRELOAD_CHUNK_DAYS = 366
+
+PROVENANCE_BROKER = "broker"
+PROVENANCE_RECONSTRUCTED = "reconstructed"
+# Значения поля ``provenance`` ответа эмулятора: лента My Robot — это дни,
+# наблюдённые роботом у брокера.
+_EMULATOR_PROVENANCE = {
+    None: PROVENANCE_BROKER,
+    "my_robot_export": PROVENANCE_BROKER,
+    "reconstructed": PROVENANCE_RECONSTRUCTED,
+}
+
+
+def day_provenance_of(row: dict) -> tuple[str, str | None]:
+    """Происхождение и версия правил дня из ответа эмулятора (без поля — брокер)."""
+    raw = row.get("provenance")
+    if raw not in _EMULATOR_PROVENANCE:
+        raise ValueError(f"Эмулятор вернул неизвестное происхождение дня: {raw!r}")
+    provenance = _EMULATOR_PROVENANCE[raw]
+    if provenance == PROVENANCE_BROKER:
+        return provenance, None
+    rules_version = row.get("rules_version")
+    if not isinstance(rules_version, str) or not rules_version:
+        raise ValueError("Эмулятор вернул восстановленный день без версии правил")
+    return provenance, rules_version
+
+
+def binding_provenance_of(raw: object) -> str:
+    """Происхождение привязки UID к режиму торгов (без поля — брокер)."""
+    if raw not in _EMULATOR_PROVENANCE:
+        raise ValueError(f"Эмулятор вернул неизвестное происхождение привязки: {raw!r}")
+    return _EMULATOR_PROVENANCE[raw]
 
 
 class CalendarSource(Protocol):
@@ -171,6 +206,25 @@ class BrokerScheduleSource:
         return self._budget.call(fn, *args, key=key, service="instruments", pace=False, **kwargs)
 
 
+class StoredScheduleSource:
+    """Источник процесса контура: расписание пишет ядро, контур только читает (add-contour-process).
+
+    Запросов в сеть нет: ``request`` и ``service`` ничего не делают, свежесть
+    расписания отвечает за ядро.
+    """
+
+    source = BrokerScheduleSource.source
+
+    def request(self, instrument_uid: str, now: datetime, *, force: bool = False) -> None:
+        return None
+
+    def service(self, now: datetime) -> bool:
+        return False
+
+    def stale(self, exchange: str, now: datetime) -> bool:
+        return False
+
+
 class EmulatorScheduleSource:
     """Расписание исторического снимка без обращения к T-Bank."""
 
@@ -214,42 +268,8 @@ class EmulatorScheduleSource:
         lower = requested_date - timedelta(days=self._horizon_days)
         upper = requested_date + timedelta(days=self._horizon_days)
         try:
-            with self._provider.client_context() as client:
-                response = client.trading_schedules(
-                    instrument_id=instrument_uid,
-                    from_=_aware_day(lower),
-                    to=_aware_day(upper),
-                )
-            if not isinstance(response, dict):
-                raise ValueError("Эмулятор вернул некорректное расписание")
-            response_uid = response.get("instrument_id")
-            if response_uid is not None and response_uid != instrument_uid:
-                raise ValueError("Эмулятор вернул расписание другого инструмента")
-            for value in response.get("missing_dates", ()) or ():
-                try:
-                    self.missing_dates.add(date.fromisoformat(str(value)))
-                except ValueError:
-                    continue
-            rows = response.get("days", ())
-            if not isinstance(rows, (list, tuple)) or any(not isinstance(row, dict) for row in rows):
-                raise ValueError("Эмулятор вернул некорректные дни расписания")
-            if not rows:
-                raise ValueError("Эмулятор не вернул расписание инструмента")
-            exchange = normalize_exchange(rows[0].get("exchange"))
-            if not exchange or any(normalize_exchange(row.get("exchange")) != exchange for row in rows):
-                raise ValueError("Эмулятор вернул дни разных или пустых режимов торгов")
-            self._store.record_schedule_binding(
-                source=self.source, instrument_uid=instrument_uid, exchange=exchange, observed_at=now
-            )
-            for row in rows:
-                day = _sdk_day(row.get("day"), row.get("trading_date"))
-                claimed_version = row.get("version")
-                if claimed_version and claimed_version != day_version(day):
-                    raise ValueError("Версия дня эмулятора не совпадает с каноническим содержимым")
-                self._store.record_schedule_day(source=self.source, exchange=exchange, day=day, observed_at=now)
+            self._load(instrument_uid, lower, upper, now, record_missing=True)
             self._tasks.pop((instrument_uid, requested_date))
-            self._loaded.setdefault(instrument_uid, []).append((lower, upper))
-            self.errors.pop(instrument_uid, None)
             return True
         except Exception as exc:
             self._tasks.pop((instrument_uid, requested_date))
@@ -262,43 +282,128 @@ class EmulatorScheduleSource:
                 self.errors[instrument_uid] = f"schedule_unavailable: {exc}"
             return True
 
+    def preload(self, instrument_uid: str, first: date, last: date, now: datetime) -> str | None:
+        """Загружает расписание UID на весь диапазон до первого тика.
+
+        Запросы — кусками не длиннее предела эмулятора. Загруженные куски
+        закрывают ленивые запросы тиков; сбой не прерывает прогон: даты
+        остаются для ленивой загрузки. Возвращает причину сбоя или ``None``.
+        """
+        now = _utc_naive(now)
+        lower = first
+        while lower <= last:
+            upper = min(last, lower + timedelta(days=PRELOAD_CHUNK_DAYS - 1))
+            try:
+                self._load(instrument_uid, lower, upper, now, record_missing=False)
+            except Exception as exc:
+                if getattr(exc, "code", None) == "SNAPSHOT_MISMATCH":
+                    raise
+                reason = ("schedule_resource_unavailable" if getattr(exc, "status", None) == 404
+                          else f"schedule_unavailable: {exc}")
+                log.warning("Предзагрузка расписания %s за %s — %s не выполнена: %s",
+                            instrument_uid, lower, upper, type(exc).__name__)
+                return reason
+            lower = upper + timedelta(days=1)
+        return None
+
+    def _load(self, instrument_uid: str, lower: date, upper: date, now: datetime, *, record_missing: bool) -> None:
+        with self._provider.client_context() as client:
+            response = client.trading_schedules(
+                instrument_id=instrument_uid,
+                from_=_aware_day(lower),
+                to=_aware_day(upper),
+            )
+        if not isinstance(response, dict):
+            raise ValueError("Эмулятор вернул некорректное расписание")
+        response_uid = response.get("instrument_id")
+        if response_uid is not None and response_uid != instrument_uid:
+            raise ValueError("Эмулятор вернул расписание другого инструмента")
+        if record_missing:
+            for value in response.get("missing_dates", ()) or ():
+                try:
+                    self.missing_dates.add(date.fromisoformat(str(value)))
+                except ValueError:
+                    continue
+        rows = response.get("days", ())
+        if not isinstance(rows, (list, tuple)) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Эмулятор вернул некорректные дни расписания")
+        if not rows:
+            raise ValueError("Эмулятор не вернул расписание инструмента")
+        exchange = normalize_exchange(rows[0].get("exchange"))
+        if not exchange or any(normalize_exchange(row.get("exchange")) != exchange for row in rows):
+            raise ValueError("Эмулятор вернул дни разных или пустых режимов торгов")
+        binding_provenance = binding_provenance_of(response.get("binding_provenance"))
+        # Сначала разбор и проверка всей страницы: неверный день не должен
+        # оставить в снимке половину ответа.
+        parsed = []
+        for row in rows:
+            day = _sdk_day(row.get("day"), row.get("trading_date"))
+            claimed_version = row.get("version")
+            if claimed_version and claimed_version != day_version(day):
+                raise ValueError("Версия дня эмулятора не совпадает с каноническим содержимым")
+            parsed.append((day, *day_provenance_of(row)))
+        self._store.record_schedule_binding(
+            source=self.source, instrument_uid=instrument_uid, exchange=exchange, observed_at=now,
+            provenance=binding_provenance,
+        )
+        for day, provenance, rules_version in parsed:
+            self._store.record_schedule_day(
+                source=self.source, exchange=exchange, day=day, observed_at=now,
+                provenance=provenance, rules_version=rules_version,
+            )
+        self._loaded.setdefault(instrument_uid, []).append((lower, upper))
+        self.errors.pop(instrument_uid, None)
+
     @staticmethod
     def _contains(ranges, requested_date: date) -> bool:
         return any(lower <= requested_date <= upper for lower, upper in ranges)
 
 
 class SnapshotScheduleStore:
-    """Непостоянное хранилище расписания одного historical snapshot."""
+    """Непостоянное хранилище расписания одного historical snapshot.
+
+    Только здесь живут восстановленные дни: в рыночную базу робота и в ленту
+    экспорта они не попадают.
+    """
 
     def __init__(self) -> None:
-        self._bindings: dict[tuple[str, str], str] = {}
+        self._bindings: dict[tuple[str, str], tuple[str, str]] = {}
         self._days: dict[tuple[str, str, str], StoredScheduleDay] = {}
         self._change_id = 0
 
-    def record_schedule_binding(self, *, source, instrument_uid, exchange, observed_at=None):
+    def record_schedule_binding(self, *, source, instrument_uid, exchange, observed_at=None,
+                                provenance=PROVENANCE_BROKER):
         exchange = normalize_exchange(exchange)
         key = (source, instrument_uid)
-        changed = self._bindings.get(key) != exchange
-        self._bindings[key] = exchange
+        changed = self._bindings.get(key) != (exchange, provenance)
+        self._bindings[key] = (exchange, provenance)
         if changed:
             self._change_id += 1
         return changed
 
     def schedule_binding(self, *, source, instrument_uid):
-        return self._bindings.get((source, instrument_uid))
+        binding = self._bindings.get((source, instrument_uid))
+        return None if binding is None else binding[0]
 
-    def record_schedule_day(self, *, source, exchange, day, observed_at=None):
+    def schedule_binding_provenance(self, *, source, instrument_uid):
+        binding = self._bindings.get((source, instrument_uid))
+        return None if binding is None else binding[1]
+
+    def record_schedule_day(self, *, source, exchange, day, observed_at=None,
+                            provenance=PROVENANCE_BROKER, rules_version=None):
         exchange = normalize_exchange(exchange)
         version = day_version(day)
         key = (source, exchange, trading_date(day).isoformat())
         previous = self._days.get(key)
         when = _utc_naive(observed_at or datetime.now(timezone.utc)).isoformat() + "Z"
-        if previous is not None and previous.version == version:
+        if (previous is not None and previous.version == version
+                and (previous.provenance, previous.rules_version) == (provenance, rules_version)):
             self._days[key] = StoredScheduleDay(**{**previous.__dict__, "last_confirmed_at": when})
             return False
         self._change_id += 1
         self._days[key] = StoredScheduleDay(source, exchange, key[2], version, canonical_day_json(day),
-            bool(getattr(day, "is_trading_day", False)), when, when, self._change_id)
+            bool(getattr(day, "is_trading_day", False)), when, when, self._change_id,
+            provenance=provenance, rules_version=rules_version)
         return True
 
     def schedule_days(self, *, source, exchange):
@@ -310,6 +415,15 @@ class SnapshotScheduleStore:
         days = self.schedule_days(source=source, exchange=exchange)
         return max((day.last_confirmed_at for day in days), default=None)
 
+@dataclass(frozen=True)
+class ScheduleCoverage:
+    """Покрытие диапазона дат расписанием: происхождение дня по дате и пропуски."""
+
+    days: dict[date, str]
+    missing_dates: tuple[date, ...]
+    rules_versions: tuple[str, ...] = ()
+
+
 class MarketCalendar:
     """Read-only на тике календарный фасад поверх сохранённого расписания."""
 
@@ -319,19 +433,24 @@ class MarketCalendar:
         source: CalendarSource,
         *,
         schedule_max_age_secs: float = 129600,
+        allow_reconstructed: bool = False,
     ) -> None:
         if schedule_max_age_secs <= 0:
             raise ValueError("schedule_max_age_secs должен быть положительным")
         self._store = store
         self._source = source
         self._max_age = timedelta(seconds=schedule_max_age_secs)
+        # Восстановленные дни доступны только по явному запросу потребителя
+        # (сессионная защита) и только если прогон их разрешил.
+        self._allow_reconstructed = allow_reconstructed
         # Ожидание запрашивается каждой парой на каждом пробуждении: SQLite и
         # разбор JSON — только после записи фоновым обслуживанием.
         self._lock = threading.Lock()
         self._bindings: dict[str, str] = {}
         self._records: dict[str, tuple[StoredScheduleDay, ...]] = {}
-        self._parsed: dict[tuple[str, str, str], CalendarDay] = {}
-        self._used: set[tuple[str, str, str]] = set()
+        self._parsed: dict[tuple[str, str, str, str, str | None], CalendarDay] = {}
+        # (режим, дата, версия, происхождение) дней, на которых принимались решения.
+        self._used: set[tuple[str, str, str, str]] = set()
 
     def expectation(
         self,
@@ -344,7 +463,8 @@ class MarketCalendar:
         calendar = self.calendar_for(instrument_uid, now)
         result = expect(calendar, rule, now, timeout, instrument_uid=instrument_uid)
         if result.schedule is not None:
-            used = {(result.schedule.exchange, day.isoformat(), version) for day, version in result.schedule.days}
+            used = {(result.schedule.exchange, day.isoformat(), version, PROVENANCE_BROKER)
+                    for day, version in result.schedule.days}
             if not used <= self._used:
                 with self._lock:
                     self._used |= used
@@ -356,25 +476,42 @@ class MarketCalendar:
             )
         return result
 
-    def calendar_for(self, instrument_uid: str, now: datetime) -> TradingCalendar | None:
-        """Возвращает только сохранённый календарь и при необходимости ставит загрузку."""
+    def calendar_for(
+        self, instrument_uid: str, now: datetime, *, include_reconstructed: bool = False,
+    ) -> TradingCalendar | None:
+        """Возвращает только сохранённый календарь и при необходимости ставит загрузку.
+
+        По умолчанию — только дни брокера: календарь служит доказательством
+        (ожидание свечей, сверка покрытия, границы). ``include_reconstructed``
+        добавляет восстановленные дни для дат без дня брокера, если прогон их
+        разрешил; такой вид нужен только сессионной защите.
+        """
         now = _utc_naive(now)
         exchange = self._binding(instrument_uid)
         if exchange is None:
             self._source.request(instrument_uid, now, force=True)
             return None
-        calendar = self.calendar(exchange, now)
-        self._source.request(instrument_uid, now, force=calendar is None or calendar.day(exchange_date(now)) is None)
+        calendar = self.calendar(exchange, now, include_reconstructed=include_reconstructed)
+        today = calendar.day(exchange_date(now)) if calendar is not None else None
+        self._source.request(instrument_uid, now, force=today is None)
+        if include_reconstructed and today is not None:
+            key = (exchange, today.trading_date.isoformat(), today.version, today.provenance)
+            if key not in self._used:
+                with self._lock:
+                    self._used.add(key)
         return calendar
 
     def exchange_for(self, instrument_uid: str) -> str | None:
         """Сохранённый режим торгов UID без сетевого обращения."""
         return self._binding(instrument_uid)
 
-    def calendar(self, exchange: str, now: datetime) -> TradingCalendar | None:
+    def calendar(
+        self, exchange: str, now: datetime, *, include_reconstructed: bool = False,
+    ) -> TradingCalendar | None:
         now = _utc_naive(now)
         exchange = normalize_exchange(exchange)
-        days = [day for day in self._days(exchange) if self._applicable(day)]
+        provenances = self._provenances(include_reconstructed)
+        days = [day for day in self._days(exchange) if day.provenance in provenances and self._applicable(day)]
         if not days:
             return None
         return TradingCalendar(
@@ -393,21 +530,82 @@ class MarketCalendar:
                 self._records.clear()
         return worked
 
+    def preload(self, ranges, now: datetime) -> dict[str, str]:
+        """Предзагрузка расписания ``(uid, first, last)`` до первого тика; причины сбоев по UID."""
+        preload = getattr(self._source, "preload", None)
+        if preload is None:
+            return {}
+        failures: dict[str, str] = {}
+        for instrument_uid, first, last in ranges:
+            reason = preload(instrument_uid, first, last, _utc_naive(now))
+            if reason is not None:
+                failures[instrument_uid] = reason
+        with self._lock:
+            self._bindings.clear()
+            self._records.clear()
+        return failures
+
+    def coverage(self, instrument_uid: str, first: date, last: date) -> ScheduleCoverage:
+        """Даты диапазона по происхождению дня, применимого для сессионной защиты."""
+        exchange = self._binding(instrument_uid)
+        records = {} if exchange is None else {record.trading_date: record for record in self._days(exchange)}
+        provenances = self._provenances(include_reconstructed=True)
+        days: dict[date, str] = {}
+        rules: set[str] = set()
+        missing: list[date] = []
+        value = first
+        while value <= last:
+            record = records.get(value.isoformat())
+            if record is None or record.provenance not in provenances:
+                missing.append(value)
+            else:
+                days[value] = record.provenance
+                if record.rules_version:
+                    rules.add(record.rules_version)
+            value += timedelta(days=1)
+        return ScheduleCoverage(days, tuple(missing), tuple(sorted(rules)))
+
     def usage(self) -> dict:
-        """Использованное расписание для отчёта прогона: режимы, версии, пробелы."""
+        """Использованное расписание для отчёта прогона: режимы, версии, пробелы.
+
+        Даты без расписания — запрошенные даты без применимого дня: при
+        выключенном восстановлении восстановленный день не считается
+        применимым, но учитывается отдельно как неиспользованный.
+        """
         source = self._source
         with self._lock:
             versions = set(self._used)
-        exchanges = {exchange for exchange, _, _ in versions}
+        exchanges = {exchange for exchange, _, _, _ in versions}
         missing: set[date] = set(getattr(source, "missing_dates", ()))
+        dates_by_provenance: dict[str, set[tuple[str, str]]] = {}
+        rules_versions: set[str] = set()
+        bindings: dict[str, set[str]] = {}
         for uid, dates in getattr(source, "requested", {}).items():
             exchange = self._binding(uid)
             if exchange is None:
                 missing.update(dates)
                 continue
             exchanges.add(exchange)
-            known = {record.trading_date for record in self._days(exchange)}
-            missing.update(value for value in dates if value.isoformat() not in known)
+            binding_provenance = self._binding_provenance(uid)
+            if binding_provenance is not None:
+                bindings.setdefault(exchange, set()).add(binding_provenance)
+            records = {record.trading_date: record for record in self._days(exchange)}
+            for value in dates:
+                record = records.get(value.isoformat())
+                if record is None:
+                    missing.add(value)
+                    continue
+                provenance = record.provenance
+                if provenance == PROVENANCE_RECONSTRUCTED:
+                    rules_versions.add(record.rules_version or "")
+                    if not self._allow_reconstructed:
+                        missing.add(value)
+                        provenance = "reconstructed_unused"
+                dates_by_provenance.setdefault(provenance, set()).add((exchange, record.trading_date))
+        # Дата без дня в ответе одного UID могла прийти с днём у другого UID.
+        applicable = {day for key, items in dates_by_provenance.items() if key != "reconstructed_unused"
+                      for _, day in items}
+        missing = {value for value in missing if value.isoformat() not in applicable}
         reasons = sorted(set(getattr(source, "errors", {}).values()))
         generation = getattr(source, "snapshot_generation", None)
         return {
@@ -418,7 +616,22 @@ class MarketCalendar:
             "day_versions": tuple(sorted(versions)),
             "missing_dates": tuple(value.isoformat() for value in sorted(missing)),
             "unavailable_reason": "; ".join(reasons) or None,
+            "provenance_counts": {key: len(value) for key, value in sorted(dates_by_provenance.items())},
+            "rules_versions": tuple(sorted(rules_versions)),
+            "binding_provenance": {key: tuple(sorted(value)) for key, value in sorted(bindings.items())},
+            "use_reconstructed": self._allow_reconstructed,
         }
+
+    def _provenances(self, include_reconstructed: bool) -> frozenset[str]:
+        if include_reconstructed and self._allow_reconstructed:
+            return frozenset((PROVENANCE_BROKER, PROVENANCE_RECONSTRUCTED))
+        return frozenset((PROVENANCE_BROKER,))
+
+    def _binding_provenance(self, instrument_uid: str) -> str | None:
+        lookup = getattr(self._store, "schedule_binding_provenance", None)
+        if lookup is None:
+            return PROVENANCE_BROKER if self._binding(instrument_uid) is not None else None
+        return lookup(source=self._source.source, instrument_uid=instrument_uid)
 
     def _binding(self, instrument_uid: str) -> str | None:
         with self._lock:
@@ -445,7 +658,7 @@ class MarketCalendar:
         return records
 
     def _parse(self, record: StoredScheduleDay) -> CalendarDay:
-        key = (record.exchange, record.trading_date, record.version)
+        key = (record.exchange, record.trading_date, record.version, record.provenance, record.rules_version)
         with self._lock:
             parsed = self._parsed.get(key)
         if parsed is None:
@@ -483,6 +696,8 @@ def _calendar_day(record: StoredScheduleDay) -> CalendarDay:
         windows=windows_for_day(day),
         version=record.version,
         observed_at=_utc_naive(record.observed_at),
+        provenance=record.provenance,
+        rules_version=record.rules_version,
     )
 
 

@@ -14,9 +14,15 @@ from src.data.timeutil import to_naive
 from src.instruments.model import instrument_key
 from src.history.source import source_identity
 from src.logging_setup import get_logger
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.live_state import normalize_rpc_candle, normalize_stream_candle
 
 log = get_logger(__name__)
+
+# Вид разрыва графика по тяжести и вид разрешённых состояний покрытия
+# (telegram-trade-cards, data-cache «Классификация разрывов окна»).
+_CHART_BREAK_ORDER = ("closed", "no_trade", "schedule_unavailable", "missing")
+_CHART_RESOLVED_KINDS = {"scheduled_closed": "closed", "confirmed_no_trade": "no_trade", "source_absent": "no_trade"}
 
 
 def _synchronized(method):
@@ -37,6 +43,8 @@ CONSECUTIVE_EMPTY_TICKS_BEFORE_END = 2
 # Верхняя граница для пауз между сессиями, выходных и праздников; разрыв длиннее
 # недели — это уже обрыв среза, и такой прогон честно останавливается с недобором.
 GAP_SEARCH_LOOKAHEAD = timedelta(days=7)
+# Сводка полос пары без смены её состояния публикуется не чаще (секунды).
+READINESS_LANES_SECONDS = 30
 
 
 def _naive_series(stamps: pd.Series) -> pd.Series:
@@ -138,6 +146,9 @@ class MarketDataCache:
         # журнал живых данных включается только вызывающим кодом live-режима.
         self._market_store = market_store
         self._market_source = market_source
+        # Торговый контур, под чьим ключом пишутся отметки исполнения
+        # (add-contour-market-feed); задаёт сборка контура.
+        self.contour_id = None
         self._market_reconciler = market_reconciler
         self._market_calendar = market_calendar
         self._data_refresh_min_interval = data_refresh_min_interval  # мин. пауза между API-дозагрузками
@@ -194,9 +205,15 @@ class MarketDataCache:
         self._pre_cutover_gaps = {}
         self._live_members = {}
         self._live_evidence = {}
+        # Свечи минут, которые исполнение могло пройти как «у источника нет»:
+        # главный поток пишет по ним отметку в журнал сделки.
+        self._late_after_source_absent = deque()
         self._live_generation = 0
         self._data_changed = threading.Condition(self._lock)
         self._pending_live_history = {}
+        # Все потребности этого запуска (адрес, тикер, тип, ТФ): по ним пары
+        # сохранённого состава, которые никто не запросил, снимаются.
+        self._requested_live = set()
 
     @property
     def history_source_failed(self):
@@ -373,6 +390,9 @@ class MarketDataCache:
                 "history": "pending", "warmup_days": 0, "history_error": "", "state": "BOOTSTRAPPING",
             })
             member["keys"].add(key)
+            # Пара сохранённого состава, затем выбранная пользователем: дальше
+            # обслуживается выбранным инструментом (семейство, полное имя).
+            member["instrument"] = instrument
             lower = self._pending_execution_lower.pop(instrument_key(instrument), None)
             if lower is not None and timeframe == "1m":
                 previous = member["execution_lower"]
@@ -393,6 +413,51 @@ class MarketDataCache:
             self._refresh_member_state(uid, timeframe, member)
             self._live_generation += 1
             self._data_changed.notify_all()
+
+    def unregister_live_pair(self, uid, timeframe):
+        """Снимает пару, не выбранную в этом запуске и без обязательств.
+
+        Данные в рыночной базе остаются; снимается только обслуживание:
+        свежий опрос, подписка и полосы её больше не видят.
+        """
+        with self._lock:
+            member = self._live_members.pop((uid, timeframe), None)
+            if member is None:
+                return False
+            self._market_store.drop_pair_readiness(source=self._market_source, instrument_uid=uid,
+                                                   interval=timeframe)
+            for key in member["keys"]:
+                self._uids.pop(key, None)
+                self._instruments.pop(key, None)
+                self._frames.pop(key, None)
+                self._last_loaded.pop(key, None)
+            self._live_evidence.pop((uid, timeframe), None)
+            self._live_generation += 1
+            self._data_changed.notify_all()
+            return True
+
+    def retire_unrequested_live_pairs(self):
+        """Снимает пары, ТФ которых этот запуск не запросил (retire-unrequired-roster-pairs).
+
+        Пара сохранённого состава регистрируется до выбора без потребности
+        прогрева. Если после регистрации потребностей стратегий, фильтров и
+        сопровождения сделок её ТФ не нужен никому, прогрев не начнётся
+        никогда, и старт ждал бы её вечно. Запрос узнаётся по UID или адресу
+        пары либо по тикеру и типу: live-выбор строит инструменты без UID.
+        Возвращает снятые пары как (UID, ТФ, тикер).
+        """
+        with self._lock:
+            stale = []
+            for (uid, timeframe), member in sorted(self._live_members.items()):
+                instrument = member["instrument"]
+                addresses = {uid} | {key[0] for key in member["keys"]}
+                if not any(tf == timeframe and (address in addresses or (
+                        ticker == instrument.ticker and kind == instrument.instrument_type))
+                        for address, ticker, kind, tf in self._requested_live):
+                    stale.append((uid, timeframe, instrument.ticker))
+            for uid, timeframe, _ in stale:
+                self.unregister_live_pair(uid, timeframe)
+        return stale
 
     def set_live_execution_lower(self, uid, timeframe, open_time):
         """Main-thread boundary сохранённых обязательств, не high-water receipt."""
@@ -460,6 +525,10 @@ class MarketDataCache:
                 pair, stamp = (item.uid, item.timeframe), _naive(item.open_time)
                 if result["state"] == "accepted" and result["changed"]:
                     changed.setdefault(pair, []).append(item)
+                    if result.get("previous_coverage") == "source_absent" and item.timeframe == "1m":
+                        row = item.as_row()
+                        self._late_after_source_absent.append((item.uid, stamp, tuple(
+                            float(row[name]) for name in ("open", "high", "low", "close"))))
                     if result.get("previous_coverage") == "scheduled_closed":
                         self._market_store.save_live_state(
                             {"outside_schedule": True, "open_time": stamp.isoformat()},
@@ -572,7 +641,7 @@ class MarketDataCache:
                                                       interval=timeframe, open_time=probe)
         else:
             state = reconciler.interval_state(instrument_uid=uid, interval=timeframe, open_time=probe, now=now)
-        if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+        if state not in RESOLVED_INTERVAL_STATES:
             return None
         following = _naive(grid.bar_close(probe))
         if state == "scheduled_closed" and reconciler is not None:
@@ -604,7 +673,34 @@ class MarketDataCache:
         else:
             state = "READY"
         member["state"] = state
+        self._publish_readiness(uid, timeframe, member)
         return state
+
+    def _publish_readiness(self, uid, timeframe, member, *, lanes_only=False):
+        """Готовность пары в рыночной базе для кэша контура (add-contour-market-feed).
+
+        Единственное место публикации: вызывается при пересчёте состояния пары
+        и при смене сводки полос. Сводка полос без смены состояния пишется не
+        чаще ``READINESS_LANES_SECONDS`` — в ней меняется время каждой проверки.
+        """
+        floor = self.live_floor(uid, timeframe)
+        instrument = member["instrument"]
+        status = {"ticker": instrument.ticker, "instrument_type": instrument.instrument_type,
+                  "short_name": instrument.short_name, "label": instrument.label,
+                  "state": member["state"], "transport": member.get("transport") or "polling",
+                  "epoch": member.get("epoch"), "history": member["history"],
+                  "history_error": member["history_error"], "gap": member.get("gap"),
+                  "cutover": None if floor is None else self._live_cutover.isoformat(),
+                  "live_floor": None if floor is None else floor.isoformat()}
+        lanes = {lane: dict(value) for lane, value in (member.get("lanes") or {}).items()}
+        now = time.monotonic()
+        published = member.get("published")
+        if published is not None and published[0] == status:
+            if published[1] == lanes or (lanes_only and now - published[2] < READINESS_LANES_SECONDS):
+                return
+        self._market_store.publish_pair_readiness(source=self._market_source, instrument_uid=uid,
+                                                  interval=timeframe, status={**status, "lanes": lanes})
+        member["published"] = (status, lanes, now)
 
     def accept_stream_candle(self, candle, *, epoch, received_at):
         evidence = self._live_evidence.get((candle.uid, candle.timeframe))
@@ -637,7 +733,7 @@ class MarketDataCache:
             if not uid:
                 raise ValueError("Нет UID для закрепления исполнительного входа")
             reference = self._market_store.pin_input(source=self._market_source, instrument_uid=uid,
-                                                    interval="1m", open_time=stamp)
+                                                    interval="1m", open_time=stamp, contour=self.contour_id)
             return reference, self._market_store.pinned_frame(reference)
 
     def resume_execution_marker(self, instrument, financial_boundary):
@@ -652,12 +748,12 @@ class MarketDataCache:
             if not uid or financial_boundary is None:
                 return None
             stamp = _naive(financial_boundary)
-            processed = self._market_store.cursors(source=self._market_source, instrument_uid=uid,
-                                                   interval="1m").get("processed_through")
+            processed = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m",
+                                                   contour=self.contour_id).get("processed_through")
             if processed is not None and pd.Timestamp(processed).tz_convert("UTC").tz_localize(None) >= stamp:
                 return None
             self._market_store.mark_processed(source=self._market_source, instrument_uid=uid,
-                                              interval="1m", open_time=stamp)
+                                              interval="1m", open_time=stamp, contour=self.contour_id)
             return stamp
 
     def wait_for_data_change(self, generation, timeout):
@@ -674,6 +770,7 @@ class MarketDataCache:
         """Недостающая потребность передаётся worker без синхронной сети."""
         with self._lock:
             key = self._key(instrument, timeframe)
+            self._requested_live.add((key[0], instrument.ticker, instrument.instrument_type, timeframe))
             self._instruments.setdefault(key, instrument)
             uid = self._uids.get(key)
             member = self._live_members.get((uid, timeframe)) if uid else None
@@ -760,6 +857,15 @@ class MarketDataCache:
             member["gap"] = gap
             self._refresh_member_state(uid, timeframe, member)
 
+    def set_lane_status(self, uid, timeframe, lane, status) -> None:
+        """Сводка фоновой полосы по паре для машиночитаемой диагностики."""
+        with self._lock:
+            member = self._live_members.get((uid, timeframe))
+            if member is not None:
+                member.setdefault("lanes", {})[lane] = status
+                if "state" in member:
+                    self._publish_readiness(uid, timeframe, member, lanes_only=True)
+
     def pair_status(self, instrument, timeframe):
         """Read-only факты готовности пары для анализа, допуска и диагностики."""
         with self._lock:
@@ -768,7 +874,8 @@ class MarketDataCache:
             if member is None:
                 return {"state": "BOOTSTRAPPING", "uid": uid, "reason": "Пара ещё не зарегистрирована ingestion"}
             state = self._refresh_member_state(uid, timeframe, member)
-            cursors = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe)
+            cursors = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval=timeframe,
+                                                 contour=self.contour_id)
             held = self._market_store.live_state(kind="uid", source=self._market_source, instrument_uid=uid)
             return {"state": state, "uid": uid, "transport": member.get("transport") or "polling",
                     "epoch": member.get("epoch"), "history": member["history"],
@@ -778,7 +885,8 @@ class MarketDataCache:
                     "processed_through": cursors.get("processed_through"),
                     "incident": held.get("incident"),
                     "cutover": None if self.live_floor(uid, timeframe) is None else self._live_cutover.isoformat(),
-                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0)}
+                    "pre_cutover_gaps": self._pre_cutover_gaps.get((uid, timeframe), 0),
+                    "lanes": {lane: dict(value) for lane, value in (member.get("lanes") or {}).items()}}
 
     def input_ready_at(self, instrument, timeframe, open_time):
         """Момент durable-публикации текущей версии свечи (UTC-naive) либо None."""
@@ -977,13 +1085,36 @@ class MarketDataCache:
                     open_time=probe, now=self._timeline.now(),
                 ) if self._market_reconciler is not None else self._market_store.coverage_state(
                     source=self._market_source, instrument_uid=instrument_id, interval=timeframe, open_time=probe))
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     self._report_coverage_block(key, probe, state)
                     return frame.loc[allowed].copy()
                 probe += pd.Timedelta(minutes=1)
             allowed.append(index)
             previous = stamp
         return frame.loc[allowed].copy()
+
+    def source_absent_between(self, instrument, last_bar, frame) -> list:
+        """Минуты «у источника нет» между границей исполнения и последним рядом кадра."""
+        if frame is None or frame.empty or last_bar is None or self._market_store is None:
+            return []
+        uid = self._uids.get(self._key(instrument, "1m"))
+        if not uid:
+            return []
+        lower = _naive(last_bar) + pd.Timedelta(minutes=1)
+        upper = _naive(frame["datetime"].max())
+        if upper < lower:
+            return []
+        snapshot = self._market_store.window_snapshot(source=self._market_source, instrument_uid=uid,
+                                                      interval="1m", lower=lower, upper=upper)
+        return sorted((stamp, evidence) for stamp, (state, evidence) in snapshot["states"].items()
+                      if state == "source_absent" and stamp not in snapshot["received"])
+
+    def drain_late_source_absent(self) -> list:
+        """Поздние свечи минут «у источника нет»: (uid, минута, (open, high, low, close))."""
+        items = []
+        while self._late_after_source_absent:
+            items.append(self._late_after_source_absent.popleft())
+        return items
 
     @_synchronized
     def mark_processed(self, instrument, timeframe: str, stamp) -> None:
@@ -994,7 +1125,7 @@ class MarketDataCache:
         if instrument_id:
             self._market_store.mark_processed(
                 source=self._market_source, instrument_uid=instrument_id,
-                interval=timeframe, open_time=stamp,
+                interval=timeframe, open_time=stamp, contour=self.contour_id,
             )
 
     def ensure_loaded(self, instrument, timeframe: str) -> None:
@@ -1152,7 +1283,7 @@ class MarketDataCache:
             while probe < _naive(right):
                 state = self._market_reconciler.interval_state(instrument_uid=uid,
                     interval=timeframe, open_time=probe, now=self._timeline.now())
-                if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                if state not in RESOLVED_INTERVAL_STATES:
                     if floor is None or probe >= floor:
                         return False
                     # До запуска: доказательства нет и получить его нельзя —
@@ -1163,6 +1294,55 @@ class MarketDataCache:
         if floor is not None:
             self._pre_cutover_gaps[uid, timeframe] = unconfirmed
         return True
+
+    def chart_breaks(self, instrument, timeframe, frame) -> dict:
+        """Вид каждого разрыва окна для графика сделки.
+
+        Ключ — (открытие свечи перед разрывом, открытие свечи после), UTC-naive;
+        значение — ``{"kind", "missing"}``. Источник — долговечное покрытие и
+        уже известный календарь того же рыночного слоя. Без сети, без записи
+        и без влияния на готовность: при любой неясности разрыв остаётся
+        ``schedule_unavailable``, а не пропуском и не полными данными.
+        """
+        if frame is None or frame.empty:
+            return {}
+        grid = self._timeline.grid(timeframe)
+        stamps = sorted({_naive(value) for value in frame["datetime"]})
+        gaps = {}
+        for left, right in zip(stamps, stamps[1:]):
+            probes, probe = [], _naive(grid.bar_close(left))
+            while probe < right:
+                probes.append(probe)
+                following = _naive(grid.bar_close(probe))
+                if following <= probe:
+                    break
+                probe = following
+            if probes:
+                gaps[left, right] = probes
+        unknown = {key: {"kind": "schedule_unavailable", "missing": len(probes)} for key, probes in gaps.items()}
+        uid = self._uids.get(self._key(instrument, timeframe))
+        if not gaps or not uid or self._market_store is None or self._market_reconciler is None:
+            return unknown
+        try:
+            window = self._market_store.window_snapshot(source=self._market_source, instrument_uid=uid,
+                                                        interval=timeframe, lower=stamps[0], upper=stamps[-1])
+            calendars = self._market_reconciler.stored_calendars(uid, self._timeline.now())
+        except Exception as exc:
+            log.warning("График %s %s: покрытие окна недоступно (%s).", uid, timeframe, type(exc).__name__)
+            return unknown
+
+        def kind(probe):
+            state = window["states"].get(probe, (None, None))[0]
+            if state in _CHART_RESOLVED_KINDS:
+                return _CHART_RESOLVED_KINDS[state]
+            calendar = next((item for item in calendars if item.covers(probe)), None)
+            if calendar is None:
+                return "schedule_unavailable"
+            closed = _naive(grid.bar_close(probe))
+            return "missing" if any(start < closed and probe < end for start, end in calendar.intervals) else "closed"
+
+        return {key: {"kind": max((kind(probe) for probe in probes), key=_CHART_BREAK_ORDER.index),
+                      "missing": len(probes)} for key, probes in gaps.items()}
 
     def calendar_for(self, instrument):
         uid = self._uids.get(self._key(instrument, "1m")) or getattr(instrument, "uid", None)
@@ -1179,6 +1359,40 @@ class MarketDataCache:
     def instrument_uid(self, instrument, timeframe="1m"):
         """UID пары из live-регистрации, иначе из карточки инструмента."""
         return self._uids.get(self._key(instrument, timeframe)) or getattr(instrument, "uid", None)
+
+    def pattern_bar(self, instrument, timeframe):
+        """Последний закрытый бар пары и прогрета ли она — для постановки паттернов ядром.
+
+        Только память: без регистрации неизвестной пары и без чтения базы.
+        """
+        with self._lock:
+            key = self._key(instrument, timeframe)
+            uid = self._uids.get(key) or self.pair_uid(instrument, timeframe)
+            member = self._live_members.get((uid, timeframe)) if uid else None
+            frame = None
+            if member is not None:
+                frame = next((self._frames.get(item) for item in sorted(member["keys"])
+                              if self._frames.get(item) is not None and not self._frames[item].empty), None)
+            if frame is None:
+                return None, False
+            closed = self._closed_only(frame, timeframe)
+            last = None if closed.empty else _naive(closed["datetime"].iloc[-1])
+            return last, member["history"] == "done"
+
+    def pair_uid(self, instrument, timeframe="1m"):
+        """Адрес рыночной пары для торговой стороны: UID, даже если в карточке его нет.
+
+        Live-выбор строит инструменты без UID, а пара сохранённого состава
+        зарегистрирована под UID раньше выбора — её находим по тикеру и типу.
+        """
+        uid = self.instrument_uid(instrument, timeframe)
+        if uid:
+            return uid
+        with self._lock:
+            found = {pair_uid for (pair_uid, tf), member in self._live_members.items()
+                     if tf == timeframe and member["instrument"].ticker == instrument.ticker
+                     and member["instrument"].instrument_type == instrument.instrument_type}
+        return found.pop() if len(found) == 1 else None
 
     def calendar_expectation(self, instrument, timeframe, now=None):
         uid = self.instrument_uid(instrument, timeframe)
@@ -1201,13 +1415,13 @@ class MarketDataCache:
         if not uid or self._market_store is None:
             return None
         return self._market_store.analysis_cursor(source=self._market_source, instrument_uid=uid,
-            interval=timeframe, assignment_id=assignment_id)
+            interval=timeframe, assignment_id=assignment_id, contour=self.contour_id)
 
     def mark_analyzed(self, instrument, timeframe, assignment_id, open_time):
         uid = self._uids.get(self._key(instrument, timeframe))
         if uid and self._market_store is not None:
             self._market_store.mark_analyzed(source=self._market_source, instrument_uid=uid,
-                interval=timeframe, assignment_id=assignment_id, open_time=open_time)
+                interval=timeframe, assignment_id=assignment_id, open_time=open_time, contour=self.contour_id)
 
     def entry_market(self, instrument):
         """Самодостаточный актуальный снимок для отдельного допуска входа."""
@@ -1244,7 +1458,8 @@ class MarketDataCache:
                 if not prior.empty:
                     previous = float(prior["close"].iloc[-1])
         uid = self._uids.get(self._key(instrument, "1m"))
-        cursors = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m") if self._market_store and uid else {}
+        cursors = (self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m",
+                                              contour=self.contour_id) if self._market_store and uid else {})
         processed = cursors.get("processed_through")
         return {"valid": True, "current_price": current, "price_time": (stamp + pd.Timedelta(minutes=1)).isoformat(),
             "source": self._market_source, "previous_session_close": previous,
@@ -1669,7 +1884,7 @@ class MarketDataCache:
                         instrument_uid=instrument_id, interval=timeframe,
                         open_time=probe, now=self._timeline.now(),
                     )
-                    if state not in {"received", "scheduled_closed", "confirmed_no_trade"}:
+                    if state not in RESOLVED_INTERVAL_STATES:
                         self._report_coverage_block(key, probe, state)
                         return ordered.loc[allowed].copy()
                     probe += period

@@ -12,11 +12,13 @@ data_dir = "data"
 poll_secs = 1
 timeout_secs = 300
 
-# Локальная база живых завершённых свечей. Экспорт выключен, пока не задан
-# MARKET_DATA_EXPORT_TOKEN в окружении и export_enabled = true.
+# Локальная база живых завершённых свечей и локальный HTTP API робота
+# (экспорт рыночных данных и отчёт кластерного фильтра, контракт docs/api/openapi.yaml,
+# Swagger UI — http://127.0.0.1:8101/docs). API запускается, только если
+# в .env задан MARKET_DATA_EXPORT_TOKEN; без токена робот работает без API.
 [market_data]
 database_file = "market-data.sqlite3"
-export_enabled = false
+export_enabled = true
 export_host = "127.0.0.1"
 export_port = 8101
 # Транспорт live-свечей: "polling" или "stream" (подписка с резервным опросом).
@@ -24,6 +26,29 @@ export_port = 8101
 # значения по умолчанию — инженерный профиль, а не гарантия брокера.
 # Stream выбран после read-only пробы брокера (8.5); откат — "polling".
 live_transport = "stream"
+
+# Паттерны завершённых свечей пишутся в Redis Stream market.events.
+# Пароль задаётся только переменной окружения MARKET_STRUCTURE_REDIS_PASSWORD.
+[market_structure]
+patterns_enabled = true  # Включает публикацию свечных паттернов только в live-режиме.
+redis_host = "127.0.0.1"  # Имя хоста или IP-адрес Redis.
+redis_port = 6379  # TCP-порт Redis.
+redis_db = 0  # Номер логической базы Redis для stream market.events.
+queue_maxsize = 1024  # Максимум необработанных закрытых свечей в фоновой очереди.
+retention_days = 90  # Сколько суток хранить события в Redis Stream; более старые удаляются.
+
+# Контур эмуляции — отдельный процесс (data/contours/emulation/), читает свечи
+# из ленты ядра и передаёт ему потребности строками в рыночной базе.
+[contours]
+feed_poll_secs = 1  # Как часто контур читает ленту, а ядро — потребности контуров, секунд.
+demand_release_secs = 900  # Через сколько секунд ядро снимает пару, которая не нужна ни одному контуру и ни одной сделке.
+heartbeat_secs = 5  # Как часто ядро бьёт пульс, а контур его читает, секунд.
+heartbeat_timeout_secs = 30  # Без пульса ядра дольше этого контур не входит в новые сделки (сопровождение продолжается).
+autostart = true  # Поднимать контур эмуляции, когда ядро готово, если перед остановкой он работал.
+max_history_runs = 2  # Сколько прогонов истории идёт одновременно (1–8), остальные ждут в очереди.
+
+[contours.emulation]
+telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env с id канала Telegram контура (сам id — только в .env).
 
 [instruments]
 fallback_type = "future"
@@ -34,6 +59,25 @@ fallback_ticker = "NGU6"
 [historical.rollover]
 policy = "calendar"
 # Пример: [historical.rollover.families.BR] lead_days = 3
+
+# Лог исторического прогона (bot_debug.log в папке прогона HIST/...). Боевой режим
+# использует [logging]. По умолчанию INFO и без ротации: лог прогона целиком.
+[historical.logging]
+level = "INFO"            # порог лога прогона: DEBUG/INFO/WARNING/ERROR
+max_bytes = 0             # размер файла до ротации; 0 — без ротации (лог не теряется)
+backup_count = 0          # ротационных копий при max_bytes > 0
+# Окно отладки по рыночному времени: внутри него пишется и DEBUG.
+# Формат ГГГГ-ММ-ДД ЧЧ:ММ; без зоны — UTC (как границы прогона), «+03:00» — МСК.
+# Пример: debug_from = "2025-08-07 14:00+03:00" и debug_to = "2025-08-07 18:00+03:00"
+debug_from = ""
+debug_to = ""
+
+# Расписание исторического прогона. Эмулятор отдаёт для прошедших дат
+# восстановленное расписание (окна по правилам сессий, торговые дни по барам).
+# Оно применяется только сессионной защитой внутридневных сделок и никогда не
+# доказывает отсутствие свечей. false — прогон без восстановленного расписания.
+[historical.schedule]
+use_reconstructed = true
 
 [notifier]
 # Каналы доставки уведомлений в порядке подписки: "console" | "telegram".
@@ -68,40 +112,40 @@ max_transport_attempts = 2
 # тикера (NG → 15m), точечный tf в инлайне, дубли на разных ТФ.
 [strategies.share.SBER]
 strategies = [
-    { id = "share-sber-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-sber-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-sber-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-sber-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-sber-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-sber-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.GAZP]
 strategies = [
-    { id = "share-gazp-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-gazp-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-gazp-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-gazp-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-gazp-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-gazp-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.LKOH]
 strategies = [
-    { id = "share-lkoh-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-lkoh-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-lkoh-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-lkoh-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-lkoh-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-lkoh-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.GMKN]
 strategies = [
-    { id = "share-gmkn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-gmkn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-gmkn-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-gmkn-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-gmkn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-gmkn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.ROSN]
 strategies = [
-    { id = "share-rosn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-rosn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-rosn-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-rosn-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-rosn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-rosn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
@@ -109,80 +153,80 @@ strategies = [
 
 [strategies.share.NVTK]
 strategies = [
-    { id = "share-nvtk-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-nvtk-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-nvtk-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-nvtk-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-nvtk-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-nvtk-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.YDEX]
 strategies = [
-    { id = "share-ydex-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-ydex-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-ydex-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-ydex-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-ydex-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-ydex-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.TCSG]
 strategies = [
-    { id = "share-tcsg-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-tcsg-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-tcsg-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-tcsg-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-tcsg-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-tcsg-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.VTBR]
 strategies = [
-    { id = "share-vtbr-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-vtbr-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-vtbr-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-vtbr-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-vtbr-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-vtbr-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.MTSS]
 strategies = [
-    { id = "share-mtss-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-mtss-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-mtss-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-mtss-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-mtss-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-mtss-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.PHOR]
 strategies = [
-    { id = "share-phor-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-phor-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-phor-macd-15m-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "15m", priority = 10, clusters = "shadow" },
+    { id = "share-phor-macd-15m-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "15m", priority = 10, clusters = "shadow" },
     { id = "share-phor-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-phor-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.ALRS]
 strategies = [
-    { id = "share-alrs-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-alrs-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-alrs-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-alrs-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-alrs-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-alrs-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.MOEX]
 strategies = [
-    { id = "share-moex-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-moex-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-moex-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-moex-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-moex-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-moex-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.PLZL]
 strategies = [
-    { id = "share-plzl-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-plzl-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-plzl-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-plzl-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-plzl-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-plzl-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
 
 [strategies.share.TATN]
 strategies = [
-    { id = "share-tatn-macd-15m", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "15m", priority = 10 },
-    { id = "share-tatn-macd-1h", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "share-tatn-macd-4h-triple", name = "macd_rsi_stoch", management = "levels_rr", filter = "triple_screen", tf = "4h", priority = 10, clusters = "shadow" },
+    { id = "share-tatn-macd-4h-levels", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", tf = "4h", priority = 10, clusters = "shadow" },
     { id = "share-tatn-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "share-tatn-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", priority = 10 },
 ]
@@ -192,13 +236,13 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10 },
+    { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10, clusters = "shadow" },
     { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "basic_levels", priority = 10 },
 ]
 
 [strategies.future.BR]
 strategies = [
-    { id = "future-br-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "5m", priority = 10 },
+    { id = "future-br-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "5m", priority = 10, clusters = "shadow" },
     { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
     { id = "future-br-harmonic", name = "harmonic_abcd", management = "pattern_targets", filter = "raw", priority = 10 },
     { id = "future-br-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "15m", priority = 10 },
@@ -210,7 +254,7 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-rts-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-rts-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-rts-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
 
@@ -219,7 +263,7 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-sbrf-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-sbrf-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-sbrf-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-sbrf-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
 
@@ -228,7 +272,7 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-gold-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-gold-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-gold-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
 
@@ -238,7 +282,7 @@ timeframe = "15m"        # база тикера: всё без явного tf 
 strategies = [
 
     { id = "future-silv-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
-    { id = "future-silv-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10 },
+    { id = "future-silv-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-silv-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
 # Сценарий сравнения привязок: SI — один инструмент, один ТФ (5m), две
@@ -257,10 +301,28 @@ strategies = [
 [strategies.future.ED]
 strategies = [
     { id = "future-ed-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", tf = "15m", priority = 5 },
-    { id = "future-ed-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10 },
+    { id = "future-ed-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-ed-harmonic", name = "harmonic_abcd", management = "pattern_targets", priority = 10 },
     { id = "future-ed-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", priority = 10 },
 ]
+
+# Кластерный фильтр входа «Кластеры» на событиях ClusterSource (Redis Stream
+# cluster.events; подключение — из [market_structure], пароль —
+# MARKET_STRUCTURE_REDIS_PASSWORD). Режим задаётся у привязки ключом clusters:
+# "off" — выключен, "shadow" — вердикт виден в консоли и в отчёте, допуск не
+# меняется, "enforce" — запрет даёт недопуск cluster-climax. Ниже — значения
+# по умолчанию; раскомментируйте, чтобы изменить.
+# [clusters]
+# stream = "cluster.events"        # поток ClusterSource
+# consumer_group = "robot-v1"      # Consumer Group робота
+# pre_move_veto_sigma = 1.5        # ход до входа (в σ15), после которого ищется кульминация
+# initiative_max_sigma = 0.5       # событие при ходе меньше этого — инициатива
+# extreme_position = 0.8           # «у края 2ч диапазона» — сильный запрет
+# climax_window_min = 30           # окно поиска кульминации, минут
+# initiative_window_min = 60       # окно поиска инициативы, минут
+# sigma_days = 10                  # торговых дней 1m истории для σ15
+# max_consumer_lag_sec = 60        # чтение Redis отстаёт сильнее — вердикт unknown
+# enforce_level = "veto"           # в enforce запрещает veto и veto_strong; "veto_strong" — только сильный
 
 # Профиль фильтрации triple_screen (методика Элдера):
 # множитель иерархии ТФ, параметры MACD/Stochastic, пороги зон %K.
@@ -299,6 +361,7 @@ journal_file = "trade_event.csv"                      # append-only лента �
 positions_file = "trade_summary.csv"                  # карточки открытых позиций (CSV-проекция журнала)
 clearing_times = ["14:05", "19:00"]                   # времена дневного клиринга (МСК): исполнение сделок приостановлено
 contract_expiry_block_days = 2                        # порог экспирации фьючерсов: вход запрещён и сделки закрываются за N календарных суток до экспирации
+contract_expiry_close_before_end_min = 20             # порог в перерыве (ночь, выходные, клиринг) сдвигается на конец последней сессии минус N минут
 
 # Фильтр разрешённых направлений входов по типам инструментов (опционально).
 # Каждый ключ — тип инструмента, значение — список направлений long и/или short.
@@ -308,6 +371,20 @@ contract_expiry_block_days = 2                        # порог экспир�
 [trading.directions]
 future = ["long", "short"]     # фьючерсы: и лонг, и шорт
 share  = ["long"]              # акции: только лонг
+
+# Сессионная защита внутридневных сделок: короткие сделки входят только в
+# разрешённых сессиях по расписанию брокера и не переносятся через закрытие
+# торгового дня без защиты. Сделки на 1h и выше (свинговые) не затрагиваются.
+[trading.intraday]
+enabled = true                       # выключатель правила целиком
+max_timeframe = "15m"                # сделки с таймфреймом плана не больше этого — внутридневные
+entry_sessions = ["morning", "main"] # сессии входа: morning (утренняя), main (основная),
+                                     # evening (вечерняя), weekend (выходного дня)
+no_entry_before_close_min = 60       # не открывать сделки позже чем за N минут до конца разрешённых сессий
+flatten_before_close_min = 20        # закрывать позиции за N минут до конца разрешённых сессий
+                                     # (не больше no_entry_before_close_min)
+keep_if_tp1_and_breakeven = true     # не закрывать позицию, если первая цель взята и стоп
+                                     # в безубытке всей сделки (или переносится в него)
 
 [trading.risk_limits]
 max_entry_deviation_r = 0.25 # неблагоприятное движение от входа / расстояние вход–стоп
@@ -326,7 +403,8 @@ min_net_payoff = 1.5      # минимум чистой плановой при�
 max_slippage_r = 0.25     # максимум запаса проскальзывания / риска; 0 выключает ограничение
 
 # Профили управления открытой позицией. Привязка происходит в [strategies.*] через
-# ключ management; параметры читаются на этапе планирования и каждого mengement-такта.
+# ключ management; параметры читаются на этапе планирования и на закрытии каждого бара
+# таймфрейма сделки: стоп и сигнальные выходы считаются только по барам этого таймфрейма.
 [trade_management.profiles.levels_rr]
 type = "levels_rr"  # профиль: риск-доходность от уровней поддержки/сопротивления
 buffer_ticks = 1    # отступ стопа от S/R в шагах цены

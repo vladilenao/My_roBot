@@ -10,6 +10,38 @@ from src.api.deadline import RpcDeadline
 
 log = get_logger(__name__)
 
+
+def _broker_telemetry_off(client) -> None:
+    """Замена ``init_error_hub`` SDK брокера: Sentry T-Bank не включается."""
+    return None
+
+
+async def _async_broker_telemetry_off(client) -> None:
+    return None
+
+
+def disable_broker_telemetry() -> bool:
+    """Отключает телеметрию SDK T-Bank Invest (Sentry разработчика SDK).
+
+    ``Client.__enter__`` SDK вызывает ``init_error_hub``, который включает
+    ``sentry_sdk`` на весь процесс со встроенным адресом T-Bank: интеграция
+    с ``logging`` собирает наши записи лога (breadcrumbs) мимо маскирования
+    секретов в файловом логе, а сбои потоков ``UNAVAILABLE`` уходят наружу.
+    Выключателя в SDK нет, поэтому точки вызова в ``t_tech.invest.clients``
+    заменяются пустыми функциями. ``False`` — точки не найдены (SDK изменился).
+    """
+    from t_tech.invest import clients
+
+    if not hasattr(clients, "init_error_hub") or not hasattr(clients, "async_init_error_hub"):
+        log.warning("SDK брокера: точка включения телеметрии не найдена — проверьте отключение после обновления SDK")
+        return False
+    clients.init_error_hub = _broker_telemetry_off
+    clients.async_init_error_hub = _async_broker_telemetry_off
+    return True
+
+
+disable_broker_telemetry()
+
 # Совместимый профиль текущей истории: UNSPECIFIED, а не EXCHANGE-only.
 # Имя существующей БД tbank_exchange не меняет фактический состав источника.
 LIVE_CANDLE_SOURCE = CandleSource.CANDLE_SOURCE_UNSPECIFIED

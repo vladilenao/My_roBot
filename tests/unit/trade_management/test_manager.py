@@ -242,6 +242,33 @@ class TestManageExpiringContract:
             assert close.reason == "contract-expiring"
             assert close.trade_id == "trade-1"
 
+    def test_manage_closes_before_session_end_when_calendar_threshold_falls_in_break(self, tmp_path):
+        from src.market_calendar.core import CalendarDay, TradingCalendar
+        from src.market_calendar.intervals import SessionWindow, exchange_date
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        contract = _contract(expiration_days=None)
+        contract = ContractMeta(**{**contract.__dict__, "expiration_date": now + timedelta(days=2, hours=12)})
+        # Последняя сессия закончилась час назад, дальше до календарного рубежа торгов нет.
+        session = SessionWindow(now - timedelta(hours=3), now - timedelta(hours=1), "continuous", "regular_trading_session")
+        first = exchange_date(session.start)
+        days = [CalendarDay(first, True, (session,), "v0", now)]
+        for offset in range(1, 4):
+            days.append(CalendarDay(first + timedelta(days=offset), False, (), f"v{offset}", now))
+        calendar = TradingCalendar("tbank", "forts_futures", tuple(days))
+        with Storage(tmp_path / "trades.sqlite3") as storage:
+            plain = TradeManager(storage, ContractBroker(contract), initial_balance=Decimal("1000"))
+            plain.submit_plan(_plan(), OpenTrade("open-1", "trade-1", 0, "entry", 2))
+            plain.dispatch(NOW)
+            assert not any(getattr(a, "reason", None) == "contract-expiring"
+                           for a in plain.manage(SimpleNamespace(ticker="NGV6"), [], None))
+
+            scheduled = TradeManager(storage, ContractBroker(contract), initial_balance=Decimal("1000"),
+                                     session_calendar=lambda instrument, moment: calendar)
+            (close,) = scheduled.manage(SimpleNamespace(ticker="NGV6"), [], None)
+            assert isinstance(close, CloseTrade)
+            assert close.reason == "contract-expiring"
+
     def test_manage_leaves_share_contract_without_expiration_unaffected(self, tmp_path):
         broker = ContractBroker(_contract(expiration_days=None))
         with Storage(tmp_path / "trades.sqlite3") as storage:

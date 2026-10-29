@@ -11,6 +11,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,10 +23,21 @@ from src.scheduler.timing import tf_period_minutes
 from src.market_calendar.serialization import canonical_day_json, day_version
 from src.market_calendar.intervals import normalize_exchange, trading_date
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SOURCE_TBANK = "tbank_exchange"
-INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade", "pending", "unresolved"})
-RESOLVED_INTERVAL_STATES = frozenset({"received", "scheduled_closed", "confirmed_no_trade"})
+from src.data.coverage_states import (  # noqa: E402,F401
+    EXPORTED_STATE, FINAL_EVIDENCE_STATES, INTERVAL_STATES, RESOLVED_INTERVAL_STATES, WAITING_INTERVAL_STATES,
+)
+ROSTER_ORIGINS = frozenset({"selected", "obligation", "previous"})
+# Подтверждения ленты расписаний живут в общей таблице под этим префиксом.
+SCHEDULE_CHECKPOINT_PREFIX = "trading-schedules:"
+# Курсоры ленты торговых контуров: внешним потребителям этот префикс закрыт.
+CONTOUR_CONSUMER_PREFIX = "contour-"
+# Отметки исполнения, записанные до add-contour-market-feed, принадлежат
+# единственному тогда исполнителю в живой базе — эмуляции.
+LEGACY_CONTOUR = "emulation"
+# Порция очистки ленты /changes — одна короткая транзакция записи.
+PRUNE_BATCH = 5000
 
 
 def _utc_text(value: object | None = None) -> str:
@@ -38,6 +50,11 @@ def _utc_text(value: object | None = None) -> str:
     else:
         stamp = stamp.tz_convert("UTC")
     return stamp.isoformat().replace("+00:00", "Z")
+
+
+def _downgrades_final(current: str, state: str) -> bool:
+    """Ожидание поверх итога по данным источника — понижение, его не пишем."""
+    return current in FINAL_EVIDENCE_STATES and state in WAITING_INTERVAL_STATES
 
 
 def _price_text(value: object) -> str:
@@ -62,6 +79,33 @@ class SourceInfo:
 
 
 @dataclass(frozen=True)
+class ChangesPrune:
+    """Итог одной порции очистки ленты ``/changes``.
+
+    ``more`` — в начале ленты остались строки, которые можно удалить
+    следующей порцией; ``holder`` — потребитель, чьё подтверждение
+    остановило порцию, ``holder_lag`` — сколько записей он не дочитал.
+    """
+
+    deleted: int
+    min_after_id: int
+    more: bool
+    holder: str | None = None
+    holder_lag: int = 0
+
+
+def _require_contour(contour: str | None) -> None:
+    """Отметку исполнения пишет только торговый контур под своим ключом."""
+    if not contour or not isinstance(contour, str):
+        raise ValueError("Отметка исполнения требует идентификатор торгового контура")
+
+
+def _require_broker(provenance: str) -> None:
+    if provenance != "broker":
+        raise ValueError(f"Расписание происхождения {provenance!r} не сохраняется в рыночной базе")
+
+
+@dataclass(frozen=True)
 class StoredScheduleDay:
     source: str
     exchange: str
@@ -72,6 +116,10 @@ class StoredScheduleDay:
     observed_at: str
     last_confirmed_at: str
     schedule_change_id: int
+    # Происхождение дня: ``broker`` — наблюдён у брокера; ``reconstructed`` —
+    # восстановлен историческим источником и живёт только в снимке прогона.
+    provenance: str = "broker"
+    rules_version: str | None = None
 
 
 class MarketDataStore:
@@ -133,7 +181,7 @@ class MarketDataStore:
                     instrument_uid TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     open_time_utc TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'pending', 'unresolved')),
+                    state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'source_absent', 'pending', 'unresolved')),
                     evidence TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
@@ -176,10 +224,34 @@ class MarketDataStore:
                     attempted_at TEXT NOT NULL, next_attempt_at TEXT NOT NULL,
                     PRIMARY KEY(source,instrument_uid,interval,open_time_utc)
                 );
-                CREATE TABLE IF NOT EXISTS analysis_cursors (
+                CREATE TABLE IF NOT EXISTS contour_cursors (
+                    contour_id TEXT NOT NULL,
                     source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
-                    assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
-                    PRIMARY KEY(source,instrument_uid,interval,assignment_id)
+                    processed_through TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,source,instrument_uid,interval)
+                );
+                CREATE TABLE IF NOT EXISTS contour_demand (
+                    contour_id TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL, interval TEXT NOT NULL,
+                    min_bars INTEGER NOT NULL,
+                    instrument_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,instrument_key,interval)
+                );
+                CREATE TABLE IF NOT EXISTS contour_obligations (
+                    contour_id TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL,
+                    lower_open_time TEXT NOT NULL,
+                    inclusive INTEGER NOT NULL CHECK(inclusive IN (0, 1)),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(contour_id,instrument_key)
+                );
+                CREATE TABLE IF NOT EXISTS pair_readiness (
+                    source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                    status_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(source,instrument_uid,interval)
                 );
                 CREATE TABLE IF NOT EXISTS trading_schedule_days (
                     source TEXT NOT NULL,
@@ -205,6 +277,42 @@ class MarketDataStore:
                 );
                 CREATE INDEX IF NOT EXISTS instrument_schedule_bindings_latest
                     ON instrument_schedule_bindings(source, instrument_uid, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS market_data_roster (
+                    source TEXT NOT NULL,
+                    instrument_uid TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    instrument_type TEXT NOT NULL,
+                    short_name TEXT,
+                    origin TEXT NOT NULL CHECK(origin IN ('selected', 'obligation', 'previous')),
+                    window_lower_utc TEXT,
+                    requirements_json TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    PRIMARY KEY (source, instrument_uid, interval)
+                );
+                CREATE TABLE IF NOT EXISTS interval_checks (
+                    source TEXT NOT NULL,
+                    instrument_uid TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    open_time_utc TEXT NOT NULL,
+                    checks INTEGER NOT NULL,
+                    first_checked_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    next_check_at TEXT,
+                    PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
+                );
+                CREATE INDEX IF NOT EXISTS interval_checks_due
+                    ON interval_checks(source, instrument_uid, interval, next_check_at);
+                CREATE TABLE IF NOT EXISTS pattern_event_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS pattern_event_outbox_due
+                    ON pattern_event_outbox(delivered_at, next_attempt_at);
                 """
             )
             # SQLite не умеет добавить значение в CHECK. Ранняя версия change
@@ -213,7 +321,8 @@ class MarketDataStore:
             definition = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='interval_coverage'"
             ).fetchone()[0]
-            if "'received'" not in definition:
+            if "'source_absent'" not in definition:
+                self._backup_before_migration(conn, "interval_coverage")
                 conn.executescript(
                     """
                     ALTER TABLE interval_coverage RENAME TO interval_coverage_v1;
@@ -222,7 +331,7 @@ class MarketDataStore:
                         instrument_uid TEXT NOT NULL,
                         interval TEXT NOT NULL,
                         open_time_utc TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'pending', 'unresolved')),
+                        state TEXT NOT NULL CHECK(state IN ('received', 'scheduled_closed', 'confirmed_no_trade', 'source_absent', 'pending', 'unresolved')),
                         evidence TEXT NOT NULL,
                         observed_at TEXT NOT NULL,
                         PRIMARY KEY (source, instrument_uid, interval, open_time_utc)
@@ -231,10 +340,68 @@ class MarketDataStore:
                     DROP TABLE interval_coverage_v1;
                     """
                 )
+            self._migrate_contour_marks(conn)
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
             self._set_default(conn, "schedule_max_change_id", "0")
+
+    def _migrate_contour_marks(self, conn: sqlite3.Connection) -> None:
+        """Отметки исполнения переходят под ключ контура (add-contour-market-feed).
+
+        Курсоры анализа получают ``contour_id`` (пересоздание таблицы),
+        граница обработки уходит из ``market_cursors`` в ``contour_cursors``,
+        закрепление входа — в ``input_references``. Всё прежнее принадлежит
+        эмуляции. Версия схемы экспорта не меняется: контракт ``/changes`` тот же.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(analysis_cursors)").fetchall()}
+        migrated = conn.execute("SELECT 1 FROM metadata WHERE key='contour_marks'").fetchone() is not None
+        if "contour_id" in columns and migrated:
+            return
+        legacy = bool(columns) and "contour_id" not in columns
+        if legacy or conn.execute("SELECT 1 FROM market_cursors WHERE processed_through IS NOT NULL LIMIT 1").fetchone():
+            self._backup_before_migration(conn, "market_cursors", label="pre-contour-feed")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if legacy:
+                conn.execute("ALTER TABLE analysis_cursors RENAME TO analysis_cursors_v1")
+            conn.execute("""CREATE TABLE IF NOT EXISTS analysis_cursors (
+                contour_id TEXT NOT NULL,
+                source TEXT NOT NULL, instrument_uid TEXT NOT NULL, interval TEXT NOT NULL,
+                assignment_id TEXT NOT NULL, open_time_utc TEXT NOT NULL,
+                PRIMARY KEY(contour_id,source,instrument_uid,interval,assignment_id))""")
+            if legacy:
+                conn.execute("""INSERT INTO analysis_cursors SELECT ?,source,instrument_uid,interval,assignment_id,open_time_utc
+                    FROM analysis_cursors_v1""", (LEGACY_CONTOUR,))
+                conn.execute("DROP TABLE analysis_cursors_v1")
+            now = _utc_text()
+            conn.execute("""INSERT OR IGNORE INTO contour_cursors(contour_id,source,instrument_uid,interval,processed_through,updated_at)
+                SELECT ?,source,instrument_uid,interval,processed_through,? FROM market_cursors WHERE processed_through IS NOT NULL""",
+                (LEGACY_CONTOUR, now))
+            conn.execute("UPDATE market_cursors SET processed_through=NULL WHERE processed_through IS NOT NULL")
+            rows = conn.execute("""SELECT key,value FROM metadata WHERE key LIKE 'live:candle:%'
+                AND value LIKE '%"input_reference"%'""").fetchall()
+            for key, value in rows:
+                facts = json.loads(value)
+                reference = facts.pop("input_reference", None)
+                if reference is not None:
+                    facts.setdefault("input_references", {})[LEGACY_CONTOUR] = reference
+                    self._write_live(conn, key, facts)
+            conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('contour_marks','1')")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _backup_before_migration(self, conn: sqlite3.Connection, table: str, *, label: str | None = None) -> None:
+        """Согласованная копия файла базы перед пересозданием таблицы с данными."""
+        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        label = label or f"before-schema-{SCHEMA_VERSION}"
+        target = self.path.with_name(f"{self.path.name}.{label}-{stamp}.bak")
+        with closing(sqlite3.connect(target)) as backup:
+            conn.backup(backup)
 
     @staticmethod
     def _set_default(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -242,9 +409,13 @@ class MarketDataStore:
 
     def source_info(self) -> SourceInfo:
         with self._lock, self._connect() as conn:
-            values = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+            # Только ключи источника: в metadata лежат и факты каждой свечи.
+            values = dict(conn.execute("SELECT key, value FROM metadata WHERE key IN "
+                                       "('producer_id', 'schema_version', 'min_after_id')").fetchall())
             maximum = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM changes").fetchone()[0]
-        return SourceInfo(values["producer_id"], int(values["schema_version"]), int(values["min_after_id"]), maximum)
+        minimum = int(values["min_after_id"])
+        # Очищенная целиком лента не опускает максимум ниже удержанного края.
+        return SourceInfo(values["producer_id"], int(values["schema_version"]), minimum, max(maximum, minimum))
 
     @property
     def producer_id(self) -> str:
@@ -275,6 +446,27 @@ class MarketDataStore:
     def save_live_state(self, value, *, kind, source, instrument_uid, interval="", open_time=None):
         with self._lock, self._connect() as conn:
             self._write_live(conn, self._live_key(kind, source, instrument_uid, interval, open_time), value)
+
+    def take_live_states(self, *, kind, source) -> list[tuple[str, str, dict]]:
+        """Забирает и удаляет одной транзакцией все состояния вида: (uid, ТФ, значение)."""
+        prefix = "live:" + kind + ":"
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute("SELECT key, value FROM metadata WHERE substr(key,1,?)=?",
+                                    (len(prefix), prefix)).fetchall()
+                taken = []
+                for key, value in rows:
+                    identity = json.loads(key[len(prefix):])
+                    if identity[0] != source:
+                        continue
+                    taken.append((identity[1], identity[2], json.loads(value)))
+                    conn.execute("DELETE FROM metadata WHERE key=?", (key,))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return taken
 
     def accept_observation(self, observation, *, source=SOURCE_TBANK, reconcile_sequence=None):
         """Единое атомарное принятие нормализованного stream/RPC наблюдения.
@@ -364,25 +556,31 @@ class MarketDataStore:
         if old is not None and old["is_complete"] and not fence_matches:
             facts["conflict"] = {"candidate_revision": revision, "received_at": candle["received_at"],
                                  "reason": "source_conflict" if source_conflict else "values_conflict"}
-            cursor = conn.execute("SELECT processed_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
-                                  (source, uid, interval)).fetchone()
-            pin = facts.get("input_reference")
-            consumed = (pin is not None and pin.get("state") == "consumed"
-                        or cursor and cursor[0] is not None and stamp <= cursor[0])
-            if interval == "1m" and consumed:
+            pins = facts.get("input_references") or {}
+            consumer, pin = next(((contour, ref) for contour, ref in sorted(pins.items())
+                                  if ref.get("state") == "consumed"), (None, None))
+            if consumer is None:
+                passed = conn.execute("""SELECT contour_id FROM contour_cursors WHERE source=? AND instrument_uid=?
+                    AND interval=? AND processed_through>=? ORDER BY contour_id LIMIT 1""",
+                    (source, uid, interval, stamp)).fetchone()
+                consumer = None if passed is None else passed[0]
+            started = next(((contour, ref) for contour, ref in sorted(pins.items())
+                            if ref.get("state") == "started"), None)
+            if interval == "1m" and consumer is not None:
                 held = self._read_live(conn, uid_key)
                 held.update(integrity_hold=True, incident={"open_time": stamp, "candidate_revision": revision,
                     "consumed_revision": None if pin is None else pin["revision"],
                     "reason": "consumed_input_changed" if pin else "legacy_input_unconfirmed",
-                    "received_at": candle["received_at"]})
+                    "contour_id": consumer, "received_at": candle["received_at"]})
                 self._write_live(conn, uid_key, held)
-            elif interval == "1m" and pin is not None:
+            elif interval == "1m" and started is not None:
                 # Начатый пакет ещё не подтверждён финансовым owner.
                 # Замораживаем зависимые новые действия, но не выдаём
                 # сам факт pin за уже исполненную минуту.
                 held = self._read_live(conn, uid_key)
                 pending = held.setdefault("pending_input_conflicts", {})
-                pending[stamp] = {"revision": pin["revision"], "candidate_revision": revision}
+                pending[stamp] = {"revision": started[1]["revision"], "candidate_revision": revision,
+                                  "contour_id": started[0]}
                 self._write_live(conn, uid_key, held)
             self._write_live(conn, facts_key, facts)
             return {"state": "conflict", "revision": revision, "changed": False}
@@ -407,14 +605,15 @@ class MarketDataStore:
         return {"state": "accepted", "revision": revision, "changed": True,
                 "previous_coverage": None if previous is None else previous["state"]}
 
-    def pin_input(self, *, source, instrument_uid, interval, open_time):
-        """Закрепляет выбранную revision до внешней финансовой обработки."""
+    def pin_input(self, *, source, instrument_uid, interval, open_time, contour=None):
+        """Закрепляет выбранную revision до финансовой обработки контура ``contour``."""
+        _require_contour(contour)
         key = self._live_key("candle", source, instrument_uid, interval, open_time)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 facts = self._read_live(conn, key)
-                reference = facts.get("input_reference")
+                reference = (facts.get("input_references") or {}).get(contour)
                 if reference is None:
                     held = self._read_live(conn, self._live_key("uid", source, instrument_uid))
                     # Коррекция начатого, но не подтверждённого пакета
@@ -427,7 +626,7 @@ class MarketDataStore:
                         raise ValueError("Нет завершённой версии рыночного входа")
                     reference = dict(source=source, instrument_uid=instrument_uid, interval=interval,
                                      open_time_utc=_utc_text(open_time), revision=row["revision"], state="started")
-                    facts["input_reference"] = reference
+                    facts.setdefault("input_references", {})[contour] = reference
                     self._write_live(conn, key, facts)
                 conn.commit()
                 return dict(reference)
@@ -548,7 +747,8 @@ class MarketDataStore:
         """Сохраняет доказанное состояние интервала и отдаёт его в экспорт.
 
         ``pending`` и ``unresolved`` намеренно не позволяют кэшу продвигать
-        симуляцию; статус записывается отдельно от временной свечи.
+        симуляцию; статус записывается отдельно от временной свечи. Итог по
+        данным источника они не понижают: тогда возвращается ``None``.
         """
         if state not in INTERVAL_STATES:
             raise ValueError(f"Неизвестное состояние интервала: {state}")
@@ -557,6 +757,9 @@ class MarketDataStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._keeps_final_state(conn, source, instrument_uid, interval, stamp, state):
+                    conn.commit()
+                    return None
                 change_id = self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True)
                 pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
                 cursor = conn.execute(
@@ -579,8 +782,9 @@ class MarketDataStore:
                             rows: Iterable[tuple[object, str, str]], observed_at: object | None = None) -> int:
         """Пакет состояний одного ряда в одной транзакции и с одним пересчётом префикса.
 
-        Полученный интервал (``received``) не понижается. Возвращает число
-        изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
+        Полученный интервал (``received``) не понижается, итог по данным
+        источника (``confirmed_no_trade``, ``source_absent``) не возвращается в
+        ``pending``/``unresolved``. Возвращает число изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
         это тысячи минут, по транзакции на каждую слишком дорого.
         """
         prepared = []
@@ -601,6 +805,8 @@ class MarketDataStore:
                         (source, instrument_uid, interval, stamp)).fetchone()
                     if current is not None and current["state"] == "received":
                         continue
+                    if current is not None and _downgrades_final(current["state"], state):
+                        continue
                     if self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True):
                         changed += 1
                 pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
@@ -619,6 +825,16 @@ class MarketDataStore:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _keeps_final_state(conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
+                           stamp: str, state: str) -> bool:
+        if state not in WAITING_INTERVAL_STATES:
+            return False
+        current = conn.execute(
+            "SELECT state FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
+            (source, instrument_uid, interval, stamp)).fetchone()
+        return current is not None and _downgrades_final(current["state"], state)
+
     def _upsert_coverage(self, conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str, stamp: str, state: str, evidence: str, observed_at: str, *, emit: bool) -> int | None:
         old = conn.execute("SELECT state,evidence FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?", (source, instrument_uid, interval, stamp)).fetchone()
         if old is not None and old["state"] == state and old["evidence"] == evidence:
@@ -631,7 +847,8 @@ class MarketDataStore:
         )
         if not emit:
             return None
-        status = {"source": source, "instrument_uid": instrument_uid, "interval": interval, "open_time_utc": stamp, "state": state, "evidence": evidence, "observed_at": observed_at}
+        status = {"source": source, "instrument_uid": instrument_uid, "interval": interval, "open_time_utc": stamp,
+                  "state": EXPORTED_STATE.get(state, state), "evidence": evidence, "observed_at": observed_at}
         return self._append_change(conn, "interval_status", {"interval_status": status})
 
     def record_observation(
@@ -651,12 +868,17 @@ class MarketDataStore:
                 (source, instrument_uid, kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), _utc_text(observed_at)),
             )
 
-    def record_schedule_day(self, *, source: str, exchange: str, day: object, observed_at: object | None = None) -> bool:
+    def record_schedule_day(
+        self, *, source: str, exchange: str, day: object, observed_at: object | None = None,
+        provenance: str = "broker", rules_version: str | None = None,
+    ) -> bool:
         """Сохраняет новую версию сырого дня либо подтверждает прежнюю.
 
         Возвращает ``True`` только если содержание дня изменилось и получило
-        новый отдельный курсор ленты расписаний.
+        новый отдельный курсор ленты расписаний. Восстановленный день сюда не
+        попадает: он не наблюдён у брокера и не должен уйти в ленту экспорта.
         """
+        _require_broker(provenance)
         exchange = normalize_exchange(exchange)
         raw_json = canonical_day_json(day)
         version = day_version(day)
@@ -717,9 +939,11 @@ class MarketDataStore:
         )
 
     def record_schedule_binding(
-        self, *, source: str, instrument_uid: str, exchange: str, observed_at: object | None = None
+        self, *, source: str, instrument_uid: str, exchange: str, observed_at: object | None = None,
+        provenance: str = "broker",
     ) -> bool:
         """Фиксирует смену режима торгов UID без дублирования прежней связи."""
+        _require_broker(provenance)
         exchange = normalize_exchange(exchange)
         when = _utc_text(observed_at)
         with self._lock, self._connect() as conn:
@@ -819,18 +1043,21 @@ class MarketDataStore:
                 (source, instrument_uid, kind, limit)).fetchall()
         return [(json.loads(row[0]), pd.Timestamp(row[1]).tz_localize(None)) for row in rows]
 
-    def analysis_cursor(self, *, source, instrument_uid, interval, assignment_id):
+    def analysis_cursor(self, *, source, instrument_uid, interval, assignment_id, contour=None):
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT open_time_utc FROM analysis_cursors WHERE source=? AND instrument_uid=? AND interval=? AND assignment_id=?",
-                (source, instrument_uid, interval, assignment_id)).fetchone()
+            row = conn.execute("""SELECT open_time_utc FROM analysis_cursors WHERE contour_id=? AND source=?
+                AND instrument_uid=? AND interval=? AND assignment_id=?""",
+                (contour, source, instrument_uid, interval, assignment_id)).fetchone()
         return pd.Timestamp(row[0]).tz_localize(None) if row else None
 
-    def mark_analyzed(self, *, source, instrument_uid, interval, assignment_id, open_time):
+    def mark_analyzed(self, *, source, instrument_uid, interval, assignment_id, open_time, contour=None):
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
-            conn.execute("""INSERT INTO analysis_cursors VALUES(?,?,?,?,?)
-                ON CONFLICT(source,instrument_uid,interval,assignment_id) DO UPDATE SET
+            conn.execute("""INSERT INTO analysis_cursors VALUES(?,?,?,?,?,?)
+                ON CONFLICT(contour_id,source,instrument_uid,interval,assignment_id) DO UPDATE SET
                 open_time_utc=MAX(analysis_cursors.open_time_utc,excluded.open_time_utc)""",
-                (source, instrument_uid, interval, assignment_id, _utc_text(open_time)))
+                (contour, source, instrument_uid, interval, assignment_id, _utc_text(open_time)))
 
     def unresolved_between(self, *, source, instrument_uid, interval, start, end, limit=1000):
         with self._lock, self._connect() as conn:
@@ -840,28 +1067,34 @@ class MarketDataStore:
                 (source, instrument_uid, interval, _utc_text(start), _utc_text(end), limit)).fetchall()
         return [pd.Timestamp(row[0]).tz_localize(None) for row in rows]
 
-    def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object) -> None:
-        """Продвигает границу симуляции после внешнего durable commit."""
+    def mark_processed(self, *, source: str, instrument_uid: str, interval: str, open_time: object,
+                       contour: str | None = None) -> None:
+        """Продвигает границу обработки контура после его durable commit."""
+        _require_contour(contour)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 stamp = _utc_text(open_time)
                 key = self._live_key("candle", source, instrument_uid, interval, stamp)
                 facts = self._read_live(conn, key)
-                reference = facts.get("input_reference")
+                reference = (facts.get("input_references") or {}).get(contour)
                 if reference is not None:
                     reference["state"] = "consumed"
                     self._write_live(conn, key, facts)
                 uid_key = self._live_key("uid", source, instrument_uid)
                 held = self._read_live(conn, uid_key)
                 pending = held.get("pending_input_conflicts", {})
-                conflict = pending.pop(stamp, None)
-                if conflict is not None:
+                conflict = pending.get(stamp)
+                if conflict is not None and conflict.get("contour_id", contour) == contour:
+                    pending.pop(stamp)
                     held.update(integrity_hold=True, incident={"open_time": stamp,
                         "consumed_revision": conflict["revision"], "candidate_revision": conflict["candidate_revision"],
-                        "reason": "consumed_input_changed", "received_at": _utc_text()})
+                        "reason": "consumed_input_changed", "contour_id": contour, "received_at": _utc_text()})
                     self._write_live(conn, uid_key, held)
-                self._advance_cursor(conn, source, instrument_uid, interval, processed=stamp)
+                conn.execute("""INSERT INTO contour_cursors(contour_id,source,instrument_uid,interval,processed_through,updated_at)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(contour_id,source,instrument_uid,interval) DO UPDATE SET
+                    processed_through=MAX(contour_cursors.processed_through,excluded.processed_through),
+                    updated_at=excluded.updated_at""", (contour, source, instrument_uid, interval, stamp, _utc_text()))
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -916,13 +1149,160 @@ class MarketDataStore:
             MarketDataStore._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
         return resolved
 
-    def cursors(self, *, source: str, instrument_uid: str, interval: str) -> dict[str, str | None]:
+    def publish_pair_readiness(self, *, source: str, instrument_uid: str, interval: str, status: dict) -> None:
+        """Текущая готовность живой пары от ядра; не событие и не строка ``/changes``."""
+        payload = json.dumps(status, separators=(",", ":"), ensure_ascii=False, sort_keys=True, default=str)
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO pair_readiness(source,instrument_uid,interval,status_json,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(source,instrument_uid,interval) DO UPDATE SET
+                status_json=excluded.status_json, updated_at=excluded.updated_at
+                WHERE pair_readiness.status_json<>excluded.status_json""",
+                (source, instrument_uid, interval, payload, _utc_text()))
+
+    # ── Потребности торговых контуров (add-contour-process) ──
+    # Пишет только контур своего contour_id, читает ядро: так процесс контура
+    # передаёт спрос пар и обязательства сделок без вызова в память ядра.
+
+    def record_contour_demand(self, contour_id: str, demands) -> None:
+        """Спрос пар ``(ключ инструмента, ТФ, глубина, карточка инструмента)``; глубина не уменьшается."""
+        rows = [(contour_id, key, interval, int(min_bars), json.dumps(instrument, ensure_ascii=False, sort_keys=True),
+                 _utc_text()) for key, interval, min_bars, instrument in demands]
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO contour_demand(contour_id,instrument_key,interval,min_bars,instrument_json,updated_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT(contour_id,instrument_key,interval) DO UPDATE SET
+                min_bars=MAX(contour_demand.min_bars,excluded.min_bars),instrument_json=excluded.instrument_json,
+                updated_at=excluded.updated_at
+                WHERE excluded.min_bars>contour_demand.min_bars OR excluded.instrument_json<>contour_demand.instrument_json""",
+                rows)
+
+    def replace_contour_demand(self, contour_id: str, demands) -> None:
+        """Спрос контура целиком — при его запуске: строки прошлых запусков удаляются (add-contour-membership)."""
+        rows = [(contour_id, key, interval, int(min_bars), json.dumps(instrument, ensure_ascii=False, sort_keys=True),
+                 _utc_text()) for key, interval, min_bars, instrument in demands]
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM contour_demand WHERE contour_id=?", (contour_id,))
+                conn.executemany("""INSERT INTO contour_demand(contour_id,instrument_key,interval,min_bars,instrument_json,
+                    updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(contour_id,instrument_key,interval) DO UPDATE SET
+                    min_bars=MAX(contour_demand.min_bars,excluded.min_bars)""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def remove_contour_demand(self, contour_id: str, instrument_key: str) -> None:
+        """Спрос инструмента, вышедшего из состава контура."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM contour_demand WHERE contour_id=? AND instrument_key=?", (contour_id, instrument_key))
+
+    def contour_demands(self) -> list[dict]:
+        """Спрос всех контуров: ``contour_id``, ``instrument_key``, ``interval``, ``min_bars``, ``instrument``."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT contour_id,instrument_key,interval,min_bars,instrument_json FROM contour_demand
+                ORDER BY contour_id,instrument_key,interval""").fetchall()
+        return [{"contour_id": row[0], "instrument_key": row[1], "interval": row[2], "min_bars": int(row[3]),
+                 "instrument": json.loads(row[4])} for row in rows]
+
+    def replace_contour_obligations(self, contour_id: str, obligations) -> None:
+        """Снимок обязательств контура ``{ключ: (граница, включительно)}`` одной транзакцией."""
+        now = _utc_text()
+        rows = [(contour_id, key, _utc_text(stamp), 1 if inclusive else 0, now)
+                for key, (stamp, inclusive) in sorted(obligations.items()) if stamp is not None]
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM contour_obligations WHERE contour_id=?", (contour_id,))
+                conn.executemany("""INSERT INTO contour_obligations(contour_id,instrument_key,lower_open_time,inclusive,updated_at)
+                    VALUES (?,?,?,?,?)""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def contour_obligations(self) -> dict[str, dict[str, tuple[datetime, bool]]]:
+        """Обязательства по контурам: ``{contour_id: {ключ: (граница naive UTC, включительно)}}``."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT contour_id,instrument_key,lower_open_time,inclusive FROM contour_obligations
+                ORDER BY contour_id,instrument_key""").fetchall()
+        result: dict[str, dict[str, tuple[datetime, bool]]] = {}
+        for contour_id, key, lower, inclusive in rows:
+            stamp = pd.Timestamp(lower).tz_convert("UTC").tz_localize(None).to_pydatetime()
+            result.setdefault(contour_id, {})[key] = (stamp, bool(inclusive))
+        return result
+
+    def consumer_checkpoint(self, consumer_id: str) -> dict | None:
+        """Подтверждённый курсор потребителя ленты: ``acknowledged_through`` и ``acknowledged_at``."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT acknowledged_through, acknowledged_at FROM consumer_checkpoints WHERE consumer_id=?",
+                               (consumer_id,)).fetchone()
+        return None if row is None else {"acknowledged_through": int(row[0]), "acknowledged_at": row[1]}
+
+    def drop_pair_readiness(self, *, source: str, instrument_uid: str | None = None,
+                            interval: str | None = None) -> None:
+        """Снимает готовность пары; без UID — всех пар источника (старт ядра)."""
+        with self._lock, self._connect() as conn:
+            if instrument_uid is None:
+                conn.execute("DELETE FROM pair_readiness WHERE source=?", (source,))
+            else:
+                conn.execute("DELETE FROM pair_readiness WHERE source=? AND instrument_uid=? AND interval=?",
+                             (source, instrument_uid, interval))
+
+    def pair_readiness(self, *, source: str, instrument_uid: str, interval: str) -> dict | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("""SELECT status_json,updated_at FROM pair_readiness
+                WHERE source=? AND instrument_uid=? AND interval=?""", (source, instrument_uid, interval)).fetchone()
+        return None if row is None else {**json.loads(row[0]), "updated_at": row[1]}
+
+    def pair_readiness_all(self, *, source: str) -> list[dict]:
+        """Готовность всех живых пар источника одной короткой транзакцией чтения."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT instrument_uid,interval,status_json,updated_at FROM pair_readiness
+                WHERE source=? ORDER BY instrument_uid,interval""", (source,)).fetchall()
+        return [{**json.loads(row["status_json"]), "instrument_uid": row["instrument_uid"],
+                 "interval": row["interval"], "updated_at": row["updated_at"]} for row in rows]
+
+    def checkpoint(self, consumer_id: str) -> dict | None:
+        """Подтверждённый курсор ленты ``/changes`` потребителя либо ``None``."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT producer_id,acknowledged_through FROM consumer_checkpoints WHERE consumer_id=?",
+                               (consumer_id,)).fetchone()
+        return None if row is None else {"producer_id": row[0], "acknowledged_through": int(row[1])}
+
+    def source_absent_opens(self, *, source: str, instrument_uid: str, interval: str) -> list[pd.Timestamp]:
+        """Интервалы, разрешённые как «у источника нет»: поздняя свеча по ним — отдельная отметка."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("""SELECT open_time_utc FROM interval_coverage WHERE source=? AND instrument_uid=?
+                AND interval=? AND state='source_absent' ORDER BY open_time_utc""",
+                (source, instrument_uid, interval)).fetchall()
+        return [pd.Timestamp(row[0]).tz_convert("UTC").tz_localize(None) for row in rows]
+
+    def cursors(self, *, source: str, instrument_uid: str, interval: str, contour: str | None = None) -> dict[str, str | None]:
+        """Границы пары; ``processed_through`` — контура ``contour`` либо наибольшая по контурам."""
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT received_through,resolved_through,processed_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                "SELECT received_through,resolved_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
                 (source, instrument_uid, interval),
             ).fetchone()
-        return dict(row) if row is not None else {"received_through": None, "resolved_through": None, "processed_through": None}
+            processed = conn.execute(
+                "SELECT MAX(processed_through) FROM contour_cursors WHERE source=? AND instrument_uid=? AND interval=?"
+                + ("" if contour is None else " AND contour_id=?"),
+                (source, instrument_uid, interval) + (() if contour is None else (contour,)),
+            ).fetchone()[0]
+        result = dict(row) if row is not None else {"received_through": None, "resolved_through": None}
+        return {**result, "processed_through": processed}
+
+    def contour_cursor_floor(self, *, source: str, instrument_uid: str, interval: str) -> pd.Timestamp | None:
+        """Наименьшая граница обработки пары по контурам (naive UTC) или None."""
+        with self._lock, self._connect() as conn:
+            value = conn.execute(
+                "SELECT MIN(processed_through) FROM contour_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+                (source, instrument_uid, interval),
+            ).fetchone()[0]
+        return None if value is None else pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
 
     @staticmethod
     def _advance_cursor(
@@ -999,7 +1379,7 @@ class MarketDataStore:
             maximum = int(row[0]) if row is not None else 0
             if change_id < 0 or change_id > maximum:
                 raise ValueError("change_id вне доступного диапазона расписаний")
-            key, now = f"trading-schedules:{consumer_id}", _utc_text()
+            key, now = f"{SCHEDULE_CHECKPOINT_PREFIX}{consumer_id}", _utc_text()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 old = conn.execute("SELECT acknowledged_through FROM consumer_checkpoints WHERE consumer_id=?", (key,)).fetchone()
@@ -1033,6 +1413,169 @@ class MarketDataStore:
             conn.commit()
         return {"producer_id": info.producer_id, "consumer_id": consumer_id, "acknowledged_through": acknowledged}
 
+    def prune_changes(self, older_than: object, *, limit: int = PRUNE_BATCH) -> ChangesPrune:
+        """Удаляет порцию начала ленты ``/changes`` старше ``older_than``.
+
+        Удаляется только префикс ленты и не дальше наименьшего подтверждения
+        потребителей ``/changes`` текущего производителя: неподтверждённое не
+        удаляется. Подтверждения ленты расписаний очистку не удерживают.
+        ``min_after_id`` поднимается в той же транзакции (add-changes-retention).
+        """
+        cutoff = _utc_text(older_than)
+        limit = max(1, int(limit))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                values = dict(conn.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('producer_id', 'min_after_id')").fetchall())
+                floor = int(values["min_after_id"])
+                held = conn.execute(
+                    "SELECT consumer_id, acknowledged_through FROM consumer_checkpoints "
+                    "WHERE producer_id=? AND consumer_id NOT LIKE ? "
+                    "ORDER BY acknowledged_through, consumer_id LIMIT 1",
+                    (values["producer_id"], SCHEDULE_CHECKPOINT_PREFIX + "%"),
+                ).fetchone()
+                bound = None if held is None else int(held["acknowledged_through"])
+                rows = conn.execute(
+                    "SELECT change_id, recorded_at FROM changes ORDER BY change_id LIMIT ?", (limit,)).fetchall()
+                last, blocked = None, False
+                for row in rows:
+                    if row["recorded_at"] >= cutoff:
+                        break
+                    if bound is not None and row["change_id"] > bound:
+                        blocked = True
+                        break
+                    last = int(row["change_id"])
+                deleted = 0
+                if last is not None:
+                    deleted = conn.execute("DELETE FROM changes WHERE change_id<=?", (last,)).rowcount
+                    floor = max(floor, last)
+                    conn.execute("UPDATE metadata SET value=? WHERE key='min_after_id'", (str(floor),))
+                lag = 0
+                if blocked:
+                    newest = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM changes").fetchone()[0]
+                    lag = max(int(newest) - bound, 0)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        more = last is not None and len(rows) == limit and last == int(rows[-1]["change_id"])
+        return ChangesPrune(deleted, floor, more, held["consumer_id"] if blocked else None, lag)
+
+    # ── состав пар и проверки полноты (add-independent-market-data-lanes) ──
+    def save_roster(self, *, source: str, entries: Iterable[dict], observed_at: object | None = None) -> None:
+        """Сохраняет пары состава; остальные пары, кроме обязательств, становятся прошлыми.
+
+        ``entries``: ``instrument_uid``, ``interval``, ``ticker``,
+        ``instrument_type``, ``origin`` (``selected``/``obligation``),
+        необязательные ``short_name``, ``window_lower``, ``requirements``.
+        """
+        when = _utc_text(observed_at)
+        rows = []
+        for entry in entries:
+            origin = entry.get("origin", "selected")
+            if origin not in ROSTER_ORIGINS:
+                raise ValueError(f"Неизвестное происхождение пары состава: {origin}")
+            lower = entry.get("window_lower")
+            rows.append((source, entry["instrument_uid"], entry["interval"], entry["ticker"],
+                         entry["instrument_type"], entry.get("short_name"), origin,
+                         None if lower is None else _utc_text(lower),
+                         json.dumps(entry.get("requirements") or {}, ensure_ascii=False, sort_keys=True), when))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                keep = {(row[1], row[2]) for row in rows}
+                for uid, interval in conn.execute(
+                        "SELECT instrument_uid, interval FROM market_data_roster WHERE source=? AND origin='selected'",
+                        (source,)).fetchall():
+                    if (uid, interval) not in keep:
+                        conn.execute("""UPDATE market_data_roster SET origin='previous'
+                            WHERE source=? AND instrument_uid=? AND interval=?""", (source, uid, interval))
+                conn.executemany(
+                    """INSERT INTO market_data_roster(source,instrument_uid,interval,ticker,instrument_type,short_name,
+                    origin,window_lower_utc,requirements_json,confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(source,instrument_uid,interval) DO UPDATE SET ticker=excluded.ticker,
+                    instrument_type=excluded.instrument_type,short_name=excluded.short_name,origin=excluded.origin,
+                    window_lower_utc=COALESCE(excluded.window_lower_utc, market_data_roster.window_lower_utc),
+                    requirements_json=excluded.requirements_json,confirmed_at=excluded.confirmed_at""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def mark_roster_previous(self, *, source: str, pairs: Iterable[tuple[str, str]]) -> None:
+        """Пары, снятые запуском как ненужные, становятся прошлыми, даже обязательства."""
+        with self._lock, self._connect() as conn:
+            conn.executemany("""UPDATE market_data_roster SET origin='previous'
+                WHERE source=? AND instrument_uid=? AND interval=?""",
+                [(source, uid, interval) for uid, interval in pairs])
+
+    def set_roster_window(self, *, source: str, instrument_uid: str, interval: str, window_lower: object) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("""UPDATE market_data_roster SET window_lower_utc=?
+                WHERE source=? AND instrument_uid=? AND interval=?""",
+                (_utc_text(window_lower), source, instrument_uid, interval))
+
+    def roster(self, *, source: str, origins: Iterable[str] = ("selected", "obligation")) -> list[dict]:
+        wanted = tuple(origins)
+        marks = ",".join("?" for _ in wanted)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(f"""SELECT * FROM market_data_roster WHERE source=? AND origin IN ({marks})
+                ORDER BY instrument_uid, interval""", (source, *wanted)).fetchall()
+        return [{"instrument_uid": row["instrument_uid"], "interval": row["interval"], "ticker": row["ticker"],
+                 "instrument_type": row["instrument_type"], "short_name": row["short_name"], "origin": row["origin"],
+                 "window_lower": None if row["window_lower_utc"] is None
+                 else pd.Timestamp(row["window_lower_utc"]).tz_convert("UTC").tz_localize(None),
+                 "requirements": json.loads(row["requirements_json"]), "confirmed_at": row["confirmed_at"]}
+                for row in rows]
+
+    def window_snapshot(self, *, source: str, instrument_uid: str, interval: str, lower: object, upper: object) -> dict:
+        """Полученные свечи, состояния покрытия и проверки окна пары без сети.
+
+        Границы включительные, моменты — UTC-naive открытия баров.
+        """
+        low, high = _utc_text(lower), _utc_text(upper)
+        identity = (source, instrument_uid, interval, low, high)
+        with self._lock, self._connect() as conn:
+            received = conn.execute("""SELECT open_time_utc FROM candle_current WHERE source=? AND instrument_uid=?
+                AND interval=? AND is_complete=1 AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+            states = conn.execute("""SELECT open_time_utc, state, evidence FROM interval_coverage WHERE source=?
+                AND instrument_uid=? AND interval=? AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+            checks = conn.execute("""SELECT * FROM interval_checks WHERE source=? AND instrument_uid=? AND interval=?
+                AND open_time_utc>=? AND open_time_utc<=?""", identity).fetchall()
+
+        def stamp(value):
+            return pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+
+        return {"received": {stamp(row[0]) for row in received},
+                "states": {stamp(row["open_time_utc"]): (row["state"], row["evidence"]) for row in states},
+                "checks": {stamp(row["open_time_utc"]): {
+                    "checks": row["checks"], "first_checked_at": stamp(row["first_checked_at"]),
+                    "last_checked_at": stamp(row["last_checked_at"]),
+                    "next_check_at": None if row["next_check_at"] is None else stamp(row["next_check_at"])}
+                    for row in checks}}
+
+    def record_interval_checks(self, *, source: str, instrument_uid: str, interval: str,
+                               open_times: Iterable[object], checked_at: object, next_check_at: object | None) -> None:
+        """Пакетная отметка пустой проверки интервалов: +1 к числу, новый срок."""
+        when = _utc_text(checked_at)
+        due = None if next_check_at is None else _utc_text(next_check_at)
+        rows = [(source, instrument_uid, interval, _utc_text(stamp), when, when, due) for stamp in open_times]
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany("""INSERT INTO interval_checks(source,instrument_uid,interval,open_time_utc,checks,
+                    first_checked_at,last_checked_at,next_check_at) VALUES (?,?,?,?,1,?,?,?)
+                    ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
+                    checks=interval_checks.checks+1,last_checked_at=excluded.last_checked_at,
+                    next_check_at=excluded.next_check_at""", rows)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def current_frame(self, *, source: str, instrument_uid: str, interval: str) -> pd.DataFrame:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT open_time_utc,open,high,low,close,volume,is_complete FROM candle_current WHERE source=? AND instrument_uid=? AND interval=? ORDER BY open_time_utc", (source, instrument_uid, interval)).fetchall()
@@ -1044,6 +1587,90 @@ class MarketDataStore:
             frame[key] = frame[key].astype(float)
         frame["is_complete"] = frame["is_complete"].astype(bool)
         return frame
+
+    def pattern_context(self, *, source: str, instrument_uid: str, interval: str,
+                        close_time: object) -> dict[str, object]:
+        """Две завершённые свечи и их покрытие из одного SQLite-снимка."""
+        upper = _utc_text(close_time)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(
+                    """SELECT open_time_utc, open, high, low, close
+                    FROM candle_current WHERE source=? AND instrument_uid=? AND interval=?
+                    AND is_complete=1 AND open_time_utc < ?
+                    ORDER BY open_time_utc DESC LIMIT 2""",
+                    (source, instrument_uid, interval, upper),
+                ).fetchall()
+                rows = list(reversed(rows))
+                coverage = {}
+                if rows:
+                    marks = [row["open_time_utc"] for row in rows]
+                    placeholders = ",".join("?" for _ in marks)
+                    coverage_rows = conn.execute(
+                        f"""SELECT open_time_utc, state FROM interval_coverage
+                        WHERE source=? AND instrument_uid=? AND interval=?
+                        AND open_time_utc IN ({placeholders})""",
+                        (source, instrument_uid, interval, *marks),
+                    ).fetchall()
+                    coverage = {row["open_time_utc"]: row["state"] for row in coverage_rows}
+                    unresolved = conn.execute(
+                        """SELECT open_time_utc FROM interval_coverage
+                        WHERE source=? AND instrument_uid=? AND interval=?
+                        AND open_time_utc>=? AND open_time_utc<?
+                        AND state IN ('pending','unresolved')
+                        ORDER BY open_time_utc LIMIT 1""",
+                        (source, instrument_uid, interval, rows[0]["open_time_utc"], upper),
+                    ).fetchone()
+                else:
+                    unresolved = None
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        candles = [
+            {"datetime": row["open_time_utc"], "open": float(row["open"]), "high": float(row["high"]),
+             "low": float(row["low"]), "close": float(row["close"])}
+            for row in rows
+        ]
+        missing = next((row["open_time_utc"] for row in rows
+                        if coverage.get(row["open_time_utc"]) in {None, "pending", "unresolved"}), None)
+        if missing is None and unresolved is not None:
+            missing = unresolved["open_time_utc"]
+        if missing is None and len(rows) != 2:
+            missing = upper
+        return {"candles": candles, "has_gap": missing is not None, "missing_open_time": missing}
+
+    def enqueue_pattern_event(self, *, event_id: str, payload_json: str) -> None:
+        now = _utc_text()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO pattern_event_outbox(event_id,payload_json,attempts,next_attempt_at)
+                VALUES (?,?,0,?) ON CONFLICT(event_id) DO NOTHING""",
+                (event_id, payload_json, now),
+            )
+
+    def pending_pattern_events(self, *, limit: int = 100) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT event_id,payload_json,attempts FROM pattern_event_outbox
+                WHERE delivered_at IS NULL AND next_attempt_at<=?
+                ORDER BY next_attempt_at,event_id LIMIT ?""", (_utc_text(), limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_pattern_event_delivered(self, event_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE pattern_event_outbox SET delivered_at=?, last_error=NULL WHERE event_id=?",
+                         (_utc_text(), event_id))
+
+    def defer_pattern_event(self, event_id: str, error: str) -> None:
+        retry_at = _utc_text(datetime.now(timezone.utc) + pd.Timedelta(seconds=1))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE pattern_event_outbox SET attempts=attempts+1,next_attempt_at=?,last_error=?
+                WHERE event_id=?""", (retry_at, error[:1000], event_id),
+            )
 
 
 class ProducerMismatch(Exception):

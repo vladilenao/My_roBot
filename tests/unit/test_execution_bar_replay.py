@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-import run
+from src.assembly import contour
 from src.portfolio import ContractMeta
 from src.trade_management.actions import MoveStop, OpenTrade
 from src.trade_management.models import CostSnapshot, PlanEconomics, ProfileSnapshot, TargetPlan, TradePlan
@@ -28,18 +28,18 @@ def frame(*bars):
 
 @pytest.fixture
 def runtime_factory(tmp_path, monkeypatch):
-    monkeypatch.setattr(run, "trading_enabled", lambda: True)
-    monkeypatch.setattr(run, "_load_contracts_metadata", lambda *args, **kwargs: {
+    monkeypatch.setattr(contour, "trading_enabled", lambda: True)
+    monkeypatch.setattr(contour, "_load_contracts_metadata", lambda *args, **kwargs: {
         "BRX6": META, "GAZP": ContractMeta("GAZP", 1, 1, 0, 0),
     })
-    monkeypatch.setattr(run, "print_contract_metadata", lambda *args: None)
+    monkeypatch.setattr(contour, "print_contract_metadata", lambda *args: None)
     cache = SimpleNamespace(frame=frame((-1, (98.35, 98.3, 98.4, 98.35))))
     cache.frames = {}
     cache.frame_for = lambda instrument, timeframe: cache.frames.get(instrument.ticker, cache.frame)
     runtimes = []
 
     def build(instruments=(INSTRUMENT,)):
-        runtime = run._build_runtime(instruments, cache, MagicMock(), tmp_path, clock=lambda: NOW)
+        runtime = contour._build_runtime(instruments, cache, MagicMock(), tmp_path, clock=lambda: NOW)
         runtimes.append(runtime)
         return runtime
 

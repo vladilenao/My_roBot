@@ -8,10 +8,13 @@ import pandas as pd
 import pytest
 
 import run
+from src.assembly.history_runs import prepare_import
+from src.assembly import contour, services
 from src.api.emulator_client import EmulatorClientProvider
 from src.bot import TradingBot
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.history.contract_lifecycle import ConstantContractLifecycle
+from src.trade_management.intraday_settings import IntradaySettings
 
 START = datetime(2025, 1, 24, 20, 48)
 END = datetime(2025, 1, 25, 12)
@@ -84,17 +87,20 @@ class Exchange:
 def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail=False):
     exchange = Exchange(future_price)
     monkeypatch.setattr("src.api.emulator_client.request.urlopen", exchange)
-    monkeypatch.setattr(run, "EmulatorClientProvider", lambda: EmulatorClientProvider("http://local-source"))
-    monkeypatch.setattr(run, "select_instruments", lambda **kw: [("NG-1.25", "NGF5", "future", "NG-1.25")])
-    monkeypatch.setattr(run, "state_dir_for", lambda *args: path)
     monkeypatch.setattr(run, "setup_logging", lambda **kw: None)
-    monkeypatch.setattr(run, "_token_client_context", lambda: pytest.fail("боевой API"))
-    monkeypatch.setattr(run, "ACTIVE_TIMEFRAMES", {"1m"})
-    monkeypatch.setattr(run, "FUTURE_STRATEGIES", {"NG": [Assignment("entry", "macd_rsi_stoch", "atr_trend", "raw", timeframe="1m")]})
+    monkeypatch.setattr(contour, "_token_client_context", lambda: pytest.fail("боевой API"))
+    monkeypatch.setattr(services, "ACTIVE_TIMEFRAMES", {"1m"})
+    assignments = {"NG": [Assignment("entry", "macd_rsi_stoch", "atr_trend", "raw", timeframe="1m")]}
+    monkeypatch.setattr(run, "FUTURE_STRATEGIES", assignments)
+    monkeypatch.setattr(contour, "FUTURE_STRATEGIES", assignments)
     monkeypatch.setattr(run, "SHARE_STRATEGIES", {})
+    monkeypatch.setattr(contour, "SHARE_STRATEGIES", {})
     monkeypatch.setattr(run, "_strategy_map", lambda: {"macd_rsi_stoch": object()})
+    monkeypatch.setattr(contour, "_strategy_map", lambda: {"macd_rsi_stoch": object()})
     monkeypatch.setattr(run, "_warmup_bars", lambda: 2)
-    monkeypatch.setattr(run, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    monkeypatch.setattr(contour, "RISK_LIMITS", {"max_qty": 1, "commission": 1, "slippage": 0})
+    # Проверяется граница прогона, а не сессии: входы 1m вне правила сессионной защиты.
+    monkeypatch.setattr(contour, "INTRADAY_SETTINGS", IntradaySettings(enabled=False))
 
     class Strategy:
         def compute(self, frame):
@@ -103,8 +109,8 @@ def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail
         def decide(self, frame, timeframe=None):
             return Decision(SignalType.BUY, float(frame["close"].iloc[-1]), bar_time=frame["datetime"].iloc[-1])
 
-    monkeypatch.setattr(run, "TradingBot", lambda **kw: TradingBot(**kw, strategy_factory=lambda *a, **k: Strategy()))
-    original_build = run._build_runtime
+    monkeypatch.setattr(contour, "TradingBot", lambda **kw: TradingBot(**kw, strategy_factory=lambda *a, **k: Strategy()))
+    original_build = contour._build_runtime
 
     def build(instruments, cache, bus, directory, **kw):
         exchange.runtime = True
@@ -136,8 +142,12 @@ def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail
             runtime.trade_manager.contract_lifecycle = runtime.contract_lifecycle
         return runtime
 
-    monkeypatch.setattr(run, "_build_runtime", build)
-    code = run._run_history(START, END, 0)
+    monkeypatch.setattr(contour, "_build_runtime", build)
+    provider = EmulatorClientProvider("http://local-source")
+    # Сверку импорта делает робот до старта процесса прогона (add-history-contour).
+    sync, _, _ = prepare_import(provider)
+    code = run._run_history(START, END, 0, None, state_dir=path, provider=provider, market_data_sync=sync,
+                            instruments=[("NG-1.25", "NGF5", "future", "NG-1.25")])
     report = json.loads((path / "report.json").read_text())
     return code, report, exchange
 

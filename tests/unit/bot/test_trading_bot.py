@@ -1123,10 +1123,32 @@ class TestTradingBot:
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
         channel = RecordingChannel()
         context_cache = MagicMock()
+        signal_filter = MagicMock()
+        signal_filter.apply.side_effect = lambda decision, context, **kwargs: (context.trend, decision)[1]
         bot = _make_bot(
             timeline=FakeTimeline(),
             cache=FakeCache(frames={"SBER": _df()}),
             bus=channel.bus,
+            strategy=strategy,
+            share={"SBER": _assign("macd_rsi_stoch", "flat_triangle")},
+            factory=lambda name, config: strategy,
+            context_cache=context_cache,
+            signal_filter=signal_filter,
+        )
+        bot._instruments = [_inst("SBER", "SBER", "share")]
+
+        bot.run()
+
+        assert signal_filter.apply.call_count == 2
+        assert context_cache.get_context.call_count == 1
+
+    def test_market_context_not_computed_when_nobody_reads_it(self):
+        strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))
+        context_cache = MagicMock()
+        bot = _make_bot(
+            timeline=FakeTimeline(),
+            cache=FakeCache(frames={"SBER": _df()}),
+            bus=RecordingChannel().bus,
             strategy=strategy,
             share={"SBER": _assign("macd_rsi_stoch", "flat_triangle")},
             factory=lambda name, config: strategy,
@@ -1136,7 +1158,7 @@ class TestTradingBot:
 
         bot.run()
 
-        assert context_cache.get_context.call_count == 1
+        context_cache.get_context.assert_not_called()
 
     def test_strategies_built_once_not_per_tick(self):
         strategy = _make_strategy(decision=Decision(SignalType.BUY, 100.5))

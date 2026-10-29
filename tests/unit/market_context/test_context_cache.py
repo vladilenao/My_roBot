@@ -114,3 +114,15 @@ class TestMultiTimeframeContext:
         cache.get_context(inst, "1h")
         cache.get_context(inst, "15m")
         assert trend.calls == 2
+
+
+class TestTickFrame:
+    def test_supplied_frame_is_used_instead_of_cache_read(self):
+        trend = CountingTrend()
+        inst = _Inst()
+        cache = MarketContextCache(FakeDataCache({("BR", "1h"): _frames(n=21)}), trend, SRLevelsCalculator())
+
+        ctx = cache.get_context(inst, "1h", _frames(n=20))
+
+        assert ctx.current_price == 119.0
+        assert trend.calls == 1

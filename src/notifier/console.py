@@ -21,8 +21,14 @@ from src.notifier.channel import Channel
 from src.notifier.templates import render
 from src.notifier.templates.console_view import render_status_group, status_label
 from src.notifier.templates.decision import idle_tick_summary
+from src.notifier.templates.holds import hold_key
 
 log = get_logger(__name__)
+
+
+def _cause(event: Event) -> tuple:
+    """Причина состояния для 15-минутного повтора: сдвиг удержания — смена причины."""
+    return event.get("reason") or "", hold_key(event.get("hold"))
 
 
 def _supports_color(stream: IO[str], *, platform_name: str | None = None) -> bool:
@@ -69,13 +75,11 @@ class ConsoleChannel(Channel):
     def __init__(
         self,
         *,
-        tz_offset_hours: float = 0.0,
         supported_types: Iterable[EventType] | None = None,
         stream: IO[str] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__(supported_types=supported_types)
-        self._tz_offset_hours = tz_offset_hours
         self._stream = stream
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._write_lock = Lock()
@@ -123,7 +127,7 @@ class ConsoleChannel(Channel):
                       and bool(event.get("trade_id")) and event.get("trade_id") == self._last_trade_id)
         stream = self._stream if self._stream is not None else sys.stdout
         rendered = render(
-            event, self._tz_offset_hours, now=self._now(),
+            event, now=self._now(),
             width=shutil.get_terminal_size(fallback=(96, 24)).columns,
             color=_supports_color(stream), linked=linked,
         )
@@ -149,7 +153,7 @@ class ConsoleChannel(Channel):
         elif key == self._api_limit_anchor:
             self._api_limit_active = False
             self._api_limit_anchor = None
-        if state in {"current", "waiting_bar"} and not event.get("reason"):
+        if state in {"current", "waiting_bar"} and not event.get("reason") and not event.get("hold"):
             previous = self._last_live_notice.pop(key, None)
             if previous is None or previous[0] in {"current", "waiting_bar", "recovered"}:
                 return
@@ -160,7 +164,7 @@ class ConsoleChannel(Channel):
             state = "recovered"
         elif state != "rate_limited":
             previous = self._last_live_notice.get(key)
-            if previous and previous[:2] == (state, event.get("reason") or "") and self._now() - previous[2] < timedelta(minutes=15):
+            if previous and previous[:2] == (state, _cause(event)) and self._now() - previous[2] < timedelta(minutes=15):
                 return
         if status_label(event) is None:
             return
@@ -177,7 +181,7 @@ class ConsoleChannel(Channel):
                 groups.setdefault(label, []).append(event)
         stream = self._stream if self._stream is not None else sys.stdout
         for label, items in groups.items():
-            rendered = render_status_group(items, self._tz_offset_hours,
+            rendered = render_status_group(items,
                 width=shutil.get_terminal_size(fallback=(96, 24)).columns,
                 color=_supports_color(stream))
             if rendered is None or not self._write(rendered):
@@ -189,7 +193,7 @@ class ConsoleChannel(Channel):
             for event in items:
                 if event.get("data_state") != "rate_limited":
                     self._last_live_notice[(event.instrument, event.timeframe)] = (
-                        event.get("data_state"), event.get("reason") or "", self._now())
+                        event.get("data_state"), _cause(event), self._now())
 
     def _flush_statuses(self) -> None:
         if self._pending_statuses:

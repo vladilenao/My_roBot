@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 from src.broker import ExecutionEvent, ExecutionStatus
+from src.logging_setup import LogRotation
 from src.history.report import (
     CalendarScheduleMetadata,
     MarketDataSync,
@@ -158,9 +159,12 @@ class TestWriteReport:
             snapshot_generation=42,
             snapshot_pinned=True,
             exchanges=("MOEX",),
-            day_versions=(("MOEX", "2026-10-13", "version-1"),),
+            day_versions=(("MOEX", "2026-10-13", "version-1", "broker"),),
             missing_dates=("2026-10-14",),
             unavailable_reason="часть дат отсутствует в снимке",
+            provenance_counts={"broker": 1},
+            binding_provenance={"MOEX": ("broker",)},
+            use_reconstructed=True,
         )
 
         txt, js = write_report(
@@ -175,17 +179,51 @@ class TestWriteReport:
             "snapshot_pinned": True,
             "exchanges": ["MOEX"],
             "day_versions": [
-                {"exchange": "MOEX", "date": "2026-10-13", "version": "version-1"}
+                {"exchange": "MOEX", "date": "2026-10-13", "version": "version-1", "provenance": "broker"}
             ],
             "missing_dates": ["2026-10-14"],
             "unavailable_reason": "часть дат отсутствует в снимке",
+            "provenance_counts": {"broker": 1},
+            "rules_versions": [],
+            "binding_provenance": {"MOEX": ["broker"]},
+            "use_reconstructed": True,
         }
         assert "Источник: emulator" in text
         assert "Снимок: закреплён (42)" in text
         assert "Режимы торгов: MOEX" in text
-        assert "MOEX 2026-10-13: version-1" in text
+        assert "MOEX 2026-10-13: version-1 (подтверждено брокером)" in text
+        assert "Дни расписания: подтверждено брокером — 1" in text
         assert "Даты без расписания: 2026-10-14" in text
         assert "Причина недоступности расписания: часть дат отсутствует в снимке" in text
+
+    def test_mixed_schedule_shows_provenance_and_date_ranges(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        versions = tuple(
+            ("forts_futures_weekend", f"2025-04-{day:02d}", f"v{day}", "reconstructed") for day in range(1, 26)
+        )
+        schedule = CalendarScheduleMetadata(
+            source="emulator",
+            exchanges=("forts_futures_weekend",),
+            day_versions=versions,
+            missing_dates=("2025-03-10", "2025-03-11", "2025-03-12", "2025-03-14", "2025-03-17"),
+            provenance_counts={"broker": 6, "reconstructed": 25},
+            rules_versions=("forts_futures_weekend/1",),
+            binding_provenance={"forts_futures_weekend": ("reconstructed",)},
+            use_reconstructed=True,
+        )
+
+        txt, js = write_report(tmp_path, _metrics(calendar_schedule=schedule), collect_result(storage))
+        text = txt.read_text(encoding="utf-8")
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Восстановленное расписание: используется" in text
+        assert "Дни расписания: подтверждено брокером — 6, восстановлено — 25" in text
+        assert "Версии правил восстановления: forts_futures_weekend/1" in text
+        assert "Привязки режимов: forts_futures_weekend (восстановлено)" in text
+        assert "Версии дней: 25 (полный список — в report.json)" in text
+        assert "Даты без расписания: 2025-03-10 — 2025-03-12, 2025-03-14, 2025-03-17" in text
+        assert len(payload["calendar_schedule"]["day_versions"]) == 25
+        assert payload["calendar_schedule"]["missing_dates"][0] == "2025-03-10"
 
     def test_calendar_schedule_is_omitted_when_absent(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
@@ -195,6 +233,38 @@ class TestWriteReport:
 
         assert "calendar_schedule" not in payload
         assert "Расписание торгов:" not in txt.read_text(encoding="utf-8")
+
+    def test_complete_log_is_reported(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        rotation = LogRotation(rollovers=0, backup_count=0, retained_from=None)
+
+        txt, js = write_report(tmp_path, _metrics(log_rotation=rotation), collect_result(storage))
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+
+        assert "Лог прогона: полный (ротаций: 0)" in txt.read_text(encoding="utf-8")
+        assert payload["log"] == {"complete": True, "rollovers": 0, "backup_count": 0, "retained_from": None}
+
+    def test_truncated_log_warns_with_market_moment(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+        rotation = LogRotation(rollovers=9, backup_count=5, retained_from=datetime(2023, 6, 1, 11, 30))
+
+        txt, js = write_report(tmp_path, _metrics(log_rotation=rotation), collect_result(storage))
+        payload = __import__("json").loads(js.read_text(encoding="utf-8"))
+        text = txt.read_text(encoding="utf-8")
+
+        assert "Лог прогона: НЕПОЛНЫЙ" in text
+        assert "9 ротаций при backup_count=5" in text
+        assert "сохранён с рыночного момента 2023-06-01 11:30" in text
+        assert payload["log"] == {"complete": False, "rollovers": 9, "backup_count": 5,
+                                  "retained_from": "2023-06-01 11:30"}
+
+    def test_log_block_is_omitted_without_logging(self, tmp_path):
+        storage = _storage_with_round_trip(tmp_path)
+
+        txt, js = write_report(tmp_path, _metrics(), collect_result(storage))
+
+        assert "Лог прогона" not in txt.read_text(encoding="utf-8")
+        assert __import__("json").loads(js.read_text(encoding="utf-8"))["log"] is None
 
     def test_sync_snapshot_is_written_to_both_reports(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
@@ -410,3 +480,14 @@ class TestConsoleLines:
 
         assert line == "Прогон аварийно остановлен на 2023-06-01 14:35"
         assert "\n" not in line
+
+
+def test_segment_line_explains_cutoff_shift_and_unknown_schedule():
+    from src.history.report import _cutoff_note
+    shifted = {"cutoff_source": "session-end", "calendar_cutoff": "2025-06-29T16:05:00Z",
+               "cutoff": "2025-06-27T20:30:00Z", "session_end": "2025-06-27T20:50:00Z"}
+    assert _cutoff_note(shifted) == ("; рубеж 2025-06-29T16:05:00Z в перерыве — сдвинут на 2025-06-27T20:30:00Z"
+                                     " (конец сессии 2025-06-27T20:50:00Z)")
+    assert _cutoff_note({"cutoff_source": "schedule-unknown"}) == "; расписание у рубежа неизвестно — рубеж календарный"
+    assert _cutoff_note({"cutoff_source": "calendar"}) == ""
+    assert _cutoff_note({}) == ""

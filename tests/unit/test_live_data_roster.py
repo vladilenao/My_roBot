@@ -1,6 +1,5 @@
 """Фактический roster конфигурации и сохранённые потребности сопровождения."""
 
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 import tomllib
@@ -8,14 +7,16 @@ import tomllib
 import pytest
 
 import src.config as config
-from src.decision.filters.triple_screen import TripleScreenParams
+from src.data.ingestion_settings import MarketDataSettings
+from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.history.warmup import live_data_requirements
 from src.strategies.contracts import Assignment
 
 
-def test_shipped_all_selected_roster_has_81_unique_pairs(monkeypatch):
-    # Это конфигурационный fixture, не исторические/торговые данные и не
-    # текущий выбор интерактивного меню. Каждый ticker/family здесь один UID.
+def test_shipped_roster_fits_live_data_limits(monkeypatch):
+    # Инварианты поставляемого default.toml, а не снимок состава: смена
+    # таймфреймов стратегий не должна требовать правки чисел в тесте.
+    # Каждый ticker/family здесь один UID.
     with (Path(__file__).resolve().parents[2] / "default.toml").open("rb") as source:
         settings = tomllib.load(source)
     monkeypatch.setattr(config, "TIMEFRAME", settings["robot"]["timeframe"])
@@ -23,8 +24,8 @@ def test_shipped_all_selected_roster_has_81_unique_pairs(monkeypatch):
                         lambda name, profile: SimpleNamespace(required_history=lambda: 1))
     params = TripleScreenParams.from_config(settings["strategies"]["filter"]["triple_screen"])
     profiles = settings["trade_management"]["profiles"]
+    ladder = tuple(config.TIMEFRAMES)
     roster = set()
-    work_pairs = set()
     instruments = []
     for kind in ("share", "future"):
         assignments = config._to_assignments(settings["strategies"][kind])
@@ -32,20 +33,24 @@ def test_shipped_all_selected_roster_has_81_unique_pairs(monkeypatch):
             uid = f"{kind}:{ticker}"
             instruments.append(uid)
             requirements = live_data_requirements(bindings, {binding.strategy: None for binding in bindings},
-                profiles, params, tuple(config.TIMEFRAMES))
+                profiles, params, ladder)
+            timeframes = set(requirements)
+            # Минутки — основа исполнения и защиты любой сделки.
+            assert "1m" in timeframes, uid
+            assert timeframes <= set(ladder), uid
+            for binding in bindings:
+                assert binding.timeframe in timeframes, (uid, binding.id)
+                if binding.filter_profile == "triple_screen":
+                    higher = tf_hierarchy(binding.timeframe, params.multiplier, ladder)
+                    assert set(higher) <= timeframes, (uid, binding.id)
+            assert all(count > 0 for count in requirements.values()), uid
             roster.update((uid, tf) for tf in requirements)
-            work_pairs.update((uid, binding.timeframe) for binding in bindings)
-    assert len(instruments) == 23
-    assert len(work_pairs) == 46
-    assert len(roster) == 81
-    assert Counter(tf for _, tf in roster) == {
-        "1m": 23, "5m": 2, "15m": 22, "30m": 1, "1h": 22, "4h": 2, "1d": 5, "1w": 4,
-    }
-    assert {tf for uid, tf in roster if uid == "future:SI"} == {"1m", "5m", "30m", "4h"}
-    # Арифметика ниже явно условна: один RPC/пара каждые 300 с и один
-    # однодневный 1m чанк без overlap/retries, не реальная доступная квота.
-    assert len(roster) * 60 / 300 == pytest.approx(16.2)
-    assert len(instruments) * 30 == 690
+    assert instruments
+    assert len(instruments) == len(set(instruments))
+    # Весь выбранный состав помещается в подписки одного потока.
+    soft_limit = settings.get("market_data", {}).get(
+        "stream_subscription_soft_limit", MarketDataSettings.stream_subscription_soft_limit)
+    assert len(roster) <= soft_limit
 
 
 def test_saved_management_timeframe_remains_after_entry_binding_removed(monkeypatch):

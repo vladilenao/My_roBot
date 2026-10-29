@@ -337,3 +337,30 @@ def test_data_change_cannot_race_between_claim_check_and_local_submit(tmp_path):
             assert len(broker.actions) == 1
         finally:
             thread.join(2)
+
+
+def test_entry_held_in_its_step_is_cancelled_on_next_step_instead_of_hanging(tmp_path):
+    """14.10: вход PHOR удержан при сигнале и навсегда неактуален (cancel-stale-undelivered-entries)."""
+    from src.trade_journal.storage import ReservationCandidate
+
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        manager, broker, evidence = setup(storage)
+        queue_entry(manager, "A")
+        storage.reserve_candidates((ReservationCandidate(
+            reservation_id="reservation-A", trade_id="trade-A", order_id="open-A", priority=0,
+            assignment_id="binding-A", instrument_id="A", signal_id="signal-A",
+            risk_amount=Decimal(770), margin_amount=Decimal(0)),), risk_budget=Decimal(1900), margin_budget=Decimal(1900))
+        manager.dispatch(NOW)                                     # шаг N: данные не подтверждены
+        assert status(storage, "open-A") == "PENDING"
+
+        evidence.by_uid["A"] = DispatchDataEvidence(True, True, None)   # данные есть, актуальность не доказана
+        for minute in range(1, 4):
+            manager.dispatch(NOW + timedelta(minutes=minute))
+        assert broker.actions == [] and manager.dispatch_block_reasons["open-A"] == "freshness-unconfirmed"
+
+        manager.cancel_undelivered_increases(NOW + timedelta(minutes=1), NOW + timedelta(minutes=1))
+
+        assert storage.connection.execute("SELECT phase FROM trades WHERE trade_id='trade-A'").fetchone() == ("CANCELLED",)
+        assert storage.connection.execute("SELECT status FROM reservations").fetchone() == ("RELEASED",)
+        assert status(storage, "open-A") == "UNDELIVERED"
+        assert broker.actions == []                                # брокер о входе не узнал

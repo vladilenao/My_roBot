@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from src.api.retry import api_call_with_retry
+from src.data.coverage_states import RESOLVED_INTERVAL_STATES
 from src.data.market_store import MarketDataStore
 from src.data.timeutil import to_aware_utc, to_naive
 from src.scheduler.timing import tf_period_minutes
@@ -68,8 +69,11 @@ class MarketDataReconciler:
     не превращает пустой ответ в ``confirmed_no_trade``.
     """
 
-    def __init__(self, store: MarketDataStore, *, source: str, token=None, client_provider=None, refresh_seconds: int = 300, request_budget=None, market_calendar: MarketCalendar | None = None, calendar_evidence: bool = True, candle_publication_timeout_secs: float = 65, candle_publication_timeout_by_tf: dict[str, float] | None = None) -> None:
+    def __init__(self, store: MarketDataStore, *, source: str, token=None, client_provider=None, refresh_seconds: int = 300, request_budget=None, market_calendar: MarketCalendar | None = None, calendar_evidence: bool = True, candle_publication_timeout_secs: float = 65, candle_publication_timeout_by_tf: dict[str, float] | None = None, read_only: bool = False) -> None:
         self._store = store
+        # Сверка кэша торгового контура: решения вычисляются так же, но в базу
+        # не пишутся — долговечное состояние интервала решает ядро.
+        self._read_only = read_only
         self._source = source
         self._token = token
         self._provider = client_provider
@@ -91,6 +95,10 @@ class MarketDataReconciler:
         self._scanned = set()
         self._recheck_after = {}
 
+    def _require_writer(self) -> None:
+        if self._read_only:
+            raise RuntimeError("Сверка кэша контура только читает рыночную базу")
+
     def reconcile(self, *, instrument_uid: str, interval: str, candles: pd.DataFrame, now: object) -> None:
         """Помечает только пропуски *между* пришедшими свечами.
 
@@ -98,6 +106,7 @@ class MarketDataReconciler:
         объявляет неявную минуту в конце полученного ряда потерянной раньше её
         нормальной публикации.
         """
+        self._require_writer()
         if candles is None or candles.empty or "datetime" not in candles:
             return
         if self._market_calendar is not None:
@@ -202,13 +211,13 @@ class MarketDataReconciler:
         state = self._store.coverage_state(
             source=self._source, instrument_uid=instrument_uid, interval=interval, open_time=open_time,
         )
-        if state in {"received", "scheduled_closed", "confirmed_no_trade"}:
+        if state in RESOLVED_INTERVAL_STATES:
             return state
         if self._market_calendar is not None and not self._calendar_evidence:
             return state or "unresolved"
         calendar = self._calendar_for(instrument_uid, now, at=open_time)
         if calendar is not None and calendar.covers(open_time) and not calendar.is_open(open_time):
-            if state is not None:
+            if state is not None and not self._read_only:
                 self._store.set_interval_state(source=self._source, instrument_uid=instrument_uid,
                     interval=interval, open_time=open_time, state="scheduled_closed",
                     evidence="applicable_trading_schedule", observed_at=now)
@@ -268,6 +277,7 @@ class MarketDataReconciler:
     def record_empty_recovery(self, *, instrument_uid: str, interval: str, open_time: object) -> None:
         # Пустой ответ не означает отсутствия сделки. Сохраняем причину, чтобы
         # повторная попытка не стала молчаливым успехом.
+        self._require_writer()
         self._store.set_interval_state(
             source=self._source, instrument_uid=instrument_uid, interval=interval,
             open_time=open_time, state="unresolved", evidence="empty_recovery_response",
@@ -279,18 +289,11 @@ class MarketDataReconciler:
         if self._market_calendar is not None:
             calendar = self._market_calendar.calendar_for(instrument_uid, current.to_pydatetime())
             return _session_calendar_from_trading_calendar(calendar)
+        if self._read_only:
+            # Кэш контура не наблюдает расписание сам: без общего календаря его нет.
+            return None
         if self._budget is not None:
-            if instrument_uid not in self._ranges:
-                self._ranges[instrument_uid] = []
-                for payload, observed in self._store.observations(source=self._source,
-                        instrument_uid=instrument_uid, kind="trading_schedule"):
-                    if "coverage_start" not in payload or "coverage_end" not in payload:
-                        continue
-                    self._ranges[instrument_uid].append(SessionCalendar(payload["exchange"],
-                        tuple((to_naive(item["start"]), to_naive(item["end"])) for item in payload["intervals"]),
-                        to_naive(payload["coverage_start"]), to_naive(payload["coverage_end"]), observed,
-                        self._source, tuple(to_naive(day) for day in payload.get("covered_dates", ()))))
-            found = next((cal for cal in reversed(self._ranges[instrument_uid]) if cal.covers(point)), None)
+            found = next((cal for cal in reversed(self._saved_ranges(instrument_uid)) if cal.covers(point)), None)
             if found is None or (point >= current.normalize() and current - found.observed_at >= self._refresh):
                 if point.normalize() < current.normalize():
                     # TradingSchedules отклоняет `from` раньше текущей даты
@@ -416,6 +419,38 @@ class MarketDataReconciler:
 
     def session_calendar(self, instrument_uid, now):
         return self._calendar_for(instrument_uid, now)
+
+    def stored_calendars(self, instrument_uid: str, now: object) -> tuple[SessionCalendar, ...]:
+        """Уже известные календари пары, новые первыми: без сети и без постановки загрузки.
+
+        Для представления (график сделки): прошлое доказывают только
+        сохранённые дни, а отключённое календарное доказательство не
+        подменяется расписанием.
+        """
+        if self._market_calendar is not None:
+            if not self._calendar_evidence:
+                return ()
+            exchange = self._market_calendar.exchange_for(instrument_uid)
+            calendar = self._market_calendar.calendar(exchange, to_naive(now).to_pydatetime()) if exchange else None
+            projected = _session_calendar_from_trading_calendar(calendar)
+            return (projected,) if projected is not None else ()
+        if self._budget is not None:
+            return tuple(reversed(self._saved_ranges(instrument_uid)))
+        cached = self._calendars.get(instrument_uid)
+        return (cached[1],) if cached is not None and cached[1] is not None else ()
+
+    def _saved_ranges(self, instrument_uid: str) -> list[SessionCalendar]:
+        if instrument_uid not in self._ranges:
+            self._ranges[instrument_uid] = []
+            for payload, observed in self._store.observations(source=self._source,
+                    instrument_uid=instrument_uid, kind="trading_schedule"):
+                if "coverage_start" not in payload or "coverage_end" not in payload:
+                    continue
+                self._ranges[instrument_uid].append(SessionCalendar(payload["exchange"],
+                    tuple((to_naive(item["start"]), to_naive(item["end"])) for item in payload["intervals"]),
+                    to_naive(payload["coverage_start"]), to_naive(payload["coverage_end"]), observed,
+                    self._source, tuple(to_naive(day) for day in payload.get("covered_dates", ()))))
+        return self._ranges[instrument_uid]
 
     def recheck(self, instrument_uid, interval, now):
         """Ограниченная переоценка 1000 старых статусов на новое доказательство."""

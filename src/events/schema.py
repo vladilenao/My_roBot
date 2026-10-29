@@ -37,17 +37,17 @@ _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.MARKET_DATA_STATUS: ("phase", "break_kind", "last_due", "next_event", "schedule",
                                   "received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
                                  "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete",
-                                 "ingestion"),
+                                 "ingestion", "hold"),
     EventType.DECISION: ("price", "strategy", "filter_profile", "filtered_out", "event_id", "analysis_mode"),
     EventType.SIGNAL: (
         "targets", "expected_r", "strategy", "filter_profile", "trade_id", "event_id",
         "risk_amount", "reward_amount", "costs_amount", "payoff_ratio",
         "fixed_reward_amount", "fixed_quantity", "net_reward_amount", "algorithm_version",
-        *DIAGNOSTIC_PAYLOAD_FIELDS,
+        *DIAGNOSTIC_PAYLOAD_FIELDS, "clusters",
     ),
     EventType.REJECTED: ("code", "side", "price", "strategy", "filter_profile", "event_id", "algorithm_version",
                          "risk_amount", "costs_amount", "slippage_amount", "payoff_ratio", "threshold",
-                         *DIAGNOSTIC_PAYLOAD_FIELDS),
+                         *DIAGNOSTIC_PAYLOAD_FIELDS, "clusters"),
     EventType.HEARTBEAT: (),
     EventType.ERROR: ("message",),
     EventType.RATE_LIMITED: ("source",),
@@ -114,6 +114,7 @@ OPTIONAL_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
 for _event_type in (EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT, EventType.TARGET_HIT, EventType.TRADE_CLOSED):
     OPTIONAL_PAYLOAD_FIELDS[_event_type] += FINANCIAL_PAYLOAD_FIELDS
 OPTIONAL_PAYLOAD_FIELDS[EventType.TARGET_HIT] += ("target_number",)
+OPTIONAL_PAYLOAD_FIELDS[EventType.STOP_MOVED] += ("previous_stop", "quantity_remaining", "pnl_at_stop", "pnl_units")
 OPTIONAL_PAYLOAD_FIELDS[EventType.POSITION_ADDED] += ("requested_quantity", "selected_quantity", "limiting_constraint")
 for _event_type in (EventType.SIGNAL, EventType.TRADE_OPENED, EventType.POSITION_ADDED, EventType.STOP_HIT,
                    EventType.TARGET_HIT, EventType.TRADE_CLOSED, EventType.STOP_MOVED,
@@ -139,9 +140,11 @@ _JSON_TYPES: dict[str, str] = {
     "target_number": "number",
     "fees_known": "boolean",
     "ingestion": "object",
+    "hold": "object",
     "last_due": "object",
     "next_event": "object",
     "schedule": "object",
+    "clusters": "object",
 }
 
 

@@ -41,3 +41,16 @@ def test_overview_snapshot_is_deeply_immutable_and_information_is_not_trading():
     assert event.get("results")[0]["outcome"] == "BUY"
     assert {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS} <= NOTIFICATION_EVENT_TYPES
     assert not {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS} & TRADING_EVENT_TYPES
+
+
+def test_shifted_hold_boundary_is_a_new_cause_but_same_hold_is_not():
+    now = datetime(2026, 10, 15, 8)
+    cadence = StatusCadence(900)
+    held = LivePairState("broker", "uid", "15m", data_state="waiting_bar",
+                         hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8)})
+    assert cadence.due(held, now)
+    assert not cadence.due(held, now + timedelta(seconds=5))
+    shifted = LivePairState("broker", "uid", "15m", data_state="waiting_bar",
+                            hold={"kind": "execution_barrier", "through": datetime(2026, 10, 15, 8, 15)})
+    assert cadence.due(shifted, now + timedelta(seconds=10))
+    assert shifted.payload(now)["hold"]["through"] == datetime(2026, 10, 15, 8, 15)

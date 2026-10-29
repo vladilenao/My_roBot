@@ -52,6 +52,21 @@ def test_external_config_overrides_bundled_defaults(tmp_path):
     assert cfg["timeframe"] == "5m"
 
 
+def test_default_lookup_applies_robot_toml_after_bundled_defaults(tmp_path, monkeypatch):
+    import src.config_loader as loader
+
+    bundled = tmp_path / "default.toml"
+    bundled.write_text("[robot]\ntimeframe = \"1h\"\n", encoding="utf-8")
+    external = tmp_path / "robot.toml"
+    external.write_text("[robot]\ntimeframe = \"5m\"\n", encoding="utf-8")
+    monkeypatch.setattr(loader, "app_dir", lambda: tmp_path)
+    monkeypatch.setattr(loader, "_root_dir", lambda: tmp_path)
+
+    cfg = loader.load_config(_defaults())
+
+    assert cfg["timeframe"] == "5m"
+
+
 def test_bundled_default_used_when_no_external(tmp_path):
     bundled = tmp_path / "default.toml"
     bundled.write_text("[robot]\ntimeframe = \"5m\"\n", encoding="utf-8")
@@ -620,6 +635,24 @@ class TestContractExpiryBlockDays:
     def test_bool_value_rejected(self, tmp_path):
         cfg = _write(tmp_path, "[trading]\ncontract_expiry_block_days = true\n")
         with pytest.raises(ConfigError, match="contract_expiry_block_days"):
+            load_config(_defaults(), config_file=cfg)
+
+
+class TestContractExpiryCloseBeforeEnd:
+    def test_default_is_twenty_minutes(self):
+        from src.config import _DEFAULTS
+        assert _DEFAULTS["contract_expiry_close_before_end_min"] == 20
+
+    def test_key_overrides_default(self, tmp_path):
+        cfg = load_config(
+            _defaults(), config_file=_write(tmp_path, "[trading]\ncontract_expiry_close_before_end_min = 45\n")
+        )
+        assert cfg["contract_expiry_close_before_end_min"] == 45
+
+    @pytest.mark.parametrize("value", ["-1", "1.5", "true", "\"20\""])
+    def test_invalid_value_rejected(self, tmp_path, value):
+        cfg = _write(tmp_path, f"[trading]\ncontract_expiry_close_before_end_min = {value}\n")
+        with pytest.raises(ConfigError, match="contract_expiry_close_before_end_min"):
             load_config(_defaults(), config_file=cfg)
 
 

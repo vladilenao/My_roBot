@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.data.cache import MarketDataCache
 from src.data.market_store import MarketDataStore
 from src.data.request_budget import RequestBudget
@@ -29,6 +29,7 @@ def setup(tmp_path, boundaries=None):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), UID), timeline,
                             request_budget=RequestBudget(lambda: NOW, 0), market_store=store)
+    cache.contour_id = "emulation"
     instrument = Instrument("SBER", "SBER", "share", "SBER", UID)
     cache.register_live_pair(instrument, UID, "1m")
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100), ("2026-10-12 12:01", 101)), received_at=NOW)
@@ -39,12 +40,12 @@ def setup(tmp_path, boundaries=None):
     storage.load_trades.return_value = ()
     # Открытая позиция: 12:00 ещё не применена симуляцией.
     storage.execution_bar_boundaries.side_effect = lambda: dict(OPEN_POSITION if boundaries is None else boundaries)
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([instrument], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([instrument], cache, MagicMock(), tmp_path)
     return cache, store, broker, runtime, instrument
 
 
@@ -60,7 +61,7 @@ def test_simulator_receives_pinned_revision_and_marker_consumes_it(tmp_path):
     assert store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")["processed_through"].endswith("12:01:00Z")
     facts = store.live_state(kind="candle", source=SOURCE, instrument_uid=UID, interval="1m",
                              open_time=pd.Timestamp("2026-10-12 12:01"))
-    assert facts["input_reference"]["state"] == "consumed"
+    assert facts["input_references"]["emulation"]["state"] == "consumed"
 
 
 def test_conflicting_minute_holds_execution_without_skipping(tmp_path):

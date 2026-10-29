@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import pandas as pd
 
 from src.logging_setup import get_logger
@@ -17,6 +18,10 @@ from src.strategies.registry import register
 
 EVENT_COLUMNS = ["datetime", "signal", "price"]
 ENTRY_WINDOW = 6
+SIGNAL_COLUMNS = ["ma_cloud_signal", "rsi_signal", "macd_zero_signal"]
+# Сколько последних проигрышей держать: одна стратегия ТФ обслуживает
+# несколько инструментов, у каждого свой кадр.
+REPLAY_SLOTS = 8
 log = get_logger(__name__)
 
 DEFAULT_CONFIG = StrategyConfig(
@@ -41,6 +46,15 @@ class MaCloudState:
 _EMPTY_STATE = MaCloudState()
 
 
+@dataclass(frozen=True)
+class _Replay:
+    """Проигранный префикс кадра: сигналы строк и состояние перед последней."""
+
+    timeframe: str | None
+    signals: np.ndarray
+    state_before_last: MaCloudState
+
+
 def _purge_pending(pending: tuple[tuple[str, int], ...], bar_idx: int) -> tuple[tuple[str, int], ...]:
     return tuple((name, bar) for name, bar in pending if bar_idx - bar < ENTRY_WINDOW)
 
@@ -56,6 +70,7 @@ class MaCloudRsiMacdStrategy:
         self._config = config or DEFAULT_CONFIG
         self.NAME = self._config.name
         self.STRATEGY_WINDOW = self._config.strategy_window
+        self._replays: list[_Replay] = []
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
         data = df.copy()
@@ -76,11 +91,60 @@ class MaCloudRsiMacdStrategy:
         return events.astype({"datetime": "datetime64[ns]", "signal": "string", "price": "float64"})
 
     def decide(self, ta: pd.DataFrame, timeframe: str | None = None) -> Decision:
-        state = _EMPTY_STATE
+        """Решение по последнему бару; уже проигранный префикс кадра не пересчитывается.
+
+        Состояние зависит только от сигнальных столбцов и номера строки, поэтому
+        проигрыш продолжается с запомненного состояния, если сигналы префикса
+        совпадают с прежними. Иначе (новый контракт, правка истории, сдвиг
+        начала кадра) кадр проигрывается целиком.
+        """
         decision = Decision(SignalType.HOLD, float(ta.iloc[-1]["close"]) if len(ta) else 0.0, timeframe=timeframe, strategy_name=self.NAME)
-        for i in range(len(ta)):
+        if not len(ta):
+            return decision
+        signals = self._signals(ta)
+        start, state = self._resume(signals, timeframe) if signals is not None else (0, _EMPTY_STATE)
+        before_last = state
+        for i in range(start, len(ta)):
+            before_last = state
             state, decision = self._step(state, i, ta.iloc[i], timeframe)
+        if signals is not None:
+            self._remember(_Replay(timeframe, signals, before_last))
+        if decision.signal_type is SignalType.BUY:
+            log.info("Entry Long: third indicator confirmed")
+        elif decision.signal_type is SignalType.SELL:
+            log.info("Entry Short: third indicator confirmed")
         return decision
+
+    @staticmethod
+    def _signals(ta: pd.DataFrame) -> np.ndarray | None:
+        """Сигнальные столбцы как float; ``None`` — сравнить нельзя, проигрыш целиком."""
+        if not set(SIGNAL_COLUMNS) <= set(ta.columns):
+            return None
+        try:
+            return ta[SIGNAL_COLUMNS].to_numpy(dtype=float)
+        except (TypeError, ValueError):
+            return None
+
+    def _resume(self, signals: np.ndarray, timeframe: str | None) -> tuple[int, MaCloudState]:
+        """Строка, с которой продолжить проигрыш, и состояние перед ней."""
+        best: _Replay | None = None
+        for replay in self._replays:
+            size = len(replay.signals)
+            if (replay.timeframe == timeframe and size <= len(signals)
+                    and (best is None or size > len(best.signals))
+                    and np.array_equal(signals[:size], replay.signals, equal_nan=True)):
+                best = replay
+        if best is None:
+            return 0, _EMPTY_STATE
+        return len(best.signals) - 1, best.state_before_last
+
+    def _remember(self, replay: _Replay) -> None:
+        kept = [
+            other for other in self._replays
+            if not (other.timeframe == replay.timeframe and len(other.signals) <= len(replay.signals)
+                    and np.array_equal(replay.signals[:len(other.signals)], other.signals, equal_nan=True))
+        ]
+        self._replays = [*kept, replay][-REPLAY_SLOTS:]
 
     def _replay_state(self, ta: pd.DataFrame) -> MaCloudState:
         state = _EMPTY_STATE
@@ -112,11 +176,9 @@ class MaCloudRsiMacdStrategy:
         event_key = bar_time.isoformat() if bar_time is not None else str(bar_idx)
         if len(state.pending_long) >= 3:
             price = float(row["high"])
-            log.info("Entry Long: third indicator confirmed")
             return replace(state, pending_long=()), Decision(SignalType.BUY, price, bar_time, f"{self.NAME}:{timeframe or ''}:{event_key}:BUY", bar_time, timeframe, self.NAME, indicators, {"entry_reference": "high"})
         if len(state.pending_short) >= 3:
             price = float(row["low"])
-            log.info("Entry Short: third indicator confirmed")
             return replace(state, pending_short=()), Decision(SignalType.SELL, price, bar_time, f"{self.NAME}:{timeframe or ''}:{event_key}:SELL", bar_time, timeframe, self.NAME, indicators, {"entry_reference": "low"})
         return state, hold
 

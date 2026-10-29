@@ -18,6 +18,7 @@ from pathlib import Path
 from tempfile import mkstemp
 from typing import Mapping
 
+from src.trade_journal.reasons import REASON_LABELS, reason_label  # noqa: F401 — публичный импорт журнала
 from src.trade_management.lifecycle import lifecycle_label
 
 log = logging.getLogger(__name__)
@@ -109,58 +110,11 @@ _ACTION_LABELS = {
     "REDUCE": "частичное закрытие",
     "CLOSE": "закрытие позиции",
     "STOP": "стоп",
+    "MOVESTOP": "перенос стопа",
 }
-
-REASON_LABELS = {
-    "levels-profitable-add": "прибыльный добор по уровням",
-    "atr-profitable-advance": "добор после продвижения по ATR",
-    "ma-cloud-profitable-retest": "прибыльный ретест облака",
-    "pattern-profitable-same-formation": "добор по той же формации",
-    "cost-aware-break-even": "безубыток всей сделки",
-    "atr-trailing-stop": "трейлинг по ATR",
-    "STOP": "стоп", "CLOSE": "закрытие", "REDUCE": "частичный выход",
-    "next-bar": "вход перенесён на следующий бар",
-    "entry-timeout": "вход не исполнен в отведённое время",
-    "contract-expiring": "контракт истекает",
-    "contract-rollover": "переход на следующий контракт",
-    "profile-entry": "вход по профилю",
-    "protective": "стоп",
-    "tp": "цель по цене",
-    "risk-cap": "лимит риска",
-    "duplicate-signal": "дублирующий сигнал",
-    "opposite-exposure": "встречная позиция",
-    "opposite-signal-management": "управление по встречному сигналу",
-    "raw-opposite-signal": "встречный сигнал",
-    "ma40-opposite-close": "цена ушла за MA40",
-    "ma10-or-cloud-partial-exit": "частичный выход по MA10/облаку",
-    "factual-increase-fill-invalidates-protection": "добор нарушил защиту",
-    "factual-increase-fill-violates-risk": "добор нарушил лимиты риска",
-    "late-increase-fill-after-cancel": "компенсация позднего добора",
-    "clearing": "клиринг",
-    "ttl": "истёк срок заявки",
-    "close-not-confirmed": "закрытие не подтверждено",
-    "filter-rejected": "сигнал отфильтрован",
-    "no-contract-meta": "нет метаданных контракта",
-    "insufficient-history": "недостаточно истории",
-    "stale-state-revision": "устарела ревизия состояния",
-    "trade-not-open": "позиция не открыта",
-    "trade-already-open": "позиция уже открыта",
-    "unknown-trade": "неизвестная сделка",
-    "unknown-target": "неизвестная цель",
-    "limit-entry-required": "вход только по лимитной заявке",
-    "quantity-non-positive": "недопустимое количество",
-    "quantity-exceeds-trade-remainder": "количество больше остатка позиции",
-    "quantity-exceeds-target-remainder": "количество больше остатка цели",
-    "unsupported-command": "неподдерживаемая команда",
-}
-
-
-def reason_label(code: object) -> str:
-    """Перевести код причины в русскую фразу; неизвестный код — как есть."""
-    text = str(code or "")
-    if text.startswith("tp:"):
-        return REASON_LABELS["tp"]
-    return REASON_LABELS.get(text, text)
+_ENTRY_ACTIONS = frozenset({"OPEN", "ADD"})
+_DEFERRED_ACK_REASONS = frozenset({"next-bar"})
+_NEXT_BAR_EXECUTION = "исполнение по следующему бару"
 
 
 class CsvExporter:
@@ -230,11 +184,12 @@ class CsvExporter:
                        events.payload_json, trades.trade_id, trades.instrument_id, trades.side,
                        orders.action_type, orders.quantity AS order_quantity,
                        orders.requested_price AS order_price, fills.quantity AS fill_quantity,
-                       fills.price AS fill_price
+                       fills.price AS fill_price, outbox.payload_json AS command_json
                 FROM events
                 LEFT JOIN trades ON trades.trade_id = events.trade_id
                 LEFT JOIN orders ON orders.order_id = events.order_id
                 LEFT JOIN fills ON fills.execution_id = events.event_id
+                LEFT JOIN outbox ON outbox.command_id = events.command_id
                 ORDER BY events.event_seq
                 """
             ):
@@ -257,20 +212,34 @@ class CsvExporter:
                     index = self._connection.execute("SELECT target_index FROM targets WHERE trade_id=? AND target_id=?",
                                                      (trade_id, display_action.partition(":")[2])).fetchone()
                     display_action = f"TARGET:TP{index[0]+1}" if index else "TARGET:"
+                event = self._describe_event(str(row.get("event_type") or ""), display_action)
+                reason = reason_label(payload.get("reason"))
+                action = display_action.partition(":")[0]
+                if str(row.get("event_type") or "").upper() == "ACK" and action not in _ENTRY_ACTIONS:
+                    # Эмулятор подтверждает любую команду кодом next-bar; для выхода
+                    # и переноса стопа причиной служит причина самой команды.
+                    command_reason = self._payload(row.get("command_json")).get("reason")
+                    if payload.get("reason") in _DEFERRED_ACK_REASONS:
+                        reason = reason_label(command_reason) if command_reason else _NEXT_BAR_EXECUTION
+                if action == "MOVESTOP":
+                    quantity = ""  # перенос стопа действует на весь остаток, объём заявки условный
+                    confirmed = payload.get("confirmed_stop")
+                    if isinstance(confirmed, dict) and confirmed.get("new") is not None:
+                        event, price = "Стоп перенесён", confirmed["new"]
+                        if confirmed.get("old") is not None:
+                            reason = f"{reason}: {confirmed['old']} → {confirmed['new']}"
                 journal_rows.append({
                     "occurred_at": self._msk(row.get("occurred_at")),
                     "contract": self._display_contract(str(row.get("instrument_id") or "")),
                     "side": _SIDE_LABELS.get(str(row.get("side") or "").upper(), ""),
-                    "event": self._describe_event(
-                        str(row.get("event_type") or ""), display_action
-                    ),
+                    "event": event,
                     "quantity": quantity,
                     "price": price,
                     "position_qty_before": before_qty if before_qty else "",
                     "position_qty_after": after_qty if after_qty else "",
                     "avg_price_before": self._money(before_avg) if before_avg is not None else "",
                     "avg_price_after": self._money(after_avg) if after_avg is not None else "",
-                    "reason": reason_label(payload.get("reason")),
+                    "reason": reason,
                 })
             cards: list[tuple[datetime, str, dict[str, object]]] = []
             for row in self._rows(
@@ -684,6 +653,10 @@ JOIN trades ON trades.trade_id = positions.trade_id
         et = (event_type or "").upper()
         if et == "FEE_ADJUSTMENT":
             return "Комиссия уточнена брокером"
+        if et == "MARKET_DATA_SOURCE_ABSENT":
+            return "Минута пропущена: свечи нет у источника"
+        if et == "MARKET_DATA_LATE_CANDLE":
+            return "Поздняя свеча пропущенной минуты"
         status = _STATUS_LABELS.get(et, event_type or "")
         action, _, target = (action_type or "").partition(":")
         if action == "TARGET" and target:

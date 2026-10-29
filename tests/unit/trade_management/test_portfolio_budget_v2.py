@@ -285,7 +285,7 @@ def test_manager_persists_zero_allocation_trailing_activation_without_target_fil
         m = manager(storage, balance=100000)
         p = replace(plan(costs=CostSnapshot(D(0), D(0))),
                     targets=(TargetPlan("tp-1", D(104), D("0.25")), TargetPlan("tp-2", D(108), D("0.25"))),
-                    profile=ProfileSnapshot("atr_trend", "1", {"atr_period": 14, "trail_k": 2}))
+                    profile=ProfileSnapshot("atr_trend", "1", {"atr_period": 14, "trail_k": 2}), timeframe="1m")
         action = submit(m, p, 3)
         fill(m, action, 3)
         frame = pd.DataFrame({"datetime": pd.date_range(NOW, periods=21, freq="min"),

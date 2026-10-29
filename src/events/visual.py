@@ -16,6 +16,10 @@ from src.scheduler.timing import CandleScheduler
 CANDLE_LIMIT = 80
 HISTORY_LIMIT = 64
 SCHEMA_ID = "visual-snapshot.json"
+# Виды разрыва между соседними свечами окна по возрастанию тяжести: закрытая
+# по расписанию биржа, интервал без сделок, нет расписания, пропуск данных.
+BREAK_KINDS = ("closed", "no_trade", "schedule_unavailable", "missing")
+INCOMPLETE_BREAKS = frozenset({"schedule_unavailable", "missing"})
 
 
 def freeze(value):
@@ -47,12 +51,15 @@ def visual_schema():
     target = _object({"id": text, "number": integer, "price": text, "quantity": integer, "filled": integer},
                      ("id", "number", "price", "quantity"))
     targets = {"type": "array", "items": target}
-    fill = _object({"key": text, "time": text, "role": text, "side": text, "quantity": integer, "price": text},
+    fill = _object({"key": text, "time": text, "role": text, "side": text, "quantity": integer, "price": text,
+                    "reason": text},
                    ("key", "time", "role", "side", "quantity", "price"))
     group = _object({"role": text, "side": text, "start": text, "end": text, "quantity": integer,
                      "price": text, "count": integer}, ("role", "side", "start", "end", "quantity", "price", "count"))
     stop = _object({"key": text, "time": text, "old": text, "new": text, "reason": text}, ("key", "time", "new", "reason"))
     candle = _object({k: text for k in ("time", "open", "high", "low", "close")}, ("time", "open", "high", "low", "close"))
+    gap = _object({"after": text, "before": text, "kind": {"type": "string", "enum": list(BREAK_KINDS)},
+                   "missing": {"type": "integer", "minimum": 1}}, ("after", "before", "kind", "missing"))
     plan = _object({"entry": text, "stop": text, "quantity": integer, "targets": targets,
                     "trailing_quantity": integer, "algorithm_version": text,
                     **{k: text for k in ("risk_amount", "reward_amount", "costs_amount", "net_reward_amount", "fixed_reward_amount")},
@@ -61,6 +68,7 @@ def visual_schema():
     state = _object({"phase": text, "quantity": integer, "average_entry": text, "stop": text, "targets": targets},
                     ("phase", "quantity", "targets"))
     market = _object({"candles": {"type": "array", "items": candle, "maxItems": CANDLE_LIMIT},
+                     "breaks": {"type": "array", "items": gap, "maxItems": CANDLE_LIMIT},
                      "limited": boolean, "gaps": boolean, "history_limited": boolean,
                      "stop_history_limited": boolean, "boundary_stop": text},
                     ("candles", "limited", "gaps", "history_limited", "stop_history_limited"))
@@ -71,7 +79,7 @@ def visual_schema():
                        "sequence": integer, "revision": integer, "as_of": text, "instrument": text,
                        "side": {"type": "string", "enum": ["BUY", "SELL"]}, "timeframe": text,
                        "unit": {"type": "string", "enum": ["lot", "contract"]}, "lot_size": integer,
-                       "price_step": text, "plan": plan, "state": state,
+                       "price_step": text, "step_cost": text, "plan": plan, "state": state,
                        "fills": {"type": "array", "items": fill, "maxItems": HISTORY_LIMIT},
                        "fill_groups": {"type": "array", "items": group},
                        "stops": {"type": "array", "items": stop, "maxItems": HISTORY_LIMIT},
@@ -125,9 +133,48 @@ def utc(value):
     return value
 
 
-def market_snapshot(frame, timeframe, as_of):
-    """Данные только из переданного frame; datetime — начало свечи UTC."""
-    result = {"candles": (), "limited": False, "gaps": False,
+def _grid_missing(grid, after, before):
+    """Число интервалов сетки ТФ строго между открытиями двух свечей."""
+    count, probe = 0, grid.bar_close(after)
+    while probe < before:
+        count += 1
+        following = grid.bar_close(probe)
+        if following <= probe:
+            break
+        probe = following
+    return count
+
+
+def _window_breaks(candles, grid, breaks):
+    """Разрывы соседних свечей окна; без классификации вид неизвестен."""
+    for left, right in zip(candles, candles[1:]):
+        after, before = utc(left["time"]), utc(right["time"])
+        if before == grid.bar_close(after):
+            continue
+        info = breaks.get((after, before)) or {}
+        kind = info.get("kind") if info.get("kind") in BREAK_KINDS else "schedule_unavailable"
+        missing = info.get("missing") or _grid_missing(grid, after, before)
+        yield {"after": left["time"], "before": right["time"], "kind": kind, "missing": max(1, int(missing))}
+
+
+def breaks_of(market, timeframe):
+    """Разрывы окна снимка; снимок до классификации — без расписания."""
+    if "breaks" in market:
+        return tuple(market["breaks"])
+    candles = market.get("candles", ())
+    if not candles or not timeframe:
+        return ()
+    return tuple(_window_breaks(candles, CandleScheduler(timeframe), {}))
+
+
+def market_snapshot(frame, timeframe, as_of, breaks=None):
+    """Данные только из переданного frame; datetime — начало свечи UTC.
+
+    ``breaks`` — классификация слоя рыночных данных: (открытие свечи перед
+    разрывом, открытие свечи после) → {"kind", "missing"}. Разрыв без неё
+    считается разрывом без расписания, а не полными данными.
+    """
+    result = {"candles": (), "breaks": (), "limited": False, "gaps": False,
               "history_limited": False, "stop_history_limited": False}
     if frame is None or not timeframe:
         return result
@@ -150,7 +197,9 @@ def market_snapshot(frame, timeframe, as_of):
     candles = sorted({c["time"]: c for c in candles}.values(), key=lambda c: c["time"])
     result["limited"] = len(frame) > CANDLE_LIMIT
     result["candles"] = tuple(candles[-CANDLE_LIMIT:])
-    result["gaps"] = any(utc(b["time"]) != utc(grid.bar_close(utc(a["time"]))) for a, b in zip(candles, candles[1:]))
+    known = {(utc(after), utc(before)): info for (after, before), info in (breaks or {}).items()}
+    result["breaks"] = tuple(_window_breaks(result["candles"], grid, known))
+    result["gaps"] = any(item["kind"] in INCOMPLETE_BREAKS for item in result["breaks"])
     return result
 
 

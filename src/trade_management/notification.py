@@ -44,7 +44,7 @@ def quantity_context(instrument=None, meta=None):
     return result
 
 
-def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=None, diagnostics=None):
+def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=None, diagnostics=None, breaks=None):
     as_of = utc(as_of or plan.created_at)
     name = getattr(instrument, "short_name", None) or (
         instrument.ticker if getattr(instrument, "instrument_type", "") == "share" else "контракт не указан")
@@ -58,7 +58,7 @@ def signal_snapshot(plan, quantity, instrument, frame=None, as_of=None, meta=Non
                            "side": plan.side, "timeframe": plan.timeframe, **quantity_context(instrument, meta),
                            "plan": data, "state": {"phase": "ENTRY_PENDING", "quantity": 0, "targets": ()},
                            "fills": (), "fill_groups": (), "stops": (),
-                           "market": market_snapshot(frame, plan.timeframe, as_of),
+                           "market": market_snapshot(frame, plan.timeframe, as_of, breaks),
                            "financial": {"units": "RUB", "fees_known": False, "fees_source": "unknown"}})
 
 
@@ -84,13 +84,16 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
     fills = []
     fee_sources = set()
     for fill in _rows(connection,
-        "SELECT f.*,o.action_type FROM fills f JOIN orders o USING(order_id) WHERE f.trade_id=? ORDER BY f.executed_at,f.rowid",
+        "SELECT f.*,o.action_type,b.payload_json AS command_json FROM fills f JOIN orders o USING(order_id) "
+        "LEFT JOIN outbox b ON b.command_id=o.command_id WHERE f.trade_id=? ORDER BY f.executed_at,f.rowid",
         (event.trade_id,)):
         action, _, target_id = fill["action_type"].partition(":")
         role = f"ЦЕЛЬ{target_numbers[target_id]}" if action == "TARGET" and target_id in target_numbers else action
         side = row["side"] if action in {"OPEN", "ADD"} else ("SELL" if row["side"] == "BUY" else "BUY")
+        reason = json.loads(fill["command_json"]).get("reason") if fill["command_json"] else None
         fills.append({"key": fill["execution_id"], "time": fill["executed_at"], "role": role,
-                      "side": side, "quantity": fill["quantity"], "price": Decimal(fill["price"])})
+                      "side": side, "quantity": fill["quantity"], "price": Decimal(fill["price"]),
+                      **({"reason": reason} if reason else {})})
         fee_sources.add(fill["fee_source"])
     stops = []
     previous = None
@@ -115,7 +118,7 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
         stops.append({"key": fact["event_id"], "time": fact["occurred_at"], "old": previous,
                       "new": price, "reason": json.loads(fact["command_json"])["reason"] if fact["action_type"] == "MOVESTOP" else "entry-protection"})
         previous = price
-    market = market or {"candles": (), "limited": False, "gaps": False,
+    market = market or {"candles": (), "breaks": (), "limited": False, "gaps": False,
                         "history_limited": False, "stop_history_limited": False}
     detailed, groups, stops, market = bounded_history(fills, stops, market)
     initial_targets = tuple({"id": t["target_id"], "number": i + 1, "price": Decimal(t["price"]),
@@ -157,7 +160,30 @@ def lifecycle_snapshot(connection, event, *, instrument=None, meta=None, market=
                            "sequence": sequence, "revision": row["state_revision"], "as_of": utc(event.timestamp).isoformat(),
                            "instrument": getattr(instrument, "short_name", None) or "контракт не указан",
                            "side": row["side"], "timeframe": plan.get("timeframe", ""), **quantity_context(instrument, meta),
-                           "price_step": row["price_step"], "plan": original,
+                           "price_step": row["price_step"], "step_cost": row["step_cost"], "plan": original,
                            "state": {"phase": phase, "quantity": row["quantity"], "average_entry": row["average_price"],
                                      "stop": row["confirmed_stop"], "targets": current_targets},
                            "fills": detailed, "fill_groups": groups, "stops": stops, "market": market, "financial": financial})
+
+
+def stop_move_fields(visual):
+    """Явные поля ``stop_moved`` из снимка сделки после подтверждения переноса.
+
+    Уровни берутся из записи переноса этого события, остаток — из состояния.
+    ``pnl_at_stop`` — валовой результат остатка при исполнении по новому стопу
+    без комиссий: отрицательный — риск до стопа, положительный — фиксируемая
+    прибыль. Без средней, шага или стоимости шага деньги не выдумываются.
+    """
+    state = visual["state"]
+    move = next((stop for stop in visual.get("stops", ()) if stop["key"] == visual["event_key"]), None)
+    new = (move or {}).get("new", state.get("stop"))
+    fields = {"stop": Decimal(str(new)), "quantity_remaining": state["quantity"], "pnl_units": "RAW"}
+    if move is not None and move.get("old") is not None:
+        fields["previous_stop"] = Decimal(str(move["old"]))
+    average, step, cost = state.get("average_entry"), visual.get("price_step"), visual.get("step_cost")
+    if None not in (average, step, cost) and Decimal(str(step)) > 0:
+        direction = 1 if visual["side"] == "BUY" else -1
+        fields["pnl_at_stop"] = (direction * (fields["stop"] - Decimal(str(average))) * state["quantity"]
+                                 * Decimal(str(cost)) / Decimal(str(step)))
+        fields["pnl_units"] = "RUB"
+    return fields

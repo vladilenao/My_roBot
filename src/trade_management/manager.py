@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Sequence
 from uuid import uuid4
@@ -13,6 +13,7 @@ from contextlib import contextmanager
 
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeAdjustment, resolve_execution_fee
 from src.logging_setup import get_logger
+from src.market_calendar.expiry import expiry_cutoff
 from src.portfolio.risk import PortfolioRiskManager, RiskLimits, RiskTrade
 from src.scheduler.clock import Clock, as_aware, as_clock
 from src.scheduler.timing import tf_period_minutes
@@ -24,6 +25,7 @@ from src.trade_management.actions import (
     AddToTrade, CancelEntry, CloseTrade, MoveStop, OpenTrade, ReduceTrade, TradeAction,
     action_from_payload, action_payload,
 )
+from src.instruments.futures import family_for, family_key
 from src.instruments.model import instrument_key
 from src.trade_management.errors import (
     InvalidStopBoundaryError,
@@ -50,6 +52,8 @@ from src.trade_management.pipeline import (
 )
 from src.trade_management.profiles.base import ManagementContext, PlanningContext, ProfileResult
 from src.trade_management.notification import lifecycle_snapshot
+from src.trade_management import session_guard
+from src.trade_management.intraday_settings import IntradaySettings
 from src.events.visual import market_snapshot, utc
 from src.scheduler.timing import CandleScheduler
 
@@ -59,6 +63,21 @@ log = get_logger(__name__)
 
 _INCREASES = (OpenTrade, AddToTrade)
 _MANAGEABLE = {TradePhase.OPEN, TradePhase.BUILDING, TradePhase.REDUCING}
+# Остановка торгового контура командой (add-control-api).
+CONTOUR_NO_ENTRIES = "no_entries"
+CONTOUR_CLOSE_ALL = "close_all"
+CONTOUR_STOPPING = "contour-stopping"   # отказ новому входу или добору
+CONTOUR_STOP = "contour-stop"           # снятие входа и закрытие позиции
+# Снятие инструмента из состава контура (add-contour-membership).
+INSTRUMENT_REMOVING = "instrument-removing"   # отказ новому входу или добору по инструменту
+INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и закрытие позиции инструмента
+# Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
+CORE_LOST = "core-lost"
+
+
+def _check_stop_mode(mode) -> None:
+    if mode not in (None, CONTOUR_NO_ENTRIES, CONTOUR_CLOSE_ALL):
+        raise ValueError(f"Неизвестный режим остановки: {mode!r}")
 _TERMINAL = {TradePhase.CLOSED, TradePhase.CANCELLED}
 _DEFAULT_RISK_LIMITS = RiskLimits(
     per_trade=Decimal("100"),
@@ -136,22 +155,68 @@ def _is_opposite(side: str, signal_type: SignalType) -> bool:
     )
 
 
-def _expires_within(meta, now: datetime, block_days: int) -> bool:
-    """Близость экспирации контракта к моменту ``now`` (оба в naive UTC).
+def _exposure_key(instrument_id: str, ticker: str | None = None, short_name: str | None = None,
+                  family: str | None = None) -> str:
+    """Ключ общей позиции счёта: семейство фьючерса, для прочих инструментов — сам контракт.
+
+    Семейство берётся из карточки, иначе распознаётся по тикеру и короткому
+    имени (``NGV6``, ``BR-6.25``); нераспознанный или неоднозначный инструмент
+    сравнивается только по своему адресу.
+    """
+    try:
+        found = family_key(family) if family else family_for(ticker or instrument_id, name=short_name or "")
+    except ValueError:
+        found = None
+    return f"family:{found}" if found else instrument_id
+
+
+def _expires_within(
+    meta, now: datetime, block_days: int, calendar=None, close_before_end: timedelta = timedelta(0),
+) -> bool:
+    """Наступил ли к ``now`` (naive UTC) рубеж близкой экспирации контракта.
 
     ``expiration_date`` у акций отсутствует (``None``) — такие контракты всегда
-    считаются неистекшими. Порог трактуется как календарные сутки: частичные
-    сутки попадают в него.
+    считаются неистекшими. Календарный рубеж — ``block_days`` суток по 24 часа
+    до экспирации; попавший в перерыв по расписанию ``calendar`` рубеж
+    сдвигается на конец последней сессии минус ``close_before_end``.
     """
     expiration_date = getattr(meta, "expiration_date", None)
-    if expiration_date is None:
+    if expiration_date is None or expiration_date != expiration_date:  # None или NaT — даты нет
         return False
-    return (expiration_date - now).total_seconds() <= block_days * 86400
+    cutoff = expiry_cutoff(calendar, expiration_date - timedelta(days=block_days), close_before_end)
+    return now >= cutoff.at
 
 
 def plan_reference_entry(plan_json: str) -> Decimal:
     """Planned entry price of a stored plan, as recorded in its immutable json."""
     return Decimal(str(json.loads(plan_json)["reference_entry"]))
+
+
+UNDELIVERED = "UNDELIVERED"
+UNDELIVERED_REASON = "entry-undelivered"
+
+
+def created_before_step(created_at, since) -> bool:
+    """Команда создана раньше начала торгового шага ``since``: её актуальность не доказать.
+
+    Единственное определение и для допуска доставки, и для снятия недоставленных
+    увеличений; наивное время журнала трактуется как UTC.
+    """
+    if since is None:
+        return False
+    stamp = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
+    return as_aware(stamp) < as_aware(since)
+
+
+def _known_timeframe(timeframe: str) -> bool:
+    """Таймфрейм плана распознан и пригоден для сопровождения по барам."""
+    if not timeframe:
+        return False
+    try:
+        tf_period_minutes(timeframe)
+    except ValueError:
+        return False
+    return True
 
 
 def _entry_ttl_seconds(timeframe: str) -> int:
@@ -168,6 +233,18 @@ def _entry_ttl_seconds(timeframe: str) -> int:
     if minutes < 240:
         return 4 * 3600
     return 24 * 3600
+
+
+def pd_timestamp_iso(value) -> str:
+    """Минута как UTC ISO без пояса — тот же вид, что у рыночной базы."""
+    stamp = value if not isinstance(value, str) else datetime.fromisoformat(value)
+    if getattr(stamp, "tzinfo", None) is not None:
+        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamp.isoformat()
+
+
+def _instrument_ids(value) -> tuple[str, ...]:
+    return (value,) if isinstance(value, str) else tuple(dict.fromkeys(value))
 
 
 class TradeManager:
@@ -194,6 +271,7 @@ class TradeManager:
         slippage_tolerance: Decimal | float | str | None = None,
         signal_filter: object | None = None,
         contract_expiry_block_days: int = 2,
+        contract_expiry_close_before_end_min: int = 20,
         direction_limits: Mapping[str, Sequence[str]] | None = None,
         min_trade_risk_pct: Decimal | float | str | None = None,
         portfolio_pct: Decimal | float | str | None = None,
@@ -203,9 +281,15 @@ class TradeManager:
         max_entry_deviation_r: Decimal | float | str = Decimal("0.25"),
         live_market_provider=None,
         clock: Clock | Callable[[], datetime] | None = None,
+        cluster_gate: object | None = None,
+        intraday_settings: IntradaySettings | None = None,
+        session_calendar: Callable[[object, datetime], object] | None = None,
+        protection_timeframe: str = "1m",
     ) -> None:
         self._storage = storage
         self._broker = broker
+        # Кластерный фильтр входа (src.clusters.gate.ClusterGate); None — выключен.
+        self._cluster_gate = cluster_gate
         self._clock = as_clock(clock)
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
@@ -226,7 +310,9 @@ class TradeManager:
         self._signal_filter = signal_filter
         self._risk = PortfolioRiskManager()
         self._traces = CalculationTraceRepository(storage)
+        self._unknown_timeframe_reported: set[str] = set()
         self._contract_expiry_block_days = contract_expiry_block_days
+        self._contract_expiry_close_before_end = timedelta(minutes=contract_expiry_close_before_end_min)
         self._direction_limits = {
             instrument_type: frozenset(str(direction).lower() for direction in directions)
             for instrument_type, directions in (direction_limits or {}).items()
@@ -243,7 +329,22 @@ class TradeManager:
         self._max_entry_deviation_r = Decimal(str(max_entry_deviation_r))
         self._live_market_provider = live_market_provider
         self._equity_unknown = False
+        self._enqueued_at: dict[str, datetime] = {}
         self.contract_lifecycle = None
+        # Сессионная защита внутридневных сделок: настройки, провайдер расписания
+        # инструмента (instrument, now) -> TradingCalendar и таймфрейм цикла защиты,
+        # на котором принимаются решения закрытия. Без провайдера правило выключено.
+        self._intraday = intraday_settings
+        self._session_calendar = session_calendar
+        self._protection_timeframe = protection_timeframe
+        self._session_instruments: dict[str, object] = {}
+        # Остановка торгового контура командой (add-control-api): None — торгует,
+        # иначе режим ``no_entries`` / ``close_all``; новых входов и доборов нет.
+        self._contour_stop: str | None = None
+        # Снятие инструментов из состава (add-contour-membership): ключ инструмента → режим.
+        self._instrument_stops: dict[str, str] = {}
+        # Запрет входов без связи с ядром (add-contour-recovery).
+        self._core_lost = False
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -262,6 +363,103 @@ class TradeManager:
         if callable(drain):
             for event in drain():
                 self.consume(event)
+
+    def enqueued_at(self, command) -> datetime:
+        """Момент создания команды для проверки «раньше начала шага» (fix-entry-command-enqueue-time).
+
+        Момент постановки в очередь по рыночным часам менеджера — той же шкале, что
+        и начало шага. ``outbox.created_at`` входа хранит время свечи сигнала,
+        которая всегда открылась раньше шага; его сравнение с началом шага признало
+        бы устаревшим любой свежий вход. Для команды, которую этот процесс не
+        ставил (после перезапуска), остаётся запись журнала: она раньше начала шага.
+        """
+        return self._enqueued_at.get(command.command_id, command.created_at)
+
+    def cancel_undelivered_increases(self, since, now=None) -> tuple[ExecutionEvent, ...]:
+        """Снять неактуальные недоставленные входы и доборы (cancel-stale-undelivered-entries).
+
+        Команда, созданная раньше начала текущего шага и не доставленная брокеру,
+        уже никогда не пройдёт допуск по актуальности. Брокер о ней не знает,
+        поэтому снятие локальное и не ждёт рыночных данных: outbox переводится
+        в UNDELIVERED под guard доставки, затем reducer получает CANCEL.
+        """
+        now = as_aware(now or self._clock.now())
+        candidates = [(command, outbox_status) for command, outbox_status in self._storage.undelivered_increases()
+                      if outbox_status == UNDELIVERED or created_before_step(self.enqueued_at(command), since)]
+        return self._cancel_undelivered(candidates, now)
+
+    def expire_pending_entries(self, now=None) -> tuple[TradeAction, ...]:
+        """Снять входы в ожидании с истёкшим сроком по всем инструментам (expire-pending-entries-before-admission).
+
+        Вызывается перед допуском нового входа, чтобы просроченная заявка любого
+        инструмента не занимала бюджет риска. Сроки и причина — те же, что у
+        ``entry-timeout``: подтверждённая заявка снимается отменой через допуск
+        доставки (он же ждёт, пока исполнение обработает минуты простоя), а
+        неотправленная — локально, как ``entry-undelivered``. Только live: без
+        допуска доставки (исторический режим) сверка не выполняется.
+        """
+        if not self._storage.outbox_guard_configured:
+            return ()
+        pending = self._storage.connection.execute(
+            "SELECT 1 FROM trades WHERE phase=? LIMIT 1", (TradePhase.ENTRY_PENDING.value,)).fetchone()
+        if pending is None:
+            return ()
+        now = as_aware(now or self._clock.now())
+        undelivered = {command.trade_id: (command, outbox_status)
+                       for command, outbox_status in self._storage.undelivered_increases()
+                       if command.payload.get("type") == "OpenTrade"}
+        submitted: list[TradeAction] = []
+        local = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if state.phase is not TradePhase.ENTRY_PENDING:
+                continue
+            if self._storage.connection.execute(
+                    "SELECT 1 FROM orders WHERE trade_id=? AND action_type='CANCEL' "
+                    "AND status IN ('PENDING','ACK','PARTIAL')", (plan.trade_id,)).fetchone():
+                continue  # отмена уже ожидает: вторую не создаём
+            ttl = timedelta(seconds=_entry_ttl_seconds(plan.timeframe))
+            if recovered.entry_ack_at is not None:
+                if now - as_aware(recovered.entry_ack_at) <= ttl:
+                    continue
+                log.info("Сверка сроков %s: отмена незаполненного входа %s (истёк срок ожидания исполнения)",
+                         plan.instrument_id, plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason="entry-timeout")
+                if self.submit_action(action, assignment_id=plan.assignment_id):
+                    submitted.append(action)
+            elif plan.trade_id in undelivered:
+                command, outbox_status = undelivered[plan.trade_id]
+                if outbox_status == UNDELIVERED or now - as_aware(self.enqueued_at(command)) > ttl:
+                    local.append((command, outbox_status))
+        if submitted:
+            # Подтверждение отмены освобождает резервацию до расчёта нового входа.
+            self.dispatch(now)
+            self.consume_queued_broker_events()
+        if local:
+            self._cancel_undelivered(local, now)
+        return tuple(submitted)
+
+    def _cancel_undelivered(self, candidates, now) -> tuple[ExecutionEvent, ...]:
+        """Локально снять неотправленные команды: outbox → UNDELIVERED под guard, затем CANCEL."""
+        if not candidates:
+            return ()
+        fresh = [command.command_id for command, outbox_status in candidates if outbox_status != UNDELIVERED]
+        marked = set(self._storage.mark_outbox_undelivered(fresh))
+        events = []
+        for command, outbox_status in candidates:
+            if outbox_status != UNDELIVERED and command.command_id not in marked:
+                continue  # доставка успела взять команду: она не снимается
+            event = ExecutionEvent(execution_id=f"{command.command_id}:undelivered-local-cancel",
+                command_id=command.command_id, order_id=command.command_id, trade_id=command.trade_id,
+                status=ExecutionStatus.CANCEL, filled_quantity=0, price=None, fee=Decimal(0),
+                timestamp=now, reason=UNDELIVERED_REASON)
+            log.info("Снят недоставленный %s %s: команда создана до начала шага и не отправлена брокеру",
+                     "вход" if command.payload.get("type") != "AddToTrade" else "добор", command.trade_id)
+            self._enqueued_at.pop(command.command_id, None)
+            self.consume(event)
+            events.append(event)
+        return tuple(events)
 
     def drain_contract(self, ticker, *, market_close=None):
         """Отменить увеличения и закрыть остаток; не создавать второе ожидание."""
@@ -311,6 +509,15 @@ class TradeManager:
                 if self.submit_action(action, assignment_id=plan.assignment_id, market_close=market_close):
                     submitted.append(action)
         return tuple(submitted)
+
+    def management_obligations(self, instrument_id: str) -> tuple[RecoveredTrade, ...]:
+        """Незавершённые сделки инструмента — источник ТФ сопровождения.
+
+        Читает только журнал, без регистрации у брокера: цикл зовёт его на
+        каждом шаге, чтобы знать таймфреймы планов, которые надо загружать и
+        обходить, даже когда привязок на них в конфигурации не осталось.
+        """
+        return tuple(trade for trade in self._storage.load_trades() if trade.plan.instrument_id == instrument_id)
 
     def restore(self) -> tuple[RecoveredTrade, ...]:
         """Return pending and open trades solely from the SQLite snapshot."""
@@ -502,6 +709,17 @@ class TradeManager:
         if isinstance(action, AddToTrade) and self.contract_lifecycle is not None:
             row = self._storage.connection.execute("SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
             if row and not self.contract_lifecycle.can_increase(row[0], self._clock.now()):
+                return False
+        if isinstance(action, AddToTrade) and not self._intraday_add_allowed(action):
+            return False
+        if isinstance(action, AddToTrade):
+            row = self._storage.connection.execute(
+                "SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            blocked = self._entry_block(row[0] if row else "")
+            if blocked is not None:
+                log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(blocked))
+                self._traces.record(self._contour_stop_trace("AddToTrade", TraceLinks(trade_id=action.trade_id),
+                                                             reason=blocked))
                 return False
         if isinstance(action, (CloseTrade, ReduceTrade)) and action.reference_price is None and market_close is not None:
             action = replace(action, reference_price=Decimal(str(market_close)))
@@ -732,6 +950,7 @@ class TradeManager:
                 # Guard только до локальной доставки. Observer/Telegram и
                 # reducer не держат market lock и не фильтруются по hold.
                 self._storage.mark_outbox_sent(command.command_id, sent_at=now)
+                self._enqueued_at.pop(command.command_id, None)
                 if event is not None:
                     self.consume(event)
                     events.append(event)
@@ -751,6 +970,9 @@ class TradeManager:
             return deny("invalid-command")
         if action.command_id != command.command_id or action.trade_id != command.trade_id:
             return deny("command-identity-mismatch")
+        outbox = connection.execute("SELECT status FROM outbox WHERE command_id=?", (command.command_id,)).fetchone()
+        if outbox is not None and outbox[0] == UNDELIVERED:
+            return deny("undelivered-cancelled")
         record = connection.execute(
             "SELECT t.instrument_id,t.phase,t.state_revision,t.plan_json,p.quantity,o.status "
             "FROM trades t JOIN positions p USING(trade_id) JOIN orders o USING(trade_id) "
@@ -785,7 +1007,7 @@ class TradeManager:
             return deny("trade-not-open")
         if isinstance(action, ReduceTrade) and action.quantity > quantity:
             return deny("quantity-exceeds-trade-remainder")
-        evidence = self._dispatch_evidence_for(instrument, action, command)
+        evidence = self._dispatch_evidence_for(instrument, action, replace(command, created_at=self.enqueued_at(command)))
         if not isinstance(evidence, DispatchDataEvidence):
             return deny("data-evidence-unconfirmed")
         if protected:
@@ -888,13 +1110,15 @@ class TradeManager:
         """Runtime metadata, independent of the notification channel."""
         self._visual_instruments.update({instrument_key(i): i for i in instruments})
 
-    def remember_market(self, instrument, timeframe, frame, as_of):
+    def remember_market(self, instrument, timeframe, frame, as_of, breaks=None):
         self._visual_instruments[instrument_key(instrument)] = instrument
-        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of)
+        self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of, breaks)
 
     def _notify_execution(self, event):
         if self._execution_observer is None:
             return
+        if event.status is ExecutionStatus.CANCEL and event.reason == UNDELIVERED_REASON:
+            return  # брокер заявку не получал: пользователю уведомление не нужно
         row = self._storage.connection.execute(
             "SELECT o.action_type,t.instrument_id,t.side,p.quantity,p.realized_pnl,p.fees,t.price_step,t.step_cost,o.quantity,b.payload_json "
             "FROM orders o JOIN trades t ON t.trade_id=o.trade_id JOIN positions p ON p.trade_id=t.trade_id "
@@ -957,6 +1181,7 @@ class TradeManager:
         if decision.signal_type is SignalType.HOLD:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
+        self._session_instruments[instrument_key(instrument)] = instrument
         if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
             return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
@@ -966,17 +1191,33 @@ class TradeManager:
             return SignalAdmission(
                 rejections=(rejection_reason("no-contract-metadata"),),
             )
-        if _expires_within(meta, self._clock.now(), self._contract_expiry_block_days):
+        if self._contract_expiring(instrument, meta, self._clock.now()):
             log.info("actions_for_signal %s: вход отклонён — близкая экспирация", instrument.ticker)
             return SignalAdmission(
                 rejections=(rejection_reason("contract-expiring"),),
             )
+        try:
+            self.expire_pending_entries()
+        except Exception as exc:  # сверка не должна ломать допуск сигнала
+            log.warning("Не удалось сверить сроки ожидающих входов: %s", exc)
         try:
             recovered = self.restore()
             owned = self._owned_trade(recovered, assignment.id)
             if owned is not None:
                 actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
                 return SignalAdmission(actions=actions)
+            blocked = self._entry_block(instrument_key(instrument))
+            if blocked is not None:
+                log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, rejection_message(blocked))
+                self._traces.record(self._contour_stop_trace(
+                    None, TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id), reason=blocked))
+                return SignalAdmission(rejections=(rejection_reason(blocked),))
+            session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
+            if session_rejection is not None:
+                return SignalAdmission(rejections=(session_rejection,))
+            opposite_rejection = self._opposite_exposure_rejection(assignment, decision, instrument)
+            if opposite_rejection is not None:
+                return SignalAdmission(rejections=(opposite_rejection,))
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except sqlite3.IntegrityError as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -1020,8 +1261,16 @@ class TradeManager:
         timeframe: str | None = None,
         now: datetime | None = None,
     ) -> tuple[TradeAction, ...]:
-        """Protect each live trade of the instrument from the provided frame."""
+        """Protect each live trade of the instrument from the provided frame.
+
+        Профиль сопровождения считается только для сделок, чей таймфрейм плана
+        совпадает с ``timeframe`` кадра: бар другого таймфрейма не двигает стоп,
+        не даёт сигнальных выходов и не меняет состояние профиля. Действия, не
+        связанные с баром (экспирация, переход контракта, таймаут входа),
+        выполняются на любом вызове.
+        """
         now = now or as_aware(self._clock.now())
+        self._session_instruments[instrument_key(instrument)] = instrument
         if self.contract_lifecycle is not None and self.contract_lifecycle.retiring(instrument_key(instrument), now):
             return self.drain_contract(instrument_key(instrument))
         contract = getattr(self._broker, "contract_for", None)
@@ -1029,16 +1278,24 @@ class TradeManager:
         if meta is None:
             return ()
         automatic_contract = self.contract_lifecycle is not None and self.contract_lifecycle.contains(instrument_key(instrument))
-        if not automatic_contract and _expires_within(meta, now.replace(tzinfo=None), self._contract_expiry_block_days):
+        if not automatic_contract and self._contract_expiring(instrument, meta, now.replace(tzinfo=None)):
             return self._close_expiring(instrument_key(instrument))
         results: list[TradeAction] = []
         results.extend(self._cancel_stale_entries(instrument_key(instrument), now))
+        results.extend(self._guard_sessions(instrument, frame, timeframe, now))
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
             if plan.instrument_id != instrument_key(instrument) or state.phase not in _MANAGEABLE or state.quantity <= 0:
                 continue
+            if self._open_order(plan.trade_id, "CLOSE", reason=session_guard.SESSION_END):
+                continue
             profile_cls = PROFILE_CLASSES.get(plan.profile.name)
             if profile_cls is None:
+                continue
+            if not _known_timeframe(plan.timeframe):
+                self._report_unknown_timeframe(plan)
+                continue
+            if plan.timeframe != timeframe:
                 continue
             market = build_management_market(
                 contract=meta,
@@ -1071,6 +1328,27 @@ class TradeManager:
                 except (ValueError, TradeManagementException) as exc:
                     log.debug("manage %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(results)
+
+    def _report_unknown_timeframe(self, plan: TradePlan) -> None:
+        """Сделка без распознанного таймфрейма плана не сопровождается по барам.
+
+        Действующая защита остаётся у брокера; причина видна в аудите и логе
+        один раз на сделку за запуск, а не на каждом баре.
+        """
+        if plan.trade_id in self._unknown_timeframe_reported:
+            return
+        self._unknown_timeframe_reported.add(plan.trade_id)
+        log.warning("manage %s: таймфрейм плана %r неизвестен — сопровождение по барам не выполняется, "
+                    "действует текущий стоп", plan.trade_id, plan.timeframe)
+        self._traces.record(calculation_trace(
+            "management.timeframe",
+            inputs={"plan_timeframe": MeasuredValue(plan.timeframe or None, "timeframe")},
+            result=MeasuredValue([], "actions"),
+            reason="management-timeframe-unknown",
+            formula="known plan timeframe -> management on its closed bars",
+            links=TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
 
     def _enrich_owned_market(self, recovered, market):
         """Supply durable factors and causality to versioned profile management."""
@@ -1149,6 +1427,371 @@ class TradeManager:
                 submitted.append(action)
         return tuple(submitted)
 
+    def _session_guard_active(self) -> bool:
+        return self._intraday is not None and self._intraday.enabled and self._session_calendar is not None
+
+    def session_guard_needed(self, timeframes) -> bool:
+        """Есть ли у инструмента незавершённые внутридневные сделки (по таймфреймам их планов)."""
+        return self._session_guard_active() and any(self._intraday.is_intraday(tf) for tf in timeframes)
+
+    def _contract_expiring(self, instrument, meta, now: datetime) -> bool:
+        """Рубеж близкой экспирации по расписанию инструмента; без расписания — календарный."""
+        calendar = self._calendar_for(instrument, now) if self._session_calendar is not None else None
+        return _expires_within(meta, now, self._contract_expiry_block_days, calendar,
+                               self._contract_expiry_close_before_end)
+
+    def _calendar_for(self, instrument, now: datetime):
+        """Сохранённое расписание режима торгов инструмента; сбой провайдера — как неизвестное."""
+        if instrument is None:
+            return None
+        try:
+            return self._session_calendar(instrument, now)
+        except Exception as exc:  # расписание не должно ломать допуск и защиту
+            log.warning("Расписание сессий %s недоступно: %s", instrument_key(instrument), type(exc).__name__)
+            return None
+
+    def _session_trace(self, *, code: str, action: str | None, timeframe: str | None, now: datetime,
+                       schedule, block, links: TraceLinks, outcome: TraceOutcome,
+                       extra: Mapping[str, MeasuredValue] | None = None):
+        settings = self._intraday
+        inputs = {
+            "plan_timeframe": MeasuredValue(timeframe or None, "timeframe"),
+            "max_timeframe": MeasuredValue(settings.max_timeframe, "timeframe"),
+            "market_time": MeasuredValue(session_guard.naive_utc(now).isoformat(), "utc"),
+            "trading_date": MeasuredValue(schedule.trading_date.isoformat(), "date"),
+            "schedule_version": MeasuredValue(schedule.version, "schedule-day-version"),
+            "schedule_provenance": MeasuredValue(schedule.provenance, "schedule-provenance"),
+            "schedule_rules_version": MeasuredValue(schedule.rules_version, "schedule-rules-version"),
+            "entry_sessions": MeasuredValue(list(settings.entry_sessions), "sessions"),
+            "blocks": MeasuredValue([[b.start.isoformat(), b.end.isoformat()] for b in schedule.blocks], "utc-intervals"),
+            "entry_cutoff": MeasuredValue(block.entry_cutoff(settings).isoformat() if block else None, "utc"),
+            "flatten_at": MeasuredValue(block.flatten_at(settings).isoformat() if block else None, "utc"),
+            **(extra or {}),
+        }
+        return calculation_trace(
+            session_guard.ALGORITHM,
+            inputs=inputs,
+            result=MeasuredValue(action, "action"),
+            reason=code,
+            formula="entry: now in allowed block and now < end - no_entry_before_close_min; "
+                    "holding: outside [block start, end - flatten_before_close_min) -> carry or close",
+            links=links,
+            outcome=outcome,
+            algorithm_version=session_guard.ALGORITHM_VERSION,
+        )
+
+    # ── Остановка торгового контура командой (add-control-api) ──
+    @property
+    def contour_stop(self) -> str | None:
+        return self._contour_stop
+
+    def stop_contour(self, mode: str | None) -> tuple[TradeAction, ...]:
+        """Режим остановки контура: запрет входов и доборов, снятие входов, при ``close_all`` — закрытие.
+
+        ``None`` снимает остановку. Повтор безопасен: по сделке с уже идущей
+        заявкой снятия или закрытия второе действие не создаётся, а сделки,
+        перешедшие в другие фазы, пропускаются.
+        """
+        _check_stop_mode(mode)
+        if mode != self._contour_stop:
+            log.info("Остановка контура: режим %s", mode or "снята")
+        self._contour_stop = mode
+        return () if mode is None else self._stop_trades(mode, CONTOUR_STOP, None)
+
+    def stop_instrument(self, key: str, mode: str | None) -> tuple[TradeAction, ...]:
+        """Снятие инструмента из состава контура (add-contour-membership): те же правила, только его сделки."""
+        _check_stop_mode(mode)
+        if mode != self._instrument_stops.get(key):
+            log.info("Снятие инструмента %s: режим %s", key, mode or "снято")
+        if mode is None:
+            self._instrument_stops.pop(key, None)
+            return ()
+        self._instrument_stops[key] = mode
+        return self._stop_trades(mode, INSTRUMENT_REMOVE, key)
+
+    def hold_entries(self, held: bool) -> None:
+        """Запрет входов и доборов без связи с ядром; неисполненные входы и закрытия не трогаются."""
+        held = bool(held)
+        if held == self._core_lost:
+            return
+        self._core_lost = held
+        log.info("Связь с ядром: %s", "потеряна — новые входы запрещены" if held else "восстановлена — запрет снят")
+        self._traces.record(calculation_trace(
+            "contour.core_link",
+            inputs={"held": MeasuredValue(held, "held")},
+            result=MeasuredValue(not held, "allowed"),
+            reason=CORE_LOST,
+            formula="no core heartbeat: no new entries or adds; pending entries and exits follow their plan",
+            links=TraceLinks(),
+            outcome=TraceOutcome.REJECTED if held else TraceOutcome.ACCEPTED,
+            algorithm_version="contour-recovery",
+        ))
+
+    def _stop_trades(self, mode: str, reason: str, key: str | None) -> tuple[TradeAction, ...]:
+        submitted: list[TradeAction] = []
+        for recovered in self.restore():
+            plan, state = recovered.plan, recovered.state
+            if key is not None and plan.instrument_id != key:
+                continue
+            links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
+            if state.phase is TradePhase.ENTRY_PENDING:
+                if self._open_order(plan.trade_id, "CANCEL"):
+                    continue
+                log.info("%s: снятие неисполненного входа %s", rejection_message(reason), plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason=reason)
+            elif mode == CONTOUR_CLOSE_ALL and state.phase in _MANAGEABLE and state.quantity > 0:
+                if self._open_order(plan.trade_id, "CLOSE"):
+                    continue
+                log.info("%s: закрытие позиции %s", rejection_message(reason), plan.trade_id)
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                    state_revision=state.state_revision, reason=reason)
+            else:
+                continue
+            if self.submit_action(action, assignment_id=plan.assignment_id,
+                                  trace=self._contour_stop_trace(type(action).__name__, links, mode=mode,
+                                                                 reason=reason)):
+                submitted.append(action)
+        return tuple(submitted)
+
+    def contour_remainder(self, key: str | None = None) -> tuple[int, int]:
+        """Открытые позиции и неисполненные входы контура или одного инструмента."""
+        positions = entries = 0
+        for recovered in self.restore():
+            if key is not None and recovered.plan.instrument_id != key:
+                continue
+            state = recovered.state
+            if state.phase is TradePhase.ENTRY_PENDING:
+                entries += 1
+            elif state.phase in _MANAGEABLE and state.quantity > 0:
+                positions += 1
+        return positions, entries
+
+    def _entry_block(self, key: str) -> str | None:
+        """Причина отказа новому входу или добору: остановка контура, снятие инструмента, нет связи с ядром."""
+        if self._contour_stop is not None:
+            return CONTOUR_STOPPING
+        if key in self._instrument_stops:
+            return INSTRUMENT_REMOVING
+        if self._core_lost:
+            return CORE_LOST
+        return None
+
+    def _contour_stop_trace(self, action: str | None, links: TraceLinks, *, mode: str | None = None,
+                            reason: str | None = None):
+        accepted = action in ("CancelEntry", "CloseTrade")
+        return calculation_trace(
+            "contour.stop",
+            inputs={"mode": MeasuredValue(mode or self._contour_stop, "mode"),
+                    "action": MeasuredValue(action, "action")},
+            result=MeasuredValue(accepted, "allowed"),
+            reason=reason or (CONTOUR_STOP if accepted else CONTOUR_STOPPING),
+            formula="contour or instrument stopping: no new entries or adds; cancel pending entries; "
+                    "close_all closes positions",
+            links=links,
+            outcome=TraceOutcome.ACCEPTED if accepted else TraceOutcome.REJECTED,
+            algorithm_version="control-api",
+        )
+
+    def _intraday_entry_rejection(self, instrument, assignment, decision, timeframe: str | None):
+        """Недопуск нового внутридневного входа вне окна разрешённых сессий (design D4)."""
+        if not self._session_guard_active() or not self._intraday.is_intraday(timeframe):
+            return None
+        now = self._clock.now()
+        verdict = session_guard.entry_decision(self._calendar_for(instrument, now), now, self._intraday)
+        if verdict.allowed:
+            return None
+        log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, rejection_message(verdict.code))
+        self._traces.record(self._session_trace(
+            code=verdict.code, action=None, timeframe=timeframe, now=now, schedule=verdict.schedule,
+            block=verdict.block, links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
+        return rejection_reason(verdict.code)
+
+    def _intraday_add_allowed(self, action: AddToTrade) -> bool:
+        """Добор внутридневной сделки разрешён только там, где был бы допущен вход (design D8)."""
+        if not self._session_guard_active():
+            return True
+        row = self._storage.connection.execute(
+            "SELECT instrument_id, assignment_id, signal_id, plan_json FROM trades WHERE trade_id=?", (action.trade_id,)
+        ).fetchone()
+        if row is None:
+            return True
+        instrument_id, assignment_id, signal_id, plan_json = row
+        timeframe = json.loads(plan_json).get("timeframe")
+        if not self._intraday.is_intraday(timeframe):
+            return True
+        now = self._clock.now()
+        instrument = self._session_instruments.get(instrument_id)
+        verdict = session_guard.entry_decision(self._calendar_for(instrument, now), now, self._intraday)
+        if verdict.allowed:
+            return True
+        log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(verdict.code))
+        self._traces.record(self._session_trace(
+            code=verdict.code, action="AddToTrade", timeframe=timeframe, now=now, schedule=verdict.schedule,
+            block=verdict.block, outcome=TraceOutcome.REJECTED,
+            links=TraceLinks(assignment_id=assignment_id, trade_id=action.trade_id, signal_id=signal_id),
+        ))
+        return False
+
+    def _opposite_exposure_rejection(self, assignment, decision, instrument):
+        """Недопуск входа против незавершённой сделки другой привязки (trade-management: «Отказ во встречном входе»).
+
+        Счёт один, позиция по контракту у брокера общая, поэтому встречной
+        считается любая незавершённая сделка другого направления — с ожидающим
+        входом или с ненулевым объёмом — по тому же контракту или по другому
+        контракту того же семейства фьючерсов (переход BR-6.25 → BR-7.25).
+        Существующая сделка не закрывается.
+        """
+        side = decision.signal_type.value
+        names = self._storage.instrument_names()
+        own_id = instrument_key(instrument)
+        key = _exposure_key(own_id, getattr(instrument, "ticker", None),
+                            getattr(instrument, "short_name", None), getattr(instrument, "family", None))
+        rows = self._storage.connection.execute(
+            "SELECT t.trade_id, t.instrument_id, t.side FROM trades t LEFT JOIN positions p USING(trade_id) "
+            f"WHERE t.side<>? AND (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) ORDER BY t.created_at",
+            (side,),
+        ).fetchall()
+        blocking = [(trade_id, instrument_id, other_side) for trade_id, instrument_id, other_side in rows
+                    if instrument_id == own_id
+                    or _exposure_key(instrument_id, instrument_id, names.get(instrument_id)) == key]
+        if not blocking:
+            return None
+        _, instrument_id, other_side = blocking[0]
+        contract = names.get(instrument_id)
+        message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
+                   f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+        log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, message)
+        self._traces.record(calculation_trace(
+            "portfolio.opposite-exposure",
+            inputs={"signal": MeasuredValue(side, "side"),
+                    "exposure_key": MeasuredValue(key, "exposure-key"),
+                    "blocking_trades": MeasuredValue([row[0] for row in blocking], "trade-ids")},
+            result=MeasuredValue(False, "allowed"),
+            reason="opposite-exposure",
+            formula="new entry side != side of an unfinished trade on the same contract or futures family -> reject",
+            links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
+            outcome=TraceOutcome.REJECTED,
+        ))
+        return rejection_reason("opposite-exposure", message=message)
+
+    def _open_order(self, trade_id: str, action_type: str, *, reason: str | None = None) -> bool:
+        """Есть ли незавершённая заявка типа ``action_type`` (при ``reason`` — с этой причиной)."""
+        query = ("SELECT b.payload_json FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+                 "WHERE o.trade_id=? AND o.action_type=? AND o.status IN ('PENDING','ACK','PARTIAL')")
+        rows = self._storage.connection.execute(query, (trade_id, action_type)).fetchall()
+        if reason is None:
+            return bool(rows)
+        return any(json.loads(payload).get("reason") == reason for payload, in rows)
+
+    def _carry_approved_at(self, trade_id: str) -> datetime | None:
+        row = self._storage.connection.execute(
+            "SELECT profile_state_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+        value = json.loads(row[0] or "{}").get(session_guard.CARRY_STATE_KEY) if row else None
+        return datetime.fromisoformat(value) if value else None
+
+    def _approve_carry(self, trade_id: str, now: datetime, trace) -> None:
+        """Одобренный перенос до следующего рубежа закрытия переживает перезапуск."""
+        with self._storage.transaction() as connection:
+            row = connection.execute("SELECT profile_state_json FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
+            values = {**json.loads(row[0] or "{}"),
+                      session_guard.CARRY_STATE_KEY: session_guard.naive_utc(now).isoformat()}
+            connection.execute("UPDATE trades SET profile_state_json=? WHERE trade_id=?",
+                               (json.dumps(values, sort_keys=True), trade_id))
+            self._traces.record_in_transaction(connection, trace)
+
+    def _guard_sessions(self, instrument, frame, timeframe: str | None, now: datetime) -> tuple[TradeAction, ...]:
+        """Снятие ожидающих входов, закрытие и перенос внутридневных позиций (design D5–D7).
+
+        Решения принимаются только на цикле таймфрейма защиты: его последнее
+        закрытие — самая свежая цена рынка для проверки безубытка.
+        """
+        if not self._session_guard_active() or timeframe != self._protection_timeframe:
+            return ()
+        ticker = instrument_key(instrument)
+        trades = [recovered for recovered in self.restore()
+                  if recovered.plan.instrument_id == ticker and self._intraday.is_intraday(recovered.plan.timeframe)]
+        if not trades:
+            return ()
+        calendar = self._calendar_for(instrument, now)
+        entry = session_guard.entry_decision(calendar, now, self._intraday)
+        holding = session_guard.holding_decision(calendar, now, self._intraday)
+        close = None
+        if frame is not None and len(frame):
+            close = Decimal(str(frame["close"].iloc[-1]))
+        submitted: list[TradeAction] = []
+        for recovered in trades:
+            plan, state = recovered.plan, recovered.state
+            links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
+            if state.phase is TradePhase.ENTRY_PENDING:
+                if entry.code not in (session_guard.SESSION_CLOSED, session_guard.CLOSE_NEAR):
+                    continue
+                if self._open_order(plan.trade_id, "CANCEL"):
+                    continue
+                log.info("manage %s: отмена незаполненного входа %s (конец разрешённой сессии)", ticker, plan.trade_id)
+                action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                     state_revision=state.state_revision, reason=session_guard.SESSION_END)
+                trace = self._session_trace(code=entry.code, action="CancelEntry", timeframe=plan.timeframe, now=now,
+                                            schedule=entry.schedule, block=entry.block, links=links,
+                                            outcome=TraceOutcome.ACCEPTED)
+                if self._submit_session_action(action, plan, trace, close):
+                    submitted.append(action)
+                continue
+            if state.phase not in _MANAGEABLE or state.quantity <= 0 or not holding.obligated:
+                continue
+            if holding.carry_valid(self._carry_approved_at(plan.trade_id)):
+                continue
+            if self._open_order(plan.trade_id, "CLOSE"):
+                continue
+            step, cost = self._storage.connection.execute(
+                "SELECT price_step, step_cost FROM trades WHERE trade_id=?", (plan.trade_id,)).fetchone()
+            carry = session_guard.carry_decision(
+                plan, state, close=close,
+                price_step=None if step is None else Decimal(step),
+                step_cost=None if cost is None else Decimal(cost),
+                settings=self._intraday,
+            )
+            extra = {
+                "first_fixation": MeasuredValue(carry.first_fixation, "flag"),
+                "break_even": MeasuredValue(carry.break_even, "price"),
+                "confirmed_stop": MeasuredValue(state.confirmed_stop, "price"),
+                "market_close": MeasuredValue(close, "price"),
+                "carry_reason": MeasuredValue(carry.reason, "reason"),
+            }
+            if carry.action == "keep":
+                log.info("manage %s: позиция %s переносится — стоп в безубытке", ticker, plan.trade_id)
+                self._approve_carry(plan.trade_id, now, self._session_trace(
+                    code="intraday-carry", action=None, timeframe=plan.timeframe, now=now,
+                    schedule=holding.schedule, block=holding.block, links=links,
+                    outcome=TraceOutcome.ACCEPTED, extra=extra))
+                continue
+            if carry.action == "move":
+                if state.pending_stop is not None:
+                    continue  # перенос уже ждёт подтверждения; решение повторится на следующем цикле
+                log.info("manage %s: стоп %s переносится в безубыток %s перед концом сессии",
+                         ticker, plan.trade_id, carry.break_even)
+                action = MoveStop(command_id=uuid4().hex, trade_id=plan.trade_id, state_revision=state.state_revision,
+                                  reason=session_guard.CARRY_BREAK_EVEN, stop_price=carry.break_even)
+            else:
+                log.info("manage %s: закрытие %s перед концом разрешённой сессии", ticker, plan.trade_id)
+                action = CloseTrade(command_id=uuid4().hex, trade_id=plan.trade_id,
+                                    state_revision=state.state_revision, reason=session_guard.SESSION_END)
+            trace = self._session_trace(code=action.reason, action=type(action).__name__, timeframe=plan.timeframe,
+                                        now=now, schedule=holding.schedule, block=holding.block, links=links,
+                                        outcome=TraceOutcome.ACCEPTED, extra=extra)
+            if self._submit_session_action(action, plan, trace, close):
+                submitted.append(action)
+        return tuple(submitted)
+
+    def _submit_session_action(self, action: TradeAction, plan: TradePlan, trace, close) -> bool:
+        try:
+            return self.submit_action(action, assignment_id=plan.assignment_id, trace=trace, market_close=close)
+        except (ValueError, TradeManagementException) as exc:
+            log.debug("сессионная защита %s пропустила %s: %s", plan.trade_id, type(action).__name__, type(exc).__name__)
+            return False
+
     def _cancel_stale_entries(self, ticker: str, now: datetime) -> tuple[TradeAction, ...]:
         """Отменить незаполненный вход, чья принятая заявка не исполнилась в срок.
 
@@ -1181,6 +1824,23 @@ class TradeManager:
         plan, state = owned.plan, owned.state
         profile_cls = PROFILE_CLASSES.get(plan.profile.name)
         if profile_cls is None:
+            return ()
+        if plan.timeframe != timeframe:
+            # Сигнал своей связки с другого таймфрейма (например, после смены
+            # tf в конфигурации) сделку не сопровождает: ни добора, ни выхода.
+            log.info("actions_for_signal %s: сигнал %s на %s не относится к сделке %s на %s",
+                     plan.instrument_id, decision.event_id, timeframe, plan.trade_id, plan.timeframe or "?")
+            self._traces.record(calculation_trace(
+                "management.timeframe",
+                inputs={"plan_timeframe": MeasuredValue(plan.timeframe or None, "timeframe"),
+                        "signal_timeframe": MeasuredValue(timeframe, "timeframe"),
+                        "signal": MeasuredValue(decision.signal_type.value, "signal")},
+                result=MeasuredValue([], "actions"),
+                reason="management-timeframe-mismatch",
+                formula="signal timeframe == plan timeframe -> management by signal",
+                links=TraceLinks(assignment_id=assignment.id, trade_id=plan.trade_id, signal_id=decision.event_id),
+                outcome=TraceOutcome.REJECTED,
+            ))
             return ()
         market = build_management_market(
             contract=meta,
@@ -1253,7 +1913,47 @@ class TradeManager:
                 log.debug("actions_for_signal %s пропустил %s: %s", plan.trade_id, type(action).__name__, exc)
         return tuple(submitted)
 
+    def _entry_filter_refusal(self, assignment, decision, instrument, context, timeframe) -> SignalAdmission | None:
+        """Фильтр профиля привязки — первый шаг допуска нового входа.
+
+        Решение фильтра пишется трассой со ссылкой на привязку; отказ идёт
+        штатным недопуском ``filter-rejected`` с причиной фильтра. Как и в
+        циклах робота, без рыночного контекста фильтр не применяется.
+        """
+        judge = getattr(self._signal_filter, "judge", None)
+        if not callable(judge) or context is None:
+            return None
+        verdict = judge(decision, context, profile_name=assignment.filter_profile,
+                        instrument=instrument_key(instrument), timeframe=timeframe)
+        if verdict.trace is not None:
+            self._traces.record(replace(verdict.trace, links=replace(verdict.trace.links, assignment_id=assignment.id)))
+        if not verdict.rejected:
+            return None
+        log.info("actions_for_signal %s: вход отклонён фильтром %s — %s",
+                 instrument.ticker, assignment.filter_profile, verdict.reason)
+        return SignalAdmission(rejections=(rejection_reason("filter-rejected", message=verdict.reason),))
+
     def _plan_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
+        """Допуск нового входа: кластерный вердикт, фильтр привязки, план и портфельный допуск.
+
+        Вердикт «Кластеров» считается до фильтра профиля, чтобы отчёт видел все
+        входные сигналы привязки; недопуск ``cluster-climax`` — только в режиме
+        enforce и только если фильтр профиля сигнал пропустил.
+        """
+        gate = self._cluster_gate
+        cluster = gate.evaluate(assignment, decision, instrument) if gate is not None else None
+        refused = self._entry_filter_refusal(assignment, decision, instrument, context, timeframe)
+        blocked = refused is None and cluster is not None and cluster.blocks(gate.settings.enforce_level)
+        if blocked:
+            log.info("actions_for_signal %s: вход отклонён кластерным фильтром — %s", instrument.ticker, cluster.message)
+            refused = SignalAdmission(rejections=(rejection_reason("cluster-climax"),))
+        if cluster is not None:
+            self._traces.record(gate.trace(cluster, assignment, decision, instrument, timeframe, rejected=blocked))
+        admission = refused if refused is not None else self._plan_new_entry(
+            assignment, decision, instrument, frame, context, meta, timeframe)
+        return admission if cluster is None else replace(admission, cluster=cluster)
+
+    def _plan_new_entry(self, assignment, decision, instrument, frame, context, meta, timeframe) -> SignalAdmission:
         live_market = None
         if self._live_market_provider is not None:
             live_market = self._live_market_provider(instrument)
@@ -1829,6 +2529,101 @@ class TradeManager:
         self._record_portfolio_budget()
         return True
 
+    _OPEN_PHASES_SQL = "phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')"
+
+    def record_source_absent(self, instrument_ids, minutes, *, observed_at):
+        """Исполнение проходит минуты «у источника нет»: явная пометка в журнале сделки.
+
+        Пишется до продвижения границы исполнения, идемпотентно по минуте и
+        сделке. Вместе с минутой сохраняются действовавшие стоп и цели — по ним
+        позже оценивается поздно пришедшая свеча (решение владельца 13.10.2026).
+        ``instrument_ids`` — ключ инструмента или все его псевдонимы журнала.
+        """
+        ids = _instrument_ids(instrument_ids)
+        rows = [(pd_timestamp_iso(minute), evidence) for minute, evidence in minutes]
+        if not rows:
+            return 0
+        written = 0
+        with self._storage.transaction() as connection:
+            trades = connection.execute(
+                "SELECT t.trade_id,t.side,p.confirmed_stop FROM trades t LEFT JOIN protection p ON p.trade_id=t.trade_id "
+                f"WHERE t.instrument_id IN ({','.join('?' * len(ids))}) AND t.{self._OPEN_PHASES_SQL}", ids).fetchall()
+            for trade_id, side, stop in trades:
+                targets = [row[0] for row in connection.execute(
+                    "SELECT price FROM targets WHERE trade_id=? ORDER BY target_index", (trade_id,))]
+                for minute, evidence in rows:
+                    payload = {"minute": minute, "evidence": evidence, "side": side, "stop": stop, "targets": targets,
+                               "reason": "source-absent-minute"}
+                    event_id = f"source-absent:{trade_id}:{minute}"
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                        (event_id, trade_id, "MARKET_DATA_SOURCE_ABSENT",
+                         json.dumps(payload, sort_keys=True), as_aware(observed_at).isoformat()))
+                    written += cursor.rowcount
+                    if cursor.rowcount:
+                        self._traces.record_in_transaction(connection, calculation_trace(
+                            "execution.source_absent_minute",
+                            inputs={"minute": MeasuredValue(minute, "utc_minute"),
+                                    "evidence": MeasuredValue(evidence, "coverage_evidence"),
+                                    "side": MeasuredValue(side, "side"),
+                                    "stop": MeasuredValue(stop, "price"),
+                                    "targets": MeasuredValue(targets, "price")},
+                            result=MeasuredValue("skipped", "execution"),
+                            reason="source-absent-minute",
+                            formula="минута без свечи у источника после всех проверок: без стопа, тейка и переоценки",
+                            links=TraceLinks(trade_id=trade_id, event_id=event_id)))
+        if written:
+            log.warning("Исполнение %s прошло минут без свечи у источника: %d", ids[0], len(rows))
+        return written
+
+    def record_late_candle(self, instrument_ids, minute, ohlc, *, observed_at):
+        """Свеча минуты, пройденной исполнением как «у источника нет»: факты не меняются.
+
+        В журнал пишется позднее поступление и признак возможного касания
+        стопа или цели, действовавших в момент пропуска.
+        """
+        ids = _instrument_ids(instrument_ids)
+        stamp = pd_timestamp_iso(minute)
+        open_price, high, low, close = (Decimal(str(value)) for value in ohlc)
+        written = 0
+        with self._storage.transaction() as connection:
+            skipped = connection.execute(
+                "SELECT e.trade_id,e.payload_json FROM events e JOIN trades t ON t.trade_id=e.trade_id "
+                f"WHERE e.event_type='MARKET_DATA_SOURCE_ABSENT' AND t.instrument_id IN ({','.join('?' * len(ids))}) "
+                "AND e.event_id LIKE ?", (*ids, f"source-absent:%:{stamp}")).fetchall()
+            for trade_id, payload_json in skipped:
+                payload = json.loads(payload_json)
+                stop = None if payload.get("stop") is None else Decimal(payload["stop"])
+                targets = [Decimal(value) for value in payload.get("targets") or ()]
+                buy = payload.get("side") == "BUY"
+                touched_stop = stop is not None and (low <= stop if buy else high >= stop)
+                touched_target = any((high >= target if buy else low <= target) for target in targets)
+                reason = ("late-candle-touched-stop" if touched_stop
+                          else "late-candle-touched-target" if touched_target else "late-candle")
+                event_id = f"late-candle:{trade_id}:{stamp}"
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO events(event_id,trade_id,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?)",
+                    (event_id, trade_id, "MARKET_DATA_LATE_CANDLE",
+                     json.dumps({"minute": stamp, "open": str(open_price), "high": str(high), "low": str(low),
+                                 "close": str(close), "touched_stop": touched_stop, "touched_target": touched_target,
+                                 "reason": reason}, sort_keys=True), as_aware(observed_at).isoformat()))
+                written += cursor.rowcount
+                if cursor.rowcount:
+                    self._traces.record_in_transaction(connection, calculation_trace(
+                        "execution.late_candle",
+                        inputs={"minute": MeasuredValue(stamp, "utc_minute"),
+                                "high": MeasuredValue(high, "price"), "low": MeasuredValue(low, "price"),
+                                "side": MeasuredValue(payload.get("side"), "side"),
+                                "stop": MeasuredValue(stop, "price"), "targets": MeasuredValue(targets, "price")},
+                        result=MeasuredValue({"touched_stop": touched_stop, "touched_target": touched_target}, "flag"),
+                        reason=reason,
+                        formula="BUY: low <= стоп, high >= цель; SELL: high >= стоп, low <= цель; факты не меняются",
+                        links=TraceLinks(trade_id=trade_id, event_id=event_id)))
+                if cursor.rowcount and (touched_stop or touched_target):
+                    log.warning("Поздняя свеча %s %s могла задеть %s сделки %s; исполнение не переигрывается",
+                                ids[0], stamp, "стоп" if touched_stop else "цель", trade_id)
+        return written
+
     def observe_bars(self, prices, bar_times, *, timeframe="1m", gap_before=False):
         """Journal closed holding bars directly, independently of notifications."""
         with self._storage.transaction() as connection:
@@ -1861,6 +2656,7 @@ class TradeManager:
 
     def _insert_action(self, connection, action: TradeAction, now: str) -> None:
         payload = _action_payload(action)
+        self._enqueued_at[action.command_id] = as_aware(self._clock.now())
         connection.execute(
             "INSERT INTO outbox VALUES (?, ?, ?, 'PENDING', ?, NULL)",
             (action.command_id, action.trade_id, json.dumps(payload, sort_keys=True), now),

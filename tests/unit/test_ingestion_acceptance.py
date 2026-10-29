@@ -34,7 +34,7 @@ import threading
 
 import pandas as pd
 
-import run
+from src.assembly import contour
 from src.api.market_data_stream import CandleSubscriptionAck, StreamCandle, StreamResponse
 from src.data.cache import MarketDataCache
 from src.data.ingestion import IngestionWorker
@@ -59,6 +59,7 @@ def test_critical_gap_of_one_uid_does_not_stop_healthy_uid(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     cache = MarketDataCache(lambda **kw: (pd.DataFrame(), kw["instrument_id"]), timeline,
                             request_budget=RequestBudget(lambda: now, 0), market_store=store)
+    cache.contour_id = "emulation"
     a, b = (Instrument(name, name, "share", name, name.lower()) for name in ("AAA", "BBB"))
     for item in (a, b):
         # Сохранённые обязательства передаются до приёма данных, как в run.py:
@@ -78,12 +79,12 @@ def test_critical_gap_of_one_uid_does_not_stop_healthy_uid(tmp_path):
     storage.load_trades.return_value = ()
     start = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
     storage.execution_bar_boundaries.side_effect = lambda: {"aaa": (start, True), "bbb": (start, True)}
-    with patch("run.trading_enabled", return_value=True), patch(
+    with patch("src.assembly.contour.trading_enabled", return_value=True), patch(
         "src.trade_journal.storage.Storage", return_value=storage
     ), patch("src.broker.create_addressable_journal_broker", return_value=broker), patch(
         "src.trade_management.manager.TradeManager", return_value=MagicMock()
-    ), patch("run._load_contracts_metadata", return_value={}), patch("run.print_contract_metadata"), patch("run._risk_limits"):
-        runtime = run._build_runtime([a, b], cache, MagicMock(), tmp_path)
+    ), patch("src.assembly.contour._load_contracts_metadata", return_value={}), patch("src.assembly.contour.print_contract_metadata"), patch("src.assembly.contour._risk_limits"):
+        runtime = contour._build_runtime([a, b], cache, MagicMock(), tmp_path)
     assert runtime.post_tick({"1m"}) is True
     executed = {}
     for call in broker.track_bar.call_args_list:
@@ -143,9 +144,10 @@ def test_end_to_end_stream_startup_overlap_internal_and_trailing_gap(tmp_path):
     # Робот работает с 11:30: внутренняя дыра — пропуск во время работы.
     cache = MarketDataCache(loader, timeline, request_budget=RequestBudget(lambda: clock[0], 0), market_store=store,
                             live_cutover=datetime(2026, 10, 12, 11, 30))
+    cache.contour_id = "emulation"
     item = Instrument("SBER", "SBER", "share", "SBER", "u")
     cache.prepare_live_history(item, "1m", 30)
-    settings = MarketDataSettings(live_transport="stream", candle_publication_timeout_secs=30,
+    settings = MarketDataSettings(independent_lanes=False, live_transport="stream", candle_publication_timeout_secs=30,
                                   stream_ack_timeout_seconds=5)
     worker = IngestionWorker(cache, settings=settings)
     session = Session()

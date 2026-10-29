@@ -34,6 +34,15 @@ def _format_futures_display(contract_name, base_name, label):
 
 
 def fetch_active_futures(client, market_now=None):
+    return [entry[:4] for entry in active_futures_with_expiry(client, market_now)]
+
+
+def active_futures_with_expiry(client, market_now=None):
+    """Те же стандартные контракты, что в меню, плюс момент экспирации (UTC, naive).
+
+    Элемент — ``(display, ticker, "future", contract_name, expiry)``; порядок —
+    по базам меню, внутри базы по экспирации.
+    """
     now = market_now if market_now is not None else datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now + FUTURES_TTL
     resp = api_call_with_retry(
@@ -65,7 +74,8 @@ def fetch_active_futures(client, market_now=None):
         entries.sort(key=lambda x: x[3])
         result.extend(entries)
 
-    return [(display, ticker, inst_type, contract_name) for display, ticker, inst_type, _, contract_name in result]
+    return [(display, ticker, inst_type, contract_name, expiry)
+            for display, ticker, inst_type, expiry, contract_name in result]
 
 
 def _ask_choice(prompt, options):
@@ -188,11 +198,15 @@ def _show_current(instruments):
             print(f"  - {item[0]} ({item[2]})")
 
 
-def select_instruments(validation_pause_secs=0, client_provider=None, market_now=None, historical=False):
+def select_instruments(validation_pause_secs=0, client_provider=None, market_now=None, historical=False,
+                       request_budget=None):
     """Интерактивный выбор инструментов через клиента источника данных прогона.
 
     ``client_provider`` — порт источника (исторический прогон отдаёт свой
     клиент), ``market_now`` — рыночный момент для окна экспирации и валидации.
+    ``request_budget`` — общий арбитр лимитов: запросы выбора идут через него
+    с приоритетом интерактивного выбора вместо собственной паузы, чтобы не
+    конкурировать вслепую с уже работающими полосами данных.
     """
     if historical:
         return _select_history(client_provider, market_now)
@@ -202,7 +216,10 @@ def select_instruments(validation_pause_secs=0, client_provider=None, market_now
     context = (
         client_provider.client_context() if client_provider is not None else client_context()
     )
-    with context as client:
+    if request_budget is not None:
+        validation_pause_secs = 0
+    with context as raw_client:
+        client = raw_client if request_budget is None else request_budget.wrap_client(raw_client, lane="interactive")
         while True:
             print("Выберите тип инструментов:")
             print("  1. Акции (индекс РТС)")
@@ -238,7 +255,7 @@ def select_instruments(validation_pause_secs=0, client_provider=None, market_now
 
     if not instruments:
         print("\nНеобходимо выбрать хотя бы один инструмент.")
-        return select_instruments(validation_pause_secs, client_provider, market_now)
+        return select_instruments(validation_pause_secs, client_provider, market_now, request_budget=request_budget)
 
     print(f"\nИтого выбрано: {len(instruments)}")
     for item in instruments:

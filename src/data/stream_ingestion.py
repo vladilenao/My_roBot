@@ -115,6 +115,15 @@ class StreamSupervisor:
             return all(info["status"] in {"ready", "failed"} for pair, info in self.pairs.items()
                        if pair in self._desired)
 
+    def startup_pending(self):
+        """Пары потока, которых ждёт ``startup_complete``: (UID, ТФ) → статус."""
+        self.sync_roster()
+        with self._lock:
+            if self.settings.stream_fallback_polling and self.connection in {"BACKOFF", "FAILED"}:
+                return {}
+            return {pair: f"поток: {info['status']}" for pair, info in sorted(self.pairs.items())
+                    if pair in self._desired and info["status"] not in {"ready", "failed"}}
+
     def sync_roster(self):
         """Желаемые подписки — зарегистрированные owner пары по UID."""
         pairs = {(pair["uid"], pair["timeframe"]) for pair in self._cache.live_pairs()}

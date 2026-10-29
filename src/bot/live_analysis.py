@@ -20,6 +20,20 @@ from src.strategies.contracts import SignalType
 log = get_logger(__name__)
 
 
+def _utc_moment(value):
+    """Момент удержания как tz-aware UTC; неразборчивое значение — None."""
+    if value is None or value == "":
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    return stamp.to_pydatetime()
+
+
 class LiveAnalysis:
     def __init__(self, bot):
         self.bot = bot
@@ -101,11 +115,12 @@ class LiveAnalysis:
         """Критический 1m-префикс UID должен быть доказан до закрытия бара."""
         ready = getattr(self.cache, "execution_ready", None)
         if not callable(ready):
-            return ""
+            return None
         last_minute = pd.Timestamp(close) - pd.Timedelta(minutes=1)
         if ready(instrument, last_minute):
-            return ""
-        return f"Удержано: базовая 1m не подтверждена до {last_minute:%d.%m.%Y %H:%M} UTC"
+            return None
+        # Граница — закрытие бара, как у bar_time; фразу соберёт шаблон канала.
+        return {"kind": "execution_barrier", "through": _utc_moment(close)}
 
     def _ingestion(self, instrument, tf):
         """Технический срез owner для market_data_status (design 11, задача 8.3)."""
@@ -120,28 +135,29 @@ class LiveAnalysis:
                 "resolved_through": status.get("resolved_through"), "processed_through": status.get("processed_through"),
                 "gap": status.get("gap"), "incident": status.get("incident"),
                 "history_error": status.get("history_error") or "",
-                "cutover": status.get("cutover"), "pre_cutover_gaps": status.get("pre_cutover_gaps", 0)}
+                "cutover": status.get("cutover"), "pre_cutover_gaps": status.get("pre_cutover_gaps", 0),
+                "lanes": status.get("lanes") or {}}
 
-    def _hold_reason(self, instrument, tf, ingestion, close):
+    def _hold(self, instrument, tf, ingestion, close):
+        """Удержание пары структурно: вид и UTC-моменты, без русской фразы."""
         state = ingestion.get("data_hold")
         if state == "INTEGRITY_HOLD":
             incident = ingestion.get("incident") or {}
-            return f"Удержано: изменена уже исполненная минута {incident.get('open_time', '')}".strip()
+            return {"kind": "integrity", "minute": _utc_moment(incident.get("open_time"))}
         if state == "CONFLICT_HOLD":
-            return "Удержано: расхождение версий свечи, идёт согласующая проверка"
+            return {"kind": "conflict"}
         if state == "GAP_HOLD":
             gap = ingestion.get("gap") or {}
-            if gap.get("state") == "parked":
-                return (f"Пропуск {gap.get('lower')}–{gap.get('upper')} не восстановлен; "
-                        f"следующая проверка {gap.get('next_retry_at')}")
-            return f"Восстановление пропуска {gap.get('lower')}–{gap.get('upper')}"
+            hold = {"kind": "gap", "state": gap.get("state") or "active",
+                    "lower": _utc_moment(gap.get("lower")), "upper": _utc_moment(gap.get("upper"))}
+            if hold["state"] == "parked":
+                hold["next_retry_at"] = _utc_moment(gap.get("next_retry_at"))
+            return hold
         if state == "RECONCILING":
-            return "Согласование потока с историей"
-        if state == "BOOTSTRAPPING" and ingestion.get("history_error"):
-            return "Прогрев: " + ingestion["history_error"]
+            return {"kind": "reconciling"}
         if tf != self.bot._protection_timeframe and close is not None and self.current(instrument, tf, close):
             return self._execution_barrier(instrument, close)
-        return ""
+        return None
 
     def next_wakeup(self):
         """Ближайший дедлайн публикации или закрытие бара активных пар."""
@@ -175,18 +191,26 @@ class LiveAnalysis:
             decision = self.bot._signal_filter.apply(raw, context, profile_name=binding.filter_profile,
                 instrument=instrument, timeframe=tf)
         filtered = raw.signal_type is not SignalType.HOLD and decision.signal_type is SignalType.HOLD
-        return decision, context, ta, filtered
+        return decision, context, ta, filtered, raw
 
     def register_needs(self):
         """Потребности прогрева без сети: owner передаёт их фоновой полосе."""
         for instrument in self.bot._instruments:
-            self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
-                                            max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
-            for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                for binding in self._bindings(instrument, tf):
-                    for need_tf, count in self._required(binding).items():
-                        self.cache.prepare_live_history(instrument, need_tf, count,
-                                                        max_close=self._warmup_close(instrument, need_tf))
+            self.register_needs_for(instrument)
+
+    def register_needs_for(self, instrument):
+        """Потребности прогрева одного инструмента — и при старте, и при добавлении в состав."""
+        self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
+                                        max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
+        for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
+            for binding in self._bindings(instrument, tf):
+                for need_tf, count in self._required(binding).items():
+                    self.cache.prepare_live_history(instrument, need_tf, count,
+                                                    max_close=self._warmup_close(instrument, need_tf))
+        # ТФ планов открытых сделок загружаются с прогревом их профилей,
+        # даже если привязок на этом ТФ в конфигурации не осталось.
+        for tf, count in self.bot._management_needs(instrument).items():
+            self.cache.prepare_live_history(instrument, tf, count, max_close=self._warmup_close(instrument, tf))
 
     def bootstrap(self):
         """Стартовый пакет состояний имеет явную границу для консольной группировки."""
@@ -204,54 +228,140 @@ class LiveAnalysis:
         if callable(waiter):
             waiter()
         for instrument in self.bot._instruments:
+            self.bootstrap_instrument(instrument)
+
+    def bootstrap_instrument(self, instrument):
+        """Стартовый обзор одного инструмента: состояния пар, курсоры анализа без переигрывания.
+
+        Курсор — сохранённый в рыночной базе или последний бар; так же
+        обозревается инструмент, добавленный в состав на ходу (add-contour-membership).
+        """
+        try:
+            self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
+                                            max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
+        except Exception as exc:
+            self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} 1m")
+        needs = self.bot._management_needs(instrument)
+        for tf in sorted(set(needs) - {a.timeframe for a in self.bot._strategies_for(instrument)}):
             try:
-                self.cache.prepare_live_history(instrument, self.bot._protection_timeframe, 1,
-                                                max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
-            except Exception as exc:
-                self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} 1m")
-            for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                bindings = self._bindings(instrument, tf)
-                required = max(self._required(a)[tf] for a in bindings)
-                rows, frame, reason = [], pd.DataFrame(), ""
-                try:
-                    frame = self.cache.prepare_live_history(instrument, tf, required,
-                                                            max_close=self._warmup_close(instrument, tf))
-                except Exception as exc:
-                    reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
-                    frame = self.cache.frame_for(instrument, tf)
-                any_calculated = False
-                for binding in bindings:
-                    row = {"assignment_id": binding.id, "strategy": binding.strategy,
-                           "filter_profile": binding.filter_profile, "outcome": "",
-                           "indicators": "", "reason": reason}
-                    try:
-                        quality = self._quality(instrument, binding, frame, prepare=True)
-                        row["reason"] = (reason + "; " + quality) if reason and quality else quality
-                        if not row["reason"]:
-                            decision, _, ta, filtered = self._calculate(instrument, binding, frame)
-                            row["outcome"] = "FILTERED" if filtered else decision.signal_type.name
-                            row["indicators"] = self.bot._ta_digest(ta)
-                            any_calculated = True
-                    except Exception as exc:
-                        row["reason"] = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
-                    rows.append(row)
-                    last = frame["datetime"].iloc[-1] if not frame.empty else None
-                    saved = self.cache.analysis_cursor(instrument, tf, binding.id)
-                    self.cursors[binding.id, instrument_key(instrument)] = saved if saved is not None else last
-                    if saved is None and last is not None and row["outcome"]:
-                        self.cache.mark_analyzed(instrument, tf, binding.id, last)
-                close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
-                complete = any_calculated and not any(row["reason"] for row in rows)
-                state = LivePairState("tbank_exchange", instrument_key(instrument), tf,
-                    received_bar=close, analyzed_bar=close if any_calculated else None,
-                    analysis_mode="overview" if any_calculated else "", available_bars=len(frame),
-                    required_bars=required, coverage_complete=complete,
-                    reason=next((row["reason"] for row in rows if row["reason"]), ""))
-                self.states[self._key(instrument, tf)] = state
-                self.bot._bus.publish(Event.startup_analysis(self.bot._display_name(instrument),
-                    published_at=self.timeline.now(), bar_time=close, timeframe=tf, results=rows,
-                    available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
+                frame = self._prime_management_pair(instrument, tf, needs[tf])
                 self.publish_status(instrument, tf, frame)
+            except Exception as exc:
+                self.bot._report_error(exc, f"Прогрев {self.bot._display_name(instrument)} {tf}")
+        for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
+            bindings = self._bindings(instrument, tf)
+            required = max([*(self._required(a)[tf] for a in bindings), needs.get(tf, 0)])
+            rows, frame, reason = [], pd.DataFrame(), ""
+            try:
+                frame = self.cache.prepare_live_history(instrument, tf, required,
+                                                        max_close=self._warmup_close(instrument, tf))
+            except Exception as exc:
+                reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+                frame = self.cache.frame_for(instrument, tf)
+            any_calculated = False
+            for binding in bindings:
+                row = {"assignment_id": binding.id, "strategy": binding.strategy,
+                       "filter_profile": binding.filter_profile, "outcome": "",
+                       "indicators": "", "reason": reason}
+                try:
+                    quality = self._quality(instrument, binding, frame, prepare=True)
+                    row["reason"] = (reason + "; " + quality) if reason and quality else quality
+                    if not row["reason"]:
+                        decision, _, ta, filtered, _ = self._calculate(instrument, binding, frame)
+                        row["outcome"] = "FILTERED" if filtered else decision.signal_type.name
+                        row["indicators"] = self.bot._ta_digest(ta)
+                        any_calculated = True
+                except Exception as exc:
+                    row["reason"] = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+                rows.append(row)
+                last = frame["datetime"].iloc[-1] if not frame.empty else None
+                saved = self.cache.analysis_cursor(instrument, tf, binding.id)
+                self.cursors[binding.id, instrument_key(instrument)] = saved if saved is not None else last
+                if saved is None and last is not None and row["outcome"]:
+                    self.cache.mark_analyzed(instrument, tf, binding.id, last)
+            close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
+            complete = any_calculated and not any(row["reason"] for row in rows)
+            state = LivePairState("tbank_exchange", instrument_key(instrument), tf,
+                received_bar=close, analyzed_bar=close if any_calculated else None,
+                analysis_mode="overview" if any_calculated else "", available_bars=len(frame),
+                required_bars=required, coverage_complete=complete,
+                reason=next((row["reason"] for row in rows if row["reason"]), ""))
+            self.states[self._key(instrument, tf)] = state
+            self.bot._bus.publish(Event.startup_analysis(self.bot._display_name(instrument),
+                published_at=self.timeline.now(), bar_time=close, timeframe=tf, results=rows,
+                available_bars=len(frame), required_bars=required, coverage_complete=complete, reason=state.reason))
+            self.publish_status(instrument, tf, frame)
+
+    def forget_instrument(self, instrument):
+        """Инструмент вышел из состава: его состояния пар и курсоры больше не нужны."""
+        key = instrument_key(instrument)
+        self.states = {item: state for item, state in self.states.items() if item[0] != key}
+        self.cursors = {item: cursor for item, cursor in self.cursors.items()
+                        if not (len(item) == 2 and item[1] == key) and not (len(item) == 3 and item[1] == key)}
+
+    def _management_cursor(self, instrument, tf):
+        return "management", instrument_key(instrument), tf
+
+    def _prime_management_pair(self, instrument, tf, required):
+        """ТФ плана открытой сделки без привязок: прогрев, состояние данных, курсор.
+
+        На таком ТФ нет стратегий и решений — только сопровождение сделок по
+        закрытию его баров. Последний уже имеющийся бар считается обработанным.
+        """
+        reason = ""
+        try:
+            frame = self.cache.prepare_live_history(instrument, tf, required,
+                                                    max_close=self._warmup_close(instrument, tf))
+        except Exception as exc:
+            reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
+            frame = self.cache.frame_for(instrument, tf)
+        close = self.timeline.grid(tf).bar_close(frame["datetime"].iloc[-1]) if not frame.empty else None
+        self.states[self._key(instrument, tf)] = LivePairState("tbank_exchange", instrument_key(instrument), tf,
+            received_bar=close, analyzed_bar=None, analysis_mode="", available_bars=len(frame),
+            required_bars=required, coverage_complete=not reason and len(frame) >= required, reason=reason)
+        self.cursors[self._management_cursor(instrument, tf)] = frame["datetime"].iloc[-1] if not frame.empty else None
+        return frame
+
+    def _manage_unbound(self, instrument, tf, frame, required, managed, execution_complete):
+        """Сопровождение сделок на ТФ плана без привязок по новому текущему бару.
+
+        Решения принимает менеджер только на закрытии бара этого ТФ и только
+        по его истории; без доказанного 1m-префикса, полного прогрева и
+        покрытия курсор не двигается — бар дождётся данных, а не потеряется.
+        """
+        if frame.empty:
+            return
+        key = self._management_cursor(instrument, tf)
+        stamp = frame["datetime"].iloc[-1]
+        cursor = self.cursors.get(key)
+        if cursor is not None and stamp <= cursor:
+            return
+        close = self.timeline.grid(tf).bar_close(stamp)
+        if not self.current(instrument, tf, close):
+            self.cursors[key] = stamp
+            return
+        if not execution_complete or self._execution_barrier(instrument, close):
+            return
+        if len(frame) < required or not self.cache.coverage_for(instrument, tf, frame.tail(required)):
+            return
+        management_key = instrument_key(instrument), tf, stamp
+        if management_key not in managed:
+            self.bot._manage(instrument, [], frame.tail(required).reset_index(drop=True).copy(), None, tf)
+            managed.add(management_key)
+        self.cursors[key] = stamp
+
+    def _guard_sessions(self, instrument, needs, managed, execution_complete):
+        """Сессионная защита внутридневных сделок на каждом новом 1m-баре.
+
+        Рубеж закрытия (18:35/18:40 МСК) не совпадает с закрытием бара плана,
+        поэтому решения о снятии входа, закрытии и переносе принимаются на
+        служебном 1m, а не только на барах 5m/15m сделки.
+        """
+        needed = getattr(self.bot._trade_manager, "session_guard_needed", None)
+        if not callable(needed) or not needed(needs):
+            return
+        tf = self.bot._protection_timeframe
+        self._manage_unbound(instrument, tf, self.cache.frame_for(instrument, tf), 1, managed, execution_complete)
 
     def publish_status(self, instrument, tf, frame):
         now = self.timeline.now()
@@ -284,7 +394,7 @@ class LiveAnalysis:
         if not reason and not self.cache.coverage_for(instrument, tf, frame.tail(required)):
             reason = "Неразрешённый пробел в диапазоне прогрева"
         unknown_schedule = "Применимое торговое расписание неизвестно"
-        state = replace(state, available_bars=len(frame), coverage_complete=not bool(reason), reason=reason)
+        state = replace(state, available_bars=len(frame), coverage_complete=not bool(reason), reason=reason, hold=None)
         if reason:
             state = replace(state, data_state="warming_up" if len(frame) < required else "coverage_blocked")
         elif session == "unknown":
@@ -293,15 +403,19 @@ class LiveAnalysis:
         if error:
             state = replace(state, reason=error.replace(instrument.ticker, self.bot._display_name(instrument)))
         if ingestion and state.reason in {"", unknown_schedule}:
-            hold = self._hold_reason(instrument, tf, ingestion, close)
-            if hold:
+            if ingestion.get("data_hold") == "BOOTSTRAPPING" and ingestion.get("history_error"):
+                # Текст исключения прогрева — причина, а не момент удержания.
+                state = replace(state, reason="Прогрев: " + ingestion["history_error"])
+            else:
                 # Удержание блокирует торговлю и важнее общей пометки о
-                # расписании; причины прогрева/покрытия остаются первыми.
-                state = replace(state, reason=hold + ("; расписание неизвестно" if state.reason == unknown_schedule else ""))
+                # расписании; причины прогрева/покрытия остаются первыми,
+                # пометка о неизвестном расписании остаётся в reason.
+                state = replace(state, hold=self._hold(instrument, tf, ingestion, close))
         state = replace(state, ingestion=ingestion)
-        budget = self.cache._request_budget
-        if budget.retry_after is not None and now < budget.retry_after:
-            state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API")
+        # У процесса контура арбитра квот нет (add-contour-process): лимиты тратит только ядро.
+        budget = getattr(self.cache, "_request_budget", None)
+        if budget is not None and budget.retry_after is not None and now < budget.retry_after:
+            state = replace(state, data_state="rate_limited", reason="Ожидание сброса общего лимита API", hold=None)
         self.states[key] = state
         if self.cadence.due(state, now):
             self.bot._bus.publish(Event.market_data_status(self.bot._display_name(instrument),
@@ -391,11 +505,22 @@ class LiveAnalysis:
             self.cache.refresh_live()
             self.diagnose_clearing()
             execution_complete = self.bot._post_tick({self.bot._protection_timeframe}) is not False if self.bot._post_tick else True
+            admits_signals = getattr(self.bot._trade_manager, "actions_for_signal", None) is not None
             for instrument in self.bot._instruments:
-                for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
-                    frame = self.cache.frame_for(instrument, tf)
+                needs = self.bot._management_needs(instrument)
+                self._guard_sessions(instrument, needs, managed, execution_complete)
+                for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)} | set(needs)):
                     bindings = self._bindings(instrument, tf)
+                    if not bindings and self._key(instrument, tf) not in self.states:
+                        self._prime_management_pair(instrument, tf, needs[tf])
+                    frame = self.cache.frame_for(instrument, tf)
                     self.publish_status(instrument, tf, frame)
+                    # Свечи для графиков переноса стопа и итога сделки.
+                    self.bot._remember_market(instrument, tf, frame)
+                    if not bindings:
+                        # ТФ плана открытой сделки без привязок: только сопровождение.
+                        self._manage_unbound(instrument, tf, frame, needs[tf], managed, execution_complete)
+                        continue
                     for binding in bindings:
                         cursor_key = binding.id, instrument_key(instrument)
                         cursor = self.cursors.get(cursor_key)
@@ -412,12 +537,17 @@ class LiveAnalysis:
                                     # Курсор не двигается: решение дождётся
                                     # непрерывной базовой 1m, а не потеряется.
                                     key = self._key(instrument, tf)
-                                    self.states[key] = replace(self.states[key], reason=barrier)
+                                    self.states[key] = replace(self.states[key], reason="", hold=barrier)
                                     break
                             publish = None
                             try:
-                                decision, context, _, filtered = self._calculate(instrument, binding, asof)
+                                decision, context, _, filtered, raw = self._calculate(instrument, binding, asof)
                                 current = self.current(instrument, tf, decision.bar_time) and stamp == frame["datetime"].iloc[-1]
+                                if current and execution_complete and admits_signals:
+                                    # Фильтр входа применяет допуск менеджера: в консоли
+                                    # СИГНАЛ и под ним ОТКЛОНЕНО с причиной фильтра, а
+                                    # противоположный сигнал доходит до сопровождения сырым.
+                                    decision, filtered = raw, False
                                 publish = partial(self.bot._publish_decision, decision, instrument,
                                     filter_profile=binding.filter_profile, filtered_out=filtered, timeframe=tf,
                                     analysis_mode="live" if current else "historical")
@@ -426,7 +556,11 @@ class LiveAnalysis:
                                     work_frame = asof.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
                                     management_key = instrument_key(instrument), tf, stamp
                                     if management_key not in managed:
-                                        self.bot._manage(instrument, bindings, work_frame, context, tf)
+                                        # Кадр сопровождения покрывает и прогрев профилей
+                                        # открытых сделок этого ТФ, а не только привязки.
+                                        depth = max(self._required(binding)[tf], needs.get(tf, 0))
+                                        management_frame = asof.tail(depth).reset_index(drop=True).copy()
+                                        self.bot._manage(instrument, bindings, management_frame, context, tf)
                                         managed.add(management_key)
                                     # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО
                                     # идут в консоли одним блоком с СИГНАЛ.

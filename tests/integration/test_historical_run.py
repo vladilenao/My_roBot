@@ -16,12 +16,15 @@ from t_tech.invest import schemas
 from t_tech.invest.schemas import CandleInterval
 
 import run
+from src.assembly.history_runs import prepare_import
+from src.assembly import contour, history, services
 from src.data.timeutil import to_naive
 from src.history.preflight import PreflightReport
 from src.history.report import REPORT_JSON, REPORT_TXT
 from src.portfolio.models import ContractMeta
 from src.strategies.contracts import Assignment, Decision, SignalType
 from src.trade_journal.storage import Storage
+from src.trade_management.intraday_settings import IntradaySettings
 
 TICKER = "NGV6"
 UID = "uid-ngv6"
@@ -230,8 +233,11 @@ def _assignment_patch():
     return (
         patch.object(run, "FUTURE_STRATEGIES", {TICKER[:2]: [ASSIGNMENT]}, create=True),
         patch.object(run, "SHARE_STRATEGIES", {}, create=True),
+        patch.object(contour, "FUTURE_STRATEGIES", {TICKER[:2]: [ASSIGNMENT]}),
+        patch.object(contour, "SHARE_STRATEGIES", {}),
         patch.object(run, "_strategy_map", return_value={"always_buy": AlwaysBuyStrategy()}),
-        patch.object(run, "ACTIVE_TIMEFRAMES", frozenset({TF}), create=True),
+        patch.object(contour, "_strategy_map", return_value={"always_buy": AlwaysBuyStrategy()}),
+        patch.object(services, "ACTIVE_TIMEFRAMES", frozenset({TF})),
     )
 
 
@@ -242,16 +248,13 @@ def _run_history(state_dir, *, pause=0.0, rows=None, start=START, end=END, crash
     with contextlib.ExitStack() as stack:
         for item in _assignment_patch():
             stack.enter_context(item)
-        stack.enter_context(
-            patch.object(run, "EmulatorClientProvider", return_value=StubProvider(client))
-        )
-        stack.enter_context(patch.object(run, "select_instruments", return_value=[INSTRUMENT]))
-        stack.enter_context(patch.object(run, "state_dir_for", return_value=state_dir))
+        # Прогон без расписания торгов: сессионная защита запретила бы входы 1m.
+        stack.enter_context(patch.object(contour, "INTRADAY_SETTINGS", IntradaySettings(enabled=False)))
         stack.enter_context(patch.object(run, "setup_logging"))
-        stack.enter_context(patch.object(run, "print_contract_metadata"))
+        stack.enter_context(patch.object(contour, "print_contract_metadata"))
         stack.enter_context(
             patch.object(
-                run,
+                contour,
                 "_load_contracts_metadata",
                 return_value={
                     TICKER: ContractMeta(
@@ -263,7 +266,11 @@ def _run_history(state_dir, *, pause=0.0, rows=None, start=START, end=END, crash
         stack.enter_context(patch("builtins.print", side_effect=print))
         if crash_after is not None:
             stack.enter_context(_interrupting_bot(crash_after))
-        code = run._run_history(start, end, pause)
+        provider = StubProvider(client)
+        # Сверку импорта делает робот до старта процесса прогона (add-history-contour).
+        sync, _, _ = prepare_import(provider)
+        code = run._run_history(start, end, pause, None, state_dir=state_dir, provider=provider,
+                                market_data_sync=sync, instruments=[INSTRUMENT])
     return code, client
 
 
@@ -313,7 +320,7 @@ def live_state_guard(tmp_path):
 
 def _traded_moments(state_dir):
     """Рыночные моменты сделок прогона (момент входа в журнале)."""
-    with Storage(Path(state_dir) / run.DATABASE_FILE) as storage:
+    with Storage(Path(state_dir) / contour.DATABASE_FILE) as storage:
         return [
             to_naive(row[0]).to_pydatetime()
             for row in storage.connection.execute(
@@ -424,21 +431,22 @@ class TestIsolatedState:
         _run_history(tmp_path / "a")
         _run_history(tmp_path / "b")
 
-        assert (tmp_path / "a" / run.DATABASE_FILE).exists()
-        assert (tmp_path / "b" / run.DATABASE_FILE).exists()
+        assert (tmp_path / "a" / contour.DATABASE_FILE).exists()
+        assert (tmp_path / "b" / contour.DATABASE_FILE).exists()
 
         assert _traded_moments(tmp_path / "a") == _traded_moments(tmp_path / "b")
         assert _traded_moments(tmp_path / "a")
 
     def test_live_files_untouched(self, tmp_path, live_state_guard):
-        with patch.object(run, "runtime_dir", return_value=tmp_path / "data"):
+        with patch.object(run, "runtime_dir", return_value=tmp_path / "data"), \
+                patch.object(history, "runtime_dir", return_value=tmp_path / "data"):
             _run_history(tmp_path / "hist")
 
     def test_history_state_dir_holds_all_run_files(self, tmp_path):
         _run_history(tmp_path / "hist")
 
         names = {path.name for path in (tmp_path / "hist").iterdir()}
-        assert {run.DATABASE_FILE, REPORT_TXT, REPORT_JSON} <= names
+        assert {contour.DATABASE_FILE, REPORT_TXT, REPORT_JSON} <= names
 
 
 class TestCrashStop:

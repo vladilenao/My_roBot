@@ -8,6 +8,12 @@ from src.notifier.telegram_navigation import descriptor, register_confirmed, rep
 from src.notifier.telegram_transport import TelegramTransport
 
 
+def _channel_id(config):
+    """Id канала контура по имени переменной из конфига; объект-заменитель — прежним полем."""
+    getter = getattr(config, "telegram_channel_id", None)
+    return getter() if callable(getter) else config.TELEGRAM_CHANNEL_ID
+
+
 def _period(day_from: str | None, day_to: str | None, offset_hours: float):
     if not day_from and not day_to:
         return None, None
@@ -19,7 +25,7 @@ def _period(day_from: str | None, day_to: str | None, offset_hours: float):
 
 def _repo(config, state_dir, *, readonly=False):
     path = state_dir / "telegram_delivery.sqlite3"
-    return DeliveryRepository(path, namespace(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHANNEL_ID, path), readonly=readonly)
+    return DeliveryRepository(path, namespace(config.TELEGRAM_BOT_TOKEN, _channel_id(config), path), readonly=readonly)
 
 
 def list_pending(config, state_dir, *, trade_id=None, day_from=None, day_to=None) -> int:
@@ -48,7 +54,7 @@ def retry(config, state_dir, *, operation_id=None, trade_id=None, day_from=None,
         return 2
     start, end = _period(day_from, day_to, config.BAR_TIME_TZ_OFFSET_HOURS)
     repo = _repo(config, state_dir)
-    transport = TelegramTransport(config.CLOUDFLARE_URL, config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHANNEL_ID, config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
+    transport = TelegramTransport(config.CLOUDFLARE_URL, config.TELEGRAM_BOT_TOKEN, _channel_id(config), config.NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
     try:
         rows = repo.pending(trade_id=trade_id, date_from=start, date_to=end, include_confirmed=True)
         if operation_id is not None:

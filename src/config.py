@@ -7,11 +7,15 @@ import pandas as pd
 
 from src.data.ingestion_settings import MarketDataSettings
 from src.config_loader import (
+    HISTORY_LOGGING_DEFAULTS,
+    HISTORY_SCHEDULE_DEFAULTS,
     ConfigError,
     app_dir,
     load_config,
     validate_triple_screen_hierarchy,
 )
+from src.clusters.settings import ClusterSettings
+from src.trade_management.intraday_settings import IntradaySettings
 from src.decision.filters.triple_screen import TripleScreenParams
 from src.strategies.contracts import DEFAULT_FILTER_PROFILE, Assignment
 from src.strategies.names import StrategyName
@@ -22,9 +26,14 @@ load_dotenv()  # загружает переменные из .env
 # Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
+# Ключ управления запуском через локальный API (схема ControlToken); отдельно от экспортного.
+ROBOT_CONTROL_TOKEN = os.getenv("ROBOT_CONTROL_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 CLOUDFLARE_URL = os.getenv("CLOUDFLARE_URL")
+# Пароль Redis — секрет, поэтому он остаётся только в окружении. Адрес и
+# поведение контура паттернов задаются в [market_structure] robot.toml.
+MARKET_STRUCTURE_REDIS_PASSWORD = os.getenv("MARKET_STRUCTURE_REDIS_PASSWORD")
 
 # Словарь таймфреймов (используется в загрузчике); всегда из кода
 TIMEFRAMES = {
@@ -70,6 +79,27 @@ _DEFAULTS = {
     "market_data_export_enabled": False,
     "market_data_export_host": "127.0.0.1",
     "market_data_export_port": 8101,
+    # Паттерны публикуются в Redis Stream только в live-режиме. Пароль Redis
+    # намеренно не хранится в robot.toml.
+    "market_structure_patterns_enabled": False,
+    "market_structure_redis_host": "127.0.0.1",
+    "market_structure_redis_port": 6379,
+    "market_structure_redis_db": 0,
+    "market_structure_queue_maxsize": 1024,
+    "market_structure_retention_days": 90,
+    # Контур эмуляции — отдельный процесс на ленте ядра (add-contour-process):
+    # как часто читать ленту и потребности контуров; канал Telegram контура —
+    # имя переменной окружения с id канала.
+    "contours_feed_poll_secs": 1,
+    # Пара без спроса контуров и обязательств снимается ядром через столько секунд.
+    "contours_demand_release_secs": 900,
+    # Пульс ядра для контуров и автоподъём контура при старте ядра (add-contour-recovery).
+    "contours_heartbeat_secs": 5,
+    "contours_heartbeat_timeout_secs": 30,
+    "contours_autostart": True,
+    # Одновременных прогонов истории, остальные ждут в очереди (add-history-contour).
+    "contours_max_history_runs": 2,
+    "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -102,11 +132,18 @@ _DEFAULTS = {
     # Горизонт блокировки входов и принудительного закрытия фьючерсов:
     # календарные сутки до момента экспирации контракта.
     "contract_expiry_block_days": 2,
+    "contract_expiry_close_before_end_min": 20,
     "historical_rollover": {"policy": "calendar", "families": {}},
+    # Лог исторического прогона (секция [historical.logging]).
+    "historical_logging": dict(HISTORY_LOGGING_DEFAULTS),
+    # Расписание исторического прогона (секция [historical.schedule]).
+    "historical_schedule": dict(HISTORY_SCHEDULE_DEFAULTS),
 }
 
 _CONFIG = load_config(_DEFAULTS)
 HISTORICAL_ROLLOVER = _CONFIG["historical_rollover"]
+HISTORICAL_LOGGING = _CONFIG["historical_logging"]
+HISTORICAL_SCHEDULE = _CONFIG["historical_schedule"]
 
 TIMEFRAME = _CONFIG["timeframe"]
 if TIMEFRAME not in TIMEFRAMES:
@@ -134,8 +171,26 @@ DATA_REFRESH_MIN_INTERVAL = _CONFIG["data_refresh_min_interval"]
 DATA_BACKFILL_WINDOW_SECONDS = _CONFIG["data_backfill_window_seconds"]
 MARKET_DATA_DATABASE_FILE = _CONFIG["market_data_database_file"]
 MARKET_DATA_EXPORT_ENABLED = _CONFIG["market_data_export_enabled"]
+CONTOURS_FEED_POLL_SECS = _CONFIG["contours_feed_poll_secs"]
+CONTOURS_DEMAND_RELEASE_SECS = _CONFIG["contours_demand_release_secs"]
+CONTOURS_HEARTBEAT_SECS = _CONFIG["contours_heartbeat_secs"]
+CONTOURS_HEARTBEAT_TIMEOUT_SECS = _CONFIG["contours_heartbeat_timeout_secs"]
+CONTOURS_AUTOSTART = _CONFIG["contours_autostart"]
+CONTOURS_MAX_HISTORY_RUNS = _CONFIG["contours_max_history_runs"]
+CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_channel_env"]
+
+
+def telegram_channel_id() -> str | None:
+    """Id канала Telegram контура эмуляции из переменной, названной в ``[contours.emulation]``."""
+    return os.getenv(CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV) or None
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
+MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]
+MARKET_STRUCTURE_REDIS_HOST = _CONFIG["market_structure_redis_host"]
+MARKET_STRUCTURE_REDIS_PORT = _CONFIG["market_structure_redis_port"]
+MARKET_STRUCTURE_REDIS_DB = _CONFIG["market_structure_redis_db"]
+MARKET_STRUCTURE_QUEUE_MAXSIZE = _CONFIG["market_structure_queue_maxsize"]
+MARKET_STRUCTURE_RETENTION_DAYS = _CONFIG["market_structure_retention_days"]
 # Эффективные параметры live-ingestion: транспорт, сроки публикации/recovery,
 # лимиты stream и бюджет запросов. Исторический режим их не использует.
 MARKET_DATA_SETTINGS = MarketDataSettings.from_flat(_CONFIG)
@@ -196,6 +251,7 @@ def _to_assignments(raw: dict[str, dict]) -> dict[str, list[Assignment]]:
                     filter_profile=item.get("filter", DEFAULT_FILTER_PROFILE),
                     priority=item.get("priority", 0),
                     timeframe=tf,
+                    clusters=item.get("clusters", "off"),
                 )
             )
         result[ticker] = assignments
@@ -226,6 +282,14 @@ _validate_global_assignment_ids(SHARE_STRATEGIES, FUTURE_STRATEGIES)
 # при отсутствии секции — дефолты (множитель 5, MACD 12/26/9, Stochastic 14/3/3, 20/80).
 TRIPLE_SCREEN_PARAMS: TripleScreenParams = TripleScreenParams.from_config(
     _CONFIG.get("triple_screen_params") or {}
+)
+
+# Кластерный фильтр входа: пороги из [clusters], режим — у каждой привязки.
+CLUSTER_SETTINGS: ClusterSettings = ClusterSettings.from_config(_CONFIG.get("clusters_params") or {})
+CLUSTERS_ENABLED: bool = any(
+    assignment.clusters != "off"
+    for items in (*SHARE_STRATEGIES.values(), *FUTURE_STRATEGIES.values())
+    for assignment in items
 )
 
 # Fail-fast на недопустимую иерархию ТФ: шаг множителя не должен выходить за лестницу TIMEFRAMES.
@@ -307,7 +371,10 @@ AUDIT_BACKUP_COUNT = _CONFIG.get("audit_backup_count", 5)
 RISK_LIMITS = dict(_CONFIG.get("risk_limits", {}))
 TRADE_MANAGEMENT_PROFILES = dict(_CONFIG.get("trade_management_profiles", {}))
 CONTRACT_EXPIRY_BLOCK_DAYS = _CONFIG["contract_expiry_block_days"]
+CONTRACT_EXPIRY_CLOSE_BEFORE_END_MIN = _CONFIG["contract_expiry_close_before_end_min"]
 TRADING_DIRECTIONS = dict(_CONFIG.get("directions", {}))
+# Сессионная защита внутридневных сделок ([trading.intraday]); без секции — дефолты.
+INTRADAY_SETTINGS = IntradaySettings.from_config(_CONFIG.get("intraday", {}))
 
 
 def trading_enabled() -> bool:

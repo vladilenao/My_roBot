@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import run
+from src.assembly import contour
 from src.scheduler.clock import HistoricalClock
 
 
@@ -13,9 +13,9 @@ def clock():
 
 
 def test_history_without_trading_section_has_initial_account_and_positive_costs(tmp_path, monkeypatch):
-    monkeypatch.setattr(run, "trading_enabled", lambda: False)
-    monkeypatch.setattr(run, "RISK_LIMITS", {})
-    runtime = run._build_runtime([], MagicMock(), MagicMock(), tmp_path, clock=clock())
+    monkeypatch.setattr(contour, "trading_enabled", lambda: False)
+    monkeypatch.setattr(contour, "RISK_LIMITS", {})
+    runtime = contour._build_runtime([], MagicMock(), MagicMock(), tmp_path, clock=clock())
     try:
         assert runtime.trade_manager is not None
         assert runtime.trade_manager._commission == Decimal("1.5")
@@ -26,17 +26,17 @@ def test_history_without_trading_section_has_initial_account_and_positive_costs(
 
 
 def test_history_initialization_error_cannot_fall_back_to_notify_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(run, "trading_enabled", lambda: False)
+    monkeypatch.setattr(contour, "trading_enabled", lambda: False)
 
     def fail(*args, **kwargs):
         raise OSError("journal unavailable")
 
     monkeypatch.setattr("src.trade_journal.storage.Storage", fail)
     with pytest.raises(RuntimeError, match="исторический симулятор/журнал"):
-        run._build_runtime([], MagicMock(), MagicMock(), tmp_path, clock=clock())
+        contour._build_runtime([], MagicMock(), MagicMock(), tmp_path, clock=clock())
 
 
 def test_live_without_trading_section_stays_notify_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(run, "trading_enabled", lambda: False)
-    runtime = run._build_runtime([], MagicMock(), MagicMock(), tmp_path)
+    monkeypatch.setattr(contour, "trading_enabled", lambda: False)
+    runtime = contour._build_runtime([], MagicMock(), MagicMock(), tmp_path)
     assert runtime.trade_manager is None and runtime.storage is None

@@ -18,8 +18,15 @@ SPEC = Path(__file__).resolve().parents[3] / "openspec/specs/notification/spec.m
 
 
 def _golden(scenario: str) -> str:
-    """Буквальный блок ```text из сценария основной спеки notification."""
-    section = SPEC.read_text().split(f"#### Scenario: {scenario}\n", 1)[1]
+    """Буквальный блок ```text из сценария спеки notification.
+
+    Основная спека — источник после архивации; до неё сценарий читается из
+    дельты активного изменения.
+    """
+    marker = f"#### Scenario: {scenario}\n"
+    sources = (SPEC, *sorted(SPEC.parents[2].glob("changes/*/specs/notification/spec.md")))
+    text = next(source.read_text() for source in sources if marker in source.read_text())
+    section = text.split(marker, 1)[1]
     return section.split("```text\n", 1)[1].split("\n```", 1)[0] + "\n"
 
 
@@ -31,7 +38,7 @@ def test_full_trading_sequence_matches_approved_text(monkeypatch) -> None:
     monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
     clock = [_at(11, 5)]
     stream = io.StringIO()
-    channel = ConsoleChannel(stream=stream, now=lambda: clock[0], tz_offset_hours=3)
+    channel = ConsoleChannel(stream=stream, now=lambda: clock[0])
 
     def send(event: Event) -> None:
         channel.handle(event)
@@ -93,7 +100,7 @@ def test_full_trading_sequence_matches_approved_text(monkeypatch) -> None:
 def test_grouped_data_sequence_matches_approved_text(monkeypatch) -> None:
     monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((120, 24)))
     stream = io.StringIO()
-    channel = ConsoleChannel(stream=stream, tz_offset_hours=3)
+    channel = ConsoleChannel(stream=stream)
     channel.handle(Event.tick_started(tick_id="data"))
     observed = datetime(2026, 10, 13, 13, 15)
     for name, tf, count in (("PHOR", "1h", 42), ("SBER", "15m", 37), ("VTBR", "15m", 51)):
@@ -121,3 +128,46 @@ def test_startup_overview_is_always_silent_and_color_is_text_neutral() -> None:
     plain = render(decision, now=_at(12, 0), color=False)
     assert "\x1b[35m" in colored
     assert re.sub(r"\x1b\[[0-9;]*m", "", colored) == plain
+
+
+def _stop_moved(name, at, old, new, *, reason, remaining, pnl):
+    return Event.broker_event(EventType.STOP_MOVED, trade_id="t", instrument=name, bar_time=at,
+        status="ack", reason=reason, previous_stop=old, stop=new, quantity_remaining=remaining,
+        pnl_at_stop=pnl, pnl_units="RUB")
+
+
+def _console(monkeypatch, width: int) -> tuple[ConsoleChannel, io.StringIO]:
+    monkeypatch.setattr("src.notifier.console.shutil.get_terminal_size", lambda **_: os.terminal_size((width, 24)))
+    stream = io.StringIO()
+    return ConsoleChannel(stream=stream, now=lambda: datetime(2026, 10, 15, 11, 5, tzinfo=timezone.utc)), stream
+
+
+def _at15(hour: int, minute: int) -> datetime:
+    return datetime(2026, 10, 15, hour, minute, tzinfo=timezone.utc)
+
+
+def test_stop_move_sequence_matches_approved_text(monkeypatch) -> None:
+    channel, stream = _console(monkeypatch, 96)
+    channel.handle(Event.broker_event(EventType.TRADE_OPENED, trade_id="t", instrument="ED-12.26", side="BUY",
+        bar_time=_at15(9, 1), quantity=4, price="1.1232", fee=6, fee_source="configured",
+        gross_pnl=0, net_pnl=-6, fees_total=6, fees_known=True))
+    channel.handle(_stop_moved("ED-12.26", _at15(10, 0), "1.1183", "1.1199",
+        reason="ma-cloud-protective-stop", remaining=4, pnl="-1108.13604"))
+    channel.handle(_stop_moved("ED-12.26", _at15(11, 0), "1.1199", "1.1205",
+        reason="ma-cloud-protective-stop", remaining=4, pnl="-906.65676"))
+    assert stream.getvalue() == _golden("Утверждённый эталон переноса стопа")
+
+
+def test_narrow_terminal_keeps_stop_prices_together(monkeypatch) -> None:
+    channel, stream = _console(monkeypatch, 60)
+    channel.handle(_stop_moved("ED-12.26", _at15(10, 0), "1.1183", "1.1199",
+        reason="ma-cloud-protective-stop", remaining=4, pnl="-1108.13604"))
+    assert stream.getvalue() == _golden("Узкий терминал не разрывает пару цен")
+    assert "\u00a0" not in stream.getvalue()
+
+
+def test_break_even_move_shows_locked_profit(monkeypatch) -> None:
+    channel, stream = _console(monkeypatch, 96)
+    channel.handle(_stop_moved("SBER", _at15(11, 30), "296.50", "300.15",
+        reason="cost-aware-break-even", remaining=3, pnl="4.5"))
+    assert stream.getvalue() == _golden("Безубыток фиксирует прибыль")

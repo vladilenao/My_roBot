@@ -52,19 +52,35 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # tbank-индекс недоступен с GitHub Actions: t-tech-investments ставится
+      # из подложенного wheel в vendor/wheels (см. vendor/wheels/README.md).
       - name: Install build dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip==24.3.1
-          python -m pip install --trusted-host opensource.tbank.ru -r requirements.txt -r requirements-dev.txt -r requirements-build.txt
+          python -m scripts.offline_requirements --output "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install --find-links vendor/wheels -r "$RUNNER_TEMP/requirements-ci.txt" -r requirements-dev.txt -r requirements-build.txt
 
       - name: Validate release metadata
         shell: bash
         run: python -m scripts.validate_release --tag "$RELEASE_TAG"
 
+      # Логи Actions без входа не видны, поэтому итог падения pytest
+      # дублируется в публичную аннотацию.
       - name: Run tests
         shell: bash
-        run: python -m pytest -q
+        run: |
+          set +e
+          python -m pytest -q -rfE --tb=short 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E '^(ERROR|FAILED|E  )|Error|error' "$RUNNER_TEMP/pytest.log" | head -40 | cut -c1-300)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=pytest (exit $status)::${summary}"
+          fi
+          exit "$status"
 
       - name: Run Ruff
         shell: bash

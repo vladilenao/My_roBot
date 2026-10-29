@@ -1,0 +1,199 @@
+{
+ "_comment": "Восстановленные дни эмулятора, ответ GET /api/v1/trading-schedules",
+ "days": [
+  {
+   "trading_date": "2025-04-17",
+   "exchange": "forts_futures_weekend",
+   "version": "49c372162a0eb4cc9f5057838cd5ebfb8d32aeddbd50e873f68963d67e2421d2",
+   "is_trading_day": true,
+   "source": "emulator-reconstructed",
+   "provenance": "reconstructed",
+   "rules_version": "forts_futures_weekend/2",
+   "day": {
+    "clearing_end_time": "1970-01-01T00:00:00.000000Z",
+    "clearing_start_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "date": "2025-04-17T00:00:00.000000Z",
+    "end_time": "2025-04-17T20:50:00.000000Z",
+    "evening_end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "evening_start_time": "1970-01-01T00:00:00.000000Z",
+    "intervals": [
+     {
+      "interval": {
+       "end_ts": "2025-04-17T05:59:59.000000Z",
+       "start_ts": "2025-04-17T05:50:00.000000Z"
+      },
+      "type": "opening_auction_morning"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-17T05:59:59.000000Z",
+       "start_ts": "2025-04-17T05:50:00.000000Z"
+      },
+      "type": "opening_auction"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-17T15:49:59.000000Z",
+       "start_ts": "2025-04-17T06:00:00.000000Z"
+      },
+      "type": "regular_trading_session_main"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-17T15:49:59.000000Z",
+       "start_ts": "2025-04-17T06:00:00.000000Z"
+      },
+      "type": "regular_trading_session"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-17T20:50:00.000000Z",
+       "start_ts": "2025-04-17T16:05:00.000000Z"
+      },
+      "type": "regular_trading_session_evening"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-17T20:50:00.000000Z",
+       "start_ts": "2025-04-17T16:05:00.000000Z"
+      },
+      "type": "regular_trading_session"
+     }
+    ],
+    "is_trading_day": true,
+    "opening_auction_end_time": "2025-04-17T05:59:59.000000Z",
+    "opening_auction_start_time": "2025-04-17T05:50:00.000000Z",
+    "premarket_end_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_start_time": "1970-01-01T00:00:00.000000Z",
+    "start_time": "2025-04-17T06:00:00.000000Z"
+   }
+  },
+  {
+   "trading_date": "2025-04-18",
+   "exchange": "forts_futures_weekend",
+   "version": "7bc333ed41f6aa287fd38a04bb75fb72b2b434f7feec583433ecdbd5b48aeae2",
+   "is_trading_day": true,
+   "source": "emulator-reconstructed",
+   "provenance": "reconstructed",
+   "rules_version": "forts_futures_weekend/2",
+   "day": {
+    "clearing_end_time": "1970-01-01T00:00:00.000000Z",
+    "clearing_start_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "date": "2025-04-18T00:00:00.000000Z",
+    "end_time": "2025-04-18T20:50:00.000000Z",
+    "evening_end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "evening_start_time": "1970-01-01T00:00:00.000000Z",
+    "intervals": [
+     {
+      "interval": {
+       "end_ts": "2025-04-18T05:59:59.000000Z",
+       "start_ts": "2025-04-18T05:50:00.000000Z"
+      },
+      "type": "opening_auction_morning"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-18T05:59:59.000000Z",
+       "start_ts": "2025-04-18T05:50:00.000000Z"
+      },
+      "type": "opening_auction"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-18T15:49:59.000000Z",
+       "start_ts": "2025-04-18T06:00:00.000000Z"
+      },
+      "type": "regular_trading_session_main"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-18T15:49:59.000000Z",
+       "start_ts": "2025-04-18T06:00:00.000000Z"
+      },
+      "type": "regular_trading_session"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-18T20:50:00.000000Z",
+       "start_ts": "2025-04-18T16:05:00.000000Z"
+      },
+      "type": "regular_trading_session_evening"
+     },
+     {
+      "interval": {
+       "end_ts": "2025-04-18T20:50:00.000000Z",
+       "start_ts": "2025-04-18T16:05:00.000000Z"
+      },
+      "type": "regular_trading_session"
+     }
+    ],
+    "is_trading_day": true,
+    "opening_auction_end_time": "2025-04-18T05:59:59.000000Z",
+    "opening_auction_start_time": "2025-04-18T05:50:00.000000Z",
+    "premarket_end_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_start_time": "1970-01-01T00:00:00.000000Z",
+    "start_time": "2025-04-18T06:00:00.000000Z"
+   }
+  },
+  {
+   "trading_date": "2025-04-19",
+   "exchange": "forts_futures_weekend",
+   "version": "4336f57f3db8efbd7a3c0d97945f44bcc3e3e74d1cb67e8a085c97a6b149e634",
+   "is_trading_day": false,
+   "source": "emulator-reconstructed",
+   "provenance": "reconstructed",
+   "rules_version": "forts_futures_weekend/2",
+   "day": {
+    "clearing_end_time": "1970-01-01T00:00:00.000000Z",
+    "clearing_start_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "date": "2025-04-19T00:00:00.000000Z",
+    "end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "evening_start_time": "1970-01-01T00:00:00.000000Z",
+    "intervals": [],
+    "is_trading_day": false,
+    "opening_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_end_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_start_time": "1970-01-01T00:00:00.000000Z",
+    "start_time": "1970-01-01T00:00:00.000000Z"
+   }
+  },
+  {
+   "trading_date": "2025-05-01",
+   "exchange": "forts_futures_weekend",
+   "version": "80cb4c84d505fd3bbbb2800f610840f90c8d7cab1f0cacc88d19f17d440f2362",
+   "is_trading_day": false,
+   "source": "emulator-reconstructed",
+   "provenance": "reconstructed",
+   "rules_version": "forts_futures_weekend/2",
+   "day": {
+    "clearing_end_time": "1970-01-01T00:00:00.000000Z",
+    "clearing_start_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "closing_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "date": "2025-05-01T00:00:00.000000Z",
+    "end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_end_time": "1970-01-01T00:00:00.000000Z",
+    "evening_opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "evening_start_time": "1970-01-01T00:00:00.000000Z",
+    "intervals": [],
+    "is_trading_day": false,
+    "opening_auction_end_time": "1970-01-01T00:00:00.000000Z",
+    "opening_auction_start_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_end_time": "1970-01-01T00:00:00.000000Z",
+    "premarket_start_time": "1970-01-01T00:00:00.000000Z",
+    "start_time": "1970-01-01T00:00:00.000000Z"
+   }
+  }
+ ]
+}
