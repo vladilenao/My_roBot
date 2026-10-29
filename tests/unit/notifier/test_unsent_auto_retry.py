@@ -180,7 +180,8 @@ def test_unsent_root_edit_is_resent_without_duplicate_post(server, tmp_path):
 
 
 def test_window_expiry_fails_operation_and_releases_trade(server, tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr("src.notifier.telegram_delivery.AUTO_RETRY_WINDOW", timedelta(seconds=0.2))
+    # Окно с запасом над задержкой 0,05 с: на медленном раннере CI досылка успевает до его конца.
+    monkeypatch.setattr("src.notifier.telegram_delivery.AUTO_RETRY_WINDOW", timedelta(seconds=1))
     path = tmp_path / "delivery.db"
     server.down = True
     instance = channel(path)
