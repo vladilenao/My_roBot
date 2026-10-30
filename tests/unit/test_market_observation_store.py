@@ -83,7 +83,7 @@ def test_oscillation_back_to_old_values_does_not_reuse_a_stale_fence(tmp_path):
     assert store.accept_observation(observation(100), reconcile_sequence=fence)["state"] == "conflict"
 
 
-def test_pinned_input_and_integrity_hold_survive_restart_and_reconciliation(tmp_path):
+def test_pinned_input_and_incident_survive_restart_and_reconciliation(tmp_path):
     path = tmp_path / "market.sqlite3"
     store = MarketDataStore(path)
     store.accept_observation(observation(100))
@@ -93,12 +93,13 @@ def test_pinned_input_and_integrity_hold_survive_restart_and_reconciliation(tmp_
     store.accept_observation(observation(101, transport="stream"))
     reopened = MarketDataStore(path)
     assert reopened.pinned_frame(reference)["close"] == 100
-    assert reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")["integrity_hold"]
-    # Повтор начатого пакета получает исходную revision, новый ключ — hold.
+    held = reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")
+    assert not held.get("integrity_hold") and held["incident"]["consumed_revision"] == reference["revision"]
+    # Повтор начатого пакета получает исходную revision.
     assert reopened.pin_input(open_time=OPEN, **IDENTITY, contour="emulation") == reference
     reopened.accept_observation(observation(101), reconcile_sequence=state(reopened)["observed_sequence"])
     assert reopened.pinned_frame(reference)["close"] == 100
-    assert reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")["integrity_hold"]
+    assert not reopened.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u").get("integrity_hold")
 
 
 def test_market_operational_state_preserves_producer_and_export_schema(tmp_path):
@@ -122,12 +123,11 @@ def test_inflight_pin_is_not_itself_financial_execution(tmp_path):
     store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")
     store.accept_observation(observation(101, transport="stream"))
     held = store.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")
-    assert not held.get("integrity_hold")
-    assert held["pending_input_conflicts"]
+    assert not held.get("integrity_hold") and not held.get("pending_input_conflicts")
+    assert held["incident"]["reason"] == "consumed_input_changed"
     store.mark_processed(open_time=OPEN, **IDENTITY, contour="emulation")
     held = store.live_state(kind="uid", source=IDENTITY["source"], instrument_uid="u")
-    assert held["integrity_hold"]
-    assert not held["pending_input_conflicts"]
+    assert not held.get("integrity_hold")
 
 
 def test_receipt_resolved_and_processed_are_independent(tmp_path):

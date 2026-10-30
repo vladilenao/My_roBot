@@ -142,19 +142,19 @@ def test_first_late_arrival_is_not_a_correction(tmp_path):
     assert cache.live_conflicts() == []
 
 
-def test_integrity_hold_of_executed_minute_survives_restart_and_reconnect(tmp_path):
+def test_correction_of_executed_minute_is_incident_and_execution_continues(tmp_path):
     cache, store, _ = live_cache(tmp_path)
     runtime, broker = runtime_for(cache, tmp_path)
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 100)), received_at=NOW)
     runtime.post_tick({"1m"})
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 90)), received_at=NOW)
-    assert cache.pair_status(ITEM, "1m")["state"] == "INTEGRITY_HOLD"
-    cache.set_live_handoff(UID, "1m", transport="stream", epoch=2, ready=True)  # reconnect
-    assert cache.pair_status(ITEM, "1m")["state"] == "INTEGRITY_HOLD"
+    status = cache.pair_status(ITEM, "1m")
+    assert status["state"] != "INTEGRITY_HOLD" and status["incident"]["reason"] == "consumed_input_changed"
     restarted, _, _ = live_cache(tmp_path)
-    status = restarted.pair_status(ITEM, "1m")
-    assert status["state"] == "INTEGRITY_HOLD" and status["incident"]["reason"] == "consumed_input_changed"
-    assert executed(broker) == [0]  # ни компенсирующего, ни повторного исполнения
+    assert restarted.pair_status(ITEM, "1m")["incident"]["open_time"] == "2026-10-12T12:00:00Z"
+    cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:01", 101)), received_at=NOW)
+    runtime.post_tick({"1m"})
+    assert executed(broker) == [0, 1]  # 12:00 не переигрывается, 12:01 исполняется
 
 
 def test_effective_availability_is_not_before_input_publication(tmp_path):
