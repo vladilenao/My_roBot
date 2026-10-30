@@ -11,7 +11,7 @@ from src.broker.port import ExecutionStatus
 from src.broker_contour.api import OrderFailure
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import CANCELLED, CANCELLING, OrderLedger, order_key
-from src.broker_contour.prices import PriceCard, entry_limit, exit_limit, points_from_rub, trade_lots
+from src.broker_contour.prices import PriceCard, entry_limit, exit_limit, fill_average, points_from_rub, trade_lots
 from src.events.types import EventType
 from src.trade_management.actions import CancelEntry, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
 from src.trade_management.models import (CURRENT_ALGORITHM, CostSnapshot, ProfileSnapshot, TargetPlan, TradePlan)
@@ -72,6 +72,37 @@ def test_rubles_to_points_and_rounding():
     share = PriceCard("uid-sber", D("0.01"), D("0.1"), lot=10, future=False)
     assert trade_lots(share, [20, 10], 3) == [2, 1]
     assert trade_lots(share, [2, 1], 3) == [2, 1]
+
+
+def test_fill_average_from_order_sum():
+    """Сумма ``executed_order_price`` за все лоты или цена лота — по ориентиру ``initial_order_price``."""
+    card = PriceCard(NG, D("0.001"), D("8.08664"))
+    one = D("23004.13")                                       # 2.845 × 8086.64 за контракт
+    assert fill_average(card, one, 1) == D("2.845")
+    assert fill_average(card, one * 3, 3, one * 3, 3) == D("2.845")       # сумма за 3 лота
+    assert fill_average(card, one, 3, one * 3, 3) == D("2.845")           # уже средняя цена лота
+    assert fill_average(card, one * 2, 2, one * 3, 3) == D("2.845")       # исполнено 2 из 3
+    share = PriceCard("uid-gazp", D("0.01"), D("0.1"), lot=10, future=False)
+    assert fill_average(share, D("2963.00"), 1) == D("296.30")
+
+
+def test_fill_without_trades_after_restart_uses_order_sum(tmp_path):
+    """Песочница: stages пусты, сделки стрима потеряны за простой — остаток по сумме заявки."""
+    from dataclasses import replace
+
+    h = Harness(tmp_path)
+    action, _ = h.open(lots=3)
+    key = order_key(action.command_id)
+    h.broker.ingest(h.api.fill(key, 1, "2.844"))       # одна сделка пришла до остановки
+    h.drain()
+    rub = D("8086.64")                                 # рублей за пункт
+    report = replace(h.api.orders[key], status="fill", lots_executed=3, trades=(),
+                     executed_rub=(D("2.844") + D("2.846") * 2) * rub, initial_rub=D("2.845") * 3 * rub)
+    h.api.orders[key] = report
+    h.broker.resync(h.clock())
+    events = h.drain()
+    assert [(e.filled_quantity, e.price) for e in events] == [(2, D("2.846"))]
+    assert h.broker.trade_state("trade-ng-1").position == 3
 
 
 def test_entry_accepted_then_partial_and_full_fill(tmp_path):

@@ -18,7 +18,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Mapping
 
 from src.broker.journal_broker import JournalBroker, stop_triggered
@@ -26,8 +26,8 @@ from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeSour
 from src.broker_contour.api import OrderFailure, OrderReport
 from src.broker_contour.orders import (ACCEPTED, CANCELLED, CANCELLING, FILLED, PARTIAL, REJECTED, SENDING, UNKNOWN,
                                        LedgerExecution, LedgerOrder, OrderLedger, order_key)
-from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, exit_limit, in_band, target_limit,
-                                       trade_lots, trade_price, with_margin)
+from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, exit_limit, fill_average, in_band,
+                                       target_limit, to_step, trade_lots, trade_price, with_margin)
 from src.events.event import Event
 from src.events.types import EventType
 from src.logging_setup import get_logger
@@ -494,11 +494,21 @@ class TInvestBroker(BrokerPort):
         self._apply_report(row, report, now)
         executed = sum(e.lots for e in self._ledger.executions(row.key))
         if report.terminal and report.lots_executed > executed and not report.trades and report.executed_rub:
-            # Брокер сообщил исполнение без сделок биржи и в stages: остаток проводится по средней заявки.
+            # Брокер сообщил исполнение без сделок биржи и в stages (в песочнице stages всегда пусты):
+            # остаток проводится по средней заявки за вычетом уже известных сделок.
             card = self._card_by_uid(row.instrument_uid)
+            known = self._ledger.executions(row.key)
+            average = fill_average(card, report.executed_rub, report.lots_executed, report.initial_rub,
+                                   report.lots_requested)
+            rest = report.lots_executed - executed
+            price = average
+            if known:
+                price = to_step((average * report.lots_executed - sum(e.price * e.lots for e in known)) / rest,
+                                card.price_step, ROUND_HALF_UP)
+                if price <= 0:
+                    price = average
             self._ledger.add_execution(LedgerExecution(
-                f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key,
-                report.lots_executed - executed, trade_price(card, report.executed_rub, card.future), now))
+                f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now))
             self._apply_report(self._ledger.get(row.key), replace(report, trades=()), now)
 
     # --- обслуживание: выходы, цели, итоги ------------------------------------

@@ -60,7 +60,8 @@ class OrderReport:
     lots_executed: int
     instrument_uid: str = ""
     trades: tuple[BrokerTrade, ...] = ()
-    executed_rub: Decimal | None = None   # средняя цена исполнения из суммы заявки (рубли у фьючерса)
+    executed_rub: Decimal | None = None   # сумма исполнения ``executed_order_price`` (рубли у фьючерса)
+    initial_rub: Decimal | None = None    # сумма заявки ``initial_order_price``: запрошенные лоты × цена лота
     temporary: bool = False               # первое событие стрима с временным номером заявки
     at: datetime | None = None
 
@@ -149,7 +150,7 @@ def report_from_state(state) -> OrderReport:
         lots_requested=int(state.lots_requested), lots_executed=int(state.lots_executed),
         instrument_uid=getattr(state, "instrument_uid", "") or "",
         trades=_trades(getattr(state, "stages", ())), executed_rub=_rub(getattr(state, "executed_order_price", None)),
-        at=_when(getattr(state, "order_date", None)))
+        initial_rub=_rub(getattr(state, "initial_order_price", None)), at=_when(getattr(state, "order_date", None)))
 
 
 def report_from_stream(state) -> OrderReport:
@@ -161,7 +162,7 @@ def report_from_stream(state) -> OrderReport:
         lots_requested=int(state.lots_requested), lots_executed=int(state.lots_executed),
         instrument_uid=getattr(state, "instrument_uid", "") or "", trades=_trades(state.trades),
         executed_rub=_rub(getattr(state, "executed_order_price", None)),
-        temporary=created is None or created < EPOCH, at=created)
+        initial_rub=_rub(getattr(state, "initial_order_price", None)), temporary=created is None or created < EPOCH, at=created)
 
 
 class TInvestApi:
