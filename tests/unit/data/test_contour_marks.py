@@ -92,13 +92,14 @@ def test_contour_marks_are_independent(tmp_path):
     assert store.cursors(**IDENTITY)["processed_through"] == "2026-10-12T12:00:00Z"
 
 
-def test_correction_of_minute_passed_by_contour_holds_uid_with_contour_id(tmp_path):
+def test_correction_of_minute_passed_by_contour_is_incident_with_contour_id(tmp_path):
     store = MarketDataStore(tmp_path / "market.sqlite3")
     store.accept_observation(observation(100))
     store.mark_processed(open_time=OPEN + pd.Timedelta(minutes=3), **IDENTITY, contour="emulation")
     store.accept_observation(observation(101, transport="stream"))
-    assert held(store)["integrity_hold"]
+    assert not held(store).get("integrity_hold")
     assert held(store)["incident"]["contour_id"] == "emulation"
+    assert held(store)["incident"]["reason"] == "legacy_input_unconfirmed"
 
 
 def test_correction_of_unconsumed_minute_is_published(tmp_path):
@@ -117,10 +118,16 @@ def test_started_pin_of_one_contour_is_consumed_only_by_that_contour(tmp_path):
     store.accept_observation(observation(100))
     store.pin_input(open_time=OPEN, **IDENTITY, contour="emulation")
     store.accept_observation(observation(101, transport="stream"))
+    assert held(store)["incident"]["contour_id"] == "emulation" and not held(store).get("integrity_hold")
+
+    def pin_state():
+        facts = store.live_state(kind="candle", open_time=OPEN, **IDENTITY)
+        return facts["input_references"]["emulation"]["state"]
+
     store.mark_processed(open_time=OPEN, **IDENTITY, contour="account")
-    assert not held(store).get("integrity_hold") and held(store)["pending_input_conflicts"]
+    assert pin_state() == "started"
     store.mark_processed(open_time=OPEN, **IDENTITY, contour="emulation")
-    assert held(store)["integrity_hold"] and held(store)["incident"]["contour_id"] == "emulation"
+    assert pin_state() == "consumed"
 
 
 def test_pair_readiness_is_current_state_not_a_change(tmp_path):
