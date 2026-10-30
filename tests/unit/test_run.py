@@ -747,3 +747,33 @@ class TestHistoryLogSettings:
         monkeypatch.setitem(run.HISTORICAL_LOGGING, "debug_to", None)
 
         assert run._log_settings(True, None)["debug_window"] is None
+
+
+def test_binding_resolver_picks_nearest_family_contract(monkeypatch):
+    """add-tinvest-orders: привязка NG без явного контракта получает ближайший контракт семейства."""
+    from contextlib import contextmanager
+
+    from src.api import instruments as api_instruments
+    from src.assembly import contracts as assembly_contracts
+    from src.instruments import selector
+    from src.portfolio import ContractMeta
+
+    now = datetime.now()
+    futures = [("NG (Природный газ) — NG-11.26", "NGX6", "future", "NG-11.26", now + timedelta(days=26)),
+               ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26", now + timedelta(days=56))]
+    monkeypatch.setattr(selector, "active_futures_with_expiry", lambda client, market_now=None: futures)
+    monkeypatch.setattr(api_instruments, "find_working_instrument_with_name",
+                        lambda client, ticker, kind, market_now=None: ("uid-" + ticker, None))
+    monkeypatch.setattr(assembly_contracts, "_load_contracts_metadata", lambda instruments, **_: {
+        "NGX6": ContractMeta("uid-NGX6", 0.001, 8.07, 6000, 6100, expiration_date=now + timedelta(days=26))})
+
+    @contextmanager
+    def client_context():
+        yield object()
+
+    core = SimpleNamespace(client_provider=SimpleNamespace(client_context=client_context), request_budget=None)
+    instrument, contracts = run._binding_resolver(core)({"id": "future-ng-macd", "instrument": "NG",
+                                                         "instrument_type": "future"})
+
+    assert instrument["ticker"] == "NGX6" and instrument["short_name"] == "NG-11.26"
+    assert contracts["NGX6"]["go_buy"] == 6000

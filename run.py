@@ -430,7 +430,7 @@ def _binding_resolver(core):
 
     def resolve(card: dict):
         from src.assembly.contracts import _load_contracts_metadata, contracts_payload, instrument_payload
-        from src.bot.launch import resolve_emulation
+        from src.bot.launch import ALL, resolve_emulation
         from src.instruments import normalize_instrument
         from src.instruments.model import instrument_key
 
@@ -440,7 +440,8 @@ def _binding_resolver(core):
         with provider.client_context() as raw_client:
             budget = core.request_budget
             client = raw_client if budget is None else budget.wrap_client(raw_client, lane="interactive")
-            resolution = resolve_emulation([], client, share_strategies=assignments if share else {},
+            # «Все с привязками» из одной привязки: у фьючерса — ближайший контракт её семейства.
+            resolution = resolve_emulation([ALL], client, share_strategies=assignments if share else {},
                                            future_strategies={} if share else assignments,
                                            block_days=CONTRACT_EXPIRY_BLOCK_DAYS)
         if not resolution.instruments:
