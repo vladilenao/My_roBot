@@ -537,6 +537,12 @@ class MarketDataCache:
                         )
                 if result["state"] == "conflict":
                     self._live_conflicts.add((*pair, stamp))
+                    incident = result.get("incident")
+                    if incident:
+                        log.warning("Источник исправил исполненную минуту %s %s %s (контур %s, версия %s → %s); "
+                                    "исполнение не переигрывается и продолжается",
+                                    item.uid, item.timeframe, incident["open_time"], incident["contour_id"],
+                                    incident["consumed_revision"], incident["candidate_revision"])
                 elif result["state"] == "accepted" and sequence is not None:
                     self._live_conflicts.discard((*pair, stamp))
                 if result["changed"] or result["state"] == "conflict" or (sequence is not None and result["state"] == "accepted"):

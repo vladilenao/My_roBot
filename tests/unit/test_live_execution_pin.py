@@ -83,15 +83,13 @@ def test_restart_after_financial_commit_does_not_replay_minute(tmp_path):
     assert store.cursors(source=SOURCE, instrument_uid=UID, interval="1m")["processed_through"].endswith("12:01:00Z")
 
 
-def test_correction_during_started_package_becomes_integrity_hold(tmp_path):
+def test_correction_during_started_package_does_not_freeze_uid(tmp_path):
     cache, store, broker, runtime, instrument = setup(tmp_path)
     reference, pinned = cache.pin_execution_input(instrument, pd.Timestamp("2026-10-12 12:00"))
     cache.accept_rpc_frame(UID, "1m", minutes(("2026-10-12 12:00", 99)), received_at=NOW)
     assert pinned["close"] == 100 and store.pinned_frame(reference)["close"] == 100
     runtime.post_tick({"1m"})
-    # Начатая минута завершается на закреплённой версии, затем hold UID.
+    # Начатая минута завершается на закреплённой версии, следующая идёт дальше.
     assert executed(broker)[0][1][3] == 100.0
-    assert cache.pair_status(instrument, "1m")["state"] == "INTEGRITY_HOLD"
-    assert [stamp.minute for stamp, _ in executed(broker)] == [0]
-    runtime.post_tick({"1m"})
-    assert [stamp.minute for stamp, _ in executed(broker)] == [0]
+    assert cache.pair_status(instrument, "1m")["state"] != "INTEGRITY_HOLD"
+    assert [stamp.minute for stamp, _ in executed(broker)] == [0, 1]
