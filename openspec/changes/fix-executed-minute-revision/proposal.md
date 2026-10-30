@@ -27,7 +27,7 @@
 
 ## Impact
 
-- `src/data/market_store.py`: `_accept_in` (инцидент вместо удержания), `mark_processed` (прежний `pending_input_conflicts` → инцидент), `pin_input` (без отказа по удержанию UID), миграция при открытии базы.
+- `src/data/market_store.py`: `_accept_in` (инцидент вместо удержания), `mark_processed` (ветка `pending_input_conflicts` удалена: новых ожиданий нет, прежние снимает миграция), `pin_input` (без отказа по удержанию UID), миграция при открытии базы.
 - `src/data/cache.py`: предупреждение ядра об инциденте.
 - Состояние готовности `INTEGRITY_HOLD`, вид удержания `integrity` в уведомлениях и схема событий остаются: новых удержаний этого вида не возникает, после миграции их нет. Удаление мёртвого состояния — отдельная уборка, не часть багфикса.
 - Тесты: `tests/unit/data/test_executed_minute_revision.py`; правка ожиданий в `tests/unit/test_live_execution_pin.py`, `tests/unit/data/test_contour_marks.py` и других тестах, проверявших удержание.
