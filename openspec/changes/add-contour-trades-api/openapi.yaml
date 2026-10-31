@@ -1869,10 +1869,48 @@ components:
                 stop_pending: null
                 targets: [{price: '2.930', lots: 2, filled: 0}]
                 opened_at: '2026-10-31T12:27:00Z'
+                entries: [{at: '2026-10-31T12:27:00Z', lots: 2, price: '2.874'}]
+                exits: []
                 phase: open
-                realized: '0'
                 fees: '4.10'
+                realized: '-4.10'
                 unrealized: '276.00'
+              - id: t_a71c09e3b55d2f80
+                binding: {id: future-si-levels, strategy: levels, timeframe: 1h}
+                instrument: Si-12.26
+                side: short
+                lots: 1
+                entry_price: '82640'
+                last_price: '82455'
+                last_price_at: '2026-10-31T14:41:00Z'
+                stop: '82900'
+                stop_pending: null
+                targets: [{price: '82100', lots: 1, filled: 0}]
+                opened_at: '2026-10-31T13:57:00Z'
+                entries: [{at: '2026-10-31T13:57:00Z', lots: 1, price: '82640'}]
+                exits: []
+                phase: open
+                fees: '2.00'
+                realized: '-2.00'
+                unrealized: '185.00'
+              - id: t_0d4e6b2a9f13c785
+                binding: {id: future-br-macd, strategy: macd_rsi_stoch, timeframe: 4h}
+                instrument: BR-12.26
+                side: long
+                lots: 3
+                entry_price: '64.38'
+                last_price: '64.12'
+                last_price_at: '2026-10-31T14:41:00Z'
+                stop: '63.80'
+                stop_pending: '64.00'
+                targets: [{price: '65.40', lots: 3, filled: 0}]
+                opened_at: '2026-10-30T11:30:00Z'
+                entries: [{at: '2026-10-30T11:30:00Z', lots: 3, price: '64.38'}]
+                exits: []
+                phase: open
+                fees: '6.20'
+                realized: '-6.20'
+                unrealized: '-632.40'
             unrealized: '-171.40'
             unrealized_complete: true
             _links: {self: {href: /api/v1/emulation/positions}}
@@ -1899,15 +1937,34 @@ components:
                 exit_price: '2.884'
                 opened_at: '2026-10-31T11:05:00Z'
                 closed_at: '2026-10-31T12:20:00Z'
-                exit: {code: 'tp:1', label: цель по цене, scenario: цель по цене}
-                exits: [{at: '2026-10-31T12:20:00Z', lots: 2, price: '2.884', code: 'tp:1', label: цель по цене}]
+                entries: [{at: '2026-10-31T11:05:00Z', lots: 2, price: '2.861'}]
+                exits: [{at: '2026-10-31T12:20:00Z', lots: 2, price: '2.884', kind: target, code: 'tp:tp-1', label: TP1}]
+                exit: {kind: target, code: 'tp:tp-1', label: TP1, scenario: TP1}
                 gross: '381.00'
                 fees: '8.00'
                 net: '373.00'
                 result_r: '1.45'
+              - id: t_5c2f81d07e9ab346
+                binding: {id: future-si-levels, strategy: levels, timeframe: 1h}
+                instrument: Si-12.26
+                side: long
+                lots: 2
+                entry_price: '82400'
+                exit_price: '82382'
+                opened_at: '2026-10-31T06:15:00Z'
+                closed_at: '2026-10-31T07:40:00Z'
+                entries: [{at: '2026-10-31T06:15:00Z', lots: 2, price: '82400'}]
+                exits:
+                  - {at: '2026-10-31T06:55:00Z', lots: 1, price: '82422', kind: partial, code: ma10-or-cloud-partial-exit, label: частичный выход по MA10/облаку}
+                  - {at: '2026-10-31T07:40:00Z', lots: 1, price: '82342', kind: stop, code: protective, label: стоп}
+                exit: {kind: stop, code: protective, label: стоп, scenario: частичный выход по MA10/облаку (часть) + стоп (остаток)}
+                gross: '-36.00'
+                fees: '4.00'
+                net: '-40.00'
+                result_r: '-0.31'
             _links:
-              self: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z'}
-              earlier: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&to=2026-10-31T12:20:00Z&limit=1'}
+              self: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&limit=2'}
+              earlier: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&to=2026-10-31T07:40:00Z&limit=2'}
     Performance:
       description: Итоги периода и кривая.
       content:
@@ -1921,15 +1978,19 @@ components:
             average_net: '147.67'
             profit_factor: '9.05'
             max_drawdown: {amount: '-110.00', at: '2026-10-31T07:40:00Z'}
-            open: {count: 3, realized: '0', unrealized: '-171.40', unrealized_complete: true}
+            open: {count: 3, realized: '-12.30', unrealized: '-171.40', unrealized_complete: true}
             curve:
               - {at: '2026-10-30T16:00:00Z', net: '0'}
+              - {at: '2026-10-31T06:10:00Z', net: '-70.00'}
               - {at: '2026-10-31T07:40:00Z', net: '-110.00'}
-              - {at: '2026-10-31T12:20:00Z', net: '886.00'}
-            curve_now: {at: '2026-10-31T14:42:00Z', net: '714.60'}
+              - {at: '2026-10-31T08:10:00Z', net: '-5.00'}
+              - {at: '2026-10-31T10:00:00Z', net: '416.00'}
+              - {at: '2026-10-31T12:20:00Z', net: '789.00'}
+              - {at: '2026-10-31T13:05:00Z', net: '886.00'}
+            curve_now: {at: '2026-10-31T14:42:00Z', net: '702.30'}
             _links:
               self: {href: '/api/v1/emulation/performance?period=day'}
-              trades: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&to=2026-10-31T14:42:00Z'}
+              trades: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z'}
     BadRequest:
       description: Неверное тело или параметр (`INVALID_REQUEST`).
       content:
@@ -2492,6 +2553,9 @@ components:
         Контур «Песочница» на общих частях торгового контура. Отличия от
         эмуляции: участник состава — привязка, текущее состояние говорит о
         счёте брокера.
+
+        `_links` (2.4.0) содержит `positions`, `trades` и `performance` —
+        позиции, сделки и итоги по журналу контура при любом состоянии.
       properties:
         state: {$ref: '#/components/schemas/TradingState'}
         target:
@@ -2663,7 +2727,12 @@ components:
     Emulation:
       allOf:
         - {$ref: '#/components/schemas/TradingContour'}
-      description: Контур эмуляции. Своих полей сверх общей схемы пока нет.
+      description: |
+        Контур эмуляции. Своих полей сверх общей схемы пока нет.
+
+        `_links` (2.4.0) содержит `positions`, `trades`, `performance` и
+        `account` — позиции, сделки, итоги и виртуальный счёт по журналу
+        контура при любом состоянии.
     StartRequest:
       type: object
       additionalProperties: false
@@ -2971,10 +3040,32 @@ components:
     # ------------------------------------------------------ торговля контура
     Money:
       allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
-      description: Сумма в рублях (`currency` ответа), десятичная строка.
+      description: |
+        Сумма в рублях (`currency` ответа), десятичная строка. Комиссии —
+        положительный расход; результаты и точки кривой — со знаком (убыток
+        отрицательный); просадка — не больше нуля.
     TradeSide:
       type: string
       enum: [long, short]
+    ExitKind:
+      type: string
+      enum: [target, stop, partial, signal, session_end, expiry, contour, other]
+      description: |
+        Вид выхода для короткой метки UI: `target` — цель (`TARGET`), `stop` —
+        стоп (`STOP`), `partial` — частичный выход по правилу (`REDUCE`);
+        у закрытия (`CLOSE`) по коду причины: `signal` — встречный сигнал или
+        правило выхода, `session_end` — конец торговой сессии, `expiry` —
+        экспирация или переход, `contour` — остановка контура или снятие из
+        состава; `other` — любой другой код, в том числе новый.
+    TradeFill:
+      type: object
+      additionalProperties: false
+      required: [at, lots, price]
+      description: Исполнение входа (в том числе добор).
+      properties:
+        at: {type: string, format: date-time}
+        lots: {type: integer, minimum: 1}
+        price: {$ref: '#/components/schemas/DecimalPrice'}
     TradeBinding:
       type: object
       additionalProperties: false
@@ -2995,7 +3086,7 @@ components:
     OpenPosition:
       type: object
       additionalProperties: false
-      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, phase, realized, fees, unrealized]
+      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, entries, exits, phase, realized, fees, unrealized]
       properties:
         id: {type: string, description: 'Непрозрачный идентификатор сделки: `t_` + 16 знаков SHA-256 от `trade_id` журнала.'}
         binding: {$ref: '#/components/schemas/TradeBinding'}
@@ -3019,9 +3110,21 @@ components:
           type: array
           items: {$ref: '#/components/schemas/TradeTarget'}
         opened_at: {type: string, format: date-time}
+        entries:
+          type: array
+          description: Исполнения входа по времени, включая доборы.
+          items: {$ref: '#/components/schemas/TradeFill'}
+        exits:
+          type: array
+          description: Частичные выходы по времени; пусто, если их не было.
+          items: {$ref: '#/components/schemas/TradeExit'}
         phase: {type: string, enum: [open, building, reducing]}
-        realized: {$ref: '#/components/schemas/Money'}
-        fees: {$ref: '#/components/schemas/Money'}
+        realized:
+          allOf: [{$ref: '#/components/schemas/Money'}]
+          description: 'Результат частичных выходов минус все комиссии сделки на сейчас, включая комиссию входа (`net_realized_pnl` журнала).'
+        fees:
+          allOf: [{$ref: '#/components/schemas/Money'}]
+          description: Все комиссии сделки на сейчас, включая комиссию входа.
         unrealized:
           allOf: [{$ref: '#/components/schemas/Money'}]
           nullable: true
@@ -3041,17 +3144,19 @@ components:
     TradeExit:
       type: object
       additionalProperties: false
-      required: [at, lots, price, code, label]
+      required: [at, lots, price, kind, code, label]
+      description: Исполнение выхода.
       properties:
         at: {type: string, format: date-time}
         lots: {type: integer, minimum: 1}
         price: {$ref: '#/components/schemas/DecimalPrice'}
+        kind: {$ref: '#/components/schemas/ExitKind'}
         code: {type: string, description: 'Код причины журнала: `STOP`, `CLOSE`, `REDUCE`, `tp:<n>`, `intraday-session-end`, …'}
         label: {type: string, description: 'Подпись причины, как в CSV-проекциях журнала.'}
     ClosedTrade:
       type: object
       additionalProperties: false
-      required: [id, binding, instrument, side, lots, entry_price, exit_price, opened_at, closed_at, exit, exits, gross, fees, net, result_r]
+      required: [id, binding, instrument, side, lots, entry_price, exit_price, opened_at, closed_at, entries, exits, exit, gross, fees, net, result_r]
       properties:
         id: {type: string}
         binding: {$ref: '#/components/schemas/TradeBinding'}
@@ -3062,11 +3167,17 @@ components:
         exit_price: {$ref: '#/components/schemas/DecimalPrice'}
         opened_at: {type: string, format: date-time}
         closed_at: {type: string, format: date-time}
+        entries:
+          type: array
+          description: Исполнения входа по времени, включая доборы — для меток на графике.
+          items: {$ref: '#/components/schemas/TradeFill'}
         exit:
           type: object
           additionalProperties: false
-          required: [code, label, scenario]
+          required: [kind, code, label, scenario]
+          description: Последний выход сделки.
           properties:
+            kind: {$ref: '#/components/schemas/ExitKind'}
             code: {type: string}
             label: {type: string}
             scenario: {type: string, description: 'Цепочка выходов: «частичный выход (часть) + стоп (остаток)».'}
@@ -3110,7 +3221,7 @@ components:
           additionalProperties: false
           required: [name, from, to]
           properties:
-            name: {type: string, enum: [day, week, month, all, custom]}
+            name: {type: string, enum: [day, week, month, all, custom], description: '`custom` — при явных `from` и `to`.'}
             from: {type: string, format: date-time, nullable: true}
             to: {type: string, format: date-time}
         realized:
@@ -3146,7 +3257,9 @@ components:
           required: [count, realized, unrealized, unrealized_complete]
           properties:
             count: {type: integer, minimum: 0}
-            realized: {$ref: '#/components/schemas/Money'}
+            realized:
+              allOf: [{$ref: '#/components/schemas/Money'}]
+              description: Сумма `realized` открытых позиций — частичные выходы минус все комиссии.
             unrealized: {$ref: '#/components/schemas/Money'}
             unrealized_complete: {type: boolean}
         curve:
@@ -3154,8 +3267,12 @@ components:
           maxItems: 500
           description: Накопленный нетто закрытых сделок; первая точка — ноль на начале периода. Больше 500 точек — прореживание с сохранением экстремумов.
           items: {$ref: '#/components/schemas/CurvePoint'}
-        curve_now: {$ref: '#/components/schemas/CurvePoint'}
-        _links: {$ref: '#/components/schemas/Links'}
+        curve_now:
+          allOf: [{$ref: '#/components/schemas/CurvePoint'}]
+          description: Сейчас; `net` = последняя точка `curve` + `open.realized` + `open.unrealized`.
+        _links:
+          allOf: [{$ref: '#/components/schemas/Links'}]
+          description: '`trades` — сделки периода; у `day`, `week`, `month`, `all` без `to`, у `custom` — с `from` и `to`.'
     VirtualAccount:
       type: object
       additionalProperties: false
