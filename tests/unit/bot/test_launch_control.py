@@ -321,7 +321,7 @@ class TestHome:
         assert payload["emulation"] == {"state": "waiting_command", "instruments": 0, "open_positions": None}
         assert payload["history"] == {"max": 0, "running": 0, "queued": 0} and payload["live"] is None
         assert payload["sandbox"] is None
-        assert set(payload["_links"]) == {"self", "core", "emulation", "history", "docs"}
+        assert set(payload["_links"]) == {"self", "core", "emulation", "history", "candles", "docs"}
 
     def test_export_key_sees_export_only(self, server):
         srv, _ = server
@@ -362,7 +362,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.2.0"
+        assert SPEC["info"]["version"] == "2.3.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -372,7 +372,8 @@ class TestContract:
     def test_every_operation_has_a_handler(self, history_server):
         """Ни одной операции контракта, на которую сервер ответил бы «Эндпоинт не найден»."""
         srv, _, _ = history_server
-        samples = {"{name}": "NG-12.26", "{run_id}": "20261024-101500", "{consumer_id}": "emulator"}
+        samples = {"{name}": "NG-12.26", "{run_id}": "20261024-101500", "{consumer_id}": "emulator",
+                   "{instrument}": "NG-12.26", "{timeframe}": "15m"}
         for path, item in SPEC["paths"].items():
             for method in ("get", "put", "post"):
                 if method not in item or path in ("/openapi.yaml", "/docs"):
@@ -393,11 +394,33 @@ class TestContract:
                     text = exc.read().decode("utf-8")
                 assert "Эндпоинт не найден" not in text, (method, path)
 
-    def test_openapi_route_serves_2_1_0(self, server):
+    def test_openapi_route_serves_2_3_0(self, server):
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.2.0" in response.read().decode("utf-8")
+            assert "version: 2.3.0" in response.read().decode("utf-8")
+
+    def test_schemas_use_only_openapi_keywords(self):
+        """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""
+        keywords = {"type", "format", "description", "nullable", "enum", "items", "properties", "required",
+                    "additionalProperties", "allOf", "oneOf", "anyOf", "$ref", "example", "pattern", "minimum",
+                    "maximum", "minLength", "maxLength", "minItems", "maxItems", "default", "discriminator",
+                    "title", "readOnly"}
+
+        def walk(schema, where):
+            if not isinstance(schema, dict):
+                return
+            assert set(schema) <= keywords, (where, set(schema) - keywords)
+            for name, child in (schema.get("properties") or {}).items():
+                walk(child, f"{where}.{name}")
+            for key in ("items", "additionalProperties"):
+                walk(schema.get(key), f"{where}[{key}]")
+            for key in ("allOf", "oneOf", "anyOf"):
+                for index, child in enumerate(schema.get(key) or []):
+                    walk(child, f"{where}.{key}[{index}]")
+
+        for name, schema in SPEC["components"]["schemas"].items():
+            walk(schema, name)
 
 
 # ── Остановка, повторный запуск, журнал, состав ──

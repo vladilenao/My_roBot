@@ -117,10 +117,23 @@ class LiveAnalysis:
         if not callable(ready):
             return None
         last_minute = pd.Timestamp(close) - pd.Timedelta(minutes=1)
-        if ready(instrument, last_minute):
+        if ready(instrument, last_minute) and self._executed(instrument, last_minute):
             return None
         # Граница — закрытие бара, как у bar_time; фразу соберёт шаблон канала.
         return {"kind": "execution_barrier", "through": _utc_moment(close)}
+
+    def _executed(self, instrument, last_minute):
+        """По контракту с обязательствами допуск требует исполненную минуту, а не полученную.
+
+        Минуту и бар приносит фоновый фид и во время тика, уже после прохода
+        исполнения; без этой проверки сигнал прошёл бы анализ и получил
+        окончательный отказ допуска (fix-signal-awaits-execution).
+        """
+        obligations = getattr(self.bot._trade_manager, "contract_has_obligations", None)
+        processed = getattr(self.cache, "execution_processed", None)
+        if not callable(obligations) or not callable(processed) or obligations(instrument_key(instrument)) is not True:
+            return True
+        return processed(instrument, last_minute)
 
     def _ingestion(self, instrument, tf):
         """Технический срез owner для market_data_status (design 11, задача 8.3)."""

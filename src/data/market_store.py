@@ -341,6 +341,7 @@ class MarketDataStore:
                     """
                 )
             self._migrate_contour_marks(conn)
+            self._release_integrity_holds(conn)
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
@@ -388,6 +389,39 @@ class MarketDataStore:
                     facts.setdefault("input_references", {})[LEGACY_CONTOUR] = reference
                     self._write_live(conn, key, facts)
             conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('contour_marks','1')")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _release_integrity_holds(self, conn: sqlite3.Connection) -> None:
+        """Удержания UID прежней версии становятся инцидентом (fix-executed-minute-revision).
+
+        Прежняя версия навсегда останавливала UID после правки исполненной
+        минуты (``integrity_hold``) или начатого пакета (``pending_input_conflicts``).
+        Контур продолжает от своих курсоров; исполненное не переигрывается.
+        """
+        released = _utc_text()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Ядро и контур открывают базу одновременно: чтение под той же блокировкой.
+            rows = conn.execute("""SELECT key,value FROM metadata WHERE key LIKE 'live:uid:%'
+                AND (value LIKE '%"integrity_hold"%' OR value LIKE '%"pending_input_conflicts"%')""").fetchall()
+            for key, value in rows:
+                held = json.loads(value)
+                held.pop("integrity_hold", None)
+                pending = held.pop("pending_input_conflicts", None) or {}
+                incident = held.get("incident")
+                if pending:
+                    stamp, conflict = max(pending.items())
+                    if incident is None or incident.get("open_time", "") < stamp:
+                        incident = {"open_time": stamp, "consumed_revision": conflict.get("revision"),
+                                    "candidate_revision": conflict.get("candidate_revision"),
+                                    "reason": "consumed_input_changed", "contour_id": conflict.get("contour_id"),
+                                    "received_at": None}
+                if incident is not None:
+                    held["incident"] = {**incident, "released_at": released}
+                self._write_live(conn, key, held)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -564,26 +598,25 @@ class MarketDataStore:
                     AND interval=? AND processed_through>=? ORDER BY contour_id LIMIT 1""",
                     (source, uid, interval, stamp)).fetchone()
                 consumer = None if passed is None else passed[0]
-            started = next(((contour, ref) for contour, ref in sorted(pins.items())
-                            if ref.get("state") == "started"), None)
+            if consumer is None:
+                consumer, pin = next(((contour, ref) for contour, ref in sorted(pins.items())
+                                      if ref.get("state") == "started"), (None, None))
+            incident = None
             if interval == "1m" and consumer is not None:
+                # Правка исполненной или закреплённой минуты — инцидент UID, не
+                # удержание: минута не переигрывается, следующие исполняются
+                # (fix-executed-minute-revision).
                 held = self._read_live(conn, uid_key)
-                held.update(integrity_hold=True, incident={"open_time": stamp, "candidate_revision": revision,
-                    "consumed_revision": None if pin is None else pin["revision"],
-                    "reason": "consumed_input_changed" if pin else "legacy_input_unconfirmed",
-                    "contour_id": consumer, "received_at": candle["received_at"]})
-                self._write_live(conn, uid_key, held)
-            elif interval == "1m" and started is not None:
-                # Начатый пакет ещё не подтверждён финансовым owner.
-                # Замораживаем зависимые новые действия, но не выдаём
-                # сам факт pin за уже исполненную минуту.
-                held = self._read_live(conn, uid_key)
-                pending = held.setdefault("pending_input_conflicts", {})
-                pending[stamp] = {"revision": started[1]["revision"], "candidate_revision": revision,
-                                  "contour_id": started[0]}
-                self._write_live(conn, uid_key, held)
+                previous = held.get("incident") or {}
+                if (previous.get("open_time"), previous.get("candidate_revision")) != (stamp, revision):
+                    incident = {"open_time": stamp, "candidate_revision": revision,
+                        "consumed_revision": None if pin is None else pin["revision"],
+                        "reason": "consumed_input_changed" if pin else "legacy_input_unconfirmed",
+                        "contour_id": consumer, "received_at": candle["received_at"]}
+                    held["incident"] = incident
+                    self._write_live(conn, uid_key, held)
             self._write_live(conn, facts_key, facts)
-            return {"state": "conflict", "revision": revision, "changed": False}
+            return {"state": "conflict", "revision": revision, "changed": False, "incident": incident}
 
         payload = {**candle, "revision": revision}
         # Прежнее состояние интервала — в той же транзакции: «свеча вне
@@ -615,10 +648,9 @@ class MarketDataStore:
                 facts = self._read_live(conn, key)
                 reference = (facts.get("input_references") or {}).get(contour)
                 if reference is None:
-                    held = self._read_live(conn, self._live_key("uid", source, instrument_uid))
-                    # Коррекция начатого, но не подтверждённого пакета
-                    # замораживает новые зависимые минуты UID до commit.
-                    if held.get("integrity_hold") or held.get("pending_input_conflicts") or facts.get("conflict"):
+                    # Держит только конфликт самой минуты до согласования;
+                    # правка соседней исполненной минуты UID не останавливает.
+                    if facts.get("conflict"):
                         raise ValueError("Невозможно закрепить неподтверждённый рыночный вход")
                     row = conn.execute("SELECT revision,is_complete FROM candle_current WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
                         (source, instrument_uid, interval, _utc_text(open_time))).fetchone()
@@ -1081,16 +1113,6 @@ class MarketDataStore:
                 if reference is not None:
                     reference["state"] = "consumed"
                     self._write_live(conn, key, facts)
-                uid_key = self._live_key("uid", source, instrument_uid)
-                held = self._read_live(conn, uid_key)
-                pending = held.get("pending_input_conflicts", {})
-                conflict = pending.get(stamp)
-                if conflict is not None and conflict.get("contour_id", contour) == contour:
-                    pending.pop(stamp)
-                    held.update(integrity_hold=True, incident={"open_time": stamp,
-                        "consumed_revision": conflict["revision"], "candidate_revision": conflict["candidate_revision"],
-                        "reason": "consumed_input_changed", "contour_id": contour, "received_at": _utc_text()})
-                    self._write_live(conn, uid_key, held)
                 conn.execute("""INSERT INTO contour_cursors(contour_id,source,instrument_uid,interval,processed_through,updated_at)
                     VALUES(?,?,?,?,?,?) ON CONFLICT(contour_id,source,instrument_uid,interval) DO UPDATE SET
                     processed_through=MAX(contour_cursors.processed_through,excluded.processed_through),
@@ -1587,6 +1609,63 @@ class MarketDataStore:
             frame[key] = frame[key].astype(float)
         frame["is_complete"] = frame["is_complete"].astype(bool)
         return frame
+
+    def candle_series(self, *, source: str) -> list[dict]:
+        """Ряды свечей для API (add-candles-api): пары состава любого происхождения одной транзакцией чтения.
+
+        У каждой пары — первая и последняя завершённая свеча, последняя цена и
+        готовность живой пары (``None`` — пары нет в ``pair_readiness``).
+        """
+        edge = """SELECT {column} FROM candle_current c WHERE c.source=r.source AND c.instrument_uid=r.instrument_uid
+            AND c.interval=r.interval AND c.is_complete=1 ORDER BY c.open_time_utc {order} LIMIT 1"""
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(f"""SELECT r.instrument_uid, r.interval, r.ticker, r.instrument_type, r.short_name,
+                    r.origin, ({edge.format(column="c.open_time_utc", order="ASC")}) AS first_open,
+                    ({edge.format(column="c.open_time_utc", order="DESC")}) AS last_open,
+                    ({edge.format(column="c.close", order="DESC")}) AS last_close, p.status_json
+                    FROM market_data_roster r LEFT JOIN pair_readiness p ON p.source=r.source
+                    AND p.instrument_uid=r.instrument_uid AND p.interval=r.interval
+                    WHERE r.source=? ORDER BY r.instrument_uid, r.interval""", (source,)).fetchall()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return [{"instrument_uid": row["instrument_uid"], "interval": row["interval"], "ticker": row["ticker"],
+                 "instrument_type": row["instrument_type"], "short_name": row["short_name"], "origin": row["origin"],
+                 "first_open": row["first_open"], "last_open": row["last_open"], "last_close": row["last_close"],
+                 "readiness": None if row["status_json"] is None else json.loads(row["status_json"]).get("state")}
+                for row in rows]
+
+    def candle_window(self, *, source: str, instrument_uid: str, interval: str, lower: object | None,
+                      upper: object, limit: int) -> tuple[list[dict], bool]:
+        """Последние ``limit`` свечей окна ``[lower, upper)`` по возрастанию и есть ли в ряду свечи раньше первой.
+
+        Незавершённая свеча попадает, только если это последняя строка ряда:
+        брошенная предварительная свеча внутри ряда на графике выглядела бы настоящей.
+        """
+        pair = (source, instrument_uid, interval)
+        bounds = "AND c.open_time_utc < ?" + ("" if lower is None else " AND c.open_time_utc >= ?")
+        values = (_utc_text(upper),) + (() if lower is None else (_utc_text(lower),))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(f"""SELECT c.open_time_utc, c.open, c.high, c.low, c.close, c.volume, c.is_complete
+                    FROM candle_current c WHERE c.source=? AND c.instrument_uid=? AND c.interval=? {bounds}
+                    AND (c.is_complete=1 OR c.open_time_utc=(SELECT MAX(open_time_utc) FROM candle_current
+                         WHERE source=? AND instrument_uid=? AND interval=?))
+                    ORDER BY c.open_time_utc DESC LIMIT ?""", (*pair, *values, *pair, limit)).fetchall()
+                first = rows[-1]["open_time_utc"] if rows else values[-1]
+                earlier = conn.execute("""SELECT 1 FROM candle_current WHERE source=? AND instrument_uid=? AND interval=?
+                    AND is_complete=1 AND open_time_utc<? LIMIT 1""", (*pair, first)).fetchone() is not None
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return [{"open_time": row["open_time_utc"], "open": row["open"], "high": row["high"], "low": row["low"],
+                 "close": row["close"], "volume": int(row["volume"]), "complete": bool(row["is_complete"])}
+                for row in reversed(rows)], earlier
 
     def pattern_context(self, *, source: str, instrument_uid: str, interval: str,
                         close_time: object) -> dict[str, object]:

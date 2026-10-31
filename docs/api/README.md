@@ -2,7 +2,7 @@
 
 | Файл | Что описывает |
 |---|---|
-| [openapi.yaml](openapi.yaml) | HTTP API робота, версия 2.2.0: точка входа, ядро, эмуляция, история, песочница, экспорт рыночных данных, отчёт кластеров |
+| [openapi.yaml](openapi.yaml) | HTTP API робота, версия 2.3.0: точка входа, ядро, эмуляция, история, песочница, свечи для графиков, экспорт рыночных данных, отчёт кластеров |
 | [market-events.asyncapi.yaml](market-events.asyncapi.yaml) | События рыночной структуры в Redis Stream |
 | [v2-decisions.md](v2-decisions.md) | Решения API 2.0, таблица «было → станет», план «Счёта» и справочника |
 
@@ -13,7 +13,7 @@
 
 | Ключ | Переменная `.env` | Что открывает |
 |---|---|---|
-| `ControlToken` | `ROBOT_CONTROL_TOKEN` | `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`, `/api/v1/sandbox…`; только с `Host` 127.0.0.1, localhost или [::1] |
+| `ControlToken` | `ROBOT_CONTROL_TOKEN` | `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`, `/api/v1/sandbox…`, `/api/v1/candles…`; только с `Host` 127.0.0.1, localhost или [::1] |
 | `ExportToken` | `MARKET_DATA_EXPORT_TOKEN` | `/api/v1/market-data/…`, `/api/v1/clusters/report` |
 
 Точка входа `GET /api/v1` принимает любой из двух ключей и показывает
@@ -28,6 +28,7 @@ flowchart LR
     home --> emu["/emulation"]
     home --> hist["/history"]
     home --> sbx["/sandbox"]
+    home --> cnd["/candles — ряды свечей"]
     home --> md["/market-data/…"]
     home --> cl["/clusters/report"]
     emu --> target["/target — режим: on, no_entries, close_all"]
@@ -40,6 +41,7 @@ flowchart LR
     sbx --> bindings["/bindings — состав из привязок, /remove — убрать"]
     sbx --> rec["/reconcile — последний отчёт сверщика"]
     sbx --> slog["/log"]
+    cnd --> series["/{instrument}/{timeframe} — свечи окна, _links.earlier — раньше"]
 ```
 
 **Песочница (2.1.0, add-sandbox-contour).** Контур на брокере в песочнице
@@ -56,6 +58,15 @@ flowchart LR
 `trading`, `draining`, `closing`, `rejected` (с `reason`) или `watching`.
 Снятие привязки с `no_entries` доводит её сделки до выхода, с `close_all` —
 закрывает их.
+
+**Свечи (2.3.0, add-candles-api).** Свечи рыночной базы ядра для графиков
+UI — только чтение, без запросов к брокеру. `GET /api/v1/candles` — какие
+ряды «инструмент × таймфрейм» хранятся; `GET /api/v1/candles/{instrument}/{timeframe}`
+— последние `limit` свечей окна `[from, to)` (по умолчанию 500 до текущего
+момента), листание назад — по `_links.earlier`. Имена — как в командах
+контуров: `NG-12.26` или `SBER`; биржевой тикер и код семейства — `404` с
+подсказкой в `suggestions`. Таймфреймы — только хранимые, без агрегации.
+Пока ядро не открыло рыночную базу — `503 MARKET_DATA_NOT_READY`.
 
 ## Форматы
 

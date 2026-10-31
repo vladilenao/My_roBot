@@ -537,6 +537,12 @@ class MarketDataCache:
                         )
                 if result["state"] == "conflict":
                     self._live_conflicts.add((*pair, stamp))
+                    incident = result.get("incident")
+                    if incident:
+                        log.warning("Источник исправил исполненную минуту %s %s %s (контур %s, версия %s → %s); "
+                                    "исполнение не переигрывается и продолжается",
+                                    item.uid, item.timeframe, incident["open_time"], incident["contour_id"],
+                                    incident["consumed_revision"], incident["candidate_revision"])
                 elif result["state"] == "accepted" and sequence is not None:
                     self._live_conflicts.discard((*pair, stamp))
                 if result["changed"] or result["state"] == "conflict" or (sequence is not None and result["state"] == "accepted"):
@@ -913,6 +919,15 @@ class MarketDataCache:
         if resolved is None:
             return False
         return pd.Timestamp(resolved).tz_convert("UTC").tz_localize(None) >= _naive(through)
+
+    def execution_processed(self, instrument, through):
+        """Исполнил ли контур 1m UID до ``through`` — курсор ``processed_through``, не получение."""
+        uid = self._uids.get(self._key(instrument, "1m"))
+        if not uid or self._market_store is None:
+            return False
+        processed = self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m",
+                                               contour=self.contour_id).get("processed_through")
+        return processed is not None and _naive(pd.Timestamp(processed).tz_localize(None)) >= _naive(through)
 
     def expected_live_open(self, key, now):
         """Открытие последнего ожидаемого закрытого бара пары по календарю."""
@@ -1457,14 +1472,10 @@ class MarketDataCache:
                 prior = frame[frame["datetime"] < lower]
                 if not prior.empty:
                     previous = float(prior["close"].iloc[-1])
-        uid = self._uids.get(self._key(instrument, "1m"))
-        cursors = (self._market_store.cursors(source=self._market_source, instrument_uid=uid, interval="1m",
-                                              contour=self.contour_id) if self._market_store and uid else {})
-        processed = cursors.get("processed_through")
         return {"valid": True, "current_price": current, "price_time": (stamp + pd.Timedelta(minutes=1)).isoformat(),
             "source": self._market_source, "previous_session_close": previous,
             "session_gap": None if previous is None else current - previous,
-            "execution_ready": processed is not None and _naive(pd.Timestamp(processed).tz_localize(None)) >= stamp}
+            "execution_ready": self.execution_processed(instrument, stamp)}
 
     def _collect_tick(self, timeframe: str, progressed: int, expected: int) -> None:
         """Копит итог текущего рыночного тика по всем таймфреймам.

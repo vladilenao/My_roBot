@@ -8,7 +8,8 @@ web-фреймворка. По умолчанию он слушает тольк
 (``attach_market``). До этого маршруты экспорта отвечают ``503``.
 
 С rework-contour-api у каждого контура свой ресурс: ``/api/v1/emulation`` и
-``/api/v1/history``; точка входа — ``/api/v1``. Ошибки управления —
+``/api/v1/history``; точка входа — ``/api/v1``. С add-candles-api —
+``/api/v1/candles``: свечи рыночной базы для графиков UI по ключу управления. Ошибки управления —
 ``application/problem+json``, экспорта и отчёта кластеров — прежний
 ``{code, message}``: его читает эмулятор данных.
 """
@@ -35,7 +36,7 @@ _CONTROL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 _CONTOURS = "/api/v1/contours"
 # /api/v1/history/{run_id}[/stop|/report|/log]; run_id — имя папки прогона.
 _RUN = re.compile(r"^/api/v1/history/([0-9]{8}-[0-9]{6}(?:-[0-9]+)?)(?:/(stop|report|log))?$")
-_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX)
+_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX, views.CANDLES)
 _OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.yaml"
 # Маршруты экспорта рыночных данных и отчёта кластеров: им нужна рыночная база ядра.
 _EXPORT_GET = ("/api/v1/market-data/source", "/api/v1/market-data/changes",
@@ -203,6 +204,7 @@ class _Handler(BaseHTTPRequestHandler):
             found.update(core=views.CORE, emulation=views.EMULATION, history=views.HISTORY)
             if server.sandbox is not None:
                 found["sandbox"] = views.SANDBOX
+            found["candles"] = views.CANDLES
         if export:
             found.update({"market-data": "/api/v1/market-data/source", "clusters-report": "/api/v1/clusters/report"})
         found["docs"] = "/docs"
@@ -229,6 +231,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_get(path, query)
+            return
+        if path == views.CANDLES or path.startswith(views.CANDLES + "/"):
+            self._candles_get(path, query)
             return
         if path == views.EMULATION:
             view = control.emulation()
@@ -297,6 +302,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run_id!r} нет.")
         else:
             self._json(HTTPStatus.OK, payload)
+
+    def _candles_get(self, path: str, query: dict[str, list[str]]) -> None:
+        """Свечи рыночной базы ядра (add-candles-api): только чтение, без брокера."""
+        from src.bot.candles_view import CandlesError, series_list, series_window
+
+        store = self.export_server.store
+        if store is None:
+            self._problem(HTTPStatus.SERVICE_UNAVAILABLE, "MARKET_DATA_NOT_READY",
+                          "Ядро ещё не открыло рыночную базу; состояние — GET /api/v1/core.")
+            return
+        try:
+            payload = series_list(store, query) if path == views.CANDLES else series_window(store, path, query)
+        except CandlesError as exc:
+            extra = None if exc.suggestions is None else {"suggestions": exc.suggestions}
+            self._problem(exc.status, exc.code, exc.detail, extra)
+            return
+        self._json(HTTPStatus.OK, payload)
 
     def _sandbox_get(self, path: str, query: dict[str, list[str]]) -> None:
         sandbox = self.export_server.sandbox
