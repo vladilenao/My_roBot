@@ -28,6 +28,9 @@ SANDBOX_BINDINGS = SANDBOX + "/bindings"
 SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
 SANDBOX_RECONCILE = SANDBOX + "/reconcile"
 SANDBOX_LOG = SANDBOX + "/log"
+# Позиции, сделки и итоги контура по журналу сделок (add-contour-trades-api); счёт — только у эмуляции.
+TRADING_PARTS = ("positions", "trades", "performance")
+EMULATION_ACCOUNT = EMULATION + "/account"
 # Состояние привязки в процессе контура на брокере (add-tinvest-orders); watching — режим только чтения.
 BINDING_STATES = ("warming", "trading", "draining", "closing", "rejected", "watching")
 # Свечи рыночной базы ядра для графиков UI (add-candles-api): только чтение.
@@ -56,6 +59,7 @@ PROBLEM_TITLES = {
     "HISTORY_UNAVAILABLE": "Очередь истории недоступна",
     "INTERNAL": "Внутренняя ошибка",
     "MARKET_DATA_NOT_READY": "Рыночная база не готова",
+    "JOURNAL_UNAVAILABLE": "Журнал контура недоступен",
 }
 _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 
@@ -63,6 +67,11 @@ _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 def links(**items: str) -> dict:
     """``rel=href`` → ``{"rel": {"href": …}}``; подчёркивание в имени связи — дефис."""
     return {name.replace("_", "-"): {"href": href} for name, href in items.items()}
+
+
+def trading_links(base: str) -> dict:
+    """Ссылки состояния контура на позиции, сделки и итоги (add-contour-trades-api)."""
+    return {part: f"{base}/{part}" for part in TRADING_PARTS}
 
 
 def member_href(name: str) -> str:

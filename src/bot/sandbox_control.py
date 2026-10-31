@@ -162,7 +162,8 @@ class SandboxControl:
             "bindings": [self._member_view(member, status, process["running"])
                          for member in (desired.members if desired is not None else ())],
             "_links": views.links(self=views.SANDBOX, target=views.SANDBOX_TARGET, bindings=views.SANDBOX_BINDINGS,
-                                  reconcile=views.SANDBOX_RECONCILE, log=views.SANDBOX_LOG),
+                                  reconcile=views.SANDBOX_RECONCILE, log=views.SANDBOX_LOG,
+                                  **views.trading_links(views.SANDBOX)),
             "_actions": views.sandbox_action_list(actions),
         }
 

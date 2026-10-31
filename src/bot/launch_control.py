@@ -260,7 +260,8 @@ class LaunchControl:
             "process": process,
             "instruments": self._member_views(desired, status, chosen, "add-instruments" in actions),
             "_links": views.links(self=views.EMULATION, target=views.EMULATION_TARGET,
-                                  instruments=views.EMULATION_INSTRUMENTS, log=views.EMULATION_LOG),
+                                  instruments=views.EMULATION_INSTRUMENTS, log=views.EMULATION_LOG,
+                                  **views.trading_links(views.EMULATION), account=views.EMULATION_ACCOUNT),
             "_actions": views.emulation_action_list(actions),
         }
 

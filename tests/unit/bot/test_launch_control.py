@@ -9,7 +9,9 @@ import pytest
 from src.assembly.contour_control import write_status
 from src.assembly.core_state import CoreStateStore
 from src.bot.launch import Chosen, Rejection, SOURCE_API, SOURCE_CLI
+from src.bot import control_views as views
 from src.bot.launch_control import BadCommand, LaunchControl, parse_add, parse_history, parse_target
+from src.bot.trades_view import ContourTrades
 from src.data.export_api import MarketDataExportServer
 from src.data.market_store import MarketDataStore
 from src.history.report import MarketDataSync
@@ -362,7 +364,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.3.0"
+        assert SPEC["info"]["version"] == "2.4.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -394,11 +396,11 @@ class TestContract:
                     text = exc.read().decode("utf-8")
                 assert "Эндпоинт не найден" not in text, (method, path)
 
-    def test_openapi_route_serves_2_3_0(self, server):
+    def test_openapi_route_serves_2_4_0(self, server):
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.3.0" in response.read().decode("utf-8")
+            assert "version: 2.4.0" in response.read().decode("utf-8")
 
     def test_schemas_use_only_openapi_keywords(self):
         """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""
@@ -757,6 +759,9 @@ def history_server(tmp_path):
                         process_factory=FakeProcess, say=lambda line: None)
     control.history = queue
     srv = MarketDataExportServer(None, EXPORT_KEY, port=0, control=control, control_token=CONTROL_KEY)
+    srv.trading = {base: ContourTrades(base=base, journal=lambda: tmp_path / "no-journal.sqlite3", catalog={},
+                                       initial_deposit=deposit)
+                   for base, deposit in ((views.EMULATION, "100000"), (views.SANDBOX, None))}
     try:
         srv.start()
     except PermissionError:

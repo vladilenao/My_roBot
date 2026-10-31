@@ -34,6 +34,7 @@ flowchart LR
     emu --> target["/target — режим: on, no_entries, close_all"]
     emu --> members["/instruments — состав, /remove — убрать пачкой"]
     emu --> elog["/log"]
+    emu --> etrade["/positions, /trades, /performance, /account — торговля по журналу"]
     hist --> run["/{run_id}"] --> stop["/stop"]
     run --> report["/report"]
     run --> rlog["/log"]
@@ -41,6 +42,7 @@ flowchart LR
     sbx --> bindings["/bindings — состав из привязок, /remove — убрать"]
     sbx --> rec["/reconcile — последний отчёт сверщика"]
     sbx --> slog["/log"]
+    sbx --> strade["/positions, /trades, /performance — торговля по журналу"]
     cnd --> series["/{instrument}/{timeframe} — свечи окна, _links.earlier — раньше"]
 ```
 
@@ -67,6 +69,28 @@ UI — только чтение, без запросов к брокеру. `GE
 контуров: `NG-12.26` или `SBER`; биржевой тикер и код семейства — `404` с
 подсказкой в `suggestions`. Таймфреймы — только хранимые, без агрегации.
 Пока ядро не открыло рыночную базу — `503 MARKET_DATA_NOT_READY`.
+
+**Позиции, сделки и итоги контура (2.4.0, add-contour-trades-api).** Только
+чтение журнала сделок контура (`trades.sqlite3` в папке контура) — для
+карточки «Позиции и сделки» UI. У эмуляции и песочницы одинаково:
+
+- `…/positions` — открытые сделки: привязка, сторона, лоты, средняя цена
+  входа, последняя цена (закрытие последней `1m` рыночной базы ядра), стоп,
+  цели, исполнения, `realized` (частичные выходы минус все комиссии) и
+  `unrealized`;
+- `…/trades` — закрытые сделки окна `[from, to)` по `closed_at`, новые
+  сверху, `limit` до 1000, фильтр `instrument`; назад — `_links.earlier`;
+  `ETag` — номер последнего события журнала, `If-None-Match` → `304`;
+- `…/performance?period=day|week|month|all` или `from`/`to` — итоги,
+  кривая накопленного нетто, просадка, открытые позиции; «день» — с 19:00 МСК
+  накануне;
+- `GET /api/v1/emulation/account` — виртуальный счёт эмуляции.
+
+У выхода `kind` — короткий вид для метки (`target`, `stop`, `partial`,
+`signal`, `session_end`, `expiry`, `contour`, `other`), `code` и `label` — как
+в журнале и CSV. Биржевой тикер наружу не выходит: инструмент — короткое имя,
+сделка — непрозрачный `id`. Ответ есть и у остановленного контура; журнала
+нет — пустой ответ, журнал не читается — `503 JOURNAL_UNAVAILABLE`.
 
 ## Форматы
 

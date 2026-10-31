@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.3.0
+  version: 2.4.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -21,6 +21,10 @@ info:
       один, состав из привязок, на этапе С2 только читает счёт и сверяет его.
     * `/api/v1/candles` — свечи рядов, которые хранит ядро (2.3.0): только
       чтение, для графиков UI.
+    * `…/positions`, `…/trades`, `…/performance` у эмуляции и песочницы и
+      `/api/v1/emulation/account` (2.4.0) — позиции, закрытые сделки, итоги
+      с кривой результата и виртуальный счёт по журналу сделок контура:
+      только чтение, для карточки «Позиции и сделки» UI.
 
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
@@ -533,6 +537,104 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
 
+  /api/v1/emulation/positions:
+    get:
+      tags: [Эмуляция]
+      summary: Открытые позиции
+      description: |
+        Сделки журнала контура с ненулевым остатком, новые сверху. Нереализованный
+        результат — по закрытию последней `1m` из рыночной базы ядра. Только
+        чтение журнала; ответ есть и у остановленного контура.
+      operationId: getEmulationPositions
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradeInstrument'
+      responses:
+        '200': {$ref: '#/components/responses/Positions'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/emulation/trades:
+    get:
+      tags: [Эмуляция]
+      summary: Закрытые сделки за окно
+      description: |
+        Сделки в фазе `CLOSED` с исполненным входом, по `closed_at`, новые
+        сверху. Последние `limit` сделок окна `[from, to)`; `_links.earlier` —
+        предыдущая страница. Сделки с тем же `closed_at`, что у последней
+        отданной, идут в той же странице целиком. `ETag` — номер последнего
+        события журнала; `If-None-Match` с ним же → `304`.
+      operationId: getEmulationTrades
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+        - $ref: '#/components/parameters/TradesLimit'
+        - $ref: '#/components/parameters/TradeInstrument'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200': {$ref: '#/components/responses/Trades'}
+        '304': {$ref: '#/components/responses/NotModified'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/emulation/performance:
+    get:
+      tags: [Эмуляция]
+      summary: Итоги периода и кривая результата
+      description: |
+        Итоги закрытых в периоде сделок, открытые позиции и кривая
+        накопленного нетто-результата. Без параметров — `day`: торговый день
+        с последних 19:00 МСК. `period` или пара `from`/`to`, не вместе.
+      operationId: getEmulationPerformance
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+      responses:
+        '200': {$ref: '#/components/responses/Performance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/emulation/account:
+    get:
+      tags: [Эмуляция]
+      summary: Виртуальный счёт эмуляции
+      description: |
+        Счёт эмулятора из журнала контура. `equity` журнала не отдаётся: в ней
+        нет переоценки открытых позиций. Капитал с открытыми —
+        `balance + open.unrealized` из `…/performance`. Журнала нет —
+        депозит из конфигурации и нули.
+      operationId: getEmulationAccount
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Виртуальный счёт.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/VirtualAccount'}
+              example:
+                currency: RUB
+                initial: '100000'
+                balance: '88653.55'
+                realized_net: '-11346.45'
+                fees: '517.5'
+                updated_at: '2026-10-30T15:41:00Z'
+                _links: {self: {href: /api/v1/emulation/account}, performance: {href: /api/v1/emulation/performance}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
   # -------------------------------------------------------------- песочница
   /api/v1/sandbox:
     get:
@@ -810,6 +912,74 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/sandbox/positions:
+    get:
+      tags: [Песочница]
+      summary: Открытые позиции
+      description: |
+        Сделки журнала контура с ненулевым остатком, новые сверху. Нереализованный
+        результат — по закрытию последней `1m` из рыночной базы ядра. Только
+        чтение журнала; ответ есть и у остановленного контура.
+      operationId: getSandboxPositions
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradeInstrument'
+      responses:
+        '200': {$ref: '#/components/responses/Positions'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/sandbox/trades:
+    get:
+      tags: [Песочница]
+      summary: Закрытые сделки за окно
+      description: |
+        Сделки в фазе `CLOSED` с исполненным входом, по `closed_at`, новые
+        сверху. Последние `limit` сделок окна `[from, to)`; `_links.earlier` —
+        предыдущая страница. Сделки с тем же `closed_at`, что у последней
+        отданной, идут в той же странице целиком. `ETag` — номер последнего
+        события журнала; `If-None-Match` с ним же → `304`.
+      operationId: getSandboxTrades
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+        - $ref: '#/components/parameters/TradesLimit'
+        - $ref: '#/components/parameters/TradeInstrument'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200': {$ref: '#/components/responses/Trades'}
+        '304': {$ref: '#/components/responses/NotModified'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/sandbox/performance:
+    get:
+      tags: [Песочница]
+      summary: Итоги периода и кривая результата
+      description: |
+        Итоги закрытых в периоде сделок, открытые позиции и кривая
+        накопленного нетто-результата. Без параметров — `day`: торговый день
+        с последних 19:00 МСК. `period` или пара `from`/`to`, не вместе.
+      operationId: getSandboxPerformance
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+      responses:
+        '200': {$ref: '#/components/responses/Performance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
 
   # ---------------------------------------------------------------- история
   /api/v1/history:
@@ -1622,7 +1792,210 @@ components:
       required: false
       description: Сколько последних свечей окна отдать.
       schema: {type: integer, minimum: 1, maximum: 5000, default: 500}
+    TradeInstrument:
+      name: instrument
+      in: query
+      required: false
+      description: Только позиции или сделки одного инструмента — короткое имя без учёта регистра. Неизвестное имя — пустой список.
+      schema: {type: string, minLength: 1, example: NG-11.26}
+    TradesFrom:
+      name: from
+      in: query
+      required: false
+      description: Начало окна по `closed_at` — момент ISO 8601 с зоной, входит в окно. По умолчанию не ограничено.
+      schema: {type: string, format: date-time, example: '2026-10-30T16:00:00Z'}
+    TradesTo:
+      name: to
+      in: query
+      required: false
+      description: Конец окна по `closed_at` — момент ISO 8601 с зоной, не входит. По умолчанию — текущий момент.
+      schema: {type: string, format: date-time}
+    TradesLimit:
+      name: limit
+      in: query
+      required: false
+      description: Сколько последних сделок окна отдать (сверх — только сделки с тем же `closed_at`, что у последней).
+      schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+    Period:
+      name: period
+      in: query
+      required: false
+      description: |
+        `day` — с последних 19:00 МСК (торговый день биржи); `week` — с
+        понедельника 00:00 МСК; `month` — с 1-го числа 00:00 МСК; `all` — без
+        нижней границы. Вместе с `from` или `to` — `400`.
+      schema: {type: string, enum: [day, week, month, all], default: day}
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: '`ETag` прошлого ответа; журнал не менялся — `304`.'
+      schema: {type: string, example: '"18342"'}
   responses:
+    NotModified:
+      description: Журнал не менялся с `ETag` из `If-None-Match`; тела нет.
+    JournalUnavailable:
+      description: |
+        Журнал контура есть, но не читается (`JOURNAL_UNAVAILABLE`). Путь к
+        файлу и текст исключения в ответ не попадают. Нет журнала — не
+        ошибка, а пустой ответ `200`.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          example:
+            type: 'urn:my-robot:problem:journal-unavailable'
+            title: Журнал контура недоступен
+            status: 503
+            code: JOURNAL_UNAVAILABLE
+            detail: Журнал сделок контура не читается; подробности — в логе робота.
+    Positions:
+      description: Открытые позиции.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PositionList'}
+          example:
+            currency: RUB
+            as_of: '2026-10-31T14:42:00Z'
+            items:
+              - id: t_3f9a0c1d2e4b5a67
+                binding: {id: future-ng-macd, strategy: macd_rsi_stoch, timeframe: 15m}
+                instrument: NG-11.26
+                side: long
+                lots: 2
+                entry_price: '2.874'
+                last_price: '2.891'
+                last_price_at: '2026-10-31T14:41:00Z'
+                stop: '2.851'
+                stop_pending: null
+                targets: [{price: '2.930', lots: 2, filled: 0}]
+                opened_at: '2026-10-31T12:27:00Z'
+                entries: [{at: '2026-10-31T12:27:00Z', lots: 2, price: '2.874'}]
+                exits: []
+                phase: open
+                fees: '4.10'
+                realized: '-4.10'
+                fees_source: configured
+                unrealized: '276.00'
+              - id: t_a71c09e3b55d2f80
+                binding: {id: future-si-levels, strategy: levels, timeframe: 1h}
+                instrument: Si-12.26
+                side: short
+                lots: 1
+                entry_price: '82640'
+                last_price: '82455'
+                last_price_at: '2026-10-31T14:41:00Z'
+                stop: '82900'
+                stop_pending: null
+                targets: [{price: '82100', lots: 1, filled: 0}]
+                opened_at: '2026-10-31T13:57:00Z'
+                entries: [{at: '2026-10-31T13:57:00Z', lots: 1, price: '82640'}]
+                exits: []
+                phase: open
+                fees: '2.00'
+                realized: '-2.00'
+                fees_source: configured
+                unrealized: '185.00'
+              - id: t_0d4e6b2a9f13c785
+                binding: {id: future-br-macd, strategy: macd_rsi_stoch, timeframe: 4h}
+                instrument: BR-12.26
+                side: long
+                lots: 3
+                entry_price: '64.38'
+                last_price: '64.12'
+                last_price_at: '2026-10-31T14:41:00Z'
+                stop: '63.80'
+                stop_pending: '64.00'
+                targets: [{price: '65.40', lots: 3, filled: 0}]
+                opened_at: '2026-10-30T11:30:00Z'
+                entries: [{at: '2026-10-30T11:30:00Z', lots: 3, price: '64.38'}]
+                exits: []
+                phase: open
+                fees: '6.20'
+                realized: '-6.20'
+                fees_source: configured
+                unrealized: '-632.40'
+            unrealized: '-171.40'
+            unrealized_complete: true
+            _links: {self: {href: /api/v1/emulation/positions}}
+    Trades:
+      description: Закрытые сделки окна.
+      headers:
+        ETag:
+          description: Номер последнего события журнала.
+          schema: {type: string}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/TradePage'}
+          example:
+            currency: RUB
+            from: '2026-10-30T16:00:00Z'
+            to: '2026-10-31T14:42:00Z'
+            items:
+              - id: t_8b1e44f0a9c3d215
+                binding: {id: future-ng-macd, strategy: macd_rsi_stoch, timeframe: 15m}
+                instrument: NG-11.26
+                side: long
+                lots: 2
+                entry_price: '2.861'
+                exit_price: '2.884'
+                opened_at: '2026-10-31T11:05:00Z'
+                closed_at: '2026-10-31T12:20:00Z'
+                entries: [{at: '2026-10-31T11:05:00Z', lots: 2, price: '2.861'}]
+                exits: [{at: '2026-10-31T12:20:00Z', lots: 2, price: '2.884', kind: target, code: 'tp:tp-1', label: TP1}]
+                exit: {kind: target, code: 'tp:tp-1', label: TP1, scenario: TP1}
+                gross: '381.00'
+                fees: '8.00'
+                fees_source: configured
+                net: '373.00'
+                result_r: '1.45'
+              - id: t_5c2f81d07e9ab346
+                binding: {id: future-si-levels, strategy: levels, timeframe: 1h}
+                instrument: Si-12.26
+                side: long
+                lots: 2
+                entry_price: '82400'
+                exit_price: '82382'
+                opened_at: '2026-10-31T06:15:00Z'
+                closed_at: '2026-10-31T07:40:00Z'
+                entries: [{at: '2026-10-31T06:15:00Z', lots: 2, price: '82400'}]
+                exits:
+                  - {at: '2026-10-31T06:55:00Z', lots: 1, price: '82422', kind: partial, code: ma10-or-cloud-partial-exit, label: частичный выход по MA10/облаку}
+                  - {at: '2026-10-31T07:40:00Z', lots: 1, price: '82342', kind: stop, code: protective, label: стоп}
+                exit: {kind: stop, code: protective, label: стоп, scenario: частичный выход по MA10/облаку (часть) + стоп (остаток)}
+                gross: '-36.00'
+                fees: '4.00'
+                fees_source: configured
+                net: '-40.00'
+                result_r: '-0.31'
+            _links:
+              self: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&limit=2'}
+              earlier: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z&to=2026-10-31T07:40:00Z&limit=2'}
+    Performance:
+      description: Итоги периода и кривая.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Performance'}
+          example:
+            currency: RUB
+            period: {name: day, from: '2026-10-30T16:00:00Z', to: '2026-10-31T14:42:00Z'}
+            realized: {net: '886.00', gross: '928.00', fees: '42.00', fees_source: configured}
+            trades: {count: 6, winners: 4, losers: 2}
+            average_net: '147.67'
+            profit_factor: '9.05'
+            max_drawdown: {amount: '-110.00', at: '2026-10-31T07:40:00Z'}
+            open: {count: 3, realized: '-12.30', unrealized: '-171.40', unrealized_complete: true}
+            curve:
+              - {at: '2026-10-30T16:00:00Z', net: '0'}
+              - {at: '2026-10-31T06:10:00Z', net: '-70.00'}
+              - {at: '2026-10-31T07:40:00Z', net: '-110.00'}
+              - {at: '2026-10-31T08:10:00Z', net: '-5.00'}
+              - {at: '2026-10-31T10:00:00Z', net: '416.00'}
+              - {at: '2026-10-31T12:20:00Z', net: '789.00'}
+              - {at: '2026-10-31T13:05:00Z', net: '886.00'}
+            curve_now: {at: '2026-10-31T14:42:00Z', net: '702.30'}
+            _links:
+              self: {href: '/api/v1/emulation/performance?period=day'}
+              trades: {href: '/api/v1/emulation/trades?from=2026-10-30T16:00:00Z'}
     BadRequest:
       description: Неверное тело или параметр (`INVALID_REQUEST`).
       content:
@@ -1839,7 +2212,7 @@ components:
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
                  CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
-                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY]
+                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE]
         rejections:
           type: array
           description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
@@ -2185,6 +2558,9 @@ components:
         Контур «Песочница» на общих частях торгового контура. Отличия от
         эмуляции: участник состава — привязка, текущее состояние говорит о
         счёте брокера.
+
+        `_links` (2.4.0) содержит `positions`, `trades` и `performance` —
+        позиции, сделки и итоги по журналу контура при любом состоянии.
       properties:
         state: {$ref: '#/components/schemas/TradingState'}
         target:
@@ -2356,7 +2732,12 @@ components:
     Emulation:
       allOf:
         - {$ref: '#/components/schemas/TradingContour'}
-      description: Контур эмуляции. Своих полей сверх общей схемы пока нет.
+      description: |
+        Контур эмуляции. Своих полей сверх общей схемы пока нет.
+
+        `_links` (2.4.0) содержит `positions`, `trades`, `performance` и
+        `account` — позиции, сделки, итоги и виртуальный счёт по журналу
+        контура при любом состоянии.
     StartRequest:
       type: object
       additionalProperties: false
@@ -2661,6 +3042,267 @@ components:
         received_at:
           type: string
           format: date-time
+    # ------------------------------------------------------ торговля контура
+    RubAmount:
+      allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
+      description: |
+        Сумма в рублях (`currency` ответа), десятичная строка. Комиссии —
+        положительный расход; результаты и точки кривой — со знаком (убыток
+        отрицательный); просадка — не больше нуля.
+    TradeSide:
+      type: string
+      enum: [long, short]
+    ExitKind:
+      type: string
+      enum: [target, stop, partial, signal, session_end, expiry, contour, other]
+      description: |
+        Вид выхода для короткой метки UI: `target` — цель (`TARGET`), `stop` —
+        стоп (`STOP`), `partial` — частичный выход по правилу (`REDUCE`);
+        у закрытия (`CLOSE`) по коду причины: `signal` — встречный сигнал или
+        правило выхода, `session_end` — конец торговой сессии, `expiry` —
+        экспирация или переход, `contour` — остановка контура или снятие из
+        состава; `other` — любой другой код, в том числе новый.
+    FeesSource:
+      type: string
+      enum: [broker, configured, unknown, mixed]
+      description: |
+        Источник комиссий по исполнениям: `broker` — сумма от брокера,
+        `configured` — оценка из конфигурации (эмуляция), `unknown` — не
+        известна, `mixed` — у исполнений разные источники.
+    TradeFill:
+      type: object
+      additionalProperties: false
+      required: [at, lots, price]
+      description: Исполнение входа (в том числе добор).
+      properties:
+        at: {type: string, format: date-time}
+        lots: {type: integer, minimum: 1}
+        price: {$ref: '#/components/schemas/DecimalPrice'}
+    TradeBinding:
+      type: object
+      additionalProperties: false
+      required: [id, strategy, timeframe]
+      description: Привязка сделки; `strategy` — `null`, если привязки больше нет в конфигурации.
+      properties:
+        id: {type: string, example: future-ng-macd}
+        strategy: {type: string, nullable: true}
+        timeframe: {type: string, nullable: true}
+    TradeTarget:
+      type: object
+      additionalProperties: false
+      required: [price, lots, filled]
+      properties:
+        price: {$ref: '#/components/schemas/DecimalPrice'}
+        lots: {type: integer, minimum: 0}
+        filled: {type: integer, minimum: 0}
+    OpenPosition:
+      type: object
+      additionalProperties: false
+      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, entries, exits, phase, realized, fees, fees_source, unrealized]
+      properties:
+        id: {type: string, description: 'Непрозрачный идентификатор сделки: `t_` + 16 знаков SHA-256 от `trade_id` журнала.'}
+        binding: {$ref: '#/components/schemas/TradeBinding'}
+        instrument: {type: string, nullable: true, description: 'Короткое имя; `null` — имени нет в журнале (UI: «контракт не указан»).'}
+        side: {$ref: '#/components/schemas/TradeSide'}
+        lots: {type: integer, minimum: 1}
+        entry_price: {$ref: '#/components/schemas/DecimalPrice'}
+        last_price:
+          allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
+          nullable: true
+          description: Закрытие последней завершённой `1m` из рыночной базы ядра.
+        last_price_at: {type: string, format: date-time, nullable: true}
+        stop:
+          allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
+          nullable: true
+        stop_pending:
+          allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
+          nullable: true
+          description: Стоп, который сейчас переставляется.
+        targets:
+          type: array
+          items: {$ref: '#/components/schemas/TradeTarget'}
+        opened_at: {type: string, format: date-time}
+        entries:
+          type: array
+          description: Исполнения входа по времени, включая доборы.
+          items: {$ref: '#/components/schemas/TradeFill'}
+        exits:
+          type: array
+          description: Частичные выходы по времени; пусто, если их не было.
+          items: {$ref: '#/components/schemas/TradeExit'}
+        phase: {type: string, enum: [open, building, reducing]}
+        realized:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          description: 'Результат частичных выходов минус все комиссии сделки на сейчас, включая комиссию входа (`net_realized_pnl` журнала).'
+        fees:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          description: Все комиссии сделки на сейчас, включая комиссию входа.
+        fees_source: {$ref: '#/components/schemas/FeesSource'}
+        unrealized:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          nullable: true
+    PositionList:
+      type: object
+      additionalProperties: false
+      required: [currency, as_of, items, unrealized, unrealized_complete, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        as_of: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/OpenPosition'}
+        unrealized: {$ref: '#/components/schemas/RubAmount'}
+        unrealized_complete: {type: boolean, description: '`false` — у части позиций нет цены, они не вошли в сумму.'}
+        _links: {$ref: '#/components/schemas/Links'}
+    TradeExit:
+      type: object
+      additionalProperties: false
+      required: [at, lots, price, kind, code, label]
+      description: Исполнение выхода.
+      properties:
+        at: {type: string, format: date-time}
+        lots: {type: integer, minimum: 1}
+        price: {$ref: '#/components/schemas/DecimalPrice'}
+        kind: {$ref: '#/components/schemas/ExitKind'}
+        code: {type: string, description: 'Код причины журнала: `STOP`, `CLOSE`, `REDUCE`, `tp:<n>`, `intraday-session-end`, …'}
+        label: {type: string, description: 'Подпись причины, как в CSV-проекциях журнала.'}
+    ClosedTrade:
+      type: object
+      additionalProperties: false
+      required: [id, binding, instrument, side, lots, entry_price, exit_price, opened_at, closed_at, entries, exits, exit, gross, fees, fees_source, net, result_r]
+      properties:
+        id: {type: string}
+        binding: {$ref: '#/components/schemas/TradeBinding'}
+        instrument: {type: string, nullable: true}
+        side: {$ref: '#/components/schemas/TradeSide'}
+        lots: {type: integer, minimum: 1, description: Наибольший объём позиции за сделку.}
+        entry_price: {$ref: '#/components/schemas/DecimalPrice'}
+        exit_price: {$ref: '#/components/schemas/DecimalPrice'}
+        opened_at: {type: string, format: date-time}
+        closed_at: {type: string, format: date-time}
+        entries:
+          type: array
+          description: Исполнения входа по времени, включая доборы — для меток на графике.
+          items: {$ref: '#/components/schemas/TradeFill'}
+        exit:
+          type: object
+          additionalProperties: false
+          required: [kind, code, label, scenario]
+          description: Последний выход сделки.
+          properties:
+            kind: {$ref: '#/components/schemas/ExitKind'}
+            code: {type: string}
+            label: {type: string}
+            scenario: {type: string, description: 'Цепочка выходов: «частичный выход (часть) + стоп (остаток)».'}
+        exits:
+          type: array
+          items: {$ref: '#/components/schemas/TradeExit'}
+        gross: {$ref: '#/components/schemas/RubAmount'}
+        fees: {$ref: '#/components/schemas/RubAmount'}
+        fees_source: {$ref: '#/components/schemas/FeesSource'}
+        net: {$ref: '#/components/schemas/RubAmount'}
+        result_r:
+          type: string
+          nullable: true
+          description: Нетто в начальных рисках; `null`, если риск неизвестен.
+    TradePage:
+      type: object
+      additionalProperties: false
+      required: [currency, from, to, items, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        from: {type: string, format: date-time, nullable: true}
+        to: {type: string, format: date-time}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ClosedTrade'}
+        _links: {$ref: '#/components/schemas/Links'}
+    CurvePoint:
+      type: object
+      additionalProperties: false
+      required: [at, net]
+      properties:
+        at: {type: string, format: date-time}
+        net: {$ref: '#/components/schemas/RubAmount'}
+    Performance:
+      type: object
+      additionalProperties: false
+      required: [currency, period, realized, trades, average_net, profit_factor, max_drawdown, open, curve, curve_now, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        period:
+          type: object
+          additionalProperties: false
+          required: [name, from, to]
+          properties:
+            name: {type: string, enum: [day, week, month, all, custom], description: '`custom` — при явных `from` и `to`.'}
+            from: {type: string, format: date-time, nullable: true}
+            to: {type: string, format: date-time}
+        realized:
+          type: object
+          additionalProperties: false
+          required: [net, gross, fees, fees_source]
+          properties:
+            net: {$ref: '#/components/schemas/RubAmount'}
+            gross: {$ref: '#/components/schemas/RubAmount'}
+            fees: {$ref: '#/components/schemas/RubAmount'}
+            fees_source:
+              allOf: [{$ref: '#/components/schemas/FeesSource'}]
+              nullable: true
+              description: По исполнениям сделок периода; `null` — сделок нет.
+        trades:
+          type: object
+          additionalProperties: false
+          required: [count, winners, losers]
+          properties:
+            count: {type: integer, minimum: 0}
+            winners: {type: integer, minimum: 0}
+            losers: {type: integer, minimum: 0}
+        average_net:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          nullable: true
+        profit_factor: {type: string, nullable: true, description: 'Прибыльные / |убыточные|, два знака; `null` без убыточных.'}
+        max_drawdown:
+          type: object
+          additionalProperties: false
+          required: [amount, at]
+          properties:
+            amount: {$ref: '#/components/schemas/RubAmount'}
+            at: {type: string, format: date-time, nullable: true}
+        open:
+          type: object
+          additionalProperties: false
+          required: [count, realized, unrealized, unrealized_complete]
+          properties:
+            count: {type: integer, minimum: 0}
+            realized:
+              allOf: [{$ref: '#/components/schemas/RubAmount'}]
+              description: Сумма `realized` открытых позиций — частичные выходы минус все комиссии.
+            unrealized: {$ref: '#/components/schemas/RubAmount'}
+            unrealized_complete: {type: boolean}
+        curve:
+          type: array
+          maxItems: 500
+          description: Накопленный нетто закрытых сделок; первая точка — ноль на начале периода. Больше 500 точек — прореживание с сохранением экстремумов.
+          items: {$ref: '#/components/schemas/CurvePoint'}
+        curve_now:
+          allOf: [{$ref: '#/components/schemas/CurvePoint'}]
+          description: Сейчас; `net` = последняя точка `curve` + `open.realized` + `open.unrealized`.
+        _links:
+          allOf: [{$ref: '#/components/schemas/Links'}]
+          description: '`trades` — сделки периода; у `day`, `week`, `month`, `all` без `to`, у `custom` — с `from` и `to`.'
+    VirtualAccount:
+      type: object
+      additionalProperties: false
+      required: [currency, initial, balance, realized_net, fees, updated_at, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        initial: {$ref: '#/components/schemas/RubAmount'}
+        balance: {$ref: '#/components/schemas/RubAmount'}
+        realized_net: {$ref: '#/components/schemas/RubAmount'}
+        fees: {$ref: '#/components/schemas/RubAmount'}
+        updated_at: {type: string, format: date-time, nullable: true}
+        _links: {$ref: '#/components/schemas/Links'}
     DecimalPrice:
       type: string
       pattern: '^-?[0-9]+(\.[0-9]+)?$'

@@ -296,6 +296,17 @@ JOIN trades ON trades.trade_id = positions.trade_id
             return remaining, average_before if remaining else None
         return quantity_before, average_before
 
+    def trade_card(self, row: Mapping[str, object]) -> dict[str, object] | None:
+        """Сделка для API торговли контура (add-contour-trades-api): исполнения и карточка CSV «Позиции».
+
+        Исполнения, причины, сценарий выхода и R — те же, что в ``trade_summary.csv``:
+        API и CSV не расходятся. ``None`` — у сделки нет исполнения входа.
+        """
+        entries, exits = self._fills(str(row["trade_id"]))
+        if not entries:
+            return None
+        return {"entries": entries, "exits": exits, "summary": self._summary_row(row, None, entries, exits)}
+
     def _summary_row(
         self, row: Mapping[str, object], meta: object | None,
         entries: list[dict[str, object]], exits: list[dict[str, object]],
@@ -405,6 +416,8 @@ JOIN trades ON trades.trade_id = positions.trade_id
             payload = self._payload(row["payload_json"])
             value = dict(row)
             value["kind"] = "entry" if action in {"OPEN", "ADD"} else "exit"
+            # Код причины как в журнале — для API (add-contour-trades-api); CSV его не выводит.
+            value["code"] = str(payload.get("reason") or action)
             value["reason"] = payload.get("reason") or self._action_reason(str(row["action_type"]))
             if action == "TARGET":
                 target_id = str(row["action_type"]).partition(":")[2]

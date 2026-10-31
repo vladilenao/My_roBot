@@ -1874,6 +1874,7 @@ components:
                 phase: open
                 fees: '4.10'
                 realized: '-4.10'
+                fees_source: configured
                 unrealized: '276.00'
               - id: t_a71c09e3b55d2f80
                 binding: {id: future-si-levels, strategy: levels, timeframe: 1h}
@@ -1892,6 +1893,7 @@ components:
                 phase: open
                 fees: '2.00'
                 realized: '-2.00'
+                fees_source: configured
                 unrealized: '185.00'
               - id: t_0d4e6b2a9f13c785
                 binding: {id: future-br-macd, strategy: macd_rsi_stoch, timeframe: 4h}
@@ -1910,6 +1912,7 @@ components:
                 phase: open
                 fees: '6.20'
                 realized: '-6.20'
+                fees_source: configured
                 unrealized: '-632.40'
             unrealized: '-171.40'
             unrealized_complete: true
@@ -1942,6 +1945,7 @@ components:
                 exit: {kind: target, code: 'tp:tp-1', label: TP1, scenario: TP1}
                 gross: '381.00'
                 fees: '8.00'
+                fees_source: configured
                 net: '373.00'
                 result_r: '1.45'
               - id: t_5c2f81d07e9ab346
@@ -1960,6 +1964,7 @@ components:
                 exit: {kind: stop, code: protective, label: стоп, scenario: частичный выход по MA10/облаку (часть) + стоп (остаток)}
                 gross: '-36.00'
                 fees: '4.00'
+                fees_source: configured
                 net: '-40.00'
                 result_r: '-0.31'
             _links:
@@ -1973,7 +1978,7 @@ components:
           example:
             currency: RUB
             period: {name: day, from: '2026-10-30T16:00:00Z', to: '2026-10-31T14:42:00Z'}
-            realized: {net: '886.00', gross: '928.00', fees: '42.00'}
+            realized: {net: '886.00', gross: '928.00', fees: '42.00', fees_source: configured}
             trades: {count: 6, winners: 4, losers: 2}
             average_net: '147.67'
             profit_factor: '9.05'
@@ -3038,7 +3043,7 @@ components:
           type: string
           format: date-time
     # ------------------------------------------------------ торговля контура
-    Money:
+    RubAmount:
       allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
       description: |
         Сумма в рублях (`currency` ответа), десятичная строка. Комиссии —
@@ -3057,6 +3062,13 @@ components:
         правило выхода, `session_end` — конец торговой сессии, `expiry` —
         экспирация или переход, `contour` — остановка контура или снятие из
         состава; `other` — любой другой код, в том числе новый.
+    FeesSource:
+      type: string
+      enum: [broker, configured, unknown, mixed]
+      description: |
+        Источник комиссий по исполнениям: `broker` — сумма от брокера,
+        `configured` — оценка из конфигурации (эмуляция), `unknown` — не
+        известна, `mixed` — у исполнений разные источники.
     TradeFill:
       type: object
       additionalProperties: false
@@ -3086,7 +3098,7 @@ components:
     OpenPosition:
       type: object
       additionalProperties: false
-      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, entries, exits, phase, realized, fees, unrealized]
+      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, entries, exits, phase, realized, fees, fees_source, unrealized]
       properties:
         id: {type: string, description: 'Непрозрачный идентификатор сделки: `t_` + 16 знаков SHA-256 от `trade_id` журнала.'}
         binding: {$ref: '#/components/schemas/TradeBinding'}
@@ -3120,13 +3132,14 @@ components:
           items: {$ref: '#/components/schemas/TradeExit'}
         phase: {type: string, enum: [open, building, reducing]}
         realized:
-          allOf: [{$ref: '#/components/schemas/Money'}]
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
           description: 'Результат частичных выходов минус все комиссии сделки на сейчас, включая комиссию входа (`net_realized_pnl` журнала).'
         fees:
-          allOf: [{$ref: '#/components/schemas/Money'}]
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
           description: Все комиссии сделки на сейчас, включая комиссию входа.
+        fees_source: {$ref: '#/components/schemas/FeesSource'}
         unrealized:
-          allOf: [{$ref: '#/components/schemas/Money'}]
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
           nullable: true
     PositionList:
       type: object
@@ -3138,7 +3151,7 @@ components:
         items:
           type: array
           items: {$ref: '#/components/schemas/OpenPosition'}
-        unrealized: {$ref: '#/components/schemas/Money'}
+        unrealized: {$ref: '#/components/schemas/RubAmount'}
         unrealized_complete: {type: boolean, description: '`false` — у части позиций нет цены, они не вошли в сумму.'}
         _links: {$ref: '#/components/schemas/Links'}
     TradeExit:
@@ -3156,7 +3169,7 @@ components:
     ClosedTrade:
       type: object
       additionalProperties: false
-      required: [id, binding, instrument, side, lots, entry_price, exit_price, opened_at, closed_at, entries, exits, exit, gross, fees, net, result_r]
+      required: [id, binding, instrument, side, lots, entry_price, exit_price, opened_at, closed_at, entries, exits, exit, gross, fees, fees_source, net, result_r]
       properties:
         id: {type: string}
         binding: {$ref: '#/components/schemas/TradeBinding'}
@@ -3184,9 +3197,10 @@ components:
         exits:
           type: array
           items: {$ref: '#/components/schemas/TradeExit'}
-        gross: {$ref: '#/components/schemas/Money'}
-        fees: {$ref: '#/components/schemas/Money'}
-        net: {$ref: '#/components/schemas/Money'}
+        gross: {$ref: '#/components/schemas/RubAmount'}
+        fees: {$ref: '#/components/schemas/RubAmount'}
+        fees_source: {$ref: '#/components/schemas/FeesSource'}
+        net: {$ref: '#/components/schemas/RubAmount'}
         result_r:
           type: string
           nullable: true
@@ -3209,7 +3223,7 @@ components:
       required: [at, net]
       properties:
         at: {type: string, format: date-time}
-        net: {$ref: '#/components/schemas/Money'}
+        net: {$ref: '#/components/schemas/RubAmount'}
     Performance:
       type: object
       additionalProperties: false
@@ -3227,11 +3241,15 @@ components:
         realized:
           type: object
           additionalProperties: false
-          required: [net, gross, fees]
+          required: [net, gross, fees, fees_source]
           properties:
-            net: {$ref: '#/components/schemas/Money'}
-            gross: {$ref: '#/components/schemas/Money'}
-            fees: {$ref: '#/components/schemas/Money'}
+            net: {$ref: '#/components/schemas/RubAmount'}
+            gross: {$ref: '#/components/schemas/RubAmount'}
+            fees: {$ref: '#/components/schemas/RubAmount'}
+            fees_source:
+              allOf: [{$ref: '#/components/schemas/FeesSource'}]
+              nullable: true
+              description: По исполнениям сделок периода; `null` — сделок нет.
         trades:
           type: object
           additionalProperties: false
@@ -3241,7 +3259,7 @@ components:
             winners: {type: integer, minimum: 0}
             losers: {type: integer, minimum: 0}
         average_net:
-          allOf: [{$ref: '#/components/schemas/Money'}]
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
           nullable: true
         profit_factor: {type: string, nullable: true, description: 'Прибыльные / |убыточные|, два знака; `null` без убыточных.'}
         max_drawdown:
@@ -3249,7 +3267,7 @@ components:
           additionalProperties: false
           required: [amount, at]
           properties:
-            amount: {$ref: '#/components/schemas/Money'}
+            amount: {$ref: '#/components/schemas/RubAmount'}
             at: {type: string, format: date-time, nullable: true}
         open:
           type: object
@@ -3258,9 +3276,9 @@ components:
           properties:
             count: {type: integer, minimum: 0}
             realized:
-              allOf: [{$ref: '#/components/schemas/Money'}]
+              allOf: [{$ref: '#/components/schemas/RubAmount'}]
               description: Сумма `realized` открытых позиций — частичные выходы минус все комиссии.
-            unrealized: {$ref: '#/components/schemas/Money'}
+            unrealized: {$ref: '#/components/schemas/RubAmount'}
             unrealized_complete: {type: boolean}
         curve:
           type: array
@@ -3279,10 +3297,10 @@ components:
       required: [currency, initial, balance, realized_net, fees, updated_at, _links]
       properties:
         currency: {type: string, enum: [RUB]}
-        initial: {$ref: '#/components/schemas/Money'}
-        balance: {$ref: '#/components/schemas/Money'}
-        realized_net: {$ref: '#/components/schemas/Money'}
-        fees: {$ref: '#/components/schemas/Money'}
+        initial: {$ref: '#/components/schemas/RubAmount'}
+        balance: {$ref: '#/components/schemas/RubAmount'}
+        realized_net: {$ref: '#/components/schemas/RubAmount'}
+        fees: {$ref: '#/components/schemas/RubAmount'}
         updated_at: {type: string, format: date-time, nullable: true}
         _links: {$ref: '#/components/schemas/Links'}
     DecimalPrice:

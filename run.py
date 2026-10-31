@@ -392,6 +392,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         pulse.stop()
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
+    server.trading = _contour_trading(state_dir, sandbox)
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
     history.start()
@@ -422,6 +423,23 @@ def _sandbox_supervisor(state_dir, core_state):
     return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
                                    autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
                                    heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _contour_trading(state_dir, sandbox):
+    """Позиции, сделки и итоги эмуляции и песочницы по журналам контуров (add-contour-trades-api)."""
+    from src.bot import control_views as views
+    from src.bot.trades_view import ContourTrades
+    from src.broker_contour.bindings import binding_catalog
+    from src.config import DATABASE_FILE, INITIAL_DEPOSIT
+
+    catalog = binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES)
+    emulation = contour_dir(state_dir, MODE_EMULATION) / DATABASE_FILE
+    return {
+        views.EMULATION: ContourTrades(base=views.EMULATION, journal=lambda: emulation, catalog=catalog,
+                                       initial_deposit=INITIAL_DEPOSIT),
+        views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
+                                     catalog=catalog),
+    }
 
 
 def _binding_resolver(core):

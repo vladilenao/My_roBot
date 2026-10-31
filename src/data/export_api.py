@@ -66,6 +66,9 @@ class MarketDataExportServer:
         self.core_state = None
         # Контур «Песочница» (src.bot.sandbox_control.SandboxControl, add-sandbox-contour) или None.
         self.sandbox = None
+        # Позиции, сделки и итоги контуров по журналу (src.bot.trades_view.ContourTrades, add-contour-trades-api):
+        # адрес контура → ресурсы; контура нет в словаре — 404.
+        self.trading: dict = {}
         self.host = host
         self.port = port
         self._server: ThreadingHTTPServer | None = None
@@ -229,6 +232,8 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, {**server.core_state(), "_links": views.links(self=views.CORE, home=views.HOME)})
             return
+        if self._trading_get(path, query):
+            return
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_get(path, query)
             return
@@ -302,6 +307,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Прогона {run_id!r} нет.")
         else:
             self._json(HTTPStatus.OK, payload)
+
+    def _trading_get(self, path: str, query: dict[str, list[str]]) -> bool:
+        """Позиции, сделки, итоги и счёт контура по журналу (add-contour-trades-api); False — маршрут не этот."""
+        from src.bot.trades_view import TradesError
+
+        base, _, part = path.rpartition("/")
+        trading = self.export_server.trading.get(base)
+        if trading is None or part not in trading.parts:
+            return False
+        store = self.export_server.store
+        try:
+            if part == "positions":
+                self._json(HTTPStatus.OK, trading.positions(query, store))
+            elif part == "performance":
+                self._json(HTTPStatus.OK, trading.performance(query, store))
+            elif part == "account":
+                self._json(HTTPStatus.OK, trading.account())
+            else:
+                payload, etag = trading.trades(query)
+                if self.headers.get("If-None-Match", "").strip() == etag:
+                    self.send_response(HTTPStatus.NOT_MODIFIED)
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                else:
+                    self._json(HTTPStatus.OK, payload, headers={"ETag": etag})
+        except TradesError as exc:
+            self._problem(exc.status, exc.code, exc.detail)
+        return True
 
     def _candles_get(self, path: str, query: dict[str, list[str]]) -> None:
         """Свечи рыночной базы ядра (add-candles-api): только чтение, без брокера."""
