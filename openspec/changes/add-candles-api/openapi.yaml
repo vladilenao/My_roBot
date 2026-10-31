@@ -1110,6 +1110,7 @@ paths:
                 _links:
                   self: {href: /api/v1/candles}
                   home: {href: /api/v1}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '503': {$ref: '#/components/responses/MarketDataNotReady'}
@@ -1757,7 +1758,7 @@ components:
               summary: Код семейства
               value:
                 type: 'urn:my-robot:problem:not-found'
-                title: Ряд свечей не найден
+                title: Не найдено
                 status: 404
                 code: NOT_FOUND
                 detail: Код семейства не принимается — укажите контракт.
@@ -1766,7 +1767,7 @@ components:
               summary: Биржевой тикер контракта
               value:
                 type: 'urn:my-robot:problem:not-found'
-                title: Ряд свечей не найден
+                title: Не найдено
                 status: 404
                 code: NOT_FOUND
                 detail: Укажите короткое имя контракта.
@@ -1775,7 +1776,7 @@ components:
               summary: У инструмента нет такого таймфрейма
               value:
                 type: 'urn:my-robot:problem:not-found'
-                title: Ряд свечей не найден
+                title: Не найдено
                 status: 404
                 code: NOT_FOUND
                 detail: У NG-12.26 нет ряда 4h.
@@ -1784,7 +1785,7 @@ components:
               summary: Неизвестное имя
               value:
                 type: 'urn:my-robot:problem:not-found'
-                title: Ряд свечей не найден
+                title: Не найдено
                 status: 404
                 code: NOT_FOUND
                 detail: Инструмента AAAA нет в рыночной базе.

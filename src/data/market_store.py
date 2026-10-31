@@ -1610,6 +1610,63 @@ class MarketDataStore:
         frame["is_complete"] = frame["is_complete"].astype(bool)
         return frame
 
+    def candle_series(self, *, source: str) -> list[dict]:
+        """Ряды свечей для API (add-candles-api): пары состава любого происхождения одной транзакцией чтения.
+
+        У каждой пары — первая и последняя завершённая свеча, последняя цена и
+        готовность живой пары (``None`` — пары нет в ``pair_readiness``).
+        """
+        edge = """SELECT {column} FROM candle_current c WHERE c.source=r.source AND c.instrument_uid=r.instrument_uid
+            AND c.interval=r.interval AND c.is_complete=1 ORDER BY c.open_time_utc {order} LIMIT 1"""
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(f"""SELECT r.instrument_uid, r.interval, r.ticker, r.instrument_type, r.short_name,
+                    r.origin, ({edge.format(column="c.open_time_utc", order="ASC")}) AS first_open,
+                    ({edge.format(column="c.open_time_utc", order="DESC")}) AS last_open,
+                    ({edge.format(column="c.close", order="DESC")}) AS last_close, p.status_json
+                    FROM market_data_roster r LEFT JOIN pair_readiness p ON p.source=r.source
+                    AND p.instrument_uid=r.instrument_uid AND p.interval=r.interval
+                    WHERE r.source=? ORDER BY r.instrument_uid, r.interval""", (source,)).fetchall()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return [{"instrument_uid": row["instrument_uid"], "interval": row["interval"], "ticker": row["ticker"],
+                 "instrument_type": row["instrument_type"], "short_name": row["short_name"], "origin": row["origin"],
+                 "first_open": row["first_open"], "last_open": row["last_open"], "last_close": row["last_close"],
+                 "readiness": None if row["status_json"] is None else json.loads(row["status_json"]).get("state")}
+                for row in rows]
+
+    def candle_window(self, *, source: str, instrument_uid: str, interval: str, lower: object | None,
+                      upper: object, limit: int) -> tuple[list[dict], bool]:
+        """Последние ``limit`` свечей окна ``[lower, upper)`` по возрастанию и есть ли в ряду свечи раньше первой.
+
+        Незавершённая свеча попадает, только если это последняя строка ряда:
+        брошенная предварительная свеча внутри ряда на графике выглядела бы настоящей.
+        """
+        pair = (source, instrument_uid, interval)
+        bounds = "AND c.open_time_utc < ?" + ("" if lower is None else " AND c.open_time_utc >= ?")
+        values = (_utc_text(upper),) + (() if lower is None else (_utc_text(lower),))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(f"""SELECT c.open_time_utc, c.open, c.high, c.low, c.close, c.volume, c.is_complete
+                    FROM candle_current c WHERE c.source=? AND c.instrument_uid=? AND c.interval=? {bounds}
+                    AND (c.is_complete=1 OR c.open_time_utc=(SELECT MAX(open_time_utc) FROM candle_current
+                         WHERE source=? AND instrument_uid=? AND interval=?))
+                    ORDER BY c.open_time_utc DESC LIMIT ?""", (*pair, *values, *pair, limit)).fetchall()
+                first = rows[-1]["open_time_utc"] if rows else values[-1]
+                earlier = conn.execute("""SELECT 1 FROM candle_current WHERE source=? AND instrument_uid=? AND interval=?
+                    AND is_complete=1 AND open_time_utc<? LIMIT 1""", (*pair, first)).fetchone() is not None
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return [{"open_time": row["open_time_utc"], "open": row["open"], "high": row["high"], "low": row["low"],
+                 "close": row["close"], "volume": int(row["volume"]), "complete": bool(row["is_complete"])}
+                for row in reversed(rows)], earlier
+
     def pattern_context(self, *, source: str, instrument_uid: str, interval: str,
                         close_time: object) -> dict[str, object]:
         """Две завершённые свечи и их покрытие из одного SQLite-снимка."""

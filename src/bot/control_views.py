@@ -28,6 +28,8 @@ SANDBOX_BINDINGS = SANDBOX + "/bindings"
 SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
 SANDBOX_RECONCILE = SANDBOX + "/reconcile"
 SANDBOX_LOG = SANDBOX + "/log"
+# Свечи рыночной базы ядра для графиков UI (add-candles-api): только чтение.
+CANDLES = "/api/v1/candles"
 
 MODE_ON = "on"
 NO_ENTRIES = "no_entries"
@@ -51,6 +53,7 @@ PROBLEM_TITLES = {
     "BINDINGS_REJECTED": "Привязки отклонены",
     "HISTORY_UNAVAILABLE": "Очередь истории недоступна",
     "INTERNAL": "Внутренняя ошибка",
+    "MARKET_DATA_NOT_READY": "Рыночная база не готова",
 }
 _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 
@@ -164,7 +167,7 @@ def run_action_list(run_id: str, names) -> list[dict]:
 # --- ошибки ------------------------------------------------------------------------
 
 def problem(status: int, code: str, detail: str, extra: dict | None = None) -> dict:
-    """Тело ``application/problem+json``; из ``extra`` берутся только ``rejections``, ``core`` и ``pid``."""
+    """Тело ``application/problem+json``; из ``extra`` берутся только ``rejections``, ``core``, ``pid`` и ``suggestions``."""
     body = {"type": PROBLEM_TYPE + code.lower().replace("_", "-"), "title": PROBLEM_TITLES.get(code, code),
             "status": int(status), "code": code, "detail": detail}
     extra = extra or {}
@@ -176,4 +179,6 @@ def problem(status: int, code: str, detail: str, extra: dict | None = None) -> d
         body["core"] = {name: extra["core"].get(name) for name in _CORE_BRIEF}
     if extra.get("pid") is not None:
         body["pid"] = extra["pid"]
+    if extra.get("suggestions") is not None:
+        body["suggestions"] = [str(item) for item in extra["suggestions"]]
     return body
