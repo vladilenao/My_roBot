@@ -17,6 +17,7 @@ from typing import Callable
 
 from src.assembly.contracts import contracts_from_payload, instrument_from_payload
 from src.assembly.core_state import read_desired
+from src.broker_contour.bindings import resolved
 from src.instruments.model import instrument_key
 from src.logging_setup import get_logger
 
@@ -135,9 +136,11 @@ class BrokerControl:
             return
         found = self._index.get(member.key)
         payload = member.instrument or {}
-        if found is None or not payload.get("ticker"):
+        if found is None or not resolved(member):
+            # Без карточки контракта менеджер сделок отклонил бы каждый сигнал молча.
             reason = ("Привязки нет в конфигурации." if found is None
-                      else "Инструмент привязки не определён — добавьте привязку заново.")
+                      else "Инструмент привязки не определён — добавьте привязку заново." if not payload.get("ticker")
+                      else "Карточка контракта не определена — добавьте привязку заново.")
             log.warning("Контур %s: привязка %s не торгует — %s", self._contour_id, member.key, reason)
             self._members[member.key] = {"state": REJECTED, "member": member, "reason": reason}
             return

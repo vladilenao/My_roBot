@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from src.assembly.core_state import CoreStateStore
-from src.broker_contour.bindings import binding_member
+from src.broker_contour.bindings import binding_member, resolved
 from src.broker_contour.control import BrokerControl, assignment_index
 from src.instruments.model import instrument_key
 from src.strategies.contracts import Assignment
@@ -86,14 +86,16 @@ def test_binding_warms_and_trades_only_its_strategy(tmp_path):
 
 def test_second_binding_of_traded_instrument_gets_its_own_overview(tmp_path):
     store, control, manager, roster, _, statuses, (_, future) = _control(tmp_path)
-    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG)])
+    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG, CONTRACT)])
     control.start(manager, roster)
     control.apply()
-    store.record_bindings("sandbox", "sandbox", add=[binding_member(_card(FLAT), NG)], remove=(), mode="no_entries",
+    store.record_bindings("sandbox", "sandbox", add=[binding_member(_card(FLAT), NG, CONTRACT)], remove=(), mode="no_entries",
                           payload={}, expected=None)
     control.apply()      # прогрев
     control.apply()      # стартовый обзор новой привязки
     control.after_tick()
+    # Добавленная на ходу привязка допускается со своей карточкой контракта, как и стартовая.
+    assert roster.admitted[1][1]["NGZ6"].go_buy == 6000
     assert [a.id for a in future["NG"]] == ["future-ng-macd", "future-ng-flat"] and len(roster.admitted) == 2
     assert {m["key"]: m["state"] for m in statuses[-1]["members"]} == {"future-ng-macd": "trading",
                                                                        "future-ng-flat": "trading"}
@@ -101,7 +103,7 @@ def test_second_binding_of_traded_instrument_gets_its_own_overview(tmp_path):
 
 def test_removed_binding_drains_then_leaves_with_instrument(tmp_path):
     store, control, manager, roster, _, statuses, (_, future) = _control(tmp_path)
-    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG)])
+    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG, CONTRACT)])
     control.start(manager, roster)
     control.apply()
     manager.remainder["future-ng-macd"] = (1, 0)
@@ -128,7 +130,7 @@ def test_binding_without_instrument_is_rejected(tmp_path):
 
 def test_close_all_finishes_when_nothing_left(tmp_path):
     store, control, manager, roster, stops, statuses, _ = _control(tmp_path, busy=True)
-    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG)])
+    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG, CONTRACT)])
     control.start(manager, roster)
     store.record_stop("sandbox", "close_all", None)
     control.apply()
@@ -138,3 +140,14 @@ def test_close_all_finishes_when_nothing_left(tmp_path):
     control._busy = lambda: False
     control.after_tick()
     assert stops == ["остановка командой (close_all)"]
+
+
+def test_future_binding_without_contract_is_rejected(tmp_path):
+    """Без карточки контракта менеджер сделок отклоняет каждый сигнал — привязка не торгует, причина видна."""
+    store, control, manager, roster, _, statuses, (_, future) = _control(tmp_path)
+    store.record_launch("sandbox", "sandbox", [], source="api", members=[binding_member(_card(MACD), NG)])
+    control.start(manager, roster)
+    control.after_tick()
+    member = statuses[-1]["members"][0]
+    assert member["state"] == "rejected" and "Карточка контракта" in member["reason"] and future == {}
+    assert not resolved(binding_member(_card(MACD), NG)) and resolved(binding_member(_card(MACD), NG, CONTRACT))

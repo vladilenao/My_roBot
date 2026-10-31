@@ -30,8 +30,11 @@ def binding_member(card: dict, instrument: dict | None = None, contract: dict | 
 
 
 def resolved(member: Member) -> bool:
-    """Инструмент привязки определён ядром: у карточки есть тикер."""
-    return bool((member.instrument or {}).get("ticker"))
+    """Инструмент привязки определён ядром: у карточки есть тикер, у фьючерса — и карточка контракта."""
+    instrument = member.instrument or {}
+    if not instrument.get("ticker"):
+        return False
+    return instrument.get("instrument_type") != "future" or bool(member.contract)
 
 
 def unknown_bindings(ids, catalog: dict) -> list[tuple[str, str]]:

@@ -577,7 +577,8 @@ class CoreStateStore:
                 for member in add:
                     old = members.get(member.key)
                     if old is None or not old.active:
-                        changes.append(Member(member.key, member.instrument))
+                        # Выбор и карточка контракта от ядра (add-tinvest-orders) — вместе с участником.
+                        changes.append(Member(member.key, member.instrument, member.chosen, member.contract))
                 for key in remove:
                     old = members.get(key)
                     if old is None:
