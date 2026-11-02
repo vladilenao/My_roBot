@@ -338,8 +338,9 @@ class _Runtime:
                 target.append(instrument)
         if self.storage is not None:
             self.execution_aliases.update({key: key, instrument.ticker: key})
-        if contracts and self.on_contracts is not None:
-            self.on_contracts(contracts)
+        if self.on_contracts is not None:
+            # И без карточек: имя нового инструмента нужно событиям исполнений (fix-contour-added-instrument-names).
+            self.on_contracts(contracts or {})
 
     def remove_instrument(self, instrument) -> None:
         """Инструмент вышел из состава: сделок по нему нет, исполнение его больше не ведёт."""
@@ -686,10 +687,13 @@ def _build_runtime(
 
     def accept_contracts(metas):
         # Тот же словарь видит исполнение по барам: карточка нового контракта — сразу в работе.
-        contracts.update(metas)
-        broker.set_contracts(metas)
-        storage.set_contract_metadata(metas)
-        names = _instrument_names(runtime.execution_instruments or instruments)
+        if metas:
+            contracts.update(metas)
+            broker.set_contracts(metas)
+            storage.set_contract_metadata(metas)
+        # Тот же словарь читает publish_execution: инструмент, добавленный на ходу, подписан своим именем
+        # в карточках исполнений, а не «контракт не указан» (fix-contour-added-instrument-names).
+        names.update(_instrument_names(runtime.execution_instruments or instruments))
         storage.set_names(names)
         broker.set_names(names)
         trade_manager.configure_visual_context(runtime.execution_instruments or instruments)
