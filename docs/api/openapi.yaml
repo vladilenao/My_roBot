@@ -164,6 +164,7 @@ paths:
                 heartbeat: {beat_at: '2026-10-24T09:01:35Z', interval_secs: 5}
                 market_data: null
                 quotas: {}
+                lanes: {}
                 _links:
                   self: {href: /api/v1/core}
                   home: {href: /api/v1}
@@ -1655,7 +1656,7 @@ components:
     # ------------------------------------------------------------------- ядро
     Core:
       type: object
-      required: [state, error, attempts, next_retry_at, version, pid, started_at, heartbeat, market_data, quotas, _links]
+      required: [state, error, attempts, next_retry_at, version, pid, started_at, heartbeat, market_data, quotas, lanes, _links]
       description: Поля — как `CoreState` в 1.8, и `_links`.
       properties:
         state: {type: string, enum: [starting, ready, retrying, failed]}
@@ -1692,6 +1693,20 @@ components:
               ceiling: {type: integer, nullable: true}
               lanes: {type: object, additionalProperties: {type: integer, minimum: 0}}
               retry_after: {type: string, format: date-time, nullable: true}
+        lanes:
+          type: object
+          description: |
+            Полосы данных ядра: `live`, `evidence`, `completeness`, `calendar`,
+            `retention`. `stalled` — текущий шаг идёт дольше
+            `market_data.lane_stall_timeout_secs`; данные этой полосы не
+            обновляются, нужен перезапуск робота. До `ready` — пустой объект.
+          additionalProperties:
+            type: object
+            required: [state, step_started_at, last_step_at]
+            properties:
+              state: {type: string, enum: [ok, stalled]}
+              step_started_at: {type: string, format: date-time, nullable: true}
+              last_step_at: {type: string, format: date-time, nullable: true}
         _links: {$ref: '#/components/schemas/Links'}
 
     # ------------------------------ общие части торговых контуров (эмуляция, счёт)
