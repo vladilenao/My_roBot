@@ -118,11 +118,18 @@ class DeliveryRepository:
             self.connection.execute("UPDATE attempt_history SET status='uncertain',finished_at=? WHERE status='attempting'", (now,))
             self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def claim_event(self, trade_id, event_key, sequence, revision):
+    def claim_event(self, trade_id, event_key, sequence, revision, *, ordered=True):
+        """Событие ещё не доставлялось и не устарело; ``ordered=False`` — только защита от повтора.
+
+        Строки жизни заявки (``broker_order``, ``order_accepted``) не несут ``visual`` и не являются
+        снимком сделки: их порядок карточек не касается, и номер сделки они не двигают.
+        """
         with self.connection:
             self.connection.execute("INSERT OR IGNORE INTO trades(namespace,trade_id) VALUES (?,?)", (self.namespace, trade_id))
             previous = self.connection.execute("SELECT sequence,revision FROM trades WHERE namespace=? AND trade_id=?", (self.namespace, trade_id)).fetchone()
             inserted = self.connection.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)", (self.namespace, trade_id, event_key)).rowcount
+            if not ordered:
+                return bool(inserted)
             if not inserted or sequence < previous[0] or revision < previous[1]:
                 return False
             self.connection.execute("UPDATE trades SET sequence=?,revision=? WHERE namespace=? AND trade_id=?", (sequence, revision, self.namespace, trade_id))

@@ -269,3 +269,30 @@ def test_financial_unknown_raw_and_configured_are_not_broker_facts():
     assert "Комиссии (оценка)" in render(replace(event, payload={**event.payload, "visual": visual}))
     visual["financial"].update(units="RAW")
     assert "Рублёвый итог недоступен" in render(replace(event, payload={**event.payload, "visual": visual}))
+
+
+def test_order_lines_after_lifecycle_posts_reach_root_card(server, tmp_path):
+    """Песочница 02.11 (Si): строки заявок без ``visual`` шли с sequence 0 и отбрасывались, как только
+    у сделки появлялась карточка жизненного цикла, — в карточке оставались только строки входа."""
+    from datetime import datetime
+
+    from src.events.event import Event
+
+    def order(kind, event_id, **fields):
+        return Event.broker_order(kind, contour="sandbox", trade_id="demo", event_id=event_id, instrument="SBER",
+                                  bar_time=datetime(2026, 10, 6, 8, 16), order="stop", order_type="limit",
+                                  side="SELL", lots=2, price="296.50", broker_order="7777", **fields)
+
+    from src.broker_contour.notify import TRADING_TYPES
+
+    instance = channel(tmp_path / "delivery.db", supported_types=TRADING_TYPES)
+    for stage in ("plan", "entry", "tp1"):
+        instance.handle(demo_event(stage))
+    instance.handle(order("sent", "order-1"))
+    instance.handle(order("requoted", "order-2", attempt=1))
+    instance.handle(order("requoted", "order-2", attempt=1))          # повтор того же события — одна строка
+    instance.close(10)
+
+    edits = [visible_text(c["data"]["caption"]) for c in server.calls if c["method"] == "editMessageCaption"]
+    assert "отправлено в Т-Инвест: стоп, лимит 296.5 · 2 лота" in edits[-1]
+    assert edits[-1].count("перевыставлен, попытка 1") == 1

@@ -381,7 +381,8 @@ class TelegramChannel(Channel):
         # Ownerless legacy messages have no cross-event sequence, but still an
         # operation key; no guessed trade association based on instrument names.
         sequence, revision = (visual["sequence"], visual["revision"]) if visual else (0, 0)
-        if not resume and not repository.claim_event(trade_id, event_key, sequence, revision):
+        if not resume and not repository.claim_event(trade_id, event_key, sequence, revision,
+                                                     ordered=event.type not in _ROOT_NOTE_TYPES):
             return
         root = repository.root(trade_id) if trade_id else None
         if root and event.type in _ROOT_NOTE_TYPES:
