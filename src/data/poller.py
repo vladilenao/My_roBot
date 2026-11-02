@@ -11,6 +11,7 @@ import threading
 import time
 from contextlib import nullcontext
 
+from src.data.lane_watchdog import LaneWatchdog
 from src.data.request_budget import RequestDeferred
 from src.logging_setup import get_logger
 
@@ -24,9 +25,13 @@ class LiveMarketDataPoller:
     LANE_ERROR_PAUSE = 5.0
     # Холостой ритм полосы полноты: её работа измеряется часами, не секундами.
     COMPLETENESS_IDLE = 5.0
+    # Имя живой полосы у сторожа и в ``GET /api/v1/core``.
+    LIVE_LANE = "live"
+    # Наибольший период проверки сторожа (fix-live-lane-stall, design 2).
+    WATCHDOG_PERIOD = 30.0
 
     def __init__(self, cache, timeframes, poll_seconds: float, *, worker=None, stream=None, lanes=(),
-                 status_interval: float | None = None) -> None:
+                 status_interval: float | None = None, stall_timeout: float = 300.0, watchdog=None) -> None:
         self._cache = cache
         self._timeframes = tuple(sorted(set(timeframes)))
         self._poll_seconds = max(float(poll_seconds), 0.1)
@@ -36,7 +41,9 @@ class LiveMarketDataPoller:
         self._status_interval = status_interval
         self._stopped = threading.Event()
         self._wake = threading.Event()
+        self._watchdog_wake = threading.Event()
         self._lane_wake = {lane.name: threading.Event() for lane in self._lanes}
+        self.watchdog = watchdog if watchdog is not None else LaneWatchdog(stall_timeout)
         self._threads: list[threading.Thread] = []
         self._background_started = False
         self._live_started = False
@@ -50,7 +57,12 @@ class LiveMarketDataPoller:
         if self._background_started:
             return
         self._background_started = True
+        # Сводку и проверку зависания ведёт свой поток: зависшая полоса не уносит их с собой.
+        watchdog = threading.Thread(target=self._run_watchdog, name="market-data-watchdog", daemon=True)
+        self._threads.append(watchdog)
+        watchdog.start()
         for lane in self._lanes:
+            self.watchdog.register(lane.name)
             thread = threading.Thread(target=self._run_lane, args=(lane,), name=f"market-data-{lane.name}", daemon=True)
             self._threads.append(thread)
             thread.start()
@@ -66,6 +78,7 @@ class LiveMarketDataPoller:
         if self._live_started:
             return
         self._live_started = True
+        self.watchdog.register(self.LIVE_LANE)
         target = self._run_worker if self._worker is not None else self._run
         live = [threading.Thread(target=target, name="live-market-data", daemon=True)]
         if self._stream is not None:
@@ -125,6 +138,7 @@ class LiveMarketDataPoller:
     def close(self) -> None:
         self._stopped.set()
         self._wake.set()
+        self._watchdog_wake.set()
         if self._stream is not None:
             self._stream.close()
         for thread in self._threads:
@@ -137,6 +151,7 @@ class LiveMarketDataPoller:
         event = self._lane_wake[lane.name]
         with self._budget_lane(lane.name):
             while not self._stopped.is_set():
+                self.watchdog.begin(lane.name)
                 try:
                     worked = lane.step()
                     pause = idle
@@ -145,6 +160,8 @@ class LiveMarketDataPoller:
                 except Exception as exc:
                     log.warning("Полоса %s: шаг не удался: %s", lane.name, exc)
                     worked, pause = False, self.LANE_ERROR_PAUSE
+                finally:
+                    self.watchdog.end(lane.name)
                 if not worked:
                     event.wait(pause)
                     event.clear()
@@ -160,23 +177,36 @@ class LiveMarketDataPoller:
         lanes = {getattr(lane, "name", ""): lane for lane in self._lanes}
         holes = sum(getattr(lanes.get("completeness"), "last_holes", {}).values())
         waiting = len(getattr(lanes.get("evidence"), "_next", {}))
-        log.info("Полосы данных: запросы за минуту %s; дыр окна к проверке %d; пар ждут доказательства %d",
-                 snapshot, holes, waiting)
+        log.info("Полосы данных: запросы за минуту %s; дыр окна к проверке %d; пар ждут доказательства %d%s",
+                 snapshot, holes, waiting, self.watchdog.stalled_text())
         return now
 
-    def _run_worker(self) -> None:
+    def _run_watchdog(self) -> None:
+        """Поток сторожа: зависшие шаги и периодическая сводка полос (fix-live-lane-stall)."""
+        period = max(0.05, min(self.WATCHDOG_PERIOD, self.watchdog.threshold / 4))
         last_status = time.monotonic()
-        with self._budget_lane("live"):
-            self._run_live_worker(last_status)
-
-    def _run_live_worker(self, last_status) -> None:
         while not self._stopped.is_set():
-            last_status = self._log_status(last_status)
+            try:
+                self.watchdog.check()
+                last_status = self._log_status(last_status)
+            except Exception as exc:
+                log.warning("Сторож полос данных: проверка не удалась: %s", exc)
+            self._watchdog_wake.wait(period)
+
+    def _run_worker(self) -> None:
+        with self._budget_lane(self.LIVE_LANE):
+            self._run_live_worker()
+
+    def _run_live_worker(self) -> None:
+        while not self._stopped.is_set():
+            self.watchdog.begin(self.LIVE_LANE)
             try:
                 worked = self._worker.step()
             except Exception as exc:
                 log.warning("Фоновое обслуживание live-данных не удалось: %s", exc)
                 worked = False
+            finally:
+                self.watchdog.end(self.LIVE_LANE)
             if not worked:
                 calendar_delay = self._worker.next_wakeup_delay()
                 timeout = self._poll_seconds if calendar_delay is None else max(0.05, min(self._poll_seconds, calendar_delay))
@@ -185,11 +215,15 @@ class LiveMarketDataPoller:
 
     def _run(self) -> None:
         while not self._stopped.is_set():
-            for timeframe in self._timeframes:
-                if self._stopped.is_set():
-                    return
-                try:
-                    self._cache.refresh_if_new_candle(timeframe, force=True)
-                except Exception as exc:
-                    log.warning("Фоновое обновление свечей %s не удалось: %s", timeframe, exc)
+            self.watchdog.begin(self.LIVE_LANE)
+            try:
+                for timeframe in self._timeframes:
+                    if self._stopped.is_set():
+                        return
+                    try:
+                        self._cache.refresh_if_new_candle(timeframe, force=True)
+                    except Exception as exc:
+                        log.warning("Фоновое обновление свечей %s не удалось: %s", timeframe, exc)
+            finally:
+                self.watchdog.end(self.LIVE_LANE)
             self._stopped.wait(self._poll_seconds)

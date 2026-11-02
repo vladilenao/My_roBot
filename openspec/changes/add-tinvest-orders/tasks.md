@@ -144,3 +144,7 @@
 - [ ] 7.5 `python -m src.sandbox buy NG 1` при работающем контуре → тревога по NG, новые входы NG заморожены, выходы работают; после `sell NG 1` — «расхождение устранено».
 - [ ] 7.6 `PUT /api/v1/sandbox/target` с `{"mode": "close_all"}` при открытой позиции → входы сняты, позиция закрыта, контур `stopped`, на счёте позиций нет.
 - [ ] 7.7 Неделя сделок в песочнице без необъяснённых расхождений сверки.
+
+## 8. Слияние с release-11
+
+- [x] 8.1 Причина `binding-remove` включена в правило команд остановки из `fix-stop-command-freshness` (release-11, PR #93): закрытие и снятие входа при снятии привязки актуальны, пока действует её режим (`TradeManager._stop_demands`, `_renew_stale_stop_close`). Сделано 02.11.2026 при слиянии release-11 в `feature/contour-trades-api`; при слиянии `feature/tinvest-orders` с release-11 повторить. Тесты — `tests/unit/trade_management/test_stop_command_freshness.py`.

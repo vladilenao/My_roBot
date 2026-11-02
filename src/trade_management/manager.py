@@ -71,6 +71,8 @@ CONTOUR_STOP = "contour-stop"           # снятие входа и закры�
 # Снятие инструмента из состава контура (add-contour-membership).
 INSTRUMENT_REMOVING = "instrument-removing"   # отказ новому входу или добору по инструменту
 INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и закрытие позиции инструмента
+# Недоставленное закрытие остановки с устаревшей ревизией снято и поставлено заново (fix-stop-command-freshness).
+STOP_COMMAND_RENEWED = "stop-command-renewed"
 # Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
 CORE_LOST = "core-lost"
 # Контур на брокере (add-tinvest-orders): снятие привязки, заморозка сверкой, капитал не прочитан.
@@ -1039,10 +1041,29 @@ class TradeManager:
             return True
         if not evidence.work_ready:
             return deny("work-input-unconfirmed")
-        if evidence.intent_current is not True:
+        if evidence.intent_current is not True and not self._stop_demands(connection, action, instrument):
             return deny("freshness-unconfirmed" if evidence.intent_current is None else "stale-intent")
         self.dispatch_block_reasons.pop(action.command_id, None)
         return True
+
+    def _stop_demands(self, connection, action, instrument) -> bool:
+        """Команду остановки делает актуальной действующий режим владельца, а не момент постановки.
+
+        Остановку применяет граница тика раньше начала шага, и каждый тик повторяет её:
+        по шагу такая команда всегда «создана раньше» (fix-stop-command-freshness).
+        """
+        if action.reason == CONTOUR_STOP:
+            mode = self._contour_stop
+        elif action.reason == INSTRUMENT_REMOVE:
+            mode = self._instrument_stops.get(instrument)
+        elif action.reason == BINDING_REMOVE:
+            row = connection.execute("SELECT assignment_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            mode = self._assignment_stops.get(row[0]) if row else None
+        else:
+            return False
+        if isinstance(action, CloseTrade):
+            return mode == CONTOUR_CLOSE_ALL
+        return isinstance(action, CancelEntry) and mode is not None
 
     def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
         """Proof существующего guard, не whitelist по строке reason."""
@@ -1573,6 +1594,7 @@ class TradeManager:
                 action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
                                      state_revision=state.state_revision, reason=reason)
             elif mode == CONTOUR_CLOSE_ALL and state.phase in _MANAGEABLE and state.quantity > 0:
+                self._renew_stale_stop_close(plan.trade_id, state.state_revision)
                 if self._open_order(plan.trade_id, "CLOSE"):
                     continue
                 log.info("%s: закрытие позиции %s", rejection_message(reason), plan.trade_id)
@@ -1585,6 +1607,27 @@ class TradeManager:
                                                                  reason=reason)):
                 submitted.append(action)
         return tuple(submitted)
+
+    def _renew_stale_stop_close(self, trade_id: str, revision: int) -> None:
+        """Снять недоставленное закрытие остановки, чья ревизия устарела: его допуск уже не пропустит.
+
+        Брокер о нём не знает, поэтому снятие локальное: outbox → UNDELIVERED под guard
+        доставки, затем CANCEL заявки; фаза и ревизия сделки не меняются.
+        """
+        rows = self._storage.connection.execute(
+            "SELECT b.command_id, b.payload_json FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+            "WHERE o.trade_id=? AND o.action_type='CLOSE' AND o.status='PENDING' AND b.status='PENDING' "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.command_id=o.command_id)", (trade_id,)).fetchall()
+        stale = [command_id for command_id, payload in rows
+                 if (data := json.loads(payload)).get("reason") in (CONTOUR_STOP, INSTRUMENT_REMOVE, BINDING_REMOVE)
+                 and data.get("state_revision") != revision]
+        now = as_aware(self._clock.now())
+        for command_id in self._storage.mark_outbox_undelivered(stale):
+            log.info("Недоставленное закрытие %s снято: ревизия сделки сменилась, закрытие ставится заново", trade_id)
+            self._enqueued_at.pop(command_id, None)
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:{STOP_COMMAND_RENEWED}", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL, filled_quantity=0,
+                price=None, fee=Decimal(0), timestamp=now, reason=STOP_COMMAND_RENEWED))
 
     def contour_remainder(self, key: str | None = None, *, assignment_id: str | None = None) -> tuple[int, int]:
         """Открытые позиции и неисполненные входы контура, одного инструмента или одной привязки."""

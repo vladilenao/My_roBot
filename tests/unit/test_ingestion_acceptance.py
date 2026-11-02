@@ -181,4 +181,5 @@ def test_end_to_end_stream_startup_overlap_internal_and_trailing_gap(tmp_path):
         assert frame["datetime"].is_unique  # стык истории и потока без дубля
     finally:
         poller.close()
-    assert len(threads) == 2 and not any(thread.is_alive() for thread in threads)  # stop прервал чтение
+    assert {thread.name for thread in threads} == {"market-data-watchdog", "live-market-data", "live-market-stream"}
+    assert not any(thread.is_alive() for thread in threads)  # stop прервал чтение и сторожа

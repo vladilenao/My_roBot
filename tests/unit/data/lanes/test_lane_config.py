@@ -64,3 +64,14 @@ def test_default_profile_is_not_reported_as_deprecated(tmp_path):
     path.write_text("[market_data]\nlive_transport = \"stream\"\n", encoding="utf-8")
     config = load_config(defaults, config_file=path, bundled_file=tmp_path / "missing.toml")
     assert MarketDataSettings.from_flat(config).deprecated_overrides() == ()
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "\"300\"", "inf"])
+def test_lane_stall_timeout_must_be_positive_number(tmp_path, value):
+    with pytest.raises(ConfigError, match="lane_stall_timeout_secs"):
+        _settings(tmp_path, f"lane_stall_timeout_secs = {value}\n")
+
+
+def test_lane_stall_timeout_default_and_override(tmp_path):
+    assert MarketDataSettings().lane_stall_timeout_secs == 300
+    assert _settings(tmp_path, "lane_stall_timeout_secs = 120\n").lane_stall_timeout_secs == 120

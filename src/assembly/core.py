@@ -298,7 +298,8 @@ def _start_early_market_data(state_dir, provider):
         lanes.append(ChangesRetentionLane(market_store, settings.changes_retention_days))
     registered = _register_saved_roster(data_cache, market_store)
     poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, lanes=lanes,
-                                  status_interval=settings.lane_status_log_interval_secs)
+                                  status_interval=settings.lane_status_log_interval_secs,
+                                  stall_timeout=settings.lane_stall_timeout_secs)
     poller.start_background()
     log.info("Полосы данных запущены до выбора инструментов: пар сохранённого состава %d", registered)
     return _EarlyMarketData(timeline=timeline, market_store=market_store, request_budget=request_budget,
@@ -364,7 +365,8 @@ def _start_live_ingestion(data_cache, demand, client_provider, early=None):
         poller = early.poller
         poller.attach_stream(stream)
     else:
-        poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream)
+        poller = LiveMarketDataPoller(data_cache, _timeframes(), TICK_POLL_SECS, worker=worker, stream=stream,
+                                      stall_timeout=settings.lane_stall_timeout_secs)
     poller.start()
     return poller, worker
 
@@ -481,7 +483,7 @@ class LiveCore:
         self.market_calendar = self.market_reconciler = self.data_cache = None
 
     def core_snapshot(self) -> dict:
-        """``GET /api/v1/core`` (add-contour-recovery): версия, пульс, готовность пар, запросы к брокеру."""
+        """``GET /api/v1/core`` (add-contour-recovery): версия, пульс, готовность пар, запросы к брокеру, полосы."""
         from collections import Counter
 
         from src import __version__
@@ -506,7 +508,16 @@ class LiveCore:
                 service: {**value, "retry_after": None if value.get("retry_after") is None
                           else value["retry_after"].isoformat().replace("+00:00", "Z")}
                 for service, value in self.request_budget.snapshot().items()},
+            "lanes": self._lanes_snapshot(),
         }
+
+    def _lanes_snapshot(self) -> dict:
+        """Состояние полос данных (fix-live-lane-stall): из сторожа, без блокировок кэша."""
+        poller = getattr(self, "_poller", None) or getattr(getattr(self, "early", None), "poller", None)
+        watchdog = getattr(poller, "watchdog", None)
+        if self.market_store is None or watchdog is None:
+            return {}
+        return watchdog.snapshot()
 
     def ensure_market_data(self):
         """Без независимых полос данные собираются после выбора инструментов, как раньше."""
