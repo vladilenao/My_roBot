@@ -637,6 +637,10 @@ def _build_runtime(
                 pending_bar = (stamp, prices, addressed, broker_events)
                 commit_bar(*pending_bar)
                 pending_bar = None
+            if live_dispatch:
+                # Команды остановки ставит граница тика, а не действие шага: без этой доставки
+                # их никто не отправит (fix-stop-command-freshness). Устаревшие увеличения уже сняты.
+                action_executor.submit(None, as_aware(trade_manager._clock.now()))
             return True
         except _UnsafeExecutionState:
             log.exception("Исполнение остановлено до восстановления из SQLite")
