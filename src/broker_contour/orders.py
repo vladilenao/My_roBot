@@ -2,7 +2,8 @@
 
 Одна строка ``broker_orders`` — одна заявка у брокера; пишется до ``PostOrder``.
 Одна строка ``broker_executions`` — одна сделка биржи; пишется до ``consume`` и
-помечается проведённой после. Outbox ``TradeManager`` отвечает за доставку
+помечается проведённой после (``consumed = 1``) или перекрытой (``consumed = 2``):
+перекрытое исполнение не проводится и в объём заявки не входит. Outbox ``TradeManager`` отвечает за доставку
 команды в ``submit``, этот журнал — за жизнь заявки у брокера. Номер счёта
 здесь не хранится. Пишут главный поток и поток стрима — одно соединение под замком.
 """
@@ -25,6 +26,7 @@ REJECTED, CANCELLING, CANCELLED, UNKNOWN = "rejected", "cancelling", "cancelled"
 TERMINAL = frozenset({FILLED, REJECTED, CANCELLED})
 IN_FLIGHT = frozenset({SENDING, UNKNOWN, CANCELLING})
 KINDS = ("entry", "add", "target", "stop", "exit", "emergency")
+SUPERSEDED = 2                  # ``consumed`` перекрытого исполнения
 
 
 def order_key(command_id: str) -> str:
@@ -76,7 +78,7 @@ class LedgerOrder:
 
 @dataclass(frozen=True)
 class LedgerExecution:
-    execution_id: str               # tinvest:<номер сделки биржи>
+    execution_id: str               # tinvest:<номер сделки биржи> · tinvest-order:<номер заявки>:<лоты> — без сделок
     key: str
     lots: int
     price: Decimal                  # пункты
@@ -214,8 +216,10 @@ class OrderLedger:
         return True
 
     def executions(self, key: str) -> list[LedgerExecution]:
+        """Исполнения заявки по порядку прихода, без перекрытых."""
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM broker_executions WHERE key=? ORDER BY seq", (key,)).fetchall()
+            rows = self._conn.execute("SELECT * FROM broker_executions WHERE key=? AND consumed<? ORDER BY seq",
+                                      (key, SUPERSEDED)).fetchall()
         return [self._execution(row) for row in rows]
 
     def pending_executions(self) -> list[LedgerExecution]:
@@ -226,6 +230,16 @@ class OrderLedger:
     def mark_consumed(self, execution_id: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE broker_executions SET consumed=1 WHERE execution_id=?", (execution_id,))
+
+    def supersede(self, execution_id: str, lots: int = 0) -> None:
+        """Непроведённое исполнение перекрыто другим: ``lots`` > 0 — урезать до них, иначе убрать из объёма."""
+        with self._lock, self._conn:
+            if lots > 0:
+                self._conn.execute("UPDATE broker_executions SET lots=? WHERE execution_id=? AND consumed=0",
+                                   (lots, execution_id))
+            else:
+                self._conn.execute("UPDATE broker_executions SET consumed=? WHERE execution_id=? AND consumed=0",
+                                   (SUPERSEDED, execution_id))
 
     @staticmethod
     def _execution(row) -> LedgerExecution:

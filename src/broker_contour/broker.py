@@ -44,6 +44,7 @@ CANCEL_CONFIRM_SECS = 10
 SYNC_EVERY_SECS = 60
 MARGIN_EVERY = timedelta(days=1)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+BY_ORDER = "tinvest-order:"    # исполнение без сделок биржи: tinvest-order:<номер заявки>:<итог lots_executed>
 
 
 @dataclass(frozen=True)
@@ -305,8 +306,8 @@ class TInvestBroker(BrokerPort):
             self._ledger.update(row.key, reported=1)
             return self._outcome(action, now, ExecutionStatus.REJECT, row.reason or "broker-rejected")
         reason = "broker-unknown" if row.state in (UNKNOWN, SENDING) else "accepted"
-        return replace(self._outcome(action, now, ExecutionStatus.ACK, reason),
-                       order_id=row.broker_order_id or action.command_id)
+        # order_id события — заявка журнала сделок (= command_id); номер брокера живёт в журнале заявок.
+        return self._outcome(action, now, ExecutionStatus.ACK, reason)
 
     def _submit_cancel(self, view: TradeView, action: CancelEntry, now: datetime) -> ExecutionEvent:
         entries = [row for row in self._ledger.orders(trade_id=view.plan.trade_id, live=True, kinds=ENTRY_KINDS)]
@@ -392,30 +393,68 @@ class TInvestBroker(BrokerPort):
     def _apply_report(self, row: LedgerOrder, report: OrderReport, now: datetime) -> None:
         card = self._card_by_uid(row.instrument_uid)
         known = self._ledger.executions(row.key)
-        if report.trades:
-            lots = trade_lots(card, [*(e.lots for e in known), *(t.quantity for t in report.trades)],
-                              report.lots_executed)[len(known):]
-            for trade, quantity in zip(report.trades, lots):
+        seen = {e.execution_id for e in known}
+        fresh = [trade for trade in report.trades if f"tinvest:{trade.trade_id}" not in seen]
+        if fresh:
+            lots = trade_lots(card, [t.quantity for t in fresh], report.lots_executed - sum(e.lots for e in known))
+            for trade, quantity in zip(fresh, lots):
                 self._ledger.add_execution(LedgerExecution(f"tinvest:{trade.trade_id}", row.key, quantity,
                                                            trade_price(card, trade.price, trade.in_rub), trade.at))
-        executions = self._ledger.executions(row.key)
-        executed = sum(e.lots for e in executions)
-        if report.lots_executed > executed:
+            self._settle(row)
+        values = self._executed(row)
+        if report.lots_executed > values["lots_executed"]:
             self._sync.add(row.key)   # сделки не пришли в этом отчёте — добрать из GetOrderState.stages
-        values: dict = {"lots_executed": executed}
-        if executed:
-            values["average"] = (sum(e.price * e.lots for e in executions) / executed).quantize(
-                card.price_step if card.price_step > 0 else Decimal("0.000001"))
         if report.broker_order_id and (not report.temporary or not row.broker_order_id):
             values["broker_order_id"] = report.broker_order_id
         state = _STATE.get(report.status)
         if state is not None and not row.terminal:
             if row.state == CANCELLING and state in (ACCEPTED, PARTIAL):
                 state = CANCELLING
-            if state == FILLED and executed < row.lots:
+            if state == FILLED and values["lots_executed"] < row.lots:
                 state = PARTIAL       # статус «исполнена» без всех сделок — ждём их
             values["state"] = state
         self._ledger.update(row.key, **values)
+
+    def _executed(self, row: LedgerOrder) -> dict:
+        """Исполненные лоты и средняя заявки по журналу исполнений."""
+        card = self._card_by_uid(row.instrument_uid)
+        executions = self._ledger.executions(row.key)
+        executed = sum(e.lots for e in executions)
+        values: dict = {"lots_executed": executed}
+        if executed:
+            values["average"] = (sum(e.price * e.lots for e in executions) / executed).quantize(
+                card.price_step if card.price_step > 0 else Decimal("0.000001"))
+        return values
+
+    def _settle(self, row: LedgerOrder) -> bool:
+        """Объём исполнений заявки не больше её лотов и итога брокера; ``True`` — что-то перекрыто.
+
+        Исполнение ``tinvest-order:`` пишется по сумме заявки, когда сделок биржи ещё нет. Сделки стрима,
+        пришедшие после, — те же лоты: лишнее снимается с непроведённых исполнений, сначала с исполнения
+        без сделок, затем с последних сделок. Проведённое в журнал сделок не трогается.
+        """
+        executions = self._ledger.executions(row.key)
+        limit = min([row.lots, *(int(e.execution_id.rsplit(":", 1)[1]) for e in executions
+                                 if e.execution_id.startswith(BY_ORDER))])
+        excess = sum(e.lots for e in executions) - limit
+        if excess <= 0:
+            return False
+        free = [e for e in executions if not e.consumed and e.execution_id not in self._emitted
+                and not self._journal_has(e.execution_id)]
+        free = [e for e in free if e.execution_id.startswith(BY_ORDER)] + [
+            e for e in reversed(free) if not e.execution_id.startswith(BY_ORDER)]
+        log.warning("Исполнения заявки %s %s сверх итога брокера на %d лот.: лишнее перекрыто",
+                    row.kind, self._display(row.instrument_uid), excess)
+        for execution in free:
+            if excess <= 0:
+                break
+            take = min(execution.lots, excess)
+            self._ledger.supersede(execution.execution_id, execution.lots - take)
+            excess -= take
+        if excess > 0:
+            log.error("Исполнения заявки %s %s уже проведены сверх итога брокера на %d лот. — разберёт сверщик",
+                      row.kind, self._display(row.instrument_uid), excess)
+        return True
 
     # --- неизвестные заявки и досверка ----------------------------------------
     def _resolve(self, row: LedgerOrder, now: datetime) -> None:
@@ -500,7 +539,7 @@ class TInvestBroker(BrokerPort):
             known = self._ledger.executions(row.key)
             average = fill_average(card, report.executed_rub, report.lots_executed, report.initial_rub,
                                    report.lots_requested)
-            rest = report.lots_executed - executed
+            rest = min(report.lots_executed, row.lots) - executed
             price = average
             if known:
                 price = to_step((average * report.lots_executed - sum(e.price * e.lots for e in known)) / rest,
@@ -704,6 +743,10 @@ class TInvestBroker(BrokerPort):
         """Новые сделки биржи и итоги заявок — события для ``consume`` по порядку прихода."""
         with self._lock:
             now = self._clock()
+            for key in dict.fromkeys(e.key for e in self._ledger.pending_executions()):
+                row = self._ledger.get(key)
+                if self._settle(row):
+                    self._ledger.update(key, **self._executed(row))
             for execution in self._ledger.pending_executions():
                 if self._journal_has(execution.execution_id):
                     self._ledger.mark_consumed(execution.execution_id)
@@ -741,8 +784,7 @@ class TInvestBroker(BrokerPort):
             status = ExecutionStatus.CANCEL
             reason = row.reason if row.reason == "entry-undelivered" else (
                 view.cancel_reason if view is not None and view.cancel_reason else "broker-cancelled")
-        event = self._outcome_ids(row.command_id, row.trade_id, now, status, reason)
-        return replace(event, order_id=row.broker_order_id or row.command_id)
+        return self._outcome_ids(row.command_id, row.trade_id, now, status, reason)
 
     def _finish_cancels(self, now: datetime) -> None:
         """Снятие входа завершено, когда все входы сделки завершены: итог самой команды отмены."""
@@ -764,15 +806,15 @@ class TInvestBroker(BrokerPort):
             log.warning("Сделка биржи по неизвестной сделке журнала: %s", row.trade_id)
             return None
         plan = view.plan
-        common = dict(execution_id=execution.execution_id, order_id=row.broker_order_id or row.key,
-                      trade_id=row.trade_id, filled_quantity=execution.lots, price=execution.price, fee=None,
-                      timestamp=execution.at, fee_source=FeeSource.BROKER)
+        # order_id — заявка журнала сделок: у неё id команды (у целей и стопа — синтезированной reducer'ом).
+        common = dict(execution_id=execution.execution_id, trade_id=row.trade_id, filled_quantity=execution.lots,
+                      price=execution.price, fee=None, timestamp=execution.at, fee_source=FeeSource.BROKER)
         if row.kind in ENTRY_KINDS:
             done = self._done_through(row.trade_id, ENTRY_KINDS, lambda other: other.command_id == row.command_id,
                                       execution)
             self._apply_entry_fill(view, execution)
             status = ExecutionStatus.FILL if done >= row.lots else ExecutionStatus.PARTIAL
-            return ExecutionEvent(command_id=row.command_id, status=status, reason="limit-fill",
+            return ExecutionEvent(command_id=row.command_id, order_id=row.command_id, status=status, reason="limit-fill",
                                   reference_price=row.price, reference_kind="signal", order_side=plan.side,
                                   slippage_source="broker", **common)
         view.position = max(0, view.position - execution.lots)
@@ -780,7 +822,8 @@ class TInvestBroker(BrokerPort):
             view.target_filled[row.target_id] = view.target_filled.get(row.target_id, 0) + execution.lots
             target = next((t for t in plan.targets if t.target_id == row.target_id), None)
             command = f"{row.trade_id}:pv:tp:{row.target_id}:{execution.execution_id.removeprefix('tinvest:')}"
-            return ExecutionEvent(command_id=command, status=ExecutionStatus.FILL, reason=f"tp:{row.target_id}",
+            return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL,
+                                  reason=f"tp:{row.target_id}",
                                   reference_price=None if target is None else target.price, reference_kind="target",
                                   order_side=view.exit_side, slippage_source="broker", **common)
         job = self._jobs.get(row.trade_id)
@@ -788,7 +831,7 @@ class TInvestBroker(BrokerPort):
             job.executed += execution.lots
         if ":pv:stop:" in row.job:
             command = f"{row.job}:{execution.execution_id.removeprefix('tinvest:')}"
-            return ExecutionEvent(command_id=command, status=ExecutionStatus.FILL, reason="protective",
+            return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL, reason="protective",
                                   reference_price=view.confirmed_stop, reference_kind="stop",
                                   order_side=view.exit_side, slippage_source="broker", **common)
         done = self._done_through(row.trade_id, EXIT_KINDS, lambda other: other.job == row.job, execution)
@@ -796,7 +839,7 @@ class TInvestBroker(BrokerPort):
         status = ExecutionStatus.FILL if total is None or done >= total else ExecutionStatus.PARTIAL
         if total is None and view.position > 0:
             status = ExecutionStatus.PARTIAL
-        return ExecutionEvent(command_id=row.job, status=status, reason=job.reason if job else "exit",
+        return ExecutionEvent(command_id=row.job, order_id=row.job, status=status, reason=job.reason if job else "exit",
                               reference_price=job.reference if job else None, reference_kind="market-exit",
                               order_side=view.exit_side, slippage_source="broker", **common)
 
