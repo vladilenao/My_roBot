@@ -702,7 +702,10 @@ class TestCoreApi:
              "heartbeat": {"beat_at": "2026-10-24T09:00:05Z", "interval_secs": 5},
              "market_data": {"producer_id": "tbank-test", "max_change_id": 7,
                              "pairs": {"total": 2, "by_status": {"READY": 1, "BOOTSTRAPPING": 1}}},
-             "quotas": {"quotes": {"per_minute": 3, "ceiling": 180, "lanes": {"live": 3}, "retry_after": None}}}
+             "quotas": {"quotes": {"per_minute": 3, "ceiling": 180, "lanes": {"live": 3}, "retry_after": None}},
+             "lanes": {"live": {"state": "stalled", "step_started_at": "2026-10-24T08:50:00Z", "last_step_at": None},
+                       "evidence": {"state": "ok", "step_started_at": None,
+                                    "last_step_at": "2026-10-24T09:00:04Z"}}}
 
     def test_state_matches_contract(self, controlled_server):
         srv, _, _ = controlled_server

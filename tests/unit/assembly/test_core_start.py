@@ -86,3 +86,30 @@ def test_last_delay_repeats(delays):
     starter, _, sleeps, _ = _starter([OSError()] * 3, delays=delays)
     starter.run()
     assert sleeps == [5, 5, 5]
+
+
+def test_snapshot_lanes_empty_before_ready():
+    live = core.LiveCore.__new__(core.LiveCore)
+    live.pulse = live.market_store = live.request_budget = None
+    live.starter, _, _, _ = _starter([])
+    assert live.core_snapshot()["lanes"] == {}
+
+
+def test_snapshot_reports_stalled_live_lane():
+    from src.data.lane_watchdog import LaneWatchdog
+
+    clock = [0.0]
+    watchdog = LaneWatchdog(300, clock=lambda: clock[0], announce=lambda text: None)
+    watchdog.register("evidence")
+    watchdog.begin("live")
+    clock[0] = 301
+    live = core.LiveCore.__new__(core.LiveCore)
+    live.pulse = live.request_budget = live.starter = live._poller = None
+    live.market_store = type("Store", (), {
+        "source_info": lambda self: type("Info", (), {"producer_id": "p", "max_change_id": 1})(),
+        "pair_readiness_all": lambda self, source: []})()
+    live.early = type("Early", (), {"poller": type("P", (), {"watchdog": watchdog})()})()
+    lanes = live.core_snapshot()["lanes"]
+    assert lanes["live"]["state"] == "stalled" and lanes["live"]["step_started_at"].endswith("Z")
+    assert lanes["evidence"] == {"state": "ok", "step_started_at": None, "last_step_at": None}
+    assert set(lanes["live"]) == {"state", "step_started_at", "last_step_at"}   # только время, без стека
