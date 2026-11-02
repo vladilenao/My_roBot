@@ -105,10 +105,117 @@ def test_fill_without_trades_after_restart_uses_order_sum(tmp_path):
     assert h.broker.trade_state("trade-ng-1").position == 3
 
 
+RUB_PER_POINT = D("8086.64")
+
+
+def _filled_by_sum(h, key, lots, price):
+    """``GetOrderState`` песочницы: заявка исполнена, ``stages`` пусты — только сумма ``executed_order_price``."""
+    from dataclasses import replace
+
+    report = replace(h.api.orders[key], status="fill", lots_executed=lots, trades=(),
+                     executed_rub=D(price) * lots * RUB_PER_POINT, initial_rub=D("2.845") * lots * RUB_PER_POINT)
+    h.api.orders[key] = report
+    return report
+
+
+def _stream_fill(h, key, lots, price, trade_id="exch-stream-1"):
+    """Событие стрима «исполнена» со сделкой биржи на все лоты."""
+    from dataclasses import replace
+
+    from src.broker_contour.api import BrokerTrade
+
+    return replace(h.api.orders[key], status="fill", lots_executed=lots, executed_rub=None,
+                   trades=(BrokerTrade(trade_id, D(price), lots, NOW),))
+
+
+def _entry_lots(events):
+    return sum(e.filled_quantity for e in events if e.status in (ExecutionStatus.FILL, ExecutionStatus.PARTIAL))
+
+
+@pytest.mark.parametrize("drained_between", [True, False], ids=["synthetic-emitted", "synthetic-pending"])
+def test_order_state_before_stream_counts_fill_once(tmp_path, drained_between):
+    """Инцидент 02.11 (SiZ6, 10 лотов): GetOrderState без сделок раньше сделки стрима — исполнение одно."""
+    h = Harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    _filled_by_sum(h, key, 10, "2.846")
+    h.broker.service(h.clock())                         # досверка: исполнение по сумме заявки
+    events = h.drain() if drained_between else []
+    h.broker.ingest(_stream_fill(h, key, 10, "2.846"))  # сделка стрима пришла после
+    events += h.drain()
+
+    assert _entry_lots(events) == 10 and len(events) == 1
+    assert events[0].status is ExecutionStatus.FILL and events[0].order_id == action.command_id
+    # Проведено то, что пришло первым к выдаче: исполнение по сумме или сделка биржи.
+    assert events[0].execution_id.startswith("tinvest-order:" if drained_between else "tinvest:")
+    row = h.ledger.get(key)
+    assert row.lots_executed == 10 and row.average == D("2.846") and row.state == "filled"
+    assert sum(e.lots for e in h.ledger.executions(key)) == 10
+    assert h.broker.trade_state("trade-ng-1").position == 10
+    assert h.ledger.pending_executions() == [] or h.drain() == []
+
+
+def test_stream_before_order_state_counts_fill_once(tmp_path):
+    h = Harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    h.broker.ingest(_stream_fill(h, key, 10, "2.846"))
+    _filled_by_sum(h, key, 10, "2.846")
+    h.broker.resync(h.clock())                          # досверка по ключу после сделки стрима
+    events = h.drain()
+
+    assert [(e.execution_id, e.filled_quantity) for e in events] == [("tinvest:exch-stream-1", 10)]
+    assert h.ledger.get(key).lots_executed == 10
+    assert h.broker.trade_state("trade-ng-1").position == 10
+
+
+def test_partial_cancel_by_sum_then_late_trade_not_counted_twice(tmp_path):
+    """Снятая после 4 из 10 заявка: исполнение по сумме на 4, поздняя сделка стрима на те же 4 — лишняя."""
+    from dataclasses import replace
+
+    h = Harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    report = _filled_by_sum(h, key, 4, "2.846")
+    h.api.orders[key] = replace(report, status="cancelled")
+    h.broker.service(h.clock())
+    events = h.drain()
+    late = replace(_stream_fill(h, key, 4, "2.846"), status="partial")
+    h.broker.ingest(late)
+    events += h.drain()
+
+    assert _entry_lots(events) == 4
+    assert h.ledger.get(key).lots_executed == 4 and h.broker.trade_state("trade-ng-1").position == 4
+
+
+def test_ledger_with_fill_counted_twice_is_settled_before_emit(tmp_path):
+    """База тестового робота 02.11: обе записи по 10 лотов не проведены — после рестарта проводится одна."""
+    from src.broker_contour.orders import LedgerExecution
+
+    first = Harness(tmp_path)
+    action, _ = first.open(lots=10)
+    key = order_key(action.command_id)
+    broker_id = first.ledger.get(key).broker_order_id
+    first.ledger.add_execution(LedgerExecution(f"tinvest-order:{broker_id}:10", key, 10, D("2.846"), NOW))
+    first.ledger.add_execution(LedgerExecution("tinvest:exch-stream-1", key, 10, D("2.846"), NOW))
+    first.ledger.update(key, state="filled", lots_executed=20, average=D("2.846"))
+    first.ledger.close()
+
+    h = Harness(tmp_path)                               # новый процесс на той же базе
+    h.broker.register_trade(_plan())
+    events = h.drain()
+
+    assert [(e.execution_id, e.filled_quantity) for e in events] == [("tinvest:exch-stream-1", 10)]
+    assert events[0].order_id == action.command_id
+    assert h.ledger.get(key).lots_executed == 10
+    assert h.ledger.pending_executions() == [] or h.drain() == []
+
+
 def test_entry_accepted_then_partial_and_full_fill(tmp_path):
     h = Harness(tmp_path)
     action, answer = h.open()
-    assert answer.status is ExecutionStatus.ACK and answer.order_id == "broker-order-0001"
+    # order_id события — заявка журнала сделок (её id — command_id), а не номер брокера.
+    assert answer.status is ExecutionStatus.ACK and answer.order_id == action.command_id
     post = h.api.posts()[0]
     assert post[2] == order_key(action.command_id) and post[5] == D("2.845") and post[4] == 2
     assert h.kinds() == ["sent"] and any(e.type is EventType.ORDER_ACCEPTED for e in h.published)
