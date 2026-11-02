@@ -132,3 +132,29 @@ def test_stuck_entry_recovers_after_restart(tmp_path):
         assert restarted.ledger.get(key).lots_executed == 10
         assert [e.status for e in restarted.broker.drain_addressed_events()
                 if e.status is ExecutionStatus.FILL] == []
+
+
+def test_execution_refused_by_journal_is_not_hidden_in_flight(tmp_path):
+    """Инцидент 02.11 (Si): лишнее исполнение выхода reducer отверг, оно навсегда осталось «в пути»,
+    и сверка не видела расхождения со счётом. Теперь оно «отвергнуто», позиция брокера — по журналу."""
+    from src.broker_contour.orders import REFUSED, LedgerExecution, LedgerOrder
+
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        env = Env(tmp_path, storage)
+        key = env.enter(10)
+        env.stream_fill(key, 10, "2.846")
+        env.manager.consume_queued_broker_events()
+        job = f"{TRADE}:pv:stop:2026-10-30T10:05:00+00:00"
+        extra = order_key(f"{job}:1")
+        env.ledger.create(LedgerOrder(extra, job, TRADE, "stop", NG, "SELL", "limit", 12, D("2.810"),
+                                      state="filled", lots_executed=12, job=job))
+        env.ledger.add_execution(LedgerExecution("tinvest:exch-extra", extra, 12, D("2.810"), NOW))
+
+        env.manager.consume_queued_broker_events()          # reducer: сверх открытой позиции — не исключение
+
+        _, fills, position = env.journal()
+        assert (fills, position) == (10, 10)
+        assert env.broker.trade_state(TRADE).position == 10
+        assert [e.consumed for e in env.ledger.executions(extra)] == [REFUSED]
+        assert env.ledger.pending_executions() == [] and env.broker.in_flight_instruments() == set()
+        assert env.broker.drain_addressed_events() == []

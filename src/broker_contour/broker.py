@@ -121,6 +121,7 @@ class TInvestBroker(BrokerPort):
         self._queued: dict[str, list[ExitJob]] = {}  # trade_id → выходы, ждущие активного
         self._events: list[ExecutionEvent] = []
         self._emitted: set[str] = set()
+        self._applied: dict[str, tuple[str, dict]] = {}   # исполнение → (сделка, что оно изменило в представлении)
         self._contracts: dict = {}
         self._cards: dict[str, PriceCard] = {}
         self._margins: dict[str, dict] = {}
@@ -630,7 +631,7 @@ class TInvestBroker(BrokerPort):
 
     def _pump(self, trade_id: str, now: datetime) -> None:
         job, view = self._jobs.get(trade_id), self._views.get(trade_id)
-        if job is None or view is None:
+        if job is None or view is None or self._unsettled(trade_id, job.job_id):
             return
         live = self._ledger.orders(trade_id=trade_id, live=True, kinds=EXIT_KINDS)
         live = [row for row in live if row.job == job.job_id]
@@ -699,7 +700,7 @@ class TInvestBroker(BrokerPort):
     def _ensure_targets(self, view: TradeView, now: datetime) -> None:
         """Лимитные заявки целей на остаток после входа; снятые брокером в конце дня ставятся заново."""
         trade_id = view.plan.trade_id
-        if view.position <= 0 or trade_id in self._jobs or view.average is None:
+        if view.position <= 0 or trade_id in self._jobs or view.average is None or self._unsettled(trade_id):
             return
         card = self._card_for(view.plan.instrument_id)
         if card is None:
@@ -731,6 +732,18 @@ class TInvestBroker(BrokerPort):
                 if retry is None:
                     self._notify("exit_rejected", row, reason=row.reason)
 
+    def _unsettled(self, trade_id: str, job_id: str | None = None) -> bool:
+        """Исполнения сделки ещё не учтены её представлением — объём выхода и целей по нему считать нельзя.
+
+        Позиция и исполненное выходом меняются, когда исполнение выдаётся в ``consume``. Заявка, исполненная
+        сразу (в ответе ``PostOrder`` или в стриме), до этого выглядит неисполненной, и новая заявка на тот же
+        объём исполнилась бы второй (инцидент 02.11, Si). Заявка выхода, ждущая своих сделок, — тоже не учтена.
+        """
+        if any(e.execution_id not in self._emitted for e in self._ledger.pending_for_trade(trade_id)):
+            return True
+        return job_id is not None and any(row.key in self._sync and row.job == job_id
+                                          for row in self._ledger.orders(trade_id=trade_id, kinds=EXIT_KINDS))
+
     def _last_price(self, uid: str) -> Decimal | None:
         try:
             price = self._api.last_price(uid)
@@ -756,9 +769,11 @@ class TInvestBroker(BrokerPort):
                 row = self._ledger.get(execution.key)
                 event = self._execution_event(row, execution)
                 self._emitted.add(execution.execution_id)
-                if event is not None:
-                    self._events.append(event)
-                    self.fills_since_capital = True
+                if event is None:
+                    self._ledger.refuse(execution.execution_id)
+                    continue
+                self._events.append(event)
+                self.fills_since_capital = True
             for row in self._ledger.unreported():
                 if row.kind not in ENTRY_KINDS:
                     self._ledger.update(row.key, reported=1)
@@ -803,7 +818,8 @@ class TInvestBroker(BrokerPort):
     def _execution_event(self, row: LedgerOrder, execution: LedgerExecution) -> ExecutionEvent | None:
         view = self._views.get(row.trade_id)
         if view is None:
-            log.warning("Сделка биржи по неизвестной сделке журнала: %s", row.trade_id)
+            log.error("Исполнение брокера %s на %d лот. по сделке вне журнала %s: на счёте вне журнала — "
+                      "расхождение покажет сверка", self._display(row.instrument_uid), execution.lots, row.trade_id)
             return None
         plan = view.plan
         # order_id — заявка журнала сделок: у неё id команды (у целей и стопа — синтезированной reducer'ом).
@@ -813,13 +829,19 @@ class TInvestBroker(BrokerPort):
             done = self._done_through(row.trade_id, ENTRY_KINDS, lambda other: other.command_id == row.command_id,
                                       execution)
             self._apply_entry_fill(view, execution)
+            self._applied[execution.execution_id] = (row.trade_id, {"position": execution.lots,
+                                                                    "entry": execution.lots})
             status = ExecutionStatus.FILL if done >= row.lots else ExecutionStatus.PARTIAL
             return ExecutionEvent(command_id=row.command_id, order_id=row.command_id, status=status, reason="limit-fill",
                                   reference_price=row.price, reference_kind="signal", order_side=plan.side,
                                   slippage_source="broker", **common)
-        view.position = max(0, view.position - execution.lots)
+        removed = min(view.position, execution.lots)
+        view.position -= removed
+        applied: dict = {"position": -removed}
+        self._applied[execution.execution_id] = (row.trade_id, applied)
         if row.kind == "target":
             view.target_filled[row.target_id] = view.target_filled.get(row.target_id, 0) + execution.lots
+            applied["target"] = (row.target_id, execution.lots)
             target = next((t for t in plan.targets if t.target_id == row.target_id), None)
             command = f"{row.trade_id}:pv:tp:{row.target_id}:{execution.execution_id.removeprefix('tinvest:')}"
             return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL,
@@ -829,6 +851,7 @@ class TInvestBroker(BrokerPort):
         job = self._jobs.get(row.trade_id)
         if job is not None and job.job_id == row.job:
             job.executed += execution.lots
+            applied["job"] = (job.job_id, execution.lots)
         if ":pv:stop:" in row.job:
             command = f"{row.job}:{execution.execution_id.removeprefix('tinvest:')}"
             return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL, reason="protective",
@@ -842,6 +865,30 @@ class TInvestBroker(BrokerPort):
         return ExecutionEvent(command_id=row.job, order_id=row.job, status=status, reason=job.reason if job else "exit",
                               reference_price=job.reference if job else None, reference_kind="market-exit",
                               order_side=view.exit_side, slippage_source="broker", **common)
+
+    def refuse_execution(self, event: ExecutionEvent, reason: str) -> None:
+        """Журнал сделок не принял исполнение брокера: откат представления, исполнение — «отвергнуто».
+
+        Исполнение было на счёте, поэтому оно не прячется «в пути»: расхождение со счётом покажет сверка
+        тревогой и заморозкой входов инструмента, выходы сделки работают от позиции журнала.
+        """
+        with self._lock:
+            self._ledger.refuse(event.execution_id)
+            trade_id, applied = self._applied.pop(event.execution_id, (event.trade_id, {}))
+            view = self._views.get(trade_id)
+            if view is not None:
+                view.position -= applied.get("position", 0)
+                view.entry_quantity -= applied.get("entry", 0)
+                if "target" in applied:
+                    target_id, lots = applied["target"]
+                    view.target_filled[target_id] = view.target_filled.get(target_id, 0) - lots
+            if "job" in applied:
+                job_id, lots = applied["job"]
+                for job in (self._jobs.get(trade_id), *self._queued.get(trade_id, ())):
+                    if job is not None and job.job_id == job_id:
+                        job.executed -= lots
+            log.error("Исполнение брокера по сделке %s на %d лот. не принято журналом (%s): на счёте вне журнала — "
+                      "расхождение покажет сверка", trade_id, event.filled_quantity, reason)
 
     def _done_through(self, trade_id: str, kinds, same, execution: LedgerExecution) -> int:
         """Лоты команды по её заявкам до этой сделки биржи включительно (порядок прихода)."""

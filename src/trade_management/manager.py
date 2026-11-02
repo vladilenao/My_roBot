@@ -1112,7 +1112,16 @@ class TradeManager:
             row = self._storage.connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
             snapshot = json.loads(row[0]).get("cost_snapshot") if row else None
             event = resolve_execution_fee(event, None if snapshot is None else Decimal(str(snapshot["commission"])))
-        applied = self._reducer.apply(event)
+        try:
+            applied = self._reducer.apply(event)
+        except ValueError as exc:
+            # Брокер на счёте (песочница) сообщает факт, который журнал не принял: брокер помечает его
+            # отвергнутым и откатывает своё представление, расхождение показывает сверка (add-tinvest-orders).
+            refuse = getattr(self._broker, "refuse_execution", None)
+            if not callable(refuse) or event.status not in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
+                raise
+            refuse(event, str(exc))
+            return False
         if not applied:
             return False
         stop_confirmed = event.status is ExecutionStatus.ACK and self._confirm_stop(event)

@@ -381,6 +381,44 @@ def test_signal_close_cancels_targets_and_exits_by_limit(tmp_path):
     assert [(e.command_id, e.status) for e in events] == [("close-1", ExecutionStatus.FILL)]
 
 
+def _opened_without_targets(h, lots=10):
+    """Сделка как у ``ma-raw``: без целей, выходы — сигналами и стопом."""
+    from dataclasses import replace
+
+    h.broker.register_trade(replace(_plan(), targets=()))
+    action = OpenTrade("trade-ng-1:entry", "trade-ng-1", 0, "signal", lots, EntryOrderType.LIMIT, D("2.8457"))
+    h.broker.submit(action, h.clock())
+    h.broker.ingest(h.api.fill(order_key(action.command_id), lots, "2.846"))
+    h.drain()
+    h.broker.service(h.clock())
+
+
+@pytest.mark.parametrize("exit_by", ["reduce", "stop"])
+def test_filled_exit_not_sent_again_before_its_fill_is_drained(tmp_path, exit_by):
+    """Инцидент 02.11 (Si): выход исполнился сразу, а представление сделки ещё не знало об этом —
+    следующее обслуживание отправляло такую же заявку, и брокер исполнял обе."""
+    h = Harness(tmp_path)
+    _opened_without_targets(h)
+    posts = len(h.api.posts())
+    if exit_by == "reduce":
+        h.broker.submit(ReduceTrade("reduce-1", "trade-ng-1", 1, "partial-exit", 1), h.clock())
+        lots = 1
+    else:
+        h.broker.track_bar(NOW + timedelta(minutes=5), {NG: (2.83, 2.80, 2.84, 2.81)})
+        lots = 10
+    exits = h.api.posts()[posts:]
+    assert [call[4] for call in exits] == [lots]
+    h.broker.ingest(h.api.fill(exits[0][2], lots, "2.812"))     # стрим: исполнена, очередь ещё не разобрана
+    h.broker.service(h.clock.advance(0.2))
+    h.broker.service(h.clock.advance(0.2))
+    assert len(h.api.posts()) == posts + 1
+    events = h.drain()
+    assert sum(e.filled_quantity for e in events) == lots
+    h.broker.service(h.clock.advance(1))
+    assert len(h.api.posts()) == posts + 1
+    assert h.broker.trade_state("trade-ng-1").position == 10 - lots
+
+
 def test_reduce_uses_free_lots_and_move_stop(tmp_path):
     h = Harness(tmp_path)
     h.filled()
