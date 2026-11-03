@@ -45,6 +45,20 @@ def family_for(ticker: str, name: str = "", basic_asset: str = "") -> str | None
     return next(iter(found), None)
 
 
+def assignment_family(ticker: str, short_name: str | None = None, family: str | None = None) -> str | None:
+    """Семейство для поиска привязок ``[strategies.future.*]`` (fix-futures-family-assignments).
+
+    Карточки состава контуров хранят ``family = None``: без распознавания RIZ6 искался бы
+    под ``RI``, а привязки записаны под ``RTS``. Неоднозначная карточка — ``None``.
+    """
+    if isinstance(family, str):
+        return family
+    try:
+        return family_for(ticker, short_name or "")
+    except ValueError:
+        return None
+
+
 def lifecycle_time(value) -> datetime | None:
     """Только достоверный момент с поясом, без догадок о времени сессии."""
     if value is None or value == "":
