@@ -67,10 +67,10 @@ class _EntryCandidate:
 def assignments_for(instrument: Instrument, share_strategies, future_strategies) -> list[Assignment]:
     """Привязки инструмента: акция — по тикеру, фьючерс — по семейству."""
     if instrument.instrument_type == "future":
-        if isinstance(instrument.family, str):
-            from src.instruments.futures import FAMILIES
-            return future_strategies.get(instrument.family,
-                future_strategies.get(FAMILIES[instrument.family][0], []))
+        from src.instruments.futures import FAMILIES, assignment_family
+        family = assignment_family(instrument.ticker, instrument.short_name, instrument.family)
+        if family is not None:
+            return future_strategies.get(family, future_strategies.get(FAMILIES[family][0], []))
         return future_strategies.get(instrument.ticker[:2].upper(), [])
     return share_strategies.get(instrument.ticker, [])
 
