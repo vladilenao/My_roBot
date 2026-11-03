@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from src.assembly.core_state import Member
-from src.instruments.futures import FAMILIES, family_for
+from src.instruments.futures import FAMILIES, assignment_family, family_for
 
 
 def binding_catalog(share_strategies: dict, future_strategies: dict) -> dict[str, dict]:
@@ -31,11 +31,12 @@ def binding_brief(card: dict) -> dict:
 
 def instrument_bindings(card: dict, catalog: dict) -> list[dict]:
     """Привязки, по которым торгует участник эмуляции, — по правилам ``assignments_for`` торговли:
-    акция — по тикеру, фьючерс — по семейству, а если по семейству привязок нет — по его коду;
-    фьючерс без семейства — по двум буквам тикера."""
+    акция — по тикеру, фьючерс — по семейству, а если по семейству привязок нет — по его коду.
+    Семейства в карточке состава нет — по тикеру и короткому имени (fix-futures-family-assignments);
+    не определилось — по двум буквам тикера."""
     ticker = str(card.get("ticker") or card.get("name") or "")
     if card.get("instrument_type") == "future":
-        family = card.get("family")
+        family = assignment_family(ticker, card.get("short_name") or card.get("name"), card.get("family"))
         kind, keys = "future", ((family, FAMILIES[family][0]) if family in FAMILIES else (ticker[:2].upper(),))
     else:
         kind, keys = "share", (ticker,)

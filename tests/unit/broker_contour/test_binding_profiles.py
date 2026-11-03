@@ -13,6 +13,7 @@ FUTURES = {
     "BR": [Assignment("future-br-flat", "flat_triangle", "levels_rr", filter_profile="triple_screen", timeframe="1h"),
            Assignment("future-br-ma", "ma_cloud_rsi_macd", "ma_cloud", timeframe="15m")],
     "SR": [Assignment("future-sr-harmonic", "harmonic_abcd", "pattern_targets", timeframe="1h")],
+    "RTS": [Assignment("future-rts-flat", "flat_triangle", "levels_rr", timeframe="1h")],
 }
 CATALOG = binding_catalog(SHARES, FUTURES)
 
@@ -28,6 +29,11 @@ def _ids(card):
     ({"ticker": "SRZ6", "instrument_type": "future", "family": "SBRF"}, ["future-sr-harmonic"]),
     # Старая карточка без тикера и семейства — по имени.
     ({"name": "BR-12.26", "instrument_type": "future"}, ["future-br-flat", "future-br-ma"]),
+    # Карточки состава контуров — без семейства (fix-futures-family-assignments): по тикеру и имени.
+    ({"ticker": "RIZ6", "short_name": "RTS-12.26", "instrument_type": "future", "family": None}, ["future-rts-flat"]),
+    ({"ticker": "SRZ6", "short_name": "SBRF-12.26", "instrument_type": "future", "family": None},
+     ["future-sr-harmonic"]),
+    ({"name": "RTS-12.26", "instrument_type": "future"}, ["future-rts-flat"]),
     ({"ticker": "GAZP", "instrument_type": "share"}, []),
     ({"ticker": "NGZ6", "instrument_type": "future", "family": "NG"}, []),
 ])
