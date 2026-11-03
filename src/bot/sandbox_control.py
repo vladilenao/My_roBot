@@ -17,7 +17,8 @@ from src.assembly.contour_control import STATUS_FILE, read_status
 from src.assembly.core_state import ACCEPTED, CLOSE_ALL, CONFLICT, NO_ENTRIES, STOP_MODES, RevisionChanged
 from src.bot import control_views as views
 from src.bot.launch_control import BadCommand, tail_lines
-from src.broker_contour.bindings import binding_catalog, binding_member, emulation_traded, resolved, unknown_bindings
+from src.broker_contour.bindings import (binding_brief, binding_catalog, binding_member, emulation_traded, resolved,
+                                         unknown_bindings)
 from src.broker_contour.store import BROKER_DATABASE_FILE, read_last_report
 
 SOURCE_API = "api"
@@ -139,8 +140,11 @@ class SandboxControl:
         card = member.instrument
         current = next((item for item in (status or {}).get("members") or () if item.get("key") == member.key), None)
         state = current.get("state") if running and current else None
+        # Профили — из текущей конфигурации, как у процесса песочницы; привязки там уже нет — из карточки состава.
+        profile = self._catalog.get(member.key) or card
         return {"id": member.key, "instrument": card.get("short_name") or card.get("instrument"),
                 "strategy": card.get("strategy"), "timeframe": card.get("timeframe"),
+                "filter": profile.get("filter"), "management": profile.get("management"),
                 "target": "active" if member.active else "removed", "remove_mode": member.remove_mode,
                 "current": state if state in views.BINDING_STATES else None,
                 "reason": current.get("reason") if running and current else None,
@@ -183,8 +187,7 @@ class SandboxControl:
         for card in self._catalog.values():
             trades = (["emulation"] if emulation_traded(card, emulation) else []) + \
                      (["sandbox"] if card["id"] in ours else [])
-            available.append({"id": card["id"], "instrument": card["instrument"], "strategy": card["strategy"],
-                              "timeframe": card["timeframe"], "trades_in": trades})
+            available.append({**binding_brief(card), "instrument": card["instrument"], "trades_in": trades})
         return {"revision": None if desired is None else desired.generation,
                 "members": [self._member_view(member, status, process["running"]) for member in members],
                 "available": available,

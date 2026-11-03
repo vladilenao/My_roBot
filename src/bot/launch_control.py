@@ -25,6 +25,7 @@ from src.bot.launch import (
     HISTORY_DEFAULT_PAUSE, MODE_EMULATION, MODE_HISTORY, SOURCE_API, Chosen, LaunchError, LaunchRequest, Rejection,
     RunConfigurationError, parse_instrument_tokens, parse_moment, validate_range,
 )
+from src.broker_contour.bindings import binding_brief, binding_catalog, instrument_bindings
 
 STATE_WAITING = "waiting_command"
 STATE_STARTING = "starting"
@@ -180,8 +181,11 @@ class LaunchControl:
     """Состояние контура эмуляции процесса робота и очередь команды запуска."""
 
     def __init__(self, *, reply_timeout: float = REPLY_TIMEOUT_SECS, clock=None, core_state=None,
-                 contour_dir: Path | None = None, log_file: str = "bot_debug.log") -> None:
+                 contour_dir: Path | None = None, log_file: str = "bot_debug.log",
+                 share_strategies: dict | None = None, future_strategies: dict | None = None) -> None:
         self._lock = threading.Lock()
+        # Привязки конфигурации — для ``bindings`` участников эмуляции (add-binding-profiles-api).
+        self._catalog = binding_catalog(share_strategies or {}, future_strategies or {})
         self._queue: queue.Queue[_Pending] = queue.Queue()
         self._reply_timeout = reply_timeout
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -298,16 +302,20 @@ class LaunchControl:
         if members:
             # Текущий целевой состав (add-contour-membership), а не состав запуска.
             items = [(member.name, member.instrument.get("instrument_type"), (member.chosen or {}).get("days_to_expiry"),
-                      member.active, member.remove_mode, current.get(member.key)) for member in members]
+                      member.active, member.remove_mode, current.get(member.key), member.instrument)
+                     for member in members]
         else:
-            items = [(item.name, item.instrument_type, item.days_to_expiry, True, None, None) for item in chosen]
+            items = [(item.name, item.instrument_type, item.days_to_expiry, True, None, None,
+                      {"name": item.name, "instrument_type": item.instrument_type, "family": item.family})
+                     for item in chosen]
         return [{
             "name": name, "instrument_type": kind, "days_to_expiry": days,
             "target": "active" if active else "removed", "remove_mode": remove_mode, "current": state,
+            "bindings": [binding_brief(item) for item in instrument_bindings(card, self._catalog)],
             "_links": views.links(self=views.member_href(name)),
             "_actions": views.member_action_list(name, views.member_actions(
                 changeable=changeable, active=active, remove_mode=remove_mode)),
-        } for name, kind, days, active, remove_mode, state in items]
+        } for name, kind, days, active, remove_mode, state, card in items]
 
     def members(self, revision: int | None = -1) -> dict:
         """``GET /api/v1/emulation/instruments`` и ответ команд состава; ``revision=None`` — итог ещё не известен."""

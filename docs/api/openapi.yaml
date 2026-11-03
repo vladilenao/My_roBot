@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.4.0
+  version: 2.5.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -25,6 +25,8 @@ info:
       `/api/v1/emulation/account` (2.4.0) — позиции, закрытые сделки, итоги
       с кривой результата и виртуальный счёт по журналу сделок контура:
       только чтение, для карточки «Позиции и сделки» UI.
+    * Профили привязки (2.5.0): `filter` и `management` у привязок
+      песочницы и каталога, `bindings` у участника эмуляции.
 
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
@@ -2510,7 +2512,7 @@ components:
     Member:
       type: object
       additionalProperties: false
-      required: [name, instrument_type, days_to_expiry, target, remove_mode, current, _links, _actions]
+      required: [name, instrument_type, days_to_expiry, target, remove_mode, current, bindings, _links, _actions]
       description: Участник состава торгового контура.
       properties:
         name: {type: string, description: 'Короткое имя контракта или тикер акции — то же, что в командах.'}
@@ -2522,8 +2524,31 @@ components:
           type: string
           nullable: true
           enum: [warming, trading, draining, closing, null]
+        bindings:
+          type: array
+          description: 'Привязки конфигурации, по которым торгует инструмент (2.5.0): акция — по тикеру, фьючерс — по семейству. Нет привязок — пустой список.'
+          items: {$ref: '#/components/schemas/MemberBinding'}
         _links: {$ref: '#/components/schemas/Links'}
         _actions: {$ref: '#/components/schemas/Actions'}
+    MemberBinding:
+      type: object
+      additionalProperties: false
+      required: [id, strategy, timeframe, filter, management]
+      description: Привязка участника эмуляции (2.5.0).
+      properties:
+        id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
+        strategy: {type: string}
+        timeframe: {type: string}
+        filter: {$ref: '#/components/schemas/BindingFilter'}
+        management: {$ref: '#/components/schemas/BindingManagement'}
+    BindingFilter:
+      type: string
+      description: 'Профиль фильтра привязки, как в конфигурации (2.5.0): `raw` — без фильтра, `basic_levels` — против тренда, `triple_screen` — старшие таймфреймы. Список не закрыт: новый профиль может появиться без смены версии.'
+      example: triple_screen
+    BindingManagement:
+      type: string
+      description: 'Профиль управления сделкой, как в конфигурации (2.5.0): `levels_rr`, `atr_trend`, `ma_cloud`, `pattern_targets`. Список не закрыт.'
+      example: levels_rr
     MemberList:
       type: object
       additionalProperties: false
@@ -2642,26 +2667,36 @@ components:
     BindingCard:
       type: object
       additionalProperties: false
-      required: [id, instrument, strategy, timeframe, trades_in]
+      required: [id, instrument, strategy, timeframe, filter, management, trades_in]
       description: Привязка конфигурации и где она сейчас торгует.
       properties:
         id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
         instrument: {type: string, description: Тикер акции или код семейства фьючерса.}
         strategy: {type: string}
         timeframe: {type: string}
+        filter: {$ref: '#/components/schemas/BindingFilter'}
+        management: {$ref: '#/components/schemas/BindingManagement'}
         trades_in:
           type: array
           items: {type: string, enum: [emulation, sandbox]}
     BindingMember:
       type: object
       additionalProperties: false
-      required: [id, instrument, strategy, timeframe, target, remove_mode, current, reason, _actions]
+      required: [id, instrument, strategy, timeframe, filter, management, target, remove_mode, current, reason, _actions]
       description: Участник состава песочницы — привязка.
       properties:
         id: {type: string}
         instrument: {type: string, description: "Короткое имя контракта, который ядро выбрало для привязки, иначе код из конфигурации."}
         strategy: {type: string}
         timeframe: {type: string}
+        filter:
+          type: string
+          nullable: true
+          description: 'Профиль фильтра из текущей конфигурации, как `BindingFilter` (2.5.0); привязки в конфигурации уже нет — из карточки состава; `null` — неизвестен.'
+        management:
+          type: string
+          nullable: true
+          description: 'Профиль управления из текущей конфигурации, как `BindingManagement` (2.5.0); `null` — неизвестен.'
         target: {type: string, enum: [active, removed]}
         remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
         current:

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from src.assembly.core_state import Member
-from src.instruments.futures import family_for
+from src.instruments.futures import FAMILIES, family_for
 
 
 def binding_catalog(share_strategies: dict, future_strategies: dict) -> dict[str, dict]:
@@ -21,6 +21,29 @@ def binding_catalog(share_strategies: dict, future_strategies: dict) -> dict[str
                                     "strategy": str(item.strategy), "management": item.management,
                                     "filter": item.filter_profile, "timeframe": item.timeframe}
     return catalog
+
+
+def binding_brief(card: dict) -> dict:
+    """Привязка в ответе API (add-binding-profiles-api): стратегия, таймфрейм, фильтр и управление."""
+    return {"id": card["id"], "strategy": card["strategy"], "timeframe": card["timeframe"],
+            "filter": card["filter"], "management": card["management"]}
+
+
+def instrument_bindings(card: dict, catalog: dict) -> list[dict]:
+    """Привязки, по которым торгует участник эмуляции, — по правилам ``assignments_for`` торговли:
+    акция — по тикеру, фьючерс — по семейству, а если по семейству привязок нет — по его коду;
+    фьючерс без семейства — по двум буквам тикера."""
+    ticker = str(card.get("ticker") or card.get("name") or "")
+    if card.get("instrument_type") == "future":
+        family = card.get("family")
+        kind, keys = "future", ((family, FAMILIES[family][0]) if family in FAMILIES else (ticker[:2].upper(),))
+    else:
+        kind, keys = "share", (ticker,)
+    for key in keys:
+        found = [item for item in catalog.values() if item["instrument_type"] == kind and item["instrument"] == key]
+        if found:
+            return found
+    return []
 
 
 def binding_member(card: dict, instrument: dict | None = None, contract: dict | None = None) -> Member:

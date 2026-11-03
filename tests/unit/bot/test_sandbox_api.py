@@ -17,8 +17,9 @@ from src.strategies.contracts import Assignment
 from tests.unit.bot.test_launch_control import CONTROL_KEY, EXPORT_KEY, INTERNAL_WORDS, _call, _keys, _problem
 from tests.unit.clusters.test_report import _check
 
-SHARES = {"SBER": [Assignment("share-sber-ma", "ma_cloud_rsi_macd", "ma_cloud", timeframe="1h")]}
-FUTURES = {"NG": [Assignment("future-ng-macd", "macd_rsi_stoch", "levels_rr", timeframe="15m")]}
+SHARES = {"SBER": [Assignment("share-sber-ma", "ma_cloud_rsi_macd", "ma_cloud", filter_profile="raw", timeframe="1h")]}
+FUTURES = {"NG": [Assignment("future-ng-macd", "macd_rsi_stoch", "levels_rr", filter_profile="triple_screen",
+                             timeframe="15m")]}
 
 
 class FakeSupervisor:
@@ -220,3 +221,18 @@ def test_current_shows_orders_mode_and_binding_states(tmp_path):
     assert (view["current"]["orders_enabled"], view["current"]["trades"], view["current"]["orders_in_flight"],
             view["current"]["stream_link"]) == (True, 1, 2, "lost")
     assert view["bindings"][0]["current"] == "rejected" and view["bindings"][0]["reason"].startswith("Инструмент")
+
+
+def test_bindings_carry_filter_and_management(tmp_path):
+    """add-binding-profiles-api: профили — у участника и в каталоге; `raw` — значением, а не пропуском."""
+    control, store, _ = _control(tmp_path)
+    control.change_bindings(("future-ng-macd",), remove=False, mode="no_entries", expected=None)
+    [member] = control.view()["bindings"]
+    assert (member["filter"], member["management"]) == ("triple_screen", "levels_rr")
+    available = {item["id"]: (item["filter"], item["management"]) for item in control.bindings()["available"]}
+    assert available == {"share-sber-ma": ("raw", "ma_cloud"), "future-ng-macd": ("triple_screen", "levels_rr")}
+    # Привязку убрали из конфигурации — профили из карточки состава.
+    control._catalog.pop("future-ng-macd")
+    [member] = control.bindings()["members"]
+    assert (member["filter"], member["management"]) == ("triple_screen", "levels_rr")
+    _check(control.view(), {"$ref": "#/components/schemas/Sandbox"})

@@ -15,6 +15,7 @@ from src.bot.trades_view import ContourTrades
 from src.data.export_api import MarketDataExportServer
 from src.data.market_store import MarketDataStore
 from src.history.report import MarketDataSync
+from src.strategies.contracts import Assignment
 from tests.unit.clusters.test_report import SPEC, _check
 
 CONTROL_KEY = "control-test-key"
@@ -22,6 +23,8 @@ EXPORT_KEY = "export-test-key"
 NG = Chosen("NG-12.26", "NG-12.26", "future", 52, "NG")
 NG_TUPLE = ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26")
 COMMAND = '{"mode": "on", "instruments": ["NG-12.26"]}'
+NG_STRATEGIES = {"NG": [Assignment("future-ng-macd", "macd_rsi_stoch", "levels_rr", filter_profile="triple_screen",
+                                     timeframe="15m")]}
 INTERNAL_WORDS = {"desired", "actual", "generation", "applied_generation", "running", "stop_mode"}
 
 
@@ -364,7 +367,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.4.0"
+        assert SPEC["info"]["version"] == "2.5.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -396,11 +399,11 @@ class TestContract:
                     text = exc.read().decode("utf-8")
                 assert "Эндпоинт не найден" not in text, (method, path)
 
-    def test_openapi_route_serves_2_4_0(self, server):
+    def test_openapi_route_serves_2_5_0(self, server):
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.4.0" in response.read().decode("utf-8")
+            assert "version: 2.5.0" in response.read().decode("utf-8")
 
     def test_schemas_use_only_openapi_keywords(self):
         """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""
@@ -429,7 +432,8 @@ class TestContract:
 
 def _controlled(tmp_path, *, alive=True):
     store = CoreStateStore(tmp_path / "core.sqlite3")
-    control = LaunchControl(reply_timeout=2, core_state=store, contour_dir=tmp_path / "contours" / "emulation")
+    control = LaunchControl(reply_timeout=2, core_state=store, contour_dir=tmp_path / "contours" / "emulation",
+                            future_strategies=NG_STRATEGIES)
     control.mark_launched(SOURCE_API, [NG], COMMAND)
     store.record_launch("emulation", "emulation", [NG.payload()], source="api", command=COMMAND)
     if alive:
@@ -717,6 +721,16 @@ class TestMembershipApi:
         _check(member, {"$ref": "#/components/schemas/Member"})
         status, payload, headers = _call(srv, "GET", "/api/v1/emulation/instruments/GAZP", CONTROL_KEY)
         _problem(status, payload, headers, "NOT_FOUND")
+
+    def test_member_bindings_with_profiles(self, controlled_server):
+        """add-binding-profiles-api: привязки участника эмуляции с фильтром и управлением."""
+        srv, _, _ = controlled_server
+        status, member, _ = _call(srv, "GET", "/api/v1/emulation/instruments/NG-12.26", CONTROL_KEY)
+        assert status == 200 and member["bindings"] == [
+            {"id": "future-ng-macd", "strategy": "macd_rsi_stoch", "timeframe": "15m",
+             "filter": "triple_screen", "management": "levels_rr"}]
+        status, payload, _ = _call(srv, "GET", "/api/v1/emulation", CONTROL_KEY)
+        assert payload["instruments"][0]["bindings"] == member["bindings"]
 
 
 class TestCoreApi:

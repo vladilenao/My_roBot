@@ -370,7 +370,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     pulse = CorePulseWriter(core_state, pid=os.getpid(), version=__version__, interval=CONTOURS_HEARTBEAT_SECS)
     pulse.start()
     control = LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
-                            log_file=LOGGING_FILE)
+                            log_file=LOGGING_FILE, share_strategies=SHARE_STRATEGIES,
+                            future_strategies=FUTURE_STRATEGIES)
     control.accept_commands()
     history = HistoryRuns(core_state, state_dir, max_runs=CONTOURS_MAX_HISTORY_RUNS, version=__version__,
                           heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, share_strategies=SHARE_STRATEGIES,
