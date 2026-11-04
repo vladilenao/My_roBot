@@ -43,6 +43,7 @@ EXIT_KINDS = ("exit", "stop", "emergency")
 CANCEL_CONFIRM_SECS = 10
 SYNC_EVERY_SECS = 60
 MARGIN_EVERY = timedelta(days=1)
+MINUTE = timedelta(minutes=1)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 BY_ORDER = "tinvest-order:"    # исполнение без сделок биржи: tinvest-order:<номер заявки>:<итог lots_executed>
 
@@ -69,6 +70,7 @@ class TradeView:
     cancel_command: str | None = None
     cancel_reason: str = ""
     entry_commands: dict[str, int] = field(default_factory=dict)   # команда входа → её лоты
+    opened_at: datetime | None = None   # первое исполнение входа: стоп не проверяется по минутам раньше него
 
     def __post_init__(self) -> None:
         self.original_plan = self.plan
@@ -233,6 +235,9 @@ class TInvestBroker(BrokerPort):
                 view.target_filled[target_id] = filled
             for pending in getattr(recovered, "pending_increases", ()):
                 view.entry_commands[pending.action.command_id] = pending.action.quantity
+            fills = [e.at for row in self._ledger.orders(trade_id=plan.trade_id, kinds=ENTRY_KINDS)
+                     for e in self._ledger.executions(row.key)]
+            view.opened_at = min(fills, default=None)
             for pending in getattr(recovered, "pending_exits", ()):
                 self._start_exit(view, pending.action, pending.submitted_at, send=False)
             rows = self._ledger.orders(trade_id=plan.trade_id, kinds=EXIT_KINDS)
@@ -576,6 +581,8 @@ class TInvestBroker(BrokerPort):
                 for view in self._views.values():
                     if view.plan.instrument_id != uid or view.position <= 0 or view.confirmed_stop is None:
                         continue
+                    if view.opened_at is not None and _utc(moment) + MINUTE <= _utc(view.opened_at):
+                        continue      # минута закрылась до входа: после рестарта прогоняются и старые минуты
                     job = self._jobs.get(view.plan.trade_id)
                     if job is not None and job.kind == "stop":
                         continue
@@ -902,6 +909,8 @@ class TInvestBroker(BrokerPort):
         return total
 
     def _apply_entry_fill(self, view: TradeView, execution: LedgerExecution) -> None:
+        if view.opened_at is None or _utc(execution.at) < _utc(view.opened_at):
+            view.opened_at = execution.at
         previous = view.position
         view.position += execution.lots
         view.entry_quantity += execution.lots
@@ -967,3 +976,7 @@ class TInvestBroker(BrokerPort):
         return ExecutionEvent(execution_id=execution_id, order_id=command_id, command_id=command_id,
                               trade_id=trade_id, status=status, filled_quantity=0, price=None, fee=Decimal("0"),
                               timestamp=now, reason=reason, fee_source=FeeSource.UNKNOWN)
+
+
+def _utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)

@@ -419,6 +419,39 @@ def test_filled_exit_not_sent_again_before_its_fill_is_drained(tmp_path, exit_by
     assert h.broker.trade_state("trade-ng-1").position == 10 - lots
 
 
+def _stop_posts(h):
+    return [call for call in h.api.posts("limit") if call[3] == "SELL" and call[4] == 2]
+
+
+@pytest.mark.parametrize("restarted", [False, True], ids=["same-process", "after-restart"])
+def test_stop_not_checked_on_minutes_before_entry(tmp_path, restarted):
+    """03.11 (Si): после рестарта контур прогнал минуты с 08:32, и стоп новой сделки (вход 16:40)
+    «сработал» по минуте 14:04 — за 2,5 часа до входа."""
+    from types import SimpleNamespace
+
+    h = Harness(tmp_path)
+    action, _ = h.open()
+    entered = NOW + timedelta(hours=2)
+    h.broker.ingest(h.api.fill(order_key(action.command_id), 2, "2.846", at=entered))
+    h.drain()
+    if restarted:
+        h.ledger.close()
+        h = Harness(tmp_path, journal=h.journal)                     # новый процесс на той же базе
+        view = h.broker.trade_state("trade-ng-1")
+        assert view is None
+        state = SimpleNamespace(quantity=2, average_price=D("2.846"), target_prices={}, confirmed_stop=D("2.812"))
+        h.broker.resume_trade(SimpleNamespace(plan=_plan(), state=state, entry_quantity=2, target_filled={},
+                                              pending_increases=(), pending_exits=()))
+        assert h.drain() == []                                       # разбор очереди при старте: вход уже в журнале
+    h.broker.track_bar(NOW + timedelta(minutes=5), {NG: (2.83, 2.80, 2.84, 2.81)})      # до входа, low ниже стопа
+    assert _stop_posts(h) == [] and h.broker.trade_state("trade-ng-1").position == 2
+    h.broker.track_bar(entered.replace(second=0), {NG: (2.83, 2.80, 2.84, 2.81)})       # минута входа — проверяется
+    for call in [call for call in h.api.posts("limit") if call[3] == "SELL" and call[4] == 1]:    # снятие целей
+        h.broker.ingest(h.api.cancelled(call[2]))
+    h.broker.service(h.clock.advance(1))
+    assert len(_stop_posts(h)) == 1
+
+
 def test_reduce_uses_free_lots_and_move_stop(tmp_path):
     h = Harness(tmp_path)
     h.filled()

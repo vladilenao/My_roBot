@@ -528,8 +528,12 @@ def _build_runtime(
         session.contract_lifecycle = lifecycle
 
     # Cursors advance only after executions and observations of a minute have
-    # committed. On restart SQLite provides the safe boundary of live state.
-    execution_cursors = storage.execution_bar_boundaries()
+    # committed. On restart SQLite provides the safe boundary of live state —
+    # read on the first bar, not here: the broker contour consumes fills that
+    # happened while it was down between build and the first tick
+    # (add-tinvest-orders 3.10).
+    execution_cursors = {}
+    cursors_loaded = []
     execution_closes = {}
     pending_bar = None
     # Live owner: каждая исполняемая минута закрепляется до симуляции, а после
@@ -588,6 +592,9 @@ def _build_runtime(
             for uid, minute, ohlc in (drain_late() if callable(drain_late) else ()):
                 trade_manager.record_late_candle(journal_ids(uid), minute, ohlc,
                                                  observed_at=trade_manager._clock.now())
+            if not cursors_loaded:
+                execution_cursors.update(storage.execution_bar_boundaries())
+                cursors_loaded.append(True)
             batches = {}
             initial_boundaries = None
             for instrument in lifecycle.execution_instruments():
