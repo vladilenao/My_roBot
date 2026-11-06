@@ -171,7 +171,7 @@
 - **THEN** ответ — только контур эмуляции; прогоны показывает `GET /api/v1/history`
 
 ### Requirement: Доступ к управлению
-Нормативный уровень: MUST. Маршруты управления — `/api/v1/core`, `/api/v1/emulation…` и `/api/v1/history…` — ДОЛЖНЫ требовать ключ `ROBOT_CONTROL_TOKEN` в заголовке `Authorization: Bearer` и НЕ ДОЛЖНЫ принимать его в адресе запроса или cookie. Точка входа `GET /api/v1` ДОЛЖНА принимать любой из двух ключей. Ключ экспорта рыночных данных НЕ ДОЛЖЕН давать доступ к управлению, а ключ управления — к экспорту. Маршруты управления ДОЛЖНЫ отклонять запрос, если заголовок `Host` не равен `127.0.0.1`, `localhost` или `[::1]` с портом сервера. Сервер НЕ ДОЛЖЕН отдавать заголовки CORS. `ROBOT_CONTROL_TOKEN` ДОЛЖЕН быть в `secrets` журнала и НЕ ДОЛЖЕН печататься нигде.
+Нормативный уровень: MUST. Маршруты управления — `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…` и `/api/v1/candles…` — ДОЛЖНЫ требовать ключ `ROBOT_CONTROL_TOKEN` в заголовке `Authorization: Bearer` и НЕ ДОЛЖНЫ принимать его в адресе запроса или cookie. Точка входа `GET /api/v1` ДОЛЖНА принимать любой из двух ключей. Ключ экспорта рыночных данных НЕ ДОЛЖЕН давать доступ к управлению, а ключ управления — к экспорту. Маршруты управления ДОЛЖНЫ отклонять запрос, если заголовок `Host` не равен `127.0.0.1`, `localhost` или `[::1]` с портом сервера. Сервер НЕ ДОЛЖЕН отдавать заголовки CORS. `ROBOT_CONTROL_TOKEN` ДОЛЖЕН быть в `secrets` журнала и НЕ ДОЛЖЕН печататься нигде.
 
 #### Scenario: Ключ экспорта для управления
 - **WHEN** команда запуска приходит с ключом `MARKET_DATA_EXPORT_TOKEN`
@@ -184,6 +184,10 @@
 #### Scenario: Ключ в адресе
 - **WHEN** ключ передан параметром адреса, а заголовка `Authorization` нет
 - **THEN** ответ `401`
+
+#### Scenario: Ключ экспорта для свечей
+- **WHEN** `GET /api/v1/candles/NG-12.26/15m` приходит с ключом `MARKET_DATA_EXPORT_TOKEN`
+- **THEN** ответ `401` с кодом `UNAUTHORIZED` в `application/problem+json`
 
 ### Requirement: Остановка контура командой
 Нормативный уровень: MUST. `PUT /api/v1/emulation/target` с телом `{"mode": "no_entries"}` или `{"mode": "close_all"}` ДОЛЖЕН записывать в `core.sqlite3` желаемое «остановлен» с режимом и новым поколением и отвечать `202` с эмуляцией и новой `target.revision`. Повтор команды с тем же режимом ДОЛЖЕН отвечать `200` с прежней ревизией и НЕ ДОЛЖЕН её менять. `close_all` поверх `no_entries` ДОЛЖЕН приниматься новой ревизией. `no_entries` поверх `close_all` ДОЛЖЕН отклоняться `409` с кодом `MODE_CONFLICT`.
@@ -762,13 +766,13 @@ API ДОЛЖЕН называть состояние словами операт
 - `history` — число идущих и ждущих прогонов и `max_history_runs`; `null` для ключа экспорта;
 - `sandbox` — `state`, число привязок, число замороженных инструментов и итог последней сверки; `null` для ключа экспорта;
 - `live` — `null`, пока контур «Счёт» не реализован;
-- `_links` — ссылки на разделы, разрешённые ключу: для ключа управления — `core`, `emulation`, `history`, `sandbox`, `docs`; для ключа экспорта — `market-data` (`/api/v1/market-data/source`), `clusters-report`, `docs`.
+- `_links` — ссылки на разделы, разрешённые ключу: для ключа управления — `core`, `emulation`, `history`, `sandbox`, `candles`, `docs`; для ключа экспорта — `market-data` (`/api/v1/market-data/source`), `clusters-report`, `docs`.
 
 Без ключа или с неверным ключом — `401`.
 
 #### Scenario: Ключ управления
 - **WHEN** приходит `GET /api/v1` с ключом управления
-- **THEN** ответ `200` со сводкой эмуляции, истории и песочницы и ссылками на ядро, эмуляцию, историю и песочницу, без ссылок на экспорт
+- **THEN** ответ `200` со сводкой эмуляции, истории и песочницы и ссылками на ядро, эмуляцию, историю, песочницу и ряды свечей (`/api/v1/candles`), без ссылок на экспорт
 
 #### Scenario: Ключ экспорта
 - **WHEN** приходит `GET /api/v1` с ключом экспорта
@@ -780,19 +784,20 @@ API ДОЛЖЕН называть состояние словами операт
 - **THEN** ответ `200` с `core.state = retrying`, сводка эмуляции, истории и песочницы показана
 
 ### Requirement: Ошибки API управления
-Нормативный уровень: MUST. Ответ с ошибкой на точке входа и на маршрутах управления (`/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`) ДОЛЖЕН быть `application/problem+json` (RFC 9457) с полями:
+Нормативный уровень: MUST. Ответ с ошибкой на точке входа и на маршрутах управления (`/api/v1/core`, `/api/v1/emulation…`, `/api/v1/sandbox…`, `/api/v1/history…`, `/api/v1/candles…`) ДОЛЖЕН быть `application/problem+json` (RFC 9457) с полями:
 
 - `type` — `urn:my-robot:problem:<код>`, код в нижнем регистре через дефис;
 - `title` — короткое название ошибки;
 - `status` — код HTTP;
-- `code` — код ошибки: `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN_HOST`, `NOT_FOUND`, `REPORT_NOT_READY`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `MODE_CONFLICT`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`, `REVISION_CHANGED`, `INSTRUMENTS_REJECTED`;
+- `code` — код ошибки: `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN_HOST`, `NOT_FOUND`, `REPORT_NOT_READY`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `MODE_CONFLICT`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`, `REVISION_CHANGED`, `INSTRUMENTS_REJECTED`, `MARKET_DATA_NOT_READY`, `JOURNAL_UNAVAILABLE`;
 - `detail` — понятная причина.
 
 Дополнительные поля:
 
 - `rejections` — у `INSTRUMENTS_REJECTED`: список `{instrument, reason}`, где `instrument` — имя из запроса как есть;
 - `core` — у `CORE_NOT_READY`: состояние, число попыток и время следующей;
-- `pid` — у `CONTOUR_DIR_BUSY`.
+- `pid` — у `CONTOUR_DIR_BUSY`;
+- `suggestions` — у `NOT_FOUND` на маршрутах `/api/v1/candles…`: подходящие короткие имена инструментов или имеющиеся таймфреймы, возможно пустой список.
 
 Ответ НЕ ДОЛЖЕН содержать секреты. Маршруты экспорта рыночных данных и отчёта кластеров ДОЛЖНЫ сохранить прежний формат `{code, message}` в `application/json`, включая ответ `401`: их читает Historical Broker API Emulator.
 
@@ -803,6 +808,15 @@ API ДОЛЖЕН называть состояние словами операт
 #### Scenario: Ошибка экспорта не меняется
 - **WHEN** эмулятор данных запрашивает `GET /api/v1/market-data/changes` с курсором старше хранимой ленты
 - **THEN** ответ `410` в `application/json` с `code = CURSOR_EXPIRED` и `message`, как в версии 1.8
+
+#### Scenario: Рыночная база ещё не открыта
+- **WHEN** `GET /api/v1/candles` приходит до того, как ядро открыло рыночную базу
+- **THEN** ответ `503` в `application/problem+json` с `code = MARKET_DATA_NOT_READY`
+
+#### Scenario: Журнал контура не читается
+- **GIVEN** `trades.sqlite3` эмуляции повреждён
+- **WHEN** приходит `GET /api/v1/emulation/trades`
+- **THEN** ответ `503` в `application/problem+json` с `code = JOURNAL_UNAVAILABLE`, в `detail` нет пути к файлу и текста исключения
 
 ### Requirement: Ссылки и доступные действия
 Нормативный уровень: MUST. Ответы точки входа, ядра, эмуляции, состава, участника состава, прогона и списка прогонов ДОЛЖНЫ содержать `_links` — объект «имя связи → `{href}`» с относительными адресами.
