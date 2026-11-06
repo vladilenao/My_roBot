@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.5.0
+  version: 2.6.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -2628,7 +2628,7 @@ components:
       type: object
       nullable: true
       additionalProperties: false
-      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link]
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link, account_at, execution_holds]
       description: Текущее состояние из `status.json` контура.
       properties:
         state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
@@ -2664,6 +2664,31 @@ components:
         trades: {type: integer, minimum: 0, description: Открытые сделки журнала контура.}
         orders_in_flight: {type: integer, minimum: 0, description: Незавершённые заявки журнала заявок брокера.}
         stream_link: {type: string, nullable: true, enum: [ok, lost, null], description: Стрим исполнений OrderStateStream.}
+        account_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Момент снимка счёта, на который верны `capital`, `positions`, `orders` и `stop_orders`
+            (2.6.0, fix-sandbox-restart-safety). Снимок берётся при старте, на каждой сверке
+            и перед остановкой процесса. У процесса, убитого без остановки, — момент последнего
+            снимка; `account_link: lost` у остановленного — снимок при остановке не прочитан.
+        execution_holds:
+          type: array
+          description: |
+            Инструменты со сделками, у которых исполнение 1m стоит дольше 5 минут: барьер покрытия
+            держит полученные минутки, и стоп по инструменту не проверяется (2.6.0,
+            fix-sandbox-restart-safety). Пусто — исполнение идёт.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, since, minutes, executed, received]
+            properties:
+              name: {type: string, description: Короткое имя контракта.}
+              since: {type: string, format: date-time, description: С какого момента процесс видит удержание.}
+              minutes: {type: integer, minimum: 0}
+              executed: {type: string, format: date-time, nullable: true, description: Последняя исполненная минута.}
+              received: {type: string, format: date-time, nullable: true, description: Последняя полученная минута.}
     BindingCard:
       type: object
       additionalProperties: false

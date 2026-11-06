@@ -214,6 +214,13 @@ def render_broker_account(event) -> str:
         if event.get("frozen"):
             lines.append("Заморожены: " + escape(", ".join(event.get("frozen"))))
         lines.append("Снять заморозку: выровнять счёт и дождаться следующей сверки.")
+    elif kind == "execution_hold":
+        lines = [f"<b>{title} · ТРЕВОГА · Исполнение стоит</b>"]
+        lines.extend(escape(f"{item['name']}: минутки не исполняются {item['minutes']} мин") for item in event.get("holds") or ())
+        lines.append("Пока исполнение стоит, стоп по инструменту не проверяется. Подробности в bot_debug.log контура.")
+    elif kind == "execution_resumed":
+        lines = [f"<b>{title} · Исполнение возобновлено</b>"]
+        lines.extend(escape(f"{item['name']}: после {item['minutes']} мин удержания") for item in event.get("holds") or ())
     elif kind == "reconcile_cleared":
         lines = [f"<b>{title} · Расхождение устранено</b>", f"Счёт {account} совпадает с журналом контура."]
         if event.get("unfrozen"):

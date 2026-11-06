@@ -1087,7 +1087,10 @@ class MarketDataCache:
         instrument_id = self._uids.get(key)
         if not instrument_id:
             return frame.iloc[0:0].copy()
-        previous = _naive(last_bar)
+        # Граница может прийти не по сетке (время исполнения у брокера): проба
+        # минуты по такому времени не найдёт ни одного состояния и удержит
+        # исполнение навсегда (fix-sandbox-restart-safety).
+        previous = _naive(last_bar).floor("min")
         allowed: list[int] = []
         for index, row in frame.sort_values("datetime").iterrows():
             stamp = _naive(row["datetime"])
@@ -1115,7 +1118,7 @@ class MarketDataCache:
         uid = self._uids.get(self._key(instrument, "1m"))
         if not uid:
             return []
-        lower = _naive(last_bar) + pd.Timedelta(minutes=1)
+        lower = _naive(last_bar).floor("min") + pd.Timedelta(minutes=1)
         upper = _naive(frame["datetime"].max())
         if upper < lower:
             return []

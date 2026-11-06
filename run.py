@@ -445,9 +445,12 @@ def _contour_trading(state_dir, sandbox):
 
 def _binding_resolver(core):
     """Инструмент привязки по правилам запуска эмуляции (add-tinvest-orders): акция — по тикеру, фьючерс —
-    ближайший контракт семейства с запасом до экспирации; карточка контракта — как у эмуляции."""
+    ближайший контракт семейства с запасом до экспирации; карточка контракта — как у эмуляции.
 
-    def resolve(card: dict):
+    Пакет привязок — один клиент, один каталог фьючерсов и маржа по разу на контракт
+    (fix-sandbox-restart-safety): по одной привязке 19 штук давали 76 запросов и упирались в квоту брокера."""
+
+    def resolve_one(card: dict, client, provider):
         from src.assembly.contracts import _load_contracts_metadata, contracts_payload, instrument_payload
         from src.bot.launch import ALL, resolve_emulation
         from src.instruments import normalize_instrument
@@ -455,22 +458,36 @@ def _binding_resolver(core):
 
         assignments = {card["instrument"]: [card["id"]]}
         share = card.get("instrument_type") == "share"
-        provider = core.client_provider
-        with provider.client_context() as raw_client:
-            budget = core.request_budget
-            client = raw_client if budget is None else budget.wrap_client(raw_client, lane="interactive")
-            # «Все с привязками» из одной привязки: у фьючерса — ближайший контракт её семейства.
-            resolution = resolve_emulation([ALL], client, share_strategies=assignments if share else {},
-                                           future_strategies={} if share else assignments,
-                                           block_days=CONTRACT_EXPIRY_BLOCK_DAYS)
+        # «Все с привязками» из одной привязки: у фьючерса — ближайший контракт её семейства.
+        resolution = resolve_emulation([ALL], client, share_strategies=assignments if share else {},
+                                       future_strategies={} if share else assignments,
+                                       block_days=CONTRACT_EXPIRY_BLOCK_DAYS)
         if not resolution.instruments:
             reasons = [item.reason for item in resolution.rejections]
             return reasons[0] if reasons else "Инструмент привязки не определён."
         instrument = normalize_instrument(resolution.instruments[0])
-        contracts = _load_contracts_metadata([instrument], client_provider=provider, request_budget=core.request_budget)
+        contracts = _load_contracts_metadata([instrument], client_provider=provider)
         own = {address: meta for address, meta in contracts.items()
                if address in (instrument_key(instrument), instrument.ticker)}
         return instrument_payload(instrument), contracts_payload(own) if own else None
+
+    def resolve(cards):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        from src.assembly.contracts import BatchClient
+
+        results = []
+        with core.client_provider.client_context() as raw_client:
+            budget = core.request_budget
+            client = BatchClient(raw_client if budget is None else budget.wrap_client(raw_client, lane="interactive"))
+            provider = SimpleNamespace(client_context=lambda: nullcontext(client))
+            for card in cards:
+                try:
+                    results.append(resolve_one(card, client, provider))
+                except Exception as exc:  # noqa: BLE001 — отказ одной привязки, не всего пакета
+                    results.append(f"Инструмент привязки не определён: {type(exc).__name__}.")
+        return results
 
     return resolve
 

@@ -89,7 +89,7 @@ class BrokerContour:
                         "stop_orders": 0, "frozen": [], "last_reconcile_at": None, "account_link": None,
                         "core_link": "ok", "reason": None, "exited_at": None, "exit_reason": None,
                         "orders_enabled": settings.orders, "trades": 0, "orders_in_flight": 0,
-                        "stream_link": None}
+                        "stream_link": None, "account_at": None, "execution_holds": []}
         self._generation: int | None = None
 
     # --- status.json ------------------------------------------------------
@@ -154,6 +154,7 @@ class BrokerContour:
         while not self._stop.requested.wait(settings.step_secs):
             self.step(gateway, account, reconciler)
         reason = self._stop.reason or "цикл завершён"
+        self._final_account(gateway, account)
         self.notifier.stopped(reason)
         self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
         log.info("Контур %s остановлен: %s", settings.contour_id, reason)
@@ -182,7 +183,23 @@ class BrokerContour:
             self._stop.request(f"остановка командой ({desired.stop_mode})")
 
     def _account(self, snapshot: AccountSnapshot) -> None:
-        self._write(**snapshot.payload(), account_link="ok")
+        # ``account_at`` — момент снимка: позиции и заявки в статусе верны на него, а не на «сейчас».
+        self._write(**snapshot.payload(), account_link="ok", account_at=_now())
+
+    def _final_account(self, gateway, account) -> None:
+        """Снимок счёта перед STOPPED (fix-sandbox-restart-safety): после остановки статус не обновит никто.
+
+        Без него ``status.json`` показывал позиции последней сверки — до выхода ``close_all``. Брокер не
+        ответил — снимок прежний, ``account_link: lost`` говорит, что он мог устареть.
+        """
+        try:
+            snapshot = read_account(gateway, account)
+        except BrokerCallError as exc:
+            log.warning("Снимок счёта при остановке не прочитан (%s)", exc.code)
+            self._write(account_link="lost")
+            return
+        self._capital = snapshot.rub
+        self._account(snapshot)
 
     def _reconcile(self, reconciler: Reconciler, gateway, account, snapshot: AccountSnapshot | None = None) -> None:
         now = self._clock()
@@ -243,7 +260,8 @@ class BrokerContour:
             core_lost=lambda: self._core_link == "lost")
         self._control = control
         trading = BrokerTrading(broker_factory=broker_factory, capital=lambda: self._capital,
-                                initial_deposit=admitted.snapshot.rub, poll=control.apply)
+                                initial_deposit=admitted.snapshot.rub, poll=control.apply,
+                                execution_alarm=self._execution_alarm)
         contour = self._trading_factory(trading, control, strategies)
         stream = None
         try:
@@ -272,11 +290,20 @@ class BrokerContour:
             contour.close()
         reason = self._stop.reason or "цикл завершён"
         positions = sum(1 for lots in holder["broker"].open_positions().values() if lots) if "broker" in holder else 0
+        self._final_account(gateway, account)
         self.notifier.stopped(reason, open_positions=positions)
         self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
         ledger.close()
         log.info("Контур %s остановлен: %s", settings.contour_id, reason)
         return 0
+
+    def _execution_alarm(self, raised, resumed, holds) -> None:
+        """Сторож исполнения 1m: тревога и возобновление — в канал, текущие удержания — в ``status.json``."""
+        if raised:
+            self.notifier.execution_hold(raised)
+        if resumed:
+            self.notifier.execution_resumed(resumed)
+        self._write(execution_holds=holds)
 
     def _consume(self, broker, manager) -> int:
         events = broker.drain_addressed_events()

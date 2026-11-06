@@ -772,8 +772,62 @@ def test_binding_resolver_picks_nearest_family_contract(monkeypatch):
         yield object()
 
     core = SimpleNamespace(client_provider=SimpleNamespace(client_context=client_context), request_budget=None)
-    instrument, contracts = run._binding_resolver(core)({"id": "future-ng-macd", "instrument": "NG",
-                                                         "instrument_type": "future"})
+    [(instrument, contracts)] = run._binding_resolver(core)([{"id": "future-ng-macd", "instrument": "NG",
+                                                              "instrument_type": "future"}])
 
     assert instrument["ticker"] == "NGX6" and instrument["short_name"] == "NG-11.26"
     assert contracts["NGX6"]["go_buy"] == 6000
+
+
+def test_binding_resolver_asks_catalog_once_and_margin_once_per_contract(monkeypatch):
+    """05.11: 19 привязок по 6 контрактам — 57 запросов каталога и 19 маржи, квота брокера ~20 в минуту
+    (fix-sandbox-restart-safety). Пакетом — один каталог и маржа по разу на контракт."""
+    from contextlib import contextmanager
+
+    from src.assembly import contracts as assembly_contracts
+    from src.bot import launch
+    from src.portfolio import ContractMeta
+
+    calls = []
+
+    class Instruments:
+        def futures(self, **kwargs):
+            calls.append(("futures", kwargs.get("instrument_status")))
+            return SimpleNamespace(instruments=[])
+
+        def get_futures_margin(self, *, instrument_id):
+            calls.append(("margin", instrument_id))
+            return None
+
+    raw = SimpleNamespace(instruments=Instruments())
+
+    def resolve_emulation(tokens, client, *, future_strategies, **_):
+        client.instruments.futures(instrument_status=1)          # ближайший контракт семейства
+        client.instruments.futures(instrument_status=1)          # проверка тикера
+        family = next(iter(future_strategies))
+        return SimpleNamespace(instruments=[(family, family + "Z6", "future", family + "-12.26")], rejections=())
+
+    def load(instruments, *, client_provider, **_):
+        with client_provider.client_context() as client:
+            client.instruments.futures(instrument_status=1)
+            ticker = instruments[0].ticker
+            client.instruments.get_futures_margin(instrument_id="uid-" + ticker)
+        return {ticker: ContractMeta(ticker, 0.01, 8.0, 100, 100)}
+
+    monkeypatch.setattr(launch, "resolve_emulation", resolve_emulation)
+    monkeypatch.setattr(assembly_contracts, "_load_contracts_metadata", load)
+
+    @contextmanager
+    def client_context():
+        yield raw
+
+    core = SimpleNamespace(client_provider=SimpleNamespace(client_context=client_context), request_budget=None)
+    cards = [{"id": f"future-{family.lower()}-{n}", "instrument": family, "instrument_type": "future"}
+             for family in ("BR", "ED", "NG") for n in range(3)]
+
+    results = run._binding_resolver(core)(cards)
+
+    assert [payload["ticker"] for payload, _ in results] == ["BRZ6"] * 3 + ["EDZ6"] * 3 + ["NGZ6"] * 3
+    assert calls.count(("futures", 1)) == 1
+    assert sorted(call for call in calls if call[0] == "margin") == [("margin", "uid-BRZ6"), ("margin", "uid-EDZ6"),
+                                                                       ("margin", "uid-NGZ6")]

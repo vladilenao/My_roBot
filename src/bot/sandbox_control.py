@@ -72,7 +72,8 @@ class SandboxControl:
         self._log_file = log_file
         self._lock = threading.Lock()
         self._rejections: list[dict] = []
-        # ``resolve_binding(card)`` → (карточка инструмента, карточки контракта) или причина отказа (add-tinvest-orders).
+        # ``resolve_binding(cards)`` → на каждую карточку (карточка инструмента, карточки контракта) или причина
+        # отказа (add-tinvest-orders); пакетом — один каталог на все привязки (fix-sandbox-restart-safety).
         self._resolve = resolve_binding
 
     # --- чтение -----------------------------------------------------------
@@ -122,7 +123,8 @@ class SandboxControl:
             "account_link": status.get("account_link"), "core_link": status.get("core_link"),
             "reason": status.get("reason"), "orders_enabled": bool(status.get("orders_enabled")),
             "trades": status.get("trades") or 0, "orders_in_flight": status.get("orders_in_flight") or 0,
-            "stream_link": status.get("stream_link"),
+            "stream_link": status.get("stream_link"), "account_at": status.get("account_at"),
+            "execution_holds": status.get("execution_holds") or [],
         }
 
     def _launch(self, desired, process) -> dict | None:
@@ -223,33 +225,90 @@ class SandboxControl:
                              rejections=rejections)
 
     def _members_for(self, ids) -> tuple[list, list[tuple[str, str]]]:
-        """Участники-привязки с инструментом и контрактом, который выбрало ядро; отказы — (id, причина)."""
+        """Участники-привязки с инструментом и контрактом, который выбрало ядро; отказы — (id, причина).
+
+        Сеть — одним пакетом на все привязки и без замка ресурса (fix-sandbox-restart-safety): 19 привязок
+        по одной давали 76 запросов каталога и 2,5 мин под замком, и остановка ждала вместе с запуском.
+        """
+        cards = [self._catalog[item] for item in ids]
+        if self._resolve is None:
+            return [binding_member(card) for card in cards], []
+        try:
+            results = list(self._resolve(cards)) if cards else []
+        except Exception as exc:  # noqa: BLE001 — сбой сети не должен оставлять API без ответа
+            results = [f"Инструмент привязки не определён: {type(exc).__name__}."] * len(cards)
         members, rejections = [], []
-        for item in ids:
-            card = self._catalog[item]
-            if self._resolve is None:
-                members.append(binding_member(card))
-                continue
-            try:
-                result = self._resolve(card)
-            except Exception as exc:  # noqa: BLE001 — сбой сети не должен оставлять API без ответа
-                result = f"Инструмент привязки не определён: {type(exc).__name__}."
+        for card, result in zip(cards, results):
             if isinstance(result, str):
-                rejections.append((item, result))
+                rejections.append((card["id"], result))
             else:
                 members.append(binding_member(card, *result))
         return members, rejections
 
+    def _generation(self) -> int | None:
+        desired = self._desired()
+        return None if desired is None else desired.generation
+
+    @staticmethod
+    def _changed_meanwhile() -> tuple[int, dict]:
+        return SandboxControl._problem(HTTPStatus.PRECONDITION_FAILED, "REVISION_CHANGED",
+                                       "Состав песочницы изменился, пока определялись инструменты привязок: "
+                                       "повторите команду.")
+
     def put_target(self, mode: str, bindings: tuple[str, ...] | None, expected: int | None) -> tuple[int, dict]:
+        if mode != views.MODE_ON:
+            with self._lock:
+                if not self._supervisor.ready:
+                    return self._problem(HTTPStatus.CONFLICT, "CORE_NOT_READY", "Ядро стартует или повторяет старт.")
+                try:
+                    return self._stop(mode, expected)
+                except RevisionChanged as exc:
+                    return self._problem(HTTPStatus.PRECONDITION_FAILED, "REVISION_CHANGED", str(exc))
         with self._lock:
-            if not self._supervisor.ready:
-                return self._problem(HTTPStatus.CONFLICT, "CORE_NOT_READY", "Ядро стартует или повторяет старт.")
+            refused = self._start_refused()
+            if refused is not None:
+                return refused
+            current = self._desired()
+            generation = None if current is None else current.generation
+            if bindings is None:
+                members = [member for member in (current.members if current else ()) if member.active]
+                # Привязки, сохранённые без инструмента (С2), получают его заново; неудача — отметка у контура.
+                pending = [member.key for member in members if not resolved(member) and member.key in self._catalog]
+            else:
+                rejected = self._rejected(bindings)
+                if rejected is not None:
+                    return rejected
+                pending = list(bindings)
+        fresh, problems = self._members_for(pending)
+        with self._lock:
+            refused = self._start_refused()
+            if refused is not None:
+                return refused
+            if self._generation() != generation:
+                return self._changed_meanwhile()
+            if bindings is None:
+                by_key = {member.key: member for member in fresh}
+                members = [by_key.get(member.key, member) for member in members]
+                ids = [member.key for member in members]
+            else:
+                rejected = self._rejected((), problems)
+                if rejected is not None:
+                    return rejected
+                members, ids = fresh, list(bindings)
+            request = {"mode": views.MODE_ON, "bindings": ids}
+            self._rejections = []
             try:
-                return self._start(bindings, expected) if mode == views.MODE_ON else self._stop(mode, expected)
+                self._core_state.record_launch(self.kind, self.kind, [], source=SOURCE_API,
+                                               command=json.dumps(request, ensure_ascii=False), payload=request,
+                                               members=members, expected=expected)
             except RevisionChanged as exc:
                 return self._problem(HTTPStatus.PRECONDITION_FAILED, "REVISION_CHANGED", str(exc))
+            self._supervisor.launch(self._desired())
+            return int(HTTPStatus.ACCEPTED), self.view()
 
-    def _start(self, bindings, expected) -> tuple[int, dict]:
+    def _start_refused(self) -> tuple[int, dict] | None:
+        if not self._supervisor.ready:
+            return self._problem(HTTPStatus.CONFLICT, "CORE_NOT_READY", "Ядро стартует или повторяет старт.")
         process = self._supervisor.snapshot()
         if process["running"]:
             desired = self._desired()
@@ -262,31 +321,7 @@ class SandboxControl:
             return self._problem(HTTPStatus.CONFLICT, "CONTOUR_DIR_BUSY",
                                  f"Папку контура держит процесс pid {busy}, который не подтверждает себя контуром.",
                                  pid=busy)
-        current = self._desired()
-        if bindings is None:
-            members = [member for member in (current.members if current else ()) if member.active]
-            ids = [member.key for member in members]
-            # Привязки, сохранённые без инструмента (С2), получают его заново; неудача — отметка у контура.
-            stale = [member.key for member in members if not resolved(member) and member.key in self._catalog]
-            fresh, _ = self._members_for(stale)
-            by_key = {member.key: member for member in fresh}
-            members = [by_key.get(member.key, member) for member in members]
-        else:
-            rejected = self._rejected(bindings)
-            if rejected is not None:
-                return rejected
-            members, problems = self._members_for(bindings)
-            rejected = self._rejected((), problems)
-            if rejected is not None:
-                return rejected
-            ids = list(bindings)
-        request = {"mode": views.MODE_ON, "bindings": ids}
-        self._rejections = []
-        self._core_state.record_launch(self.kind, self.kind, [], source=SOURCE_API,
-                                       command=json.dumps(request, ensure_ascii=False), payload=request,
-                                       members=members, expected=expected)
-        self._supervisor.launch(self._desired())
-        return int(HTTPStatus.ACCEPTED), self.view()
+        return None
 
     def _stop(self, mode, expected) -> tuple[int, dict]:
         if not self._supervisor.snapshot()["running"]:
@@ -301,9 +336,14 @@ class SandboxControl:
             rejected = self._rejected(ids)
             if rejected is not None:
                 return rejected
-            added = []
+            generation = self._generation()
+        added = []
+        if not remove:
+            added, problems = self._members_for(ids)
+        with self._lock:
             if not remove:
-                added, problems = self._members_for(ids)
+                if self._generation() != generation:
+                    return self._changed_meanwhile()
                 rejected = self._rejected((), problems)
                 if rejected is not None:
                     return rejected

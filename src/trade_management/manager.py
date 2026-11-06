@@ -2618,6 +2618,11 @@ class TradeManager:
             "FROM positions p JOIN trades t ON t.trade_id=p.trade_id WHERE p.quantity>0",
         ):
             if instrument not in prices or step is None or cost is None or average is None:
+                if self._capital is not None and instrument not in prices and None not in (step, cost, average):
+                    # Капитал допуска — со счёта брокера: переоценка журнала справочная, и неизвестная
+                    # цена одной позиции не запрещает входы всем инструментам (fix-sandbox-restart-safety).
+                    log.debug("переоценка журнала пропущена: нет цены %s", instrument)
+                    return False
                 self._equity_unknown = True
                 log.warning("нет полной переоценки: неизвестны цена/факторы открытой позиции")
                 return False

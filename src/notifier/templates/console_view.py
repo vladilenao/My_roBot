@@ -389,6 +389,11 @@ def _broker_account(event: Event, stamp: str) -> Block:
         return Block(stamp, label, f"Сверка: расхождение · заморожены {frozen}", role="warning")
     if kind == "reconcile_cleared":
         return Block(stamp, label, "Сверка: расхождение устранено", role="muted")
+    if kind in ("execution_hold", "execution_resumed"):
+        names = ", ".join(f"{item['name']} {item['minutes']} мин" for item in event.get("holds") or ()) or "—"
+        if kind == "execution_hold":
+            return Block(stamp, label, f"Исполнение стоит: {names} — стоп не проверяется", role="warning")
+        return Block(stamp, label, f"Исполнение возобновлено: {names}", role="muted")
     if kind == "started":
         return Block(stamp, label, f"Контур запущен · счёт {event.get('account')}", role="muted")
     return Block(stamp, label, "Контур остановлен" + (f" · {event.get('reason')}" if event.get("reason") else ""),

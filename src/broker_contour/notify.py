@@ -64,5 +64,12 @@ class BrokerNotifier:
     def cleared(self, unfrozen) -> None:
         self._publish("reconcile_cleared", unfrozen=list(unfrozen))
 
+    def execution_hold(self, items) -> None:
+        """Исполнение 1m инструмента со сделками стоит дольше порога (fix-sandbox-restart-safety)."""
+        self._publish("execution_hold", holds=list(items))
+
+    def execution_resumed(self, items) -> None:
+        self._publish("execution_resumed", holds=list(items))
+
     def stopped(self, reason: str, *, open_positions: int | None = None) -> None:
         self._publish("stopped", reason=reason, open_positions=open_positions)

@@ -192,10 +192,10 @@ def test_binding_instrument_resolved_or_rejected(tmp_path):
     supervisor = FakeSupervisor(tmp_path / "contours" / "sandbox")
     asked = []
 
-    def resolve(card):
-        asked.append(card["id"])
-        return (NG_PAYLOAD, {"NGZ6": {"ticker": "NGZ6"}}) if card["instrument"] == "NG" else \
-            "Нет торгуемого контракта семейства с экспирацией позже чем через 2 дня."
+    def resolve(cards):
+        asked.extend(card["id"] for card in cards)
+        return [(NG_PAYLOAD, {"NGZ6": {"ticker": "NGZ6"}}) if card["instrument"] == "NG" else
+                "Нет торгуемого контракта семейства с экспирацией позже чем через 2 дня." for card in cards]
 
     control = SandboxControl(kind="sandbox", core_state=store, supervisor=supervisor, share_strategies=SHARES,
                              future_strategies=FUTURES, resolve_binding=resolve)
@@ -236,3 +236,59 @@ def test_bindings_carry_filter_and_management(tmp_path):
     [member] = control.bindings()["members"]
     assert (member["filter"], member["management"]) == ("triple_screen", "levels_rr")
     _check(control.view(), {"$ref": "#/components/schemas/Sandbox"})
+
+
+# --- пакет привязок без замка (fix-sandbox-restart-safety) ----------------------------
+
+def _batch_control(tmp_path, resolve):
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    supervisor = FakeSupervisor(tmp_path / "contours" / "sandbox")
+    control = SandboxControl(kind="sandbox", core_state=store, supervisor=supervisor, share_strategies=SHARES,
+                             future_strategies=FUTURES, resolve_binding=resolve)
+    return control, store
+
+
+def test_bindings_resolved_in_one_batch_outside_resource_lock(tmp_path):
+    """05.11: 19 привязок разрешались по одной 2 мин 39 с под замком — остановка ждала вместе с запуском."""
+    batches, free = [], []
+
+    def resolve(cards):
+        batches.append([card["id"] for card in cards])
+        free.append(control._lock.acquire(blocking=False))
+        if free[-1]:
+            control._lock.release()
+        return [(NG_PAYLOAD, None) for _ in cards]
+
+    control, store = _batch_control(tmp_path, resolve)
+    status, _ = control.put_target("on", ("future-ng-macd", "share-sber-ma"), None)
+
+    assert status == 202
+    assert batches == [["future-ng-macd", "share-sber-ma"]] and free == [True]
+    assert [member.key for member in store.desired("sandbox").members] == ["future-ng-macd", "share-sber-ma"]
+
+
+def test_composition_changed_while_resolving_is_not_overwritten(tmp_path):
+    def resolve(cards):
+        store.record_bindings("sandbox", "sandbox", add=(), remove=("future-ng-macd",), mode="no_entries")
+        return [(NG_PAYLOAD, None) for _ in cards]
+
+    control, store = _batch_control(tmp_path, lambda cards: [(NG_PAYLOAD, None) for _ in cards])
+    assert control.change_bindings(("future-ng-macd",), remove=False, mode="no_entries", expected=None)[0] in (200, 202)
+    control._resolve = resolve
+    generation = store.desired("sandbox").generation
+
+    status, payload = control.put_target("on", ("future-ng-macd",), None)
+
+    assert status == 412 and payload["code"] == "REVISION_CHANGED"
+    assert store.desired("sandbox").generation == generation + 1     # только изменение состава, без запуска
+
+
+def test_failed_batch_rejects_bindings_with_reason(tmp_path):
+    def resolve(cards):
+        raise ConnectionError("нет сети")
+
+    control, store = _batch_control(tmp_path, resolve)
+    status, payload = control.put_target("on", ("future-ng-macd",), None)
+
+    assert status == 422 and payload["rejections"][0]["reason"] == "Инструмент привязки не определён: ConnectionError."
+    assert store.desired("sandbox") is None

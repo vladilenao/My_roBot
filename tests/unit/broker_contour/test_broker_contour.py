@@ -365,3 +365,31 @@ def test_process_with_orders_recovers_reconciles_and_stops(tmp_path):
     assert "orders_stream.order_state_stream" in {name for name, _ in broker.calls}
     text = (tmp_path / "contours/sandbox/status.json").read_text(encoding="utf-8")
     assert ACCOUNT_ID not in text and TOKEN not in text
+
+
+def test_stopped_status_shows_account_after_stop_not_last_reconcile(tmp_path):
+    """05.11 (close_all ED): после остановки статус показывал позицию и заявки последней сверки —
+    до выхода. Перед STOPPED контур снимает счёт ещё раз (fix-sandbox-restart-safety)."""
+    broker = FakeBroker(rub=Decimal(1_000_000))
+    robot_account(broker)
+    store = _launch(tmp_path)
+    stop = Stop()
+    bus = EventBus()
+
+    def factory(trading, control, strategies):
+        return FakeTradingPart(trading, control, strategies, stop)
+
+    contour = BrokerContour(_settings(tmp_path, orders=True, reconcile_every_secs=3600), gateway_factory=_gateway(broker),
+                            bus=bus, stop=stop, pid=4242, trading_factory=factory)
+    thread, result = _run_in_thread(contour)
+    assert _wait(lambda: (tmp_path / "contours/sandbox/status.json").exists() and _status(tmp_path).get("members"))
+    started = _status(tmp_path)
+    assert started["positions"] == [] and started["account_at"]
+    broker.positions[NG_UID] = 3            # счёт изменился после последней сверки
+    store.record_stop("sandbox", "no_entries")
+    thread.join(timeout=5)
+
+    status = _status(tmp_path)
+    assert result["code"] == 0 and status["state"] == "stopped"
+    assert status["positions"] == [{"name": "NG-12.26", "lots": 3}]
+    assert status["account_at"] >= started["account_at"] and status["account_link"] == "ok"

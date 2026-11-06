@@ -6,7 +6,7 @@ from src.market_context import (
     TrendAnalyzer,
 )
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import json
@@ -309,6 +309,70 @@ class _Roster:
             self._forget(instrument)
 
 
+# Сторож исполнения 1m (fix-sandbox-restart-safety): удержание на минуту-другую — норма тонкого
+# рынка (минута без сделок разрешается ядром за 1–3 мин), дольше порога — тревога.
+EXECUTION_HOLD_ALARM_SECS = 300
+EXECUTION_HOLD_REPEAT_SECS = 900
+
+
+class _ExecutionWatch:
+    """Барьер покрытия держит минуты инструмента со сделками дольше порога.
+
+    Пока исполнение 1m стоит, виртуальный стоп и переоценка по инструменту не работают,
+    поэтому удержание видно в журнале (повтор раз в ``repeat_secs``) и у владельца
+    (``report`` — канал и ``status.json`` контура на брокере). Удержание без сделок
+    последствий не имеет и тревоги не даёт.
+    """
+
+    def __init__(self, *, alarm_secs=EXECUTION_HOLD_ALARM_SECS, repeat_secs=EXECUTION_HOLD_REPEAT_SECS,
+                 report=None) -> None:
+        self._alarm = timedelta(seconds=alarm_secs)
+        self._repeat = timedelta(seconds=repeat_secs)
+        self._report = report
+        self._holds: dict[str, dict] = {}
+
+    @staticmethod
+    def _minutes(since, now) -> int:
+        return int((now - since).total_seconds() // 60)
+
+    def _view(self, hold, now) -> dict:
+        return {"name": hold["name"], "since": hold["since"].isoformat(), "minutes": self._minutes(hold["since"], now),
+                "executed": hold["executed"].isoformat() if hold["executed"] is not None else None,
+                "received": hold["received"].isoformat() if hold["received"] is not None else None}
+
+    def alarms(self, now) -> list[dict]:
+        return [self._view(hold, now) for hold in self._holds.values() if hold["alarmed"] is not None]
+
+    def observe(self, now, held: dict, tracked) -> None:
+        """``held``: ключ → (имя, последняя исполненная минута, последняя полученная); ``tracked(ключ)`` — есть сделки."""
+        raised, resumed = [], []
+        for key in [key for key in self._holds if key not in held]:
+            hold = self._holds.pop(key)
+            if hold["alarmed"] is not None:
+                log.info("Исполнение 1m %s возобновлено после %s мин удержания", hold["name"],
+                         self._minutes(hold["since"], now))
+                resumed.append(self._view(hold, now))
+        for key, (name, executed, received) in held.items():
+            hold = self._holds.setdefault(key, {"name": name, "since": now, "alarmed": None})
+            hold.update(executed=executed, received=received)
+            if now - hold["since"] < self._alarm:
+                continue
+            if hold["alarmed"] is None and not tracked(key):
+                continue
+            if hold["alarmed"] is None or now - hold["alarmed"] >= self._repeat:
+                if hold["alarmed"] is None:
+                    raised.append(self._view(hold, now))
+                hold["alarmed"] = now
+                log.warning("Исполнение 1m %s стоит %s мин: исполнена минута %s, получены свечи до %s — "
+                            "стоп и переоценка по инструменту не работают", name, self._minutes(hold["since"], now),
+                            executed, received)
+        if (raised or resumed) and self._report is not None:
+            try:
+                self._report(raised, resumed, self.alarms(now))
+            except Exception as exc:  # noqa: BLE001 — тревога не должна ронять исполнение
+                log.warning("Не удалось доставить тревогу исполнения (%s)", type(exc).__name__)
+
+
 class _UnsafeExecutionState(RuntimeError):
     """The in-memory simulator must be rebuilt from durable state."""
 
@@ -371,6 +435,8 @@ class BrokerTrading:
     capital: object
     initial_deposit: Decimal
     poll: object = None
+    # ``execution_alarm(raised, resumed, holds)`` — тревога сторожа исполнения 1m (fix-sandbox-restart-safety).
+    execution_alarm: object = None
 
 
 def _build_runtime(
@@ -541,6 +607,8 @@ def _build_runtime(
     pin_input = getattr(data_cache, "pin_execution_input", None)
     pinned_execution = getattr(data_cache, "live_session_enabled", False) is True and callable(pin_input)
     resumed_markers = set()
+    execution_watch = None if historical else _ExecutionWatch(
+        report=None if broker_trading is None else broker_trading.execution_alarm)
 
     def commit_bar(stamp, prices, addressed, broker_events):
         instrument_bar_times = {ticker: stamp for ticker in prices}
@@ -597,6 +665,8 @@ def _build_runtime(
                 cursors_loaded.append(True)
             batches = {}
             initial_boundaries = None
+            held = {}
+            seeded = False
             for instrument in lifecycle.execution_instruments():
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -617,6 +687,14 @@ def _build_runtime(
                             initial_boundaries = storage.execution_bar_boundaries()
                         boundary = initial_boundaries.get(ticker, (stamps.max(), True))
                     last, inclusive = boundary
+                    if ticker not in execution_closes:
+                        # После рестарта цена позиции — закрытие последней исполненной минуты, как и до
+                        # рестарта: переоценка не ждёт новую минутку тихого инструмента, а удержанные
+                        # барьером минуты в неё не попадают (fix-sandbox-restart-safety).
+                        executed = frame.loc[stamps < last if inclusive else stamps <= last]
+                        if not executed.empty:
+                            execution_closes[ticker] = float(executed.sort_values("datetime")["close"].iloc[-1])
+                            seeded = True
                     if pinned_execution and ticker not in resumed_markers:
                         resumed_markers.add(ticker)
                         if not inclusive:
@@ -630,6 +708,10 @@ def _build_runtime(
                         # новый контракт покрытия; в таком случае оставляем
                         # исходный DataFrame.
                         if isinstance(protected, type(fresh)):
+                            if len(protected) < len(fresh):
+                                # Барьер держит полученные минуты: сторожу исполнения.
+                                held[ticker] = (names.get(ticker) or "контракт не указан", last,
+                                                to_aware_utc(fresh["datetime"].max()).to_pydatetime())
                             fresh = protected
                     skipped = getattr(data_cache, "source_absent_between", None)
                     absent = skipped(instrument, last, fresh) if callable(skipped) and not fresh.empty else []
@@ -648,6 +730,8 @@ def _build_runtime(
                                 # не перескакиваем минуту; healthy UID идут дальше.
                                 log.warning("Исполнение %s удержано перед %s: %s",
                                             _instrument_ticker(instrument), stamp, exc)
+                                held[ticker] = (names.get(ticker) or "контракт не указан", last,
+                                                to_aware_utc(fresh["datetime"].max()).to_pydatetime())
                                 break
                             values = tuple(float(pinned[key]) for key in ("open", "low", "high", "close"))
                         batches.setdefault(stamp, {})[ticker] = values
@@ -670,6 +754,18 @@ def _build_runtime(
                 pending_bar = (stamp, prices, addressed, broker_events)
                 commit_bar(*pending_bar)
                 pending_bar = None
+            if seeded and not batches:
+                trade_manager.mark_to_market(execution_closes)
+            if execution_watch is not None:
+                tracked = []
+
+                def has_trades(key):
+                    if not tracked:
+                        tracked.append(set(storage.execution_bar_boundaries()))
+                    return any(alias in tracked[0] for alias in journal_ids(key))
+                now = as_aware(trade_manager._clock.now())
+                if isinstance(now, datetime):
+                    execution_watch.observe(now, held, has_trades)
             if live_dispatch:
                 # Команды остановки ставит граница тика, а не действие шага: без этой доставки
                 # их никто не отправит (fix-stop-command-freshness). Устаревшие увеличения уже сняты.
