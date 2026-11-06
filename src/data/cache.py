@@ -135,12 +135,15 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, market_calendar=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, market_calendar=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None, history_depth=0) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
         self._clock = clock
         self._history = bool(getattr(clock, "is_virtual", False))
+        # Прогон истории расширяет стартовый кадр назад до глубины расчёта, как
+        # прогрев живого ядра: окно старших ТФ одинаково (add-analysis-depth).
+        self._history_depth = history_depth
         self._client_provider = client_provider
         # В историческом режиме источник уже является эмулятором. Локальный
         # журнал живых данных включается только вызывающим кодом live-режима.
@@ -1614,6 +1617,8 @@ class MarketDataCache:
     def _initial_load(self, instrument, timeframe: str, key: tuple) -> None:
         self._wait_throttle()
         df = self._load(instrument, timeframe, start_date=None)
+        if self._history and self._history_depth:
+            df = self._deepen_history(instrument, timeframe, df)
         self._frames[key] = df if df is not None else None
         self._instruments[key] = instrument
         grid = self._timeline.grid(timeframe)
@@ -1622,6 +1627,28 @@ class MarketDataCache:
             closed = self._closed_only(df, timeframe)
             if not closed.empty:
                 self._last_loaded[key] = _naive(closed["datetime"].max())
+
+    def _deepen_history(self, instrument, timeframe: str, df):
+        """Стартовый кадр истории до глубины расчёта: окна 60…960 дней, как у прогрева ядра.
+
+        Расширение останавливается, когда закрытых свечей хватает или окно не
+        дало ни одной более ранней свечи (история контракта кончилась).
+        """
+        from src.data.ingestion import WARMUP_DAYS
+
+        now = _naive(self._timeline.now())
+        for days in WARMUP_DAYS[1:]:
+            closed = self._closed_only(df, timeframe) if df is not None and not df.empty else pd.DataFrame()
+            if len(closed) >= self._history_depth:
+                break
+            wider = self._load(instrument, timeframe, start_date=now - pd.Timedelta(days=days))
+            if wider is None or wider.empty:
+                break
+            earlier = closed.empty or wider["datetime"].min() < closed["datetime"].min()
+            df = wider
+            if not earlier:
+                break
+        return df
 
     def _wait_throttle(self) -> None:
         """Досыпает остаток ``data_refresh_min_interval`` с последнего API-вызова.

@@ -69,13 +69,14 @@ class FakeProvider:
         self.frames = dict(frames)
         self.calls = []
 
-    def frame_for(self, instrument, timeframe, *, max_close=None, min_bars=0):
+    def frame_for(self, instrument, timeframe, *, max_close=None, min_bars=0, depth=0):
         self.calls.append(
             {
                 "instrument": instrument,
                 "timeframe": timeframe,
                 "max_close": max_close,
                 "min_bars": min_bars,
+                "depth": depth,
             }
         )
         return self.frames.get(timeframe, pd.DataFrame()).copy()
@@ -271,3 +272,15 @@ class TestTripleScreenFilter:
         # MACD warmup = slow + signal = 35 → запрос на 37 баров; Stochastic warmup = 17 → 18 баров
         assert htf_call["min_bars"] == 37
         assert int_call["min_bars"] == 18
+        assert htf_call["depth"] == 37 and int_call["depth"] == 18  # без глубины расчёта — прежние окна
+
+    def test_screens_take_analysis_depth_but_keep_minimums(self):
+        frames = {
+            "30m": _frame_from_close(_oversold_tail(), freq="30min"),
+            "4h": _frame_from_close(_uptrend(), freq="4h"),
+        }
+        flt = _triple_filter(frames, depth=150)
+        flt.apply(_decision(SignalType.BUY), ctx=None, instrument="SBER", timeframe="5m")
+        calls = {call["timeframe"]: call for call in flt.provider.calls}
+        assert (calls["4h"]["min_bars"], calls["4h"]["depth"]) == (37, 150)
+        assert (calls["30m"]["min_bars"], calls["30m"]["depth"]) == (18, 150)

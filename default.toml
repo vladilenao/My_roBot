@@ -7,6 +7,9 @@ timeframe = "1h"
 sleep_seconds = 3600
 heartbeat_every_ticks = 60
 data_dir = "data"
+# Глубина расчёта стратегий и фильтров в свечах (50…1000): на 150 MACD, RSI и
+# тренд сходятся, и живой контур принимает те же решения, что прогон истории.
+analysis_depth = 150
 
 [tick]
 poll_secs = 1

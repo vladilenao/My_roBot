@@ -13,6 +13,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from src.data.analysis_window import analysis_window
 from src.data.timeutil import to_naive
 from src.logging_setup import get_logger
 
@@ -33,19 +34,23 @@ class HtfFrameProvider:
         *,
         max_close: datetime | None = None,
         min_bars: int = 0,
+        depth: int = 0,
     ) -> pd.DataFrame:
         """Кадр закрытых свечей ``timeframe``, выровненный до ``max_close``.
 
         Возвращает только свечи, закрывшиеся не позднее ``max_close``
         (время закрытия рабочей свечи тика). Если ``max_close`` не задан —
-        свечи, закрытые к текущему моменту планировщика.
+        свечи, закрытые к текущему моменту планировщика. ``depth`` — глубина
+        расчёта: кадр не длиннее неё, одинаково в живом и историческом
+        режиме; ``min_bars`` остаётся условием прогрева (add-analysis-depth).
         """
         resolver = getattr(self._cache, "instrument_for", None)
         if isinstance(instrument, str) and callable(resolver):
             instrument = resolver(instrument)
         live = getattr(self._cache, "live_session_enabled", False) is True
+        depth = max(depth, min_bars)
         if live:
-            frame = self._cache.prepare_live_history(instrument, timeframe, min_bars, max_close=max_close)
+            frame = self._cache.prepare_live_history(instrument, timeframe, depth, max_close=max_close)
         else:
             self._cache.ensure_loaded(instrument, timeframe)
             frame = self._cache.frame_for(instrument, timeframe)
@@ -70,6 +75,8 @@ class HtfFrameProvider:
             )
         if live and not frame.empty and not self._cache.coverage_for(instrument, timeframe, frame.tail(min_bars or len(frame))):
             return frame.iloc[:0].copy()
-        if live and min_bars:
-            frame = frame.tail(min_bars).reset_index(drop=True)
+        if live and depth:
+            frame = analysis_window(self._cache, instrument, timeframe, frame, min_bars, depth)
+        elif depth:
+            frame = frame.tail(depth).reset_index(drop=True)
         return frame

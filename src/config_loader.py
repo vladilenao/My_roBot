@@ -40,6 +40,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "sleep_seconds": "sleep_seconds",
         "heartbeat_every_ticks": "heartbeat_every_ticks",
         "data_dir": "data_dir",
+        "analysis_depth": "analysis_depth",
     },
     "tick": {
         "poll_secs": "tick_poll_secs",
@@ -123,6 +124,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "timeframe": str,
     "sleep_seconds": int,
     "heartbeat_every_ticks": int,
+    "analysis_depth": int,
     "tick_poll_secs": int,
     "tick_timeout_secs": int,
     "tick_catch_up_bars": int,
@@ -686,6 +688,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             raise ConfigError(f"{path}: [{key}] должен быть непустой строкой")
         if key in {"audit_max_bytes", "audit_backup_count"} and value < 0:
             raise ConfigError(f"{path}: [{key}] должен быть неотрицательным целым числом")
+        if key == "analysis_depth" and (isinstance(value, bool) or not 50 <= value <= 1000):
+            raise ConfigError(f"{path}: [robot] analysis_depth должен быть целым числом от 50 до 1000, "
+                              f"получено {value!r}")
         if key == "tick_catch_up_bars" and (isinstance(value, bool) or value < 0):
             raise ConfigError(
                 f"{path}: [tick] catch_up_bars должен быть неотрицательным целым числом"

@@ -295,6 +295,9 @@ def test_actual_bot_runtime_trades_three_contracts_without_live_requests(tmp_pat
     runtime = contour._build_runtime(selection.instruments, cache, bus, tmp_path, clock=clock, session=session)
 
     class EntryStrategy:
+        def required_history(self):
+            return 1
+
         def compute(self, frame):
             return frame
 

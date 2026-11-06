@@ -5,6 +5,7 @@ import os
 
 
 from src.config import (
+    ANALYSIS_DEPTH,
     CATCH_UP_BARS,
     DATA_BACKFILL_WINDOW_SECONDS,
     DATA_REFRESH_MIN_INTERVAL,
@@ -265,6 +266,7 @@ def _build_market_data(*, state_dir, clock, provider, history, market_calendar=N
         market_calendar=market_calendar,
         request_budget=request_budget,
         recovery_retry_seconds=MARKET_DATA_SETTINGS.recovery_recheck_interval_secs,
+        history_depth=ANALYSIS_DEPTH,
     )
     return timeline, market_store, request_budget, market_calendar, market_reconciler, data_cache
 

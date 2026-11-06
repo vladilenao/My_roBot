@@ -9,7 +9,7 @@
 
 #### Scenario: Значение вне диапазона
 - **WHEN** задано `analysis_depth = 30`, `2000`, `150.5` или `true`
-- **THEN** загрузка завершается `ConfigError` с указанием `robot.analysis_depth`
+- **THEN** загрузка завершается `ConfigError` с указанием `[robot] analysis_depth`
 
 #### Scenario: Глубина меньше минимума привязки
 - **GIVEN** `analysis_depth = 50`, у привязки минимум допуска 60

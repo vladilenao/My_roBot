@@ -38,6 +38,7 @@ class FrameProvider(Protocol):
         *,
         max_close: datetime | None = None,
         min_bars: int = 0,
+        depth: int = 0,
     ) -> pd.DataFrame: ...
 
 
@@ -142,6 +143,9 @@ class TripleScreenFilter:
     provider: FrameProvider
     params: TripleScreenParams
     ladder: tuple[str, ...] = field(default_factory=_default_ladder)
+    # Глубина расчёта старших ТФ (``[robot] analysis_depth``); минимум экрана —
+    # условие подтверждения, глубина — окно MACD/Stochastic (add-analysis-depth).
+    depth: int = 0
 
     def apply(
         self,
@@ -241,7 +245,8 @@ class TripleScreenFilter:
             signal=self.params.macd_signal,
         )
         htf = self.provider.frame_for(
-            instrument, tf_htf, max_close=max_close, min_bars=macd.warmup + 2
+            instrument, tf_htf, max_close=max_close, min_bars=macd.warmup + 2,
+            depth=max(macd.warmup + 2, self.depth),
         )
         screen1 = self._screen1_direction(htf, macd, tf_htf)
 
@@ -251,7 +256,8 @@ class TripleScreenFilter:
             smooth_k=self.params.stoch_smooth_k,
         )
         intf = self.provider.frame_for(
-            instrument, tf_int, max_close=max_close, min_bars=stoch.warmup + 1
+            instrument, tf_int, max_close=max_close, min_bars=stoch.warmup + 1,
+            depth=max(stoch.warmup + 1, self.depth),
         )
         screen2 = self._screen2_direction(intf, stoch, tf_int)
 
