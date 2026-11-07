@@ -58,6 +58,8 @@ _DEFAULTS = {
     "timeframe": "1h",
     "sleep_seconds": 3600,
     "heartbeat_every_ticks": 60,
+    # Глубина расчёта стратегий, фильтров и сопровождения (add-analysis-depth).
+    "analysis_depth": 150,
     "tick_poll_secs": 1,
     "tick_timeout_secs": 65,
     # Горизонт догона поздно опубликованных баров (в периодах ТФ) — управляет
@@ -164,6 +166,11 @@ if TIMEFRAME not in TIMEFRAMES:
 # Параметры бота (можно менять в robot.toml)
 SLEEP_SECONDS = _CONFIG["sleep_seconds"]
 HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
+
+# Глубина расчёта: окно последних свечей для стратегии, контекста фильтра,
+# старших ТФ triple_screen и сопровождения — одинаково в живом и историческом
+# цикле. Минимум допуска пары не меняет (src/history/warmup.py).
+ANALYSIS_DEPTH = _CONFIG["analysis_depth"]
 
 # Ожидание свежего закрытого бара после границы закрытия свечи
 # (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).

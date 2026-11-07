@@ -45,6 +45,7 @@ def _df():
 def _make_strategy(name="macd_rsi_stoch", decision=None):
     strat = MagicMock()
     strat.NAME = name
+    strat.required_history.return_value = 40
     strat.compute.return_value = _df()
     strat.decide.return_value = decision or Decision(SignalType.BUY, 100.5)
     return strat
@@ -625,6 +626,7 @@ class TestTradingBot:
 
     def test_delivers_on_signal_change(self):
         strategy = MagicMock()
+        strategy.required_history.return_value = 40
         strategy.compute.return_value = _df()
         strategy.decide.side_effect = [
             Decision(SignalType.HOLD, 100.5),
@@ -646,6 +648,7 @@ class TestTradingBot:
 
     def test_delivers_on_price_change_with_same_signal(self):
         strategy = MagicMock()
+        strategy.required_history.return_value = 40
         strategy.compute.return_value = _df()
         strategy.decide.side_effect = [
             Decision(SignalType.HOLD, 100.5),

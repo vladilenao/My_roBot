@@ -90,7 +90,8 @@ def test_trade_timeframe_without_binding_is_managed_on_its_own_bar_close():
     (hourly,) = _manage_calls(manager, "1h")
     instrument, assignments, managed_frame, context = hourly.args
     assert assignments == [] and context is None
-    assert len(managed_frame) == 41
+    # Окно сопровождения — до глубины расчёта, не только прогрев профиля (41).
+    assert 41 < len(managed_frame) <= live.depth
     assert str(managed_frame["datetime"].iloc[-1]) == "2026-10-12 09:00:00"
 
     # Тот же час повторно не сопровождается.

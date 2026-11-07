@@ -14,6 +14,7 @@ import json
 from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
+    ANALYSIS_DEPTH,
     MARKET_DATA_SETTINGS,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
@@ -976,7 +977,7 @@ def build_demand(runtime, instruments, data_cache) -> ContourDemand:
     for instrument in roster:
         key = instrument_key(instrument)
         for timeframe, count in obligation_requirements(
-                [t for t in trades if aliases.get(t.plan.instrument_id) == key]).items():
+                [t for t in trades if aliases.get(t.plan.instrument_id) == key], ANALYSIS_DEPTH).items():
             requests.append((instrument, timeframe, count))
         if key in boundaries:
             lowers.append((instrument, boundaries[key][0]))
@@ -1035,7 +1036,8 @@ class TradingContour:
             self.bus = EventBus()
             self.bus.subscribe_all(self.channels)
         htf_provider = HtfFrameProvider(cache=services.data_cache, timeline=services.timeline)
-        PROFILES["triple_screen"] = TripleScreenFilter(provider=htf_provider, params=TRIPLE_SCREEN_PARAMS)
+        PROFILES["triple_screen"] = TripleScreenFilter(provider=htf_provider, params=TRIPLE_SCREEN_PARAMS,
+                                                       depth=ANALYSIS_DEPTH)
         cluster_gate = services.cluster_gate(settings.state_dir)
         self.runtime = _build_runtime(
             settings.instruments, services.data_cache, self.bus, settings.state_dir, clock=settings.clock,

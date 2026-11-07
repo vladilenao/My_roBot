@@ -605,6 +605,27 @@ class TestCatchUpBars:
             load_config(_defaults(), config_file=cfg)
 
 
+class TestAnalysisDepth:
+    def test_key_optional_in_robot_section(self, tmp_path):
+        cfg = load_config(_defaults(), config_file=_write(tmp_path, "[robot]\ntimeframe = \"1h\"\n"))
+        assert "analysis_depth" not in cfg
+
+    def test_valid_value(self, tmp_path):
+        cfg = load_config(_defaults(), config_file=_write(tmp_path, "[robot]\nanalysis_depth = 200\n"))
+        assert cfg["analysis_depth"] == 200
+
+    @pytest.mark.parametrize("value", ["30", "2000", "150.5", "true", "\"150\""])
+    def test_invalid_value_rejected(self, tmp_path, value):
+        cfg = _write(tmp_path, f"[robot]\nanalysis_depth = {value}\n")
+        with pytest.raises(ConfigError, match="analysis_depth"):
+            load_config(_defaults(), config_file=cfg)
+
+    def test_default_is_150(self):
+        from src import config
+        assert config._DEFAULTS["analysis_depth"] == 150
+        assert "analysis_depth = 150" in (config.Path(config.__file__).parents[1] / "default.toml").read_text()
+
+
 class TestContractExpiryBlockDays:
     def test_key_optional_in_trading_section(self, tmp_path):
         cfg = load_config(_defaults(), config_file=_write(tmp_path, "[trading]\ninitial_deposit = 100000\n"))

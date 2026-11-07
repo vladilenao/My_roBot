@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from src.api.retry import DEFAULT_BASE_DELAY, _is_rate_limited, rate_limit_reset_secs
 from src.bot.run_session import LiveRunSession
-from src.config import BAR_TIME_TZ_OFFSET_HOURS, TIMEFRAMES
+from src.config import ANALYSIS_DEPTH, BAR_TIME_TZ_OFFSET_HOURS, TIMEFRAMES, TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS
 from src.data.ingestion_settings import MarketDataSettings
 from src.instruments import Instrument, normalize_instrument
 from src.instruments.model import instrument_key
@@ -23,7 +23,7 @@ from src.strategies.contracts import Assignment, SignalType
 from src.strategies.registry import get_strategy, validate_assignments
 from src.trade_management.actions import AddToTrade, TradeAction
 from src.history.contract_lifecycle import ConstantContractLifecycle, ContractLifecycleError
-from src.history.warmup import obligation_requirements
+from src.history.warmup import binding_requirements, obligation_requirements
 
 log = get_logger(__name__)
 
@@ -108,6 +108,7 @@ class TradingBot:
         market_data_settings=None,
         live_data_waiter=None,
         poll=None,
+        analysis_depth: int | None = None,
     ) -> None:
         self._bus = bus
         # Работа между тиками (add-tinvest-orders): исполнения брокера разбираются не реже опроса.
@@ -134,6 +135,10 @@ class TradingBot:
         self._trade_manager = trade_manager
         self._action_executor = action_executor
         self._protection_timeframe = protection_timeframe
+        # Глубина расчёта: окно стратегии, контекста и сопровождения — одно и
+        # то же в историческом тике и в живом анализе (add-analysis-depth).
+        self._analysis_depth = ANALYSIS_DEPTH if analysis_depth is None else analysis_depth
+        self._binding_minimums: dict[str, int] = {}
         # Последний переданный менеджеру кадр графика по паре: (бар, длина).
         self._remembered_markets: dict[tuple[str, str], tuple] = {}
 
@@ -331,6 +336,27 @@ class TradingBot:
             self._bus.publish(Event.tick_finished(tick_id=tick_id, completed=completed))
             correlation_id_var.set(None)
 
+    def _analysis_window(self, frame, tf: str, assignments, management: int = 0):
+        """Окно расчёта исторического тика: последние свечи до глубины расчёта.
+
+        Длина — max(глубина, минимумы привязок ТФ, прогрев сопровождения),
+        как у ``LiveAnalysis``; у служебного 1m окна нет — его кадр
+        сопровождения остаётся прежним.
+        """
+        if tf == self._protection_timeframe and not assignments:
+            return frame
+        minimums = [self._binding_minimum(assignment) for assignment in assignments]
+        return frame.tail(max(self._analysis_depth, management, *minimums)).reset_index(drop=True)
+
+    def _binding_minimum(self, assignment: Assignment) -> int:
+        """Минимум допуска привязки на её ТФ — тот же, что у живого анализа."""
+        if assignment.id not in self._binding_minimums:
+            strategy = self._strategy_cache.get((assignment.strategy, assignment.timeframe))
+            self._binding_minimums[assignment.id] = 0 if strategy is None else binding_requirements(
+                assignment, strategy, TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS,
+                tuple(TIMEFRAMES))[assignment.timeframe]
+        return self._binding_minimums[assignment.id]
+
     def _lazy_context(self, instrument: Instrument, tf: str, frame) -> LazyMarketContext:
         """Контекст ТФ считается, только если его прочтут фильтр или сопровождение."""
         name = self._display_name(instrument)
@@ -365,7 +391,8 @@ class TradingBot:
         # Защитный 1m нужен действиям, не связанным с баром (таймаут входа,
         # экспирация); профиль на нём не считается — менеджер сопровождает
         # сделку только кадром таймфрейма её плана.
-        management_needs = set(self._management_needs(instrument)) if self._trade_manager is not None else set()
+        needs = self._management_needs(instrument) if self._trade_manager is not None else {}
+        management_needs = set(needs)
         management_tfs = (
             {self._protection_timeframe} | management_needs
             if self._trade_manager is not None else set()
@@ -378,8 +405,11 @@ class TradingBot:
             if frame.empty:
                 log.info("Нет готовых свечей для %s (%s) — пропускаем.", self._display_name(instrument), tf)
                 continue
-            context = self._lazy_context(instrument, tf, frame) if self._context_cache else None
             tf_assignments = [a for a in assignments if a.timeframe == tf]
+            # Стратегия, контекст и сопровождение видят то же окно, что живой
+            # анализ; графики сделки по-прежнему получают весь кадр.
+            window = self._analysis_window(frame, tf, tf_assignments, needs.get(tf, 0))
+            context = self._lazy_context(instrument, tf, window) if self._context_cache else None
             log.debug(
                 "%s %s | получено свечей=%d, последний бар O=%.4f H=%.4f L=%.4f C=%.4f",
                 self._display_name(instrument), tf, len(frame),
@@ -388,9 +418,9 @@ class TradingBot:
             )
             if tf_assignments or tf in management_needs:
                 self._remember_market(instrument, tf, frame)
-            self._manage(instrument, tf_assignments, frame, context, tf)
+            self._manage(instrument, tf_assignments, window, context, tf)
             if tf_assignments:
-                self._analyze(instrument, tf_assignments, frame, context, tf, entry_candidates)
+                self._analyze(instrument, tf_assignments, window, context, tf, entry_candidates)
 
     # ── ПУНКТ 4.2: анализ по каждой привязке «стратегия × профиль» одного ТФ ──
     def _analyze(
