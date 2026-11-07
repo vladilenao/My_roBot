@@ -394,6 +394,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
     server.trading = _contour_trading(state_dir, sandbox)
+    server.indicators = _indicators_view()
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
     history.start()
@@ -424,6 +425,17 @@ def _sandbox_supervisor(state_dir, core_state):
     return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
                                    autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
                                    heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _indicators_view():
+    """Индикаторы стратегий привязок на свечах базы ядра (add-indicators-api): та же конфигурация и глубина,
+    что у живого анализа."""
+    from src.bot.indicators_view import IndicatorsView
+    from src.config import ANALYSIS_DEPTH, TIMEFRAMES, TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS
+
+    return IndicatorsView(share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
+                          strategy_map=_strategy_map(), profiles=TRADE_MANAGEMENT_PROFILES,
+                          triple_screen=TRIPLE_SCREEN_PARAMS, ladder=tuple(TIMEFRAMES), depth=ANALYSIS_DEPTH)
 
 
 def _contour_trading(state_dir, sandbox):

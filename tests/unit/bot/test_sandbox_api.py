@@ -207,6 +207,9 @@ def test_binding_instrument_resolved_or_rejected(tmp_path):
     assert member.instrument["ticker"] == "NGZ6" and member.instrument["strategy"] == "macd_rsi_stoch"
     assert member.contract == {"NGZ6": {"ticker": "NGZ6"}}
     assert control.view()["bindings"][0]["instrument"] == "NG-12.26"
+    # add-indicators-api: контракт выбран — ссылка на индикаторы привязки на её таймфрейме.
+    assert control.view()["bindings"][0]["_links"] == {
+        "indicators": {"href": "/api/v1/candles/NG-12.26/15m/indicators?binding=future-ng-macd"}}
 
 
 def test_current_shows_orders_mode_and_binding_states(tmp_path):
@@ -235,6 +238,8 @@ def test_bindings_carry_filter_and_management(tmp_path):
     control._catalog.pop("future-ng-macd")
     [member] = control.bindings()["members"]
     assert (member["filter"], member["management"]) == ("triple_screen", "levels_rr")
+    # add-indicators-api: привязки нет в конфигурации — ссылки на индикаторы нет.
+    assert "_links" not in member
     _check(control.view(), {"$ref": "#/components/schemas/Sandbox"})
 
 

@@ -64,6 +64,11 @@ PROBLEM_TITLES = {
 _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 
 
+def binding_indicators_href(instrument: str, timeframe: str, binding_id: str) -> str:
+    """``_links.indicators`` привязки (add-indicators-api): её таймфрейм на инструменте участника."""
+    return f"{CANDLES}/{quote(instrument, safe='')}/{timeframe}/indicators?binding={quote(binding_id, safe='')}"
+
+
 def links(**items: str) -> dict:
     """``rel=href`` → ``{"rel": {"href": …}}``; подчёркивание в имени связи — дефис."""
     return {name.replace("_", "-"): {"href": href} for name, href in items.items()}

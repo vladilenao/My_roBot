@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.6.0
+  version: 2.7.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -28,6 +28,10 @@ info:
     * Профили привязки (2.5.0): `filter` и `management` у привязок
       песочницы и каталога, `bindings` у участника эмуляции.
 
+    * `/api/v1/candles/{instrument}/{timeframe}/indicators` (2.7.0) —
+      индикаторы стратегии привязки на тех же свечах, что `/api/v1/candles…`:
+      «как видела стратегия» и классический расчёт; `_links.indicators` у
+      привязок участников эмуляции и песочницы.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -86,6 +90,8 @@ tags:
     description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
   - name: Свечи
     description: Свечи рядов рыночной базы ядра для графиков UI — только чтение.
+  - name: Индикаторы
+    description: Индикаторы стратегии привязки на свечах рыночной базы ядра (2.7.0) — только чтение.
   - name: Рыночные данные
     description: Лента изменений для Historical Broker API Emulator. Как в 1.8, без изменений.
   - name: Кластеры
@@ -1363,6 +1369,140 @@ paths:
         '404': {$ref: '#/components/responses/CandlesNotFound'}
         '503': {$ref: '#/components/responses/MarketDataNotReady'}
 
+  /api/v1/candles/{instrument}/{timeframe}/indicators:
+    parameters:
+      - $ref: '#/components/parameters/CandleInstrument'
+      - $ref: '#/components/parameters/Timeframe'
+    get:
+      tags: [Индикаторы]
+      summary: Индикаторы стратегии привязки на свечах окна
+      description: |
+        Значения индикаторов стратегии привязки `binding` на свечах того же
+        окна, что отдаёт `GET /api/v1/candles/{instrument}/{timeframe}` с
+        теми же `from`, `to` и `limit`: `times` совпадает с `open_time`
+        свечей поэлементно, значения линий выровнены по `times`.
+
+        **Режимы (`mode`).**
+        * `strategy` (по умолчанию) — как видела стратегия: точка свечи —
+          последняя строка `compute()` стратегии на хвосте до `depth`
+          свечей, заканчивающемся этой свечой. `depth` — глубина расчёта
+          живого анализа привязки: max(минимум допуска,
+          `[robot] analysis_depth`), по умолчанию 150. `null` — в ряду до
+          свечи включительно меньше свечей, чем минимум допуска. При малой
+          `analysis_depth` MACD и RSI стратегии отличаются от классических —
+          это и есть то, на чём принималось решение.
+        * `continuous` — классический расчёт по окну с прогревом не менее
+          300 свечей, как в терминалах; один расчёт на ответ. `depth: null`.
+
+        **Таймфрейм** — любой хранимый у инструмента. Не таймфрейм
+        привязки — `binding_timeframe: false`; режим `strategy` берёт те же
+        `depth` и минимум допуска.
+
+        **Отрисовка.** У индикатора `pane` (`price` — на свечах,
+        `separate` — своя панель), `levels` — горизонтальные уровни, у
+        линии `kind` (`line`, `histogram`). Цвета — дело UI.
+
+        **Нагрузка.** Расчёт идёт в процессе ядра: одновременно один,
+        остальные ждут; точки завершённых свечей режима `strategy`
+        кэшируются. Холодный запрос 500 точек — несколько секунд, опрос
+        новых точек — миллисекунды. `limit` — до 1000.
+
+        `last_complete: false` — последняя точка посчитана с
+        незавершённой свечой и изменится. Только чтение: без запросов к
+        брокеру и без записи в базу.
+      operationId: getIndicators
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IndicatorBinding'
+        - $ref: '#/components/parameters/IndicatorMode'
+        - $ref: '#/components/parameters/CandleFrom'
+        - $ref: '#/components/parameters/CandleTo'
+        - $ref: '#/components/parameters/IndicatorLimit'
+      responses:
+        '200':
+          description: Индикаторы окна.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IndicatorPage'}
+              examples:
+                strategy:
+                  summary: Как видела стратегия, текущая свеча не завершена
+                  value:
+                    instrument: NG-12.26
+                    instrument_type: future
+                    timeframe: 15m
+                    binding: {id: future-ng-macd, strategy: macd_rsi_stoch, timeframe: 15m}
+                    binding_timeframe: true
+                    mode: strategy
+                    depth: 150
+                    from: null
+                    to: '2026-11-06T09:14:05Z'
+                    times: ['2026-11-06T08:30:00Z', '2026-11-06T08:45:00Z', '2026-11-06T09:00:00Z']
+                    last_complete: false
+                    indicators:
+                      - key: macd
+                        title: MACD 12/26/9
+                        params: {fast: 12, slow: 26, signal: 9}
+                        pane: separate
+                        levels: [0]
+                        lines:
+                          - {name: macd, kind: line, values: [0.0041, 0.0046, 0.0049]}
+                          - {name: signal, kind: line, values: [0.0035, 0.0038, 0.0041]}
+                          - {name: histogram, kind: histogram, values: [0.0006, 0.0008, 0.0008]}
+                      - key: rsi
+                        title: RSI 14
+                        params: {period: 14}
+                        pane: separate
+                        levels: [30, 50, 70]
+                        lines:
+                          - {name: rsi, kind: line, values: [54.21, 55.02, 53.87]}
+                      - key: stochastic
+                        title: Стохастик 14/3/3
+                        params: {k: 14, d: 3, smooth_k: 3}
+                        pane: separate
+                        levels: [20, 80]
+                        lines:
+                          - {name: k, kind: line, values: [61.4, 66.2, 63.0]}
+                          - {name: d, kind: line, values: [58.9, 62.3, 63.5]}
+                    _links:
+                      self: {href: '/api/v1/candles/NG-12.26/15m/indicators?binding=future-ng-macd&mode=strategy&limit=3'}
+                      candles: {href: '/api/v1/candles/NG-12.26/15m?limit=3'}
+                      earlier: {href: '/api/v1/candles/NG-12.26/15m/indicators?binding=future-ng-macd&mode=strategy&to=2026-11-06T08:30:00Z&limit=3'}
+                otherTimeframe:
+                  summary: Классический расчёт на чужом таймфрейме, облако MA на свечах
+                  value:
+                    instrument: NG-12.26
+                    instrument_type: future
+                    timeframe: 1h
+                    binding: {id: future-ng-ma, strategy: ma_cloud_rsi_macd, timeframe: 15m}
+                    binding_timeframe: false
+                    mode: continuous
+                    depth: null
+                    from: null
+                    to: '2026-11-06T09:14:05Z'
+                    times: ['2026-11-06T07:00:00Z', '2026-11-06T08:00:00Z']
+                    last_complete: true
+                    indicators:
+                      - key: ma_cloud
+                        title: Облако MA 10/40
+                        params: {fast_period: 10, slow_period: 40}
+                        pane: price
+                        levels: []
+                        fill: {between: [fast, slow]}
+                        lines:
+                          - {name: fast, kind: line, values: [3.3412, 3.3437]}
+                          - {name: slow, kind: line, values: [3.3105, 3.3119]}
+                    _links:
+                      self: {href: '/api/v1/candles/NG-12.26/1h/indicators?binding=future-ng-ma&mode=continuous&limit=2'}
+                      candles: {href: '/api/v1/candles/NG-12.26/1h?limit=2'}
+                      earlier: {href: '/api/v1/candles/NG-12.26/1h/indicators?binding=future-ng-ma&mode=continuous&to=2026-11-06T07:00:00Z&limit=2'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/IndicatorsNotFound'}
+        '503': {$ref: '#/components/responses/MarketDataNotReady'}
+
   # Перенесено из docs/openapi.yaml 1.8 без изменений (вариант А): экспорт
   # уже в релизе, его читает Historical Broker API Emulator.
   /api/v1/market-data/source:
@@ -1795,6 +1935,24 @@ components:
       required: false
       description: Сколько последних свечей окна отдать.
       schema: {type: integer, minimum: 1, maximum: 5000, default: 500}
+    IndicatorBinding:
+      name: binding
+      in: query
+      required: true
+      description: '`id` привязки из `[strategies.*]` без учёта регистра — из неё стратегия, набор индикаторов и глубина. Привязка не обязана торговать этим инструментом.'
+      schema: {type: string, minLength: 1, example: future-ng-macd}
+    IndicatorMode:
+      name: mode
+      in: query
+      required: false
+      description: '`strategy` — как видела стратегия (хвост до глубины расчёта живого анализа, `analysis_depth`); `continuous` — классический расчёт по окну, один на ответ.'
+      schema: {type: string, enum: [strategy, continuous], default: strategy}
+    IndicatorLimit:
+      name: limit
+      in: query
+      required: false
+      description: Сколько последних свечей окна посчитать. Меньше, чем у свечей, из-за цены расчёта.
+      schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
     TradeInstrument:
       name: instrument
       in: query
@@ -2121,6 +2279,34 @@ components:
             status: 503
             code: MARKET_DATA_NOT_READY
             detail: Ядро ещё не открыло рыночную базу; состояние — GET /api/v1/core.
+    IndicatorsNotFound:
+      description: |
+        `NOT_FOUND`: привязки нет в конфигурации, имя инструмента не
+        разрешилось или у инструмента нет такого таймфрейма. `suggestions` —
+        `id` привязок этого инструмента, подходящие короткие имена или
+        имеющиеся таймфреймы, возможно пустой список.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+          examples:
+            binding:
+              summary: Неизвестная привязка
+              value:
+                type: 'urn:my-robot:problem:not-found'
+                title: Не найдено
+                status: 404
+                code: NOT_FOUND
+                detail: Привязки ng-macd нет в конфигурации.
+                suggestions: [future-ng-macd, future-ng-ma]
+            timeframe:
+              summary: Нет таймфрейма
+              value:
+                type: 'urn:my-robot:problem:not-found'
+                title: Не найдено
+                status: 404
+                code: NOT_FOUND
+                detail: У NG-12.26 нет ряда 4h.
+                suggestions: [1m, 15m, 1h]
     CandlesNotFound:
       description: |
         Ряда нет (`NOT_FOUND`): имя инструмента не разрешилось или у
@@ -2235,7 +2421,8 @@ components:
           type: array
           description: |
             Только у `NOT_FOUND` на маршрутах `/api/v1/candles…`: подходящие
-            короткие имена инструментов или имеющиеся таймфреймы.
+            короткие имена инструментов, имеющиеся таймфреймы или (2.7.0)
+            `id` привязок инструмента.
           items: {type: string}
     Rejection:
       type: object
@@ -2367,6 +2554,82 @@ components:
         _links:
           allOf: [{$ref: '#/components/schemas/Links'}]
           description: '`self`, `series` — ряды этого инструмента, `earlier` — предыдущее окно, если раньше есть свечи.'
+
+    IndicatorPage:
+      type: object
+      additionalProperties: false
+      required: [instrument, instrument_type, timeframe, binding, binding_timeframe, mode, depth, from, to, times, last_complete, indicators, _links]
+      description: Индикаторы стратегии привязки на свечах окна (2.7.0).
+      properties:
+        instrument: {type: string, description: Каноническое имя — как в составе базы.}
+        instrument_type: {type: string}
+        timeframe: {$ref: '#/components/schemas/Timeframe'}
+        binding:
+          type: object
+          additionalProperties: false
+          required: [id, strategy, timeframe]
+          properties:
+            id: {type: string}
+            strategy: {type: string}
+            timeframe: {$ref: '#/components/schemas/Timeframe'}
+        binding_timeframe: {type: boolean, description: '`false` — таймфрейм графика не таймфрейм привязки.'}
+        mode: {type: string, enum: [strategy, continuous]}
+        depth: {type: integer, minimum: 1, nullable: true, description: 'Глубина расчёта режима `strategy` — max(минимум допуска, `[robot] analysis_depth`); `null` у `continuous`.'}
+        from: {type: string, format: date-time, nullable: true, description: Начало окна из запроса; null — не ограничено.}
+        to: {type: string, format: date-time, description: Конец окна — из запроса или момент ответа.}
+        times:
+          type: array
+          description: Моменты открытия свечей окна по возрастанию — те же, что `open_time` у `/api/v1/candles…`.
+          items: {type: string, format: date-time}
+        last_complete: {type: boolean, description: '`false` — последняя точка посчитана с незавершённой свечой.'}
+        indicators:
+          type: array
+          description: Индикаторы стратегии в порядке её конфигурации; пусто — у стратегии нет индикаторов.
+          items: {$ref: '#/components/schemas/IndicatorSeries'}
+        _links:
+          allOf: [{$ref: '#/components/schemas/Links'}]
+          description: '`self`, `candles` — свечи того же окна, `earlier` — предыдущее окно той же привязки и режима, если раньше есть свечи.'
+    IndicatorSeries:
+      type: object
+      additionalProperties: false
+      required: [key, title, params, pane, levels, lines]
+      properties:
+        key: {type: string, description: 'Вид индикатора: `ma_cloud`, `bbands`, `rsi`, `macd`, `stochastic`. Список не закрыт.', example: macd}
+        title: {type: string, description: Подпись для легенды с параметрами., example: MACD 12/26/9}
+        params:
+          type: object
+          description: Параметры экземпляра, которые меняют значения.
+          additionalProperties: {type: number}
+        pane: {type: string, enum: [price, separate], description: '`price` — на свечах, `separate` — своя панель под свечами.'}
+        levels:
+          type: array
+          description: Горизонтальные уровни панели.
+          items: {type: number}
+        fill:
+          type: object
+          additionalProperties: false
+          required: [between]
+          description: Заливка между двумя линиями — у облака MA.
+          properties:
+            between:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items: {type: string}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/IndicatorLine'}
+    IndicatorLine:
+      type: object
+      additionalProperties: false
+      required: [name, kind, values]
+      properties:
+        name: {type: string, description: 'Роль линии: `macd`, `signal`, `histogram`, `rsi`, `k`, `d`, `fast`, `slow`, `upper`, `middle`, `lower`.'}
+        kind: {type: string, enum: [line, histogram]}
+        values:
+          type: array
+          description: Значения по `times`, 8 значащих цифр; `null` — значения нет (прогрев).
+          items: {type: number, nullable: true}
 
     # ------------------------------------------------------------------- ядро
     Core:
@@ -2541,6 +2804,12 @@ components:
         timeframe: {type: string}
         filter: {$ref: '#/components/schemas/BindingFilter'}
         management: {$ref: '#/components/schemas/BindingManagement'}
+        _links:
+          type: object
+          additionalProperties: false
+          description: '`indicators` — индикаторы привязки на её таймфрейме для инструмента участника (2.7.0); нет, если привязки нет в конфигурации.'
+          properties:
+            indicators: {$ref: '#/components/schemas/Link'}
     BindingFilter:
       type: string
       description: 'Профиль фильтра привязки, как в конфигурации (2.5.0): `raw` — без фильтра, `basic_levels` — против тренда, `triple_screen` — старшие таймфреймы. Список не закрыт: новый профиль может появиться без смены версии.'
@@ -2722,6 +2991,12 @@ components:
           type: string
           nullable: true
           description: 'Профиль управления из текущей конфигурации, как `BindingManagement` (2.5.0); `null` — неизвестен.'
+        _links:
+          type: object
+          additionalProperties: false
+          description: '`indicators` — индикаторы привязки на её таймфрейме для инструмента участника (2.7.0); нет, если привязки нет в конфигурации.'
+          properties:
+            indicators: {$ref: '#/components/schemas/Link'}
         target: {type: string, enum: [active, removed]}
         remove_mode: {type: string, nullable: true, enum: [no_entries, close_all, null]}
         current:

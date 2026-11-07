@@ -1,40 +1,40 @@
 ## 0. Swagger на проверке владельцем
 
-- [ ] 0.1 Владелец проверила черновик `openspec/changes/add-indicators-api/openapi.yaml` (операция, параметры, схемы `IndicatorPage`, `IndicatorSeries`, `IndicatorLine`, `_links.indicators` у привязок) и ответила на открытые вопросы `design.md`.
+- [x] 0.1 Владелец проверила черновик `openspec/changes/add-indicators-api/openapi.yaml` (операция, параметры, схемы `IndicatorPage`, `IndicatorSeries`, `IndicatorLine`, `_links.indicators` у привязок) и ответила на открытые вопросы `design.md`.
 
 ## 1. Описание отрисовки
 
-- [ ] 1.1 `src/strategies/indicators/chart.py`: `IndicatorChart` и `ChartLine` (frozen-dataclass'ы), абстрактное свойство `chart` у `Indicator`.
-- [ ] 1.2 `chart` у `MaCloudIndicator` (`price`, `fast`/`slow`, заливка), `BollingerBandsIndicator` (`price`, `upper`/`middle`/`lower`), `RsiIndicator` (30/50/70), `MacdIndicator` (`macd`/`signal`/`histogram`, 0), `StochasticIndicator` (`k`/`d`, 20/80). Колонки — из тех же параметров, что в `compute()`.
+- [x] 1.1 `src/strategies/indicators/chart.py`: `IndicatorChart` и `ChartLine` (frozen-dataclass'ы), абстрактное свойство `chart` у `Indicator`.
+- [x] 1.2 `chart` у `MaCloudIndicator` (`price`, `fast`/`slow`, заливка), `BollingerBandsIndicator` (`price`, `upper`/`middle`/`lower`), `RsiIndicator` (30/50/70), `MacdIndicator` (`macd`/`signal`/`histogram`, 0), `StochasticIndicator` (`k`/`d`, 20/80). Колонки — из тех же параметров, что в `compute()`.
 
 ## 2. Расчёт
 
-- [ ] 2.1 `src/bot/indicators_view.py`: разбор `binding`, `mode`, `from`, `to`, `limit` (1…1000); имя инструмента, таймфрейм и окно — общими функциями с `candles_view.py`, без копии.
-- [ ] 2.2 Привязка: поиск по `id` без учёта регистра среди привязок конфигурации; `suggestions` — привязки инструмента по `assignments_for`; стратегия и её конфигурация — из той же карты, что `_strategy_map()` ядра; `minimum = binding_requirements(...)[binding.timeframe]`, `depth = binding_depths(..., depth=analysis_depth)[binding.timeframe]` с профилями сопровождения, параметрами фильтра и `[robot] analysis_depth` живого анализа (серверу передаётся та же `analysis_depth`, что ядру).
-- [ ] 2.3 Чтение: свечи окна по `candle_window` и до `depth − 1` (`strategy`) или 300 (`continuous`) завершённых свечей до первой — одной транзакцией хранилища; кадр той же формы, что у живого анализа.
-- [ ] 2.4 Режим `strategy`: точка свечи — последняя строка `compute()` индикаторов на хвосте из min(`depth`, свечей ряда до неё включительно) свечей; меньше `minimum` свечей до неё включительно — `null`. Кэш точек завершённых свечей (LRU, 100 000 точек, ключ — привязка, отпечаток конфигурации, `minimum`, `depth`, `instrument_uid`, таймфрейм, `open_time`); точка незавершённой свечи не кэшируется.
-- [ ] 2.5 Режим `continuous`: один `compute()` на окне с прогревом.
-- [ ] 2.6 Один расчёт за раз (`threading.Lock`), расчёт вне блокировки хранилища. Ответ: `times`, `last_complete`, `indicators` по описанию отрисовки, значения — 8 значащих цифр, `NaN` → `null`; `_links` `self`, `candles`, `earlier`. Исключение расчёта — `500`, в журнал только тип исключения, `id` привязки, короткое имя и таймфрейм.
+- [x] 2.1 `src/bot/indicators_view.py`: разбор `binding`, `mode`, `from`, `to`, `limit` (1…1000); имя инструмента, таймфрейм и окно — общими функциями с `candles_view.py`, без копии.
+- [x] 2.2 Привязка: поиск по `id` без учёта регистра среди привязок конфигурации; `suggestions` — привязки инструмента по `assignments_for`; стратегия и её конфигурация — из той же карты, что `_strategy_map()` ядра; `minimum = binding_requirements(...)[binding.timeframe]`, `depth = binding_depths(..., depth=analysis_depth)[binding.timeframe]` с профилями сопровождения, параметрами фильтра и `[robot] analysis_depth` живого анализа (серверу передаётся та же `analysis_depth`, что ядру).
+- [x] 2.3 Чтение: свечи окна по `candle_window` и до `depth − 1` (`strategy`) или 300 (`continuous`) завершённых свечей до первой — одной транзакцией хранилища; кадр той же формы, что у живого анализа.
+- [x] 2.4 Режим `strategy`: точка свечи — последняя строка `compute()` индикаторов на хвосте из min(`depth`, свечей ряда до неё включительно) свечей; меньше `minimum` свечей до неё включительно — `null`. Кэш точек завершённых свечей (LRU, 100 000 точек, ключ — привязка, отпечаток конфигурации, `minimum`, `depth`, `instrument_uid`, таймфрейм, `open_time`); точка незавершённой свечи не кэшируется.
+- [x] 2.5 Режим `continuous`: один `compute()` на окне с прогревом.
+- [x] 2.6 Один расчёт за раз (`threading.Lock`), расчёт вне блокировки хранилища. Ответ: `times`, `last_complete`, `indicators` по описанию отрисовки, значения — 8 значащих цифр, `NaN` → `null`; `_links` `self`, `candles`, `earlier`. Исключение расчёта — `500`, в журнал только тип исключения, `id` привязки, короткое имя и таймфрейм.
 
 ## 3. Маршрут и ссылки
 
-- [ ] 3.1 `src/data/export_api.py`: `GET /api/v1/candles/{instrument}/{timeframe}/indicators` под ключом управления и проверкой `Host`, `503 MARKET_DATA_NOT_READY`, пока `store is None`; серверу передаются привязки конфигурации и конфигурации стратегий (`run.py`).
-- [ ] 3.2 `_links.indicators` у привязок участника эмуляции (`src/broker_contour/bindings.py`, `src/bot/launch_control.py`) и состава песочницы (`src/bot/sandbox_control.py`); нет привязки в конфигурации — нет ссылки; у каталога ссылки нет.
+- [x] 3.1 `src/data/export_api.py`: `GET /api/v1/candles/{instrument}/{timeframe}/indicators` под ключом управления и проверкой `Host`, `503 MARKET_DATA_NOT_READY`, пока `store is None`; серверу передаются привязки конфигурации и конфигурации стратегий (`run.py`).
+- [x] 3.2 `_links.indicators` у привязок участника эмуляции (`src/broker_contour/bindings.py`, `src/bot/launch_control.py`) и состава песочницы (`src/bot/sandbox_control.py`); нет привязки в конфигурации — нет ссылки; у фьючерса песочницы, для которого ядро ещё не выбрало контракт, — тоже (в карточке только код семейства); у каталога ссылки нет.
 
 ## 4. Контракт и документы
 
-- [ ] 4.1 Черновик `openapi.yaml` переносится в `docs/api/openapi.yaml` (2.7.0) вместе с обработчиками; контрактные тесты `test_launch_control.py` — на новую версию, `samples` для новой операции, проверка ключевых слов схем.
-- [ ] 4.2 `docs/api/README.md` — раздел «Индикаторы»: два режима, глубина `analysis_depth` и почему при малой глубине MACD стратегии не похож на терминальный, нагрузка; `docs/api/v2-decisions.md` — место ресурса и ссылки у привязок.
+- [x] 4.1 Черновик `openapi.yaml` переносится в `docs/api/openapi.yaml` (2.7.0) вместе с обработчиками; контрактные тесты `test_launch_control.py` — на новую версию, `samples` для новой операции, проверка ключевых слов схем.
+- [x] 4.2 `docs/api/README.md` — раздел «Индикаторы»: два режима, глубина `analysis_depth` и почему при малой глубине MACD стратегии не похож на терминальный, нагрузка; `docs/api/v2-decisions.md` — место ресурса и ссылки у привязок.
 
 ## 5. Тесты
 
-- [ ] 5.1 `tests/unit/strategies/`: описание каждого индикатора конфигураций зарегистрированных стратегий; колонки `chart.lines` есть в результате `compute()`; цветов в описании нет.
-- [ ] 5.2 Режим `strategy` совпадает с окном и расчётом `LiveAnalysis` на том же кадре до 10⁻⁹ для `macd_rsi_stoch`, `ma_cloud_rsi_macd`, `flat_triangle`; `depth` берётся из `analysis_depth` (150 и нестандартное значение); `null` до минимума допуска, хвост короче глубины на молодом ряду; `harmonic_abcd` — пустой `indicators`.
-- [ ] 5.3 Режим `continuous` совпадает с `compute()` на всём ряде до 10⁻⁶.
-- [ ] 5.4 API: `times` равен `open_time` свечей того же окна, в том числе по `earlier` и с незавершённой свечой; чужой таймфрейм — `binding_timeframe: false` и та же `depth`; `400` без `binding`, с `mode=fast`, `limit=1001`; `404` с `suggestions` для привязки, имени и таймфрейма; `401` с ключом экспорта; `403` с чужим `Host`; `503` до открытия базы; биржевой тикер и `instrument_uid` не встречаются в ответах.
-- [ ] 5.5 Кэш и блокировка: второй запрос с одной новой свечой считает одну точку; два одновременных запроса идут по очереди; база не меняется (курсоры, покрытие, `change_id`).
-- [ ] 5.6 Ссылки у привязок эмуляции и песочницы; привязки нет в конфигурации — ссылки нет.
-- [ ] 5.7 Полный `pytest` и `ruff check`.
+- [x] 5.1 `tests/unit/strategies/`: описание каждого индикатора конфигураций зарегистрированных стратегий; колонки `chart.lines` есть в результате `compute()`; цветов в описании нет.
+- [x] 5.2 Режим `strategy` совпадает с окном и расчётом `LiveAnalysis` на том же кадре до 8 значащих цифр (10⁻⁷) для `macd_rsi_stoch`, `ma_cloud_rsi_macd`, `flat_triangle`; `depth` берётся из `analysis_depth` (150 и нестандартное значение); `null` до минимума допуска, хвост короче глубины на молодом ряду; `harmonic_abcd` — пустой `indicators`.
+- [x] 5.3 Режим `continuous` совпадает с `compute()` на всём ряде до 10⁻⁶.
+- [x] 5.4 API: `times` равен `open_time` свечей того же окна, в том числе по `earlier` и с незавершённой свечой; чужой таймфрейм — `binding_timeframe: false` и та же `depth`; `400` без `binding`, с `mode=fast`, `limit=1001`; `404` с `suggestions` для привязки, имени и таймфрейма; `401` с ключом экспорта; `403` с чужим `Host`; `503` до открытия базы; биржевой тикер и `instrument_uid` не встречаются в ответах.
+- [x] 5.5 Кэш и блокировка: второй запрос с одной новой свечой считает одну точку; два одновременных запроса идут по очереди; база не меняется (курсоры, покрытие, `change_id`).
+- [x] 5.6 Ссылки у привязок эмуляции и песочницы; привязки нет в конфигурации — ссылки нет.
+- [x] 5.7 Полный `pytest` и `ruff check`.
 
 ## 6. Ручная проверка владельцем
 

@@ -66,29 +66,53 @@ def series_window(store, path: str, query: dict[str, list[str]], now: datetime |
     if match is None:
         raise CandlesError(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
     raw, timeframe = (unquote(part) for part in match.groups())
+    lower, upper, limit = window_bounds(timeframe, query, now)
+    row = resolve_series(store, raw, timeframe)
+    candles, earlier = store.candle_window(source=SOURCE_TBANK, instrument_uid=row["instrument_uid"],
+                                           interval=row["interval"], lower=lower, upper=upper, limit=limit)
+    name = row["name"]
+    found = {"self": series_href(name, timeframe) + window_query(query, lower, upper, limit),
+             "series": instrument_series_href(name)}
+    if earlier:
+        found["earlier"] = f"{series_href(name, timeframe)}?{earlier_query(candles, lower, upper, limit)}"
+    return {"instrument": name, "instrument_type": row["instrument_type"], "timeframe": timeframe,
+            "from": None if lower is None else _text(lower), "to": _text(upper), "candles": candles,
+            "_links": views.links(**found)}
+
+
+def window_bounds(timeframe: str, query: dict[str, list[str]], now: datetime | None = None,
+                  limit_max: int = LIMIT_MAX) -> tuple[pd.Timestamp | None, pd.Timestamp, int]:
+    """Таймфрейм, окно ``[from, to)`` и ``limit`` ряда свечей; неверные — ``400``.
+
+    Общие для свечей и индикаторов (add-indicators-api): окно индикаторов то же, что у свечей.
+    """
     if timeframe not in NATIVE_TIMEFRAMES:
         raise CandlesError(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST",
                            f"Таймфрейм — один из: {', '.join(NATIVE_TIMEFRAMES)}.")
     lower = _moment(query, "from")
     upper = _moment(query, "to") or _ceil_second(now or datetime.now(timezone.utc))
-    limit = _limit(query)
+    limit = _limit(query, limit_max)
     if lower is not None and lower >= upper:
         raise CandlesError(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Начало окна from должно быть раньше конца to.")
-    rows = _named(store)
-    row = _resolve(rows, raw, timeframe)
-    candles, earlier = store.candle_window(source=SOURCE_TBANK, instrument_uid=row["instrument_uid"],
-                                           interval=row["interval"], lower=lower, upper=upper, limit=limit)
-    name, to_text = row["name"], _text(upper)
-    params = ([f"from={_text(lower)}"] if lower is not None else []) + \
-             ([f"to={to_text}"] if "to" in query else []) + ([f"limit={limit}"] if "limit" in query else [])
-    found = {"self": series_href(name, timeframe) + ("?" + "&".join(params) if params else ""),
-             "series": instrument_series_href(name)}
-    if earlier:
-        bound = candles[0]["open_time"] if candles else _text(lower if lower is not None else upper)
-        found["earlier"] = f"{series_href(name, timeframe)}?to={bound}&limit={limit}"
-    return {"instrument": name, "instrument_type": row["instrument_type"], "timeframe": timeframe,
-            "from": None if lower is None else _text(lower), "to": to_text, "candles": candles,
-            "_links": views.links(**found)}
+    return lower, upper, limit
+
+
+def resolve_series(store, raw: str, timeframe: str) -> dict:
+    """Ряд базы по имени инструмента и таймфрейму; иначе ``404`` с подсказками."""
+    return _resolve(_named(store), raw, timeframe)
+
+
+def window_query(query: dict[str, list[str]], lower, upper, limit: int, prefix: tuple[str, ...] = ()) -> str:
+    """Строка запроса ссылки на окно: заданные ``from``, ``to``, ``limit`` после ``prefix``."""
+    params = list(prefix) + ([f"from={_text(lower)}"] if lower is not None else []) + \
+        ([f"to={_text(upper)}"] if "to" in query else []) + ([f"limit={limit}"] if "limit" in query else [])
+    return "?" + "&".join(params) if params else ""
+
+
+def earlier_query(candles: list[dict], lower, upper, limit: int) -> str:
+    """``to`` и ``limit`` предыдущего окна: граница — первая свеча окна, без свечей — край окна."""
+    bound = candles[0]["open_time"] if candles else _text(lower if lower is not None else upper)
+    return f"to={bound}&limit={limit}"
 
 
 # --- имена ---------------------------------------------------------------------------
@@ -186,12 +210,12 @@ def _ceil_second(value: datetime) -> pd.Timestamp:
     return pd.Timestamp(value).tz_convert("UTC").ceil("s")
 
 
-def _limit(query: dict[str, list[str]]) -> int:
+def _limit(query: dict[str, list[str]], maximum: int = LIMIT_MAX) -> int:
     raw = _one(query, "limit")
     if raw is None:
         return LIMIT_DEFAULT
-    if not raw.isdigit() or not 1 <= int(raw) <= LIMIT_MAX:
-        raise CandlesError(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", f"limit — целое число от 1 до {LIMIT_MAX}.")
+    if not raw.isdigit() or not 1 <= int(raw) <= maximum:
+        raise CandlesError(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", f"limit — целое число от 1 до {maximum}.")
     return int(raw)
 
 

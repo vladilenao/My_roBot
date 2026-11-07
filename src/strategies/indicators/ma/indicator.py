@@ -7,6 +7,7 @@ import pandas as pd
 import pandas_ta_classic as ta
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.chart import PANE_PRICE, ChartLine, IndicatorChart
 from src.strategies.indicators.ma.signalEnum import MaCloudSignalEnum
 from src.logging_setup import get_logger
 from src.trade_management.audit import CalculationTrace, MeasuredValue, calculation_trace
@@ -35,6 +36,16 @@ class MaCloudIndicator(Indicator):
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
         return self.slow_period
+
+    @property
+    def chart(self) -> IndicatorChart:
+        """Облако MA на свечах: заливка между быстрой и медленной SMA."""
+        return IndicatorChart(
+            key="ma_cloud", title=f"Облако MA {self.fast_period}/{self.slow_period}",
+            params={"fast_period": self.fast_period, "slow_period": self.slow_period},
+            pane=PANE_PRICE, lines=(ChartLine("fast", "sma_fast"), ChartLine("slow", "sma_slow")),
+            fill=("fast", "slow"),
+        )
 
     def __post_init__(self) -> None:
         if self.fast_period <= 0:

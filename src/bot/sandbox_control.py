@@ -150,7 +150,17 @@ class SandboxControl:
                 "target": "active" if member.active else "removed", "remove_mode": member.remove_mode,
                 "current": state if state in views.BINDING_STATES else None,
                 "reason": current.get("reason") if running and current else None,
+                **self._indicators_links(member.key, card),
                 "_actions": views.binding_action_list(member.key, member.active)}
+
+    def _indicators_links(self, key: str, card: dict) -> dict:
+        """``_links.indicators`` (add-indicators-api): привязка есть в конфигурации и инструмент — контракт или
+        акция; у фьючерса без выбранного контракта в карточке только код семейства — ссылки нет."""
+        name = card.get("short_name") or (card.get("instrument") if card.get("instrument_type") == "share" else None)
+        if key not in self._catalog or not name:
+            return {}
+        timeframe = self._catalog[key]["timeframe"]
+        return {"_links": views.links(indicators=views.binding_indicators_href(name, timeframe, key))}
 
     def view(self) -> dict:
         desired, status, process = self._desired(), self._status(), self._supervisor.snapshot()

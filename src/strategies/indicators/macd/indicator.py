@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.chart import KIND_HISTOGRAM, PANE_SEPARATE, ChartLine, IndicatorChart
 from src.strategies.indicators.macd.signalEnum import (
     MacdSignalEnum,
     MacdZeroCrossSignalEnum,
@@ -57,6 +58,18 @@ class MacdIndicator(Indicator):
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
         return self.slow + self.signal
+
+    @property
+    def chart(self) -> IndicatorChart:
+        """MACD в своей панели: линии MACD и сигнальная, гистограмма, уровень 0."""
+        suffix = f"{self.fast}_{self.slow}_{self.signal}"
+        return IndicatorChart(
+            key="macd", title=f"MACD {suffix.replace('_', '/')}",
+            params={"fast": self.fast, "slow": self.slow, "signal": self.signal}, pane=PANE_SEPARATE,
+            lines=(ChartLine("macd", f"macd_{suffix}"), ChartLine("signal", f"macds_{suffix}"),
+                   ChartLine("histogram", f"macdh_{suffix}", KIND_HISTOGRAM)),
+            levels=(0.0,),
+        )
 
     def __post_init__(self) -> None:
         if self.fast >= self.slow:

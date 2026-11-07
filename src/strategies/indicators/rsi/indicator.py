@@ -7,6 +7,7 @@ import pandas as pd
 import pandas_ta_classic as ta
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.chart import PANE_SEPARATE, ChartLine, IndicatorChart
 from src.strategies.indicators.rsi.signalEnum import RsiSignalEnum
 from src.logging_setup import get_logger
 
@@ -33,6 +34,14 @@ class RsiIndicator(Indicator):
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
         return self.period
+
+    @property
+    def chart(self) -> IndicatorChart:
+        """RSI в своей панели с уровнями 30, 50, 70."""
+        return IndicatorChart(
+            key="rsi", title=f"RSI {self.period}", params={"period": self.period},
+            pane=PANE_SEPARATE, lines=(ChartLine("rsi", "rsi"),), levels=(30.0, 50.0, 70.0),
+        )
 
     def __post_init__(self) -> None:
         if self.period <= 0:

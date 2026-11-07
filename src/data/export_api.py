@@ -9,7 +9,8 @@ web-фреймворка. По умолчанию он слушает тольк
 
 С rework-contour-api у каждого контура свой ресурс: ``/api/v1/emulation`` и
 ``/api/v1/history``; точка входа — ``/api/v1``. С add-candles-api —
-``/api/v1/candles``: свечи рыночной базы для графиков UI по ключу управления. Ошибки управления —
+``/api/v1/candles``: свечи рыночной базы для графиков UI по ключу управления, с add-indicators-api —
+и индикаторы стратегии привязки на них. Ошибки управления —
 ``application/problem+json``, экспорта и отчёта кластеров — прежний
 ``{code, message}``: его читает эмулятор данных.
 """
@@ -69,6 +70,9 @@ class MarketDataExportServer:
         # Позиции, сделки и итоги контуров по журналу (src.bot.trades_view.ContourTrades, add-contour-trades-api):
         # адрес контура → ресурсы; контура нет в словаре — 404.
         self.trading: dict = {}
+        # Индикаторы стратегий привязок на свечах базы (src.bot.indicators_view.IndicatorsView, add-indicators-api)
+        # или None — ресурс отвечает 404.
+        self.indicators = None
         self.host = host
         self.port = port
         self._server: ThreadingHTTPServer | None = None
@@ -339,6 +343,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _candles_get(self, path: str, query: dict[str, list[str]]) -> None:
         """Свечи рыночной базы ядра (add-candles-api): только чтение, без брокера."""
         from src.bot.candles_view import CandlesError, series_list, series_window
+        from src.bot.indicators_view import is_indicators_path
 
         store = self.export_server.store
         if store is None:
@@ -346,7 +351,13 @@ class _Handler(BaseHTTPRequestHandler):
                           "Ядро ещё не открыло рыночную базу; состояние — GET /api/v1/core.")
             return
         try:
-            payload = series_list(store, query) if path == views.CANDLES else series_window(store, path, query)
+            if is_indicators_path(path):
+                indicators = self.export_server.indicators
+                if indicators is None:
+                    raise CandlesError(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Индикаторы недоступны в этом процессе.")
+                payload = indicators.page(store, path, query)
+            else:
+                payload = series_list(store, query) if path == views.CANDLES else series_window(store, path, query)
         except CandlesError as exc:
             extra = None if exc.suggestions is None else {"suggestions": exc.suggestions}
             self._problem(exc.status, exc.code, exc.detail, extra)

@@ -311,7 +311,9 @@ class LaunchControl:
         return [{
             "name": name, "instrument_type": kind, "days_to_expiry": days,
             "target": "active" if active else "removed", "remove_mode": remove_mode, "current": state,
-            "bindings": [binding_brief(item) for item in instrument_bindings(card, self._catalog)],
+            "bindings": [{**binding_brief(item), "_links": views.links(
+                indicators=views.binding_indicators_href(name, item["timeframe"], item["id"]))}
+                for item in instrument_bindings(card, self._catalog)],
             "_links": views.links(self=views.member_href(name)),
             "_actions": views.member_action_list(name, views.member_actions(
                 changeable=changeable, active=active, remove_mode=remove_mode)),
