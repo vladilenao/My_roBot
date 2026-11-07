@@ -1384,17 +1384,19 @@ paths:
 
         **Режимы (`mode`).**
         * `strategy` (по умолчанию) — как видела стратегия: точка свечи —
-          последняя строка `compute()` стратегии на хвосте из `depth`
-          свечей, заканчивающемся этой свечой. `depth` — глубина живого
-          анализа привязки. MACD и RSI стратегии на коротком хвосте
-          отличаются от классических — это и есть то, на чём принималось
-          решение. `null` — перед свечой меньше `depth − 1` свечей.
+          последняя строка `compute()` стратегии на хвосте до `depth`
+          свечей, заканчивающемся этой свечой. `depth` — глубина расчёта
+          живого анализа привязки: max(минимум допуска,
+          `[robot] analysis_depth`), по умолчанию 150. `null` — в ряду до
+          свечи включительно меньше свечей, чем минимум допуска. При малой
+          `analysis_depth` MACD и RSI стратегии отличаются от классических —
+          это и есть то, на чём принималось решение.
         * `continuous` — классический расчёт по окну с прогревом не менее
-          300 свечей, как в терминалах. `depth: null`.
+          300 свечей, как в терминалах; один расчёт на ответ. `depth: null`.
 
         **Таймфрейм** — любой хранимый у инструмента. Не таймфрейм
-        привязки — `binding_timeframe: false`; режим `strategy` берёт ту же
-        `depth`.
+        привязки — `binding_timeframe: false`; режим `strategy` берёт те же
+        `depth` и минимум допуска.
 
         **Отрисовка.** У индикатора `pane` (`price` — на свечах,
         `separate` — своя панель), `levels` — горизонтальные уровни, у
@@ -1433,7 +1435,7 @@ paths:
                     binding: {id: future-ng-macd, strategy: macd_rsi_stoch, timeframe: 15m}
                     binding_timeframe: true
                     mode: strategy
-                    depth: 50
+                    depth: 150
                     from: null
                     to: '2026-11-06T09:14:05Z'
                     times: ['2026-11-06T08:30:00Z', '2026-11-06T08:45:00Z', '2026-11-06T09:00:00Z']
@@ -1943,7 +1945,7 @@ components:
       name: mode
       in: query
       required: false
-      description: '`strategy` — как видела стратегия (хвост глубины живого анализа); `continuous` — классический расчёт по окну.'
+      description: '`strategy` — как видела стратегия (хвост до глубины расчёта живого анализа, `analysis_depth`); `continuous` — классический расчёт по окну, один на ответ.'
       schema: {type: string, enum: [strategy, continuous], default: strategy}
     IndicatorLimit:
       name: limit
@@ -2572,7 +2574,7 @@ components:
             timeframe: {$ref: '#/components/schemas/Timeframe'}
         binding_timeframe: {type: boolean, description: '`false` — таймфрейм графика не таймфрейм привязки.'}
         mode: {type: string, enum: [strategy, continuous]}
-        depth: {type: integer, minimum: 1, nullable: true, description: 'Глубина хвоста режима `strategy`; `null` у `continuous`.'}
+        depth: {type: integer, minimum: 1, nullable: true, description: 'Глубина расчёта режима `strategy` — max(минимум допуска, `[robot] analysis_depth`); `null` у `continuous`.'}
         from: {type: string, format: date-time, nullable: true, description: Начало окна из запроса; null — не ограничено.}
         to: {type: string, format: date-time, description: Конец окна — из запроса или момент ответа.}
         times:
