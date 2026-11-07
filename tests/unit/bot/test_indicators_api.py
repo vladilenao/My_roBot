@@ -208,6 +208,17 @@ def test_continuous_matches_full_series(server, store):
     assert payload["_links"]["self"]["href"].endswith("binding=future-ng-macd&mode=continuous&limit=50")
 
 
+@pytest.mark.parametrize("path", [
+    "/api/v1/candles/SBER/15m/indicators?binding=future-ng-ma&mode=continuous",
+    # Листание назад до начала ряда: 12 свечей 1h, облаку MA нужно SMA-40.
+    "/api/v1/candles/NG-12.26/1h/indicators?binding=future-ng-ma&mode=continuous&to=2026-10-01T18:00:00Z",
+], ids=["short-series", "series-start"])
+def test_continuous_shorter_than_minimum_is_null(server, path):
+    payload = _ok(server, path)
+    assert 0 < len(payload["times"]) <= 30
+    assert all(value is None for values in _values(payload).values() for value in values)
+
+
 # --- окно и листание -----------------------------------------------------------------
 
 class TestWindow:

@@ -108,7 +108,7 @@ class IndicatorsView:
                     key = (binding.id, repr(config.indicators), minimum, depth, row["instrument_uid"], timeframe)
                     points = self._strategy_points(config.indicators, prior, candles, minimum, depth, key)
                 else:
-                    points = _continuous_points(config.indicators, prior, candles)
+                    points = _continuous_points(config.indicators, prior, candles, minimum)
         except Exception as exc:
             # Без данных кадра и текста исключения: в журнал — тип, привязка, короткое имя и таймфрейм.
             log.error("Индикаторы %s %s %s не посчитаны: %s", binding.id, name, timeframe, type(exc).__name__)
@@ -174,8 +174,11 @@ class IndicatorsView:
         return points
 
 
-def _continuous_points(indicators, prior, candles) -> list[dict | None]:
-    if not indicators or not candles:
+def _continuous_points(indicators, prior, candles, minimum) -> list[dict | None]:
+    """Один расчёт по всему окну с прогревом; ряд короче минимума допуска — без значений."""
+    # Как в режиме strategy: на коротком начале ряда индикаторы pandas_ta отдают ``None``
+    # вместо колонок (SMA-40 облака MA на 12 свечах), и расчёт падает.
+    if not indicators or not candles or len(prior) + len(candles) < minimum:
         return [None] * len(candles)
     data = _compute(indicators, _frame(prior + candles)).iloc[len(prior):]
     columns = _columns(indicators)
