@@ -409,6 +409,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
         seen = {e.execution_id for e in known}
         fresh = [trade for trade in report.trades if f"tinvest:{trade.trade_id}" not in seen]
         if fresh:
+            self.note_fill(row.instrument_uid)
             lots = trade_lots(card, [t.quantity for t in fresh], report.lots_executed - sum(e.lots for e in known))
             for trade, quantity in zip(fresh, lots):
                 self._ledger.add_execution(LedgerExecution(f"tinvest:{trade.trade_id}", row.key, quantity,
@@ -564,6 +565,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
                                 card.price_step, ROUND_HALF_UP)
                 if price <= 0:
                     price = average
+            self.note_fill(row.instrument_uid)
             self._ledger.add_execution(LedgerExecution(
                 f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now))
             self._apply_report(self._ledger.get(row.key), replace(report, trades=()), now)

@@ -71,5 +71,5 @@ class BrokerNotifier:
     def execution_resumed(self, items) -> None:
         self._publish("execution_resumed", holds=list(items))
 
-    def stopped(self, reason: str, *, open_positions: int | None = None) -> None:
-        self._publish("stopped", reason=reason, open_positions=open_positions)
+    def stopped(self, reason: str, *, open_positions: int | None = None, broker_stops: int | None = None) -> None:
+        self._publish("stopped", reason=reason, open_positions=open_positions, broker_stops=broker_stops)

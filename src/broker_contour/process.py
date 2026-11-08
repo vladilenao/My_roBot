@@ -222,16 +222,19 @@ class BrokerContour:
         from src.broker_contour.broker import ExitPolicy, TInvestBroker
         from src.broker_contour.control import BrokerControl, assignment_index
         from src.broker_contour.orders import OrderLedger
+        from src.broker_contour.stops import StopLedger
         from src.broker_contour.stream import OrderStream
         from src.config import FUTURE_STRATEGIES, SHARE_STRATEGIES
         from src.trade_management.manager import _entry_ttl_seconds
 
         settings = self.settings
         account = admitted.account
+        admitted_at = self._clock()         # снимок допуска не новее: сделки, разобранные дальше, — после него
         register_secrets([account.account_id])
         self.notifier.account_tail = account.masked
         api = TInvestApi(gateway, account.account_id)
         ledger = OrderLedger(settings.directory / BROKER_DATABASE_FILE)
+        stops = StopLedger(ledger)          # стоп у брокера (add-broker-protection)
         reconciler = Reconciler(store=store, notifier=self.notifier, account_tail=account.masked,
                                 every_secs=settings.reconcile_every_secs)
         self._capital = admitted.snapshot.rub
@@ -246,7 +249,8 @@ class BrokerContour:
 
             broker = TInvestBroker(api, ledger, contour=settings.contour_id,
                                    policy=settings.exit_policy or ExitPolicy(), publish=self._bus.publish,
-                                   journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock)
+                                   journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
+                                   stops=stops)
             holder["broker"] = broker
             return broker
 
@@ -274,7 +278,13 @@ class BrokerContour:
             broker.refresh_margins(now)
             broker.recover(now)
             self._consume(broker, manager)
-            self._reconcile_trading(reconciler, gateway, account, broker, manager, admitted.snapshot)
+            # Стопы — до сверки и первого тика: исполненные за простой проведены, недостающие поставлены,
+            # лишние срезаны по позиции счёта (add-broker-protection, решение 6). Сверка читает счёт заново:
+            # снимок допуска — до этих стоп-заявок.
+            broker.set_account_positions(self._positions_by_uid(admitted.snapshot), at=admitted_at)
+            broker.service(self._clock())
+            self._consume(broker, manager)
+            self._reconcile_trading(reconciler, gateway, account, broker, manager)
             stream = OrderStream(api, broker, stop=self._stop.requested)
             stream.start()
             desired = read_desired(settings.core_db, settings.contour_id)
@@ -289,13 +299,21 @@ class BrokerContour:
                 stream.close()
             contour.close()
         reason = self._stop.reason or "цикл завершён"
-        positions = sum(1 for lots in holder["broker"].open_positions().values() if lots) if "broker" in holder else 0
+        broker = holder.get("broker")
+        positions = sum(1 for lots in broker.open_positions().values() if lots) if broker is not None else 0
+        broker_stops = len(broker.active_stops()) if broker is not None else 0
         self._final_account(gateway, account)
-        self.notifier.stopped(reason, open_positions=positions)
+        self.notifier.stopped(reason, open_positions=positions, broker_stops=broker_stops)
         self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
         ledger.close()
         log.info("Контур %s остановлен: %s", settings.contour_id, reason)
         return 0
+
+    @staticmethod
+    def _positions_by_uid(snapshot: AccountSnapshot) -> dict[str, int]:
+        """Знаковые лоты счёта по UID: снимок хранит короткие имена, ``names`` — их UID."""
+        by_name = {short: uid for uid, short in snapshot.names.items()}
+        return {by_name.get(name, name): lots for name, lots in snapshot.holdings}
 
     def _execution_alarm(self, raised, resumed, holds) -> None:
         """Сторож исполнения 1m: тревога и возобновление — в канал, текущие удержания — в ``status.json``."""
@@ -341,6 +359,9 @@ class BrokerContour:
         """Сверка со своим журналом: позиции сделок, заявки в работе; «в пути» не сравнивается."""
         now = self._clock()
         self._consume(broker, manager)
+        broker.service(now)                 # хранитель стопа — до снимка: свежие стоп-заявки уже в журнале
+        self._consume(broker, manager)
+        snapshot_at = self._clock()
         if snapshot is None:
             try:
                 snapshot = read_account(gateway, account)
@@ -360,10 +381,12 @@ class BrokerContour:
             except BrokerCallError:
                 return uid
 
+        broker.set_account_positions(self._positions_by_uid(snapshot), at=snapshot_at)
         journal = JournalView(
             holdings=tuple((name(uid), lots) for uid, lots in broker.open_positions().items() if lots),
             orders=tuple(name(row.instrument_uid) for row in broker.live_orders()
-                         if row.broker_order_id and row.state in (ACCEPTED, PARTIAL)))
+                         if row.broker_order_id and row.state in (ACCEPTED, PARTIAL)),
+            stop_orders=tuple(name(row.instrument_uid) for row in broker.active_stops()))
         in_flight = {name(uid) for uid in broker.in_flight_instruments()}
         report = reconciler.run(now, snapshot, journal, in_flight=in_flight)
         by_name = {short: uid for uid, short in names.items()}

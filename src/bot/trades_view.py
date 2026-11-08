@@ -97,9 +97,12 @@ class ContourTrades:
     """Ресурсы торговли одного контура: ``…/positions``, ``…/trades``, ``…/performance``, ``…/account``."""
 
     def __init__(self, *, base: str, journal: Callable[[], Path | None], catalog: dict[str, dict],
-                 initial_deposit: object | None = None, clock: Callable[[], datetime] | None = None) -> None:
+                 initial_deposit: object | None = None, clock: Callable[[], datetime] | None = None,
+                 broker_db: Callable[[], Path | None] | None = None) -> None:
         self.base = base
         self._journal = journal
+        # ``broker.sqlite3`` контура на брокере: стоп-заявки для ``broker_stop`` позиций; None — эмуляция.
+        self._broker_db = broker_db
         self._catalog = catalog
         # Депозит виртуального счёта; None — у контура нет ресурса счёта (песочница).
         self._initial = None if initial_deposit is None else Decimal(str(initial_deposit))
@@ -118,7 +121,7 @@ class ContourTrades:
         _known(query, ("instrument",))
         instrument = _instrument_filter(query)
         with self._snapshot() as journal:
-            items = [] if journal is None else journal.positions(_prices(store))
+            items = [] if journal is None else journal.positions(_prices(store), self._broker_stops())
         items = [item for item in items if _matches(item, instrument)]
         unrealized, complete = _unrealized_total(items)
         return {"currency": CURRENCY, "as_of": _iso(self._clock()), "items": items,
@@ -200,6 +203,19 @@ class ContourTrades:
                 "_links": views.links(self=f"{self.base}/account", performance=f"{self.base}/performance")}
 
     # --- журнал -----------------------------------------------------------
+    def _broker_stops(self) -> dict[str, list] | None:
+        """Стоп-заявки контура на брокере по сделке; ``None`` — у контура их не бывает (эмуляция)."""
+        if self._broker_db is None:
+            return None
+        from src.broker_contour.stops import read_stop_rows
+
+        path = self._broker_db()
+        rows = read_stop_rows(path) if path is not None and path.is_file() else []
+        result: dict[str, list] = {}
+        for row in rows:
+            result.setdefault(row.trade_id, []).append(row)
+        return result
+
     def _snapshot(self) -> _Snapshot:
         return _Snapshot(self._journal(), self._binding)
 
@@ -318,7 +334,7 @@ class _Journal:
             "result_r": summary["result_r"] or None,
         }
 
-    def positions(self, prices: dict[str, tuple[str, str]]) -> list[dict]:
+    def positions(self, prices: dict[str, tuple[str, str]], broker_stops: dict[str, list] | None = None) -> list[dict]:
         items = []
         for trade_id, trade in self.rows().items():
             lots = int(trade["quantity"] or 0)
@@ -346,6 +362,8 @@ class _Journal:
                 "last_price_at": _iso(_utc(price_at)) if last is not None and price_at else None,
                 "stop": _price(_decimal(stop[0]), trade) if stop and stop[0] not in (None, "") else None,
                 "stop_pending": _price(_decimal(stop[1]), trade) if stop and stop[1] not in (None, "") else None,
+                "broker_stop": None if broker_stops is None else _broker_stop(
+                    broker_stops.get(trade_id, ()), lots, _decimal(stop[0]) if stop else None, trade),
                 "targets": [{"price": _price(_decimal(price), trade), "lots": int(planned or 0),
                              "filled": int(filled or 0)} for price, planned, filled in targets],
                 "opened_at": _iso(_utc(entries[0]["executed_at"])),
@@ -366,6 +384,18 @@ class _Journal:
         return {"id": trade_ref(trade_id), "binding": self._binding(str(trade["assignment_id"]), trade_id),
                 "instrument": self._names.get(str(trade["instrument_id"])),
                 "side": "long" if side == "BUY" else "short"}
+
+
+def _broker_stop(rows, lots: int, confirmed, trade: dict) -> dict:
+    """Стоп у брокера позиции (add-broker-protection): стоит, ставится или его держит контур."""
+    live = [row for row in rows if row.live]
+    active = [row for row in live if row.state == "active"]
+    row = active[-1] if active else (live[-1] if live else None)
+    if row is None:
+        return {"state": "contour", "price": _price(confirmed, trade) if confirmed is not None else None,
+                "lots": lots, "order": None}
+    return {"state": "active" if active else "placing", "price": _price(row.stop_price, trade), "lots": row.lots,
+            "order": row.stop_order_id[-4:] if row.stop_order_id else None}
 
 
 # --- цена ---------------------------------------------------------------------

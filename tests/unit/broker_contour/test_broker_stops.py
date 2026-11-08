@@ -361,3 +361,59 @@ def test_disabled_stops_keep_contour_condition(tmp_path):
     assert not [c for c in h.api.calls if c[0] in ("post_stop", "stop_orders")]
     add = AddToTrade("add-1", "trade-ng-1", 1, "add", 1, EntryOrderType.LIMIT, D("2.850"))
     assert h.broker.submit(add, h.clock()).status is ExecutionStatus.ACK
+
+
+def test_stale_account_snapshot_does_not_cut_new_entry_stop(tmp_path):
+    """Снимок счёта до входа показывает 0 — стоп нового входа не срезается (только снимок после сделки)."""
+    h = Harness(tmp_path)
+    h.broker.set_account_positions({NG: 0}, at=h.clock())
+    h.clock.advance(1)
+    h.filled(targets=False)
+    h.service()
+    assert h.active() == [("SELL", 2, STOP)]
+
+
+def test_order_lines_for_broker_stop():
+    from src.events.event import Event
+    from src.notifier.templates.orders import order_line
+
+    def line(kind, **fields):
+        return order_line(Event.broker_order(kind, contour="sandbox", trade_id="t", event_id="e", instrument="NG",
+                                             order="broker_stop", order_type="stop", side="SELL", **fields))
+
+    assert line("stop_placed", lots=10, price=D("2.901"), broker_order="ab12") == \
+        "стоп у брокера 2.901 · 10 лотов, стоп-заявка …ab12"
+    assert line("stop_placed", lots=5, price=D("2.901"), broker_order="cd34", replaced=True, reason="target") == \
+        "стоп пересоздан на остаток 5 лотов (цель): 2.901, стоп-заявка …cd34"
+    assert line("stop_placed", lots=10, price=D("2.916"), replaced=True, reason="move") == "стоп перенесён: 2.916 · 10 лотов"
+    assert line("stop_triggered", lots=10, price=D("2.901"), exchange_order="91c0") == \
+        "стоп сработал у брокера, заявка …91c0"
+    assert line("stop_failed", lots=10, price=D("2.901"), reason="broker:30042") == \
+        "⚠️ стоп не принят брокером: broker:30042 — выход из сделки"
+    assert line("stop_removed", lots=10, price=D("2.901"), broker_order="ab12") == "стоп снят перед выходом, стоп-заявка …ab12"
+
+
+def test_stopped_message_counts_broker_stops():
+    from src.events.event import Event
+    from src.notifier.telegram_templates import render_broker_account
+
+    def text(**fields):
+        return render_broker_account(Event.broker_account("stopped", contour="sandbox", account="…09c3",
+                                                          event_id="e", reason="Ctrl+C", **fields))
+
+    assert "стоп-заявок у брокера: 2 — позиции защищены без контура" in text(open_positions=2, broker_stops=2)
+    assert "не у всех позиций стоп у брокера" in text(open_positions=2, broker_stops=1)
+    assert "стоп без контура не проверяется" in text(open_positions=1)
+
+
+def test_reconcile_compares_own_stops_with_account():
+    """Своя стоп-заявка совпадает со счётом; лишняя на счёте — расхождение ``stop_order`` (задача 9.3)."""
+    from src.broker_contour.account import AccountSnapshot
+    from src.broker_contour.reconcile import JournalView, compare
+
+    journal = JournalView(holdings=(("NG-12.26", 2),), stop_orders=("NG-12.26",))
+    own = AccountSnapshot(D(1_000_000), None, (("NG-12.26", 2),), (), ("NG-12.26",))
+    assert compare(own, journal) == []
+    foreign = AccountSnapshot(D(1_000_000), None, (("NG-12.26", 2),), (), ("NG-12.26", "NG-12.26"))
+    [item] = compare(foreign, journal)
+    assert (item["instrument"], item["what"], item["account"], item["journal"]) == ("NG-12.26", "stop_order", 2, 1)

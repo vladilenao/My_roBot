@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.7.0
+  version: 2.8.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -32,6 +32,8 @@ info:
       индикаторы стратегии привязки на тех же свечах, что `/api/v1/candles…`:
       «как видела стратегия» и классический расчёт; `_links.indicators` у
       привязок участников эмуляции и песочницы.
+    * `broker_stop` у позиций песочницы (2.8.0) — стоп-заявка у брокера:
+      стоит, ставится или стоп держит контур.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -2028,6 +2030,7 @@ components:
                 last_price_at: '2026-10-31T14:41:00Z'
                 stop: '2.851'
                 stop_pending: null
+                broker_stop: null
                 targets: [{price: '2.930', lots: 2, filled: 0}]
                 opened_at: '2026-10-31T12:27:00Z'
                 entries: [{at: '2026-10-31T12:27:00Z', lots: 2, price: '2.874'}]
@@ -2047,6 +2050,7 @@ components:
                 last_price_at: '2026-10-31T14:41:00Z'
                 stop: '82900'
                 stop_pending: null
+                broker_stop: null
                 targets: [{price: '82100', lots: 1, filled: 0}]
                 opened_at: '2026-10-31T13:57:00Z'
                 entries: [{at: '2026-10-31T13:57:00Z', lots: 1, price: '82640'}]
@@ -2066,6 +2070,7 @@ components:
                 last_price_at: '2026-10-31T14:41:00Z'
                 stop: '63.80'
                 stop_pending: '64.00'
+                broker_stop: null
                 targets: [{price: '65.40', lots: 3, filled: 0}]
                 opened_at: '2026-10-30T11:30:00Z'
                 entries: [{at: '2026-10-30T11:30:00Z', lots: 3, price: '64.38'}]
@@ -3445,10 +3450,25 @@ components:
         price: {$ref: '#/components/schemas/DecimalPrice'}
         lots: {type: integer, minimum: 0}
         filled: {type: integer, minimum: 0}
+    BrokerStop:
+      type: object
+      additionalProperties: false
+      required: [state, price, lots, order]
+      description: |
+        Стоп-заявка `STOP_LOSS` «до отмены» у брокера на остаток позиции контура на брокере.
+        `state`: `active` — стоп-заявка стоит; `placing` — ставится или пересоздаётся (окно «снять →
+        поставить»); `contour` — стоп-заявки нет, условие стопа проверяет контур по минутам.
+      properties:
+        state: {type: string, enum: [active, placing, contour]}
+        price:
+          allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
+          nullable: true
+        lots: {type: integer, minimum: 0}
+        order: {type: string, nullable: true, description: Последние четыре символа номера стоп-заявки.}
     OpenPosition:
       type: object
       additionalProperties: false
-      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, targets, opened_at, entries, exits, phase, realized, fees, fees_source, unrealized]
+      required: [id, binding, instrument, side, lots, entry_price, last_price, last_price_at, stop, stop_pending, broker_stop, targets, opened_at, entries, exits, phase, realized, fees, fees_source, unrealized]
       properties:
         id: {type: string, description: 'Непрозрачный идентификатор сделки: `t_` + 16 знаков SHA-256 от `trade_id` журнала.'}
         binding: {$ref: '#/components/schemas/TradeBinding'}
@@ -3468,6 +3488,10 @@ components:
           allOf: [{$ref: '#/components/schemas/DecimalPrice'}]
           nullable: true
           description: Стоп, который сейчас переставляется.
+        broker_stop:
+          allOf: [{$ref: '#/components/schemas/BrokerStop'}]
+          nullable: true
+          description: Стоп у брокера (2.8.0, add-broker-protection). `null` у эмуляции.
         targets:
           type: array
           items: {$ref: '#/components/schemas/TradeTarget'}

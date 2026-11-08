@@ -470,3 +470,40 @@ class TestHttp:
         assert {name: payload["_links"][name]["href"] for name in ("positions", "trades", "performance", "account")} == {
             "positions": "/api/v1/emulation/positions", "trades": "/api/v1/emulation/trades",
             "performance": "/api/v1/emulation/performance", "account": "/api/v1/emulation/account"}
+
+
+class TestBrokerStop:
+    """``broker_stop`` позиции контура на брокере (add-broker-protection, задача 9.5)."""
+
+    def _sandbox(self, journal_path, tmp_path, state=None):
+        from src.broker_contour.orders import OrderLedger
+        from src.broker_contour.stops import StopLedger, StopRow
+
+        db = tmp_path / "broker.sqlite3"
+        if state is not None:
+            ledger = OrderLedger(db)
+            stops = StopLedger(ledger)
+            row = stops.create(StopRow("key-1", BR, "uid-br", "SELL", 3, Decimal("63.80")))
+            stops.update(row.key, state=state, stop_order_id="stop-order-0a1b" if state == "active" else "")
+            ledger.close()
+        return ContourTrades(base=views.SANDBOX, journal=lambda: journal_path, catalog=CATALOG,
+                             clock=lambda: NOW, broker_db=lambda: db)
+
+    def test_active_stop(self, journal_path, tmp_path):
+        payload = self._sandbox(journal_path, tmp_path, "active").positions({}, None)
+        _check(payload, {"$ref": "#/components/schemas/PositionList"})
+        assert payload["items"][0]["broker_stop"] == {"state": "active", "price": "63.8", "lots": 3, "order": "0a1b"}
+
+    def test_placing_stop(self, journal_path, tmp_path):
+        payload = self._sandbox(journal_path, tmp_path, "unknown").positions({}, None)
+        assert payload["items"][0]["broker_stop"] == {"state": "placing", "price": "63.8", "lots": 3, "order": None}
+
+    def test_contour_holds_stop_without_stop_order(self, journal_path, tmp_path):
+        payload = self._sandbox(journal_path, tmp_path).positions({}, None)
+        _check(payload, {"$ref": "#/components/schemas/PositionList"})
+        stop = payload["items"][0]["broker_stop"]
+        assert (stop["state"], stop["lots"], stop["order"]) == ("contour", 3, None)
+        assert stop["price"] == payload["items"][0]["stop"]
+
+    def test_emulation_has_null(self, trading):
+        assert trading.positions({}, None)["items"][0]["broker_stop"] is None

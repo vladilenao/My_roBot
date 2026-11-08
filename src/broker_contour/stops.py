@@ -177,15 +177,25 @@ class StopKeeping:
         self._announced: dict[str, tuple[int, Decimal]] = {}
         self._last_stop_poll: datetime | None = None
         self._account_lots: dict[str, int] | None = None
+        self._account_at: datetime | None = None
+        self._fill_seen: dict[str, datetime] = {}          # UID → когда пришла последняя сделка биржи
 
     @property
     def stops_enabled(self) -> bool:
         return self._stops is not None
 
-    def set_account_positions(self, holdings: dict[str, int] | None) -> None:
-        """Знаковые лоты счёта по UID из снимка сверки: сумма стопов инструмента не больше позиции."""
+    def set_account_positions(self, holdings: dict[str, int] | None, at: datetime | None = None) -> None:
+        """Знаковые лоты счёта по UID из снимка сверки: сумма стопов инструмента не больше позиции.
+
+        ``at`` — момент, на который снят снимок. По инструменту, где после него пришла сделка биржи,
+        снимок устарел и стоп не ограничивает: иначе новый вход остался бы без стопа до следующей сверки.
+        """
         with self._lock:
             self._account_lots = None if holdings is None else dict(holdings)
+            self._account_at = at or self._clock()
+
+    def note_fill(self, uid: str) -> None:
+        self._fill_seen[uid] = self._clock()
 
     # --- желаемый стоп ---------------------------------------------------------
     def _wanted_stops(self) -> dict[str, WantedStop]:
@@ -212,6 +222,9 @@ class StopKeeping:
             by_uid.setdefault(card.uid, []).append(view)
         if self._account_lots is not None:
             for uid, views in by_uid.items():
+                seen = self._fill_seen.get(uid)
+                if seen is not None and self._account_at is not None and seen > self._account_at:
+                    continue
                 sign = 1 if views[0].plan.side == "BUY" else -1
                 room = max(0, sign * self._account_lots.get(uid, 0))
                 total = sum(result[v.plan.trade_id].lots for v in views)

@@ -10,7 +10,10 @@ from decimal import Decimal
 from src.events.types import EventType
 
 ORDER_KINDS = {"entry": "вход", "add": "добор", "target": "цель", "stop": "стоп", "exit": "выход",
-               "emergency": "аварийный выход"}
+               "emergency": "аварийный выход", "broker_stop": "стоп у брокера"}
+# Почему стоп-заявка пересоздана (add-broker-protection).
+STOP_REASONS = {"entry": "вход", "add": "добор", "target": "цель", "reduce": "сокращение", "move": "перенос",
+                "restart": "рестарт", "replace": "пересоздание"}
 
 
 def _price(value) -> str:
@@ -33,6 +36,8 @@ def order_line(event) -> str:
     if event.type is EventType.ORDER_ACCEPTED:
         return f"принято брокером{number}"
     kind = event.get("kind")
+    if kind in ("stop_placed", "stop_triggered", "stop_failed", "stop_removed"):
+        return _stop_line(event, kind)
     what = ORDER_KINDS.get(event.get("order"), event.get("order") or "заявка")
     lots = f" · {_lots(event.get('lots'))}" if event.get("lots") else ""
     at = f" {_price(event.get('price'))}" if event.get("price") is not None else ""
@@ -56,3 +61,25 @@ def order_line(event) -> str:
     if kind == "emergency_market":
         return f"⚠️ {what}: лимит не исполнился, выход по рынку{lots}"
     return f"{what}: {kind}"
+
+
+def _stop_line(event, kind: str) -> str:
+    """Строка стоп-заявки у брокера: номер — последние четыре символа стоп-заявки."""
+    tail = event.get("broker_order")
+    number = f", стоп-заявка …{str(tail)[-4:]}" if tail else ""
+    lots = _lots(event.get("lots")) if event.get("lots") else ""
+    at = _price(event.get("price")) if event.get("price") is not None else ""
+    if kind == "stop_placed":
+        if not event.get("replaced"):
+            return f"стоп у брокера {at} · {lots}{number}"
+        if event.get("reason") == "move":
+            return f"стоп перенесён: {at} · {lots}{number}"
+        why = STOP_REASONS.get(event.get("reason"), event.get("reason") or "")
+        return f"стоп пересоздан на остаток {lots}" + (f" ({why})" if why else "") + f": {at}{number}"
+    if kind == "stop_triggered":
+        exchange = event.get("exchange_order")
+        return "стоп сработал у брокера" + (f", заявка …{str(exchange)[-4:]}" if exchange else "")
+    if kind == "stop_failed":
+        reason = event.get("reason")
+        return "⚠️ стоп не принят брокером" + (f": {reason}" if reason else "") + " — выход из сделки"
+    return f"стоп снят перед выходом{number}"

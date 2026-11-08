@@ -38,7 +38,7 @@ _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.STARTUP_ANALYSIS: (),
     EventType.BROKER_ACCOUNT: ("rub", "liquid_portfolio", "holdings", "orders", "stop_orders", "bindings",
                                "generation", "mismatches", "frozen", "unfrozen", "reason", "orders_enabled",
-                               "open_positions"),
+                               "open_positions", "broker_stops"),
     EventType.BROKER_ORDER: ("order", "order_type", "side", "lots", "price", "broker_order", "state", "attempt",
                              "reason", "replaced", "exchange_order"),
     EventType.MARKET_DATA_STATUS: ("phase", "break_kind", "last_due", "next_event", "schedule",
@@ -161,6 +161,7 @@ _JSON_TYPES: dict[str, str] = {
     "lots": "number",
     "orders_enabled": "boolean",
     "open_positions": "number",
+    "broker_stops": "number",
     "attempt": "number",
     "replaced": "boolean",
 }

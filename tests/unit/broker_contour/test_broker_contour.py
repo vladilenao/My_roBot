@@ -361,6 +361,10 @@ def test_process_with_orders_recovers_reconciles_and_stops(tmp_path):
     thread.join(timeout=5)
     assert result["code"] == 0 and _status(tmp_path)["state"] == "stopped"
     assert collector.kinds()[-1] == "stopped" and collector.events[-1].get("open_positions") == 0
+    assert collector.events[-1].get("broker_stops") == 0       # стоп у брокера (add-broker-protection)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "contours/sandbox/broker.sqlite3") as db:
+        assert db.execute("SELECT COUNT(*) FROM broker_stop_orders").fetchone() == (0,)
     assert not TRADING_CALLS & {name for name, _ in broker.calls}
     assert "orders_stream.order_state_stream" in {name for name, _ in broker.calls}
     text = (tmp_path / "contours/sandbox/status.json").read_text(encoding="utf-8")

@@ -403,7 +403,7 @@ def _broker_account(event: Event, stamp: str) -> Block:
 def _broker_order(event: Event, stamp: str) -> Block:
     """Заявка контура на брокере (add-tinvest-orders): одна строка в консоли."""
     label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
-    alarm = event.get("kind") in {"exit_rejected", "emergency_market"}
+    alarm = event.get("kind") in {"exit_rejected", "emergency_market", "stop_failed"}
     return Block(stamp, label, f"{_name(event)} · " + order_line(event).replace("⚠️ ", ""),
                  role="warning" if alarm else "muted")
 

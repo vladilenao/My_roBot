@@ -1284,7 +1284,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 Событие контура на брокере (add-sandbox-contour): контур «Песочница», позже —
 «Счёт». `kind`: `started` — допуск пройден; `reconcile_alarm` — сверщик нашёл
 расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
-нет; `stopped` — штатный выход. `account` — только последние четыре символа
+нет; `stopped` — штатный выход (`broker_stops` — сколько стоп-заявок осталось у
+брокера, add-broker-protection). `account` — только последние четыре символа
 номера счёта. Деньги — десятичные строки. Инструменты — короткие имена.
 Доставляется в канал своего контура, каналам эмуляции не отправляется.
 
@@ -1395,6 +1396,9 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
       "type": "boolean"
     },
     "open_positions": {
+      "type": "number"
+    },
+    "broker_stops": {
       "type": "number"
     }
   },

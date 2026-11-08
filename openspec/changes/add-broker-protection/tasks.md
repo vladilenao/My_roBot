@@ -42,20 +42,20 @@
 
 - [x] 6.1 Потерянный ответ `PostStopOrder` → `unknown`; разбор: поиск по инструменту, стороне, объёму, стоп-цене и времени среди `ACTIVE`, затем повтор тем же ключом или `cancelled` (решение 6). Две подходящие стоп-заявки — строка остаётся `unknown`.
 - [x] 6.2 Потерянный ответ `CancelStopOrder` — разбор по статусу из `GetStopOrders`.
-- [ ] 6.3 Подъём до первого тика: сверка живых строк с `GetStopOrders`, проводка исполненных за простой через `order_by_exchange_id` (с `fill_average`, если сделок нет), разбор `unknown`, хранитель приводит стопы к желаемому — всё до сверки.
+- [x] 6.3 Подъём до первого тика: сверка живых строк с `GetStopOrders`, проводка исполненных за простой через `order_by_exchange_id` (с `fill_average`, если сделок нет), разбор `unknown`, хранитель приводит стопы к желаемому — всё до сверки.
 
-  Сделано 08.11 в слое брокера: `src/broker_contour/stops.py` (журнал `broker_stop_orders`, примесь `StopKeeping`), `TInvestBroker(stops=…)`, `TInvestApi` — стоп-заявки и `order_by_exchange_id`, `classify` → `market_closed` для 30079. Без `stops` брокер ведёт себя как на С3. В процесс контура хранитель подключается задачей 8.1 вместе с 6.3 и 7.1: до этого тестовый робот на ветке торгует по-старому. Тесты — `tests/unit/broker_contour/test_broker_stops.py` (22).
+  Сделано 08.11 в слое брокера: `src/broker_contour/stops.py` (журнал `broker_stop_orders`, примесь `StopKeeping`), `TInvestBroker(stops=…)`, `TInvestApi` — стоп-заявки и `order_by_exchange_id`, `classify` → `market_closed` для 30079. Без `stops` брокер ведёт себя как на С3. Подключение к процессу контура — задачи 6.3, 7.1, 8.1 (08.11): журнал стоп-заявок создаётся при старте торговли, хранитель работает до сверки и первого тика, ограничение по позиции счёта — только по снимку новее последней сделки инструмента. Тесты — `tests/unit/broker_contour/test_broker_stops.py` (22).
 
 ## 7. Сверщик
 
-- [ ] 7.1 `JournalView.stop_orders` из активных строк стоп-заявок; `in_flight` для `sending`, `unknown`, `cancelling` и незнакомых отчётов моложе 60 с; хранитель — перед сверкой.
+- [x] 7.1 `JournalView.stop_orders` из активных строк стоп-заявок; `in_flight` для `sending`, `unknown`, `cancelling` и незнакомых отчётов моложе 60 с; хранитель — перед сверкой.
 
 ## 8. Остановка, уведомления, API
 
-- [ ] 8.1 Остановка по решению 8: `close_all` и снятие привязки с `close_all` — через 4.1; процесс завершается без живых стоп-заявок; `no_entries` и выход процесса оставляют стопы; `stopped` с `broker_stops`.
-- [ ] 8.2 `broker_order` с `kind` `stop_placed`, `stop_triggered`, `stop_failed`, `stop_removed`: схема события, шаблоны Telegram и консоли, `docs/notification/event-schemas.md`; строки дописываются в корневую карточку сделки; повтор без смены объёма и цены не публикуется.
-- [ ] 8.3 `…/positions`: `broker_stop` по design.md решение 10 из `broker.sqlite3` контура только на чтение; у эмуляции `null`.
-- [ ] 8.4 `docs/api/openapi.yaml` 2.8.0 (схема `broker_stop`, `stopped.broker_stops`), `docs/api/README.md`.
+- [x] 8.1 Остановка по решению 8: `close_all` и снятие привязки с `close_all` — через 4.1; процесс завершается без живых стоп-заявок; `no_entries` и выход процесса оставляют стопы; `stopped` с `broker_stops`.
+- [x] 8.2 `broker_order` с `kind` `stop_placed`, `stop_triggered`, `stop_failed`, `stop_removed`: схема события, шаблоны Telegram и консоли, `docs/notification/event-schemas.md`; строки дописываются в корневую карточку сделки; повтор без смены объёма и цены не публикуется.
+- [x] 8.3 `…/positions`: `broker_stop` по design.md решение 10 из `broker.sqlite3` контура только на чтение; у эмуляции `null`.
+- [x] 8.4 `docs/api/openapi.yaml` 2.8.0 (схема `broker_stop`, `stopped.broker_stops`), `docs/api/README.md`.
 
 ## 9. Тесты
 
@@ -77,12 +77,13 @@
   - две подходящие → `unknown` и расхождение;
   - часть позиции продана вручную за простой → стоп срезан, тревога по позиции;
   - сделка С3 без стопа → стоп поставлен с причиной «рестарт».
-- [ ] 9.3 Сверщик: своя стоп-заявка — `ok`; чужая — `mismatch stop_order`; стоп в пути — `in_flight`.
-- [ ] 9.4 Остановка: `close_all` → на счёте нет стоп-заявок, `stopped`; `no_entries` и Ctrl+C → стоп остаётся, `stopped.broker_stops`.
-- [ ] 9.5 API позиций: `broker_stop` в состояниях `active`, `placing`, `contour`; у эмуляции `null`.
+- [x] 9.3 Сверщик: своя стоп-заявка — `ok`; чужая — `mismatch stop_order`; стоп в пути — `in_flight`.
+- [x] 9.4 Остановка: `close_all` → на счёте нет стоп-заявок, `stopped`; `no_entries` и Ctrl+C → стоп остаётся, `stopped.broker_stops`.
+- [x] 9.5 API позиций: `broker_stop` в состояниях `active`, `placing`, `contour`; у эмуляции `null`.
 - [x] 9.6 Настройка `stop_place_secs`: значение по умолчанию, вне диапазона — `ConfigError`.
-- [ ] 9.7 Шаблоны строк карточки и консоли для четырёх новых `kind`.
-- [ ] 9.8 Полный `pytest` и `ruff check src tests run.py`.
+- [x] 9.7 Шаблоны строк карточки и консоли для четырёх новых `kind`.
+- [x] 9.8 Полный `pytest` и `ruff check src tests run.py`.
+  Сделано 08.11 перед коммитом подключения (хук: полный `pytest`), `ruff check` чистый.
 
 ## 10. Ручная проверка владельцем
 

@@ -443,6 +443,7 @@ def _contour_trading(state_dir, sandbox):
     from src.bot import control_views as views
     from src.bot.trades_view import ContourTrades
     from src.broker_contour.bindings import binding_catalog
+    from src.broker_contour.store import BROKER_DATABASE_FILE
     from src.config import DATABASE_FILE, INITIAL_DEPOSIT
 
     catalog = binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES)
@@ -451,7 +452,7 @@ def _contour_trading(state_dir, sandbox):
         views.EMULATION: ContourTrades(base=views.EMULATION, journal=lambda: emulation, catalog=catalog,
                                        initial_deposit=INITIAL_DEPOSIT),
         views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
-                                     catalog=catalog),
+                                     catalog=catalog, broker_db=lambda: sandbox.directory / BROKER_DATABASE_FILE),
     }
 
 

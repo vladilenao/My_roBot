@@ -230,8 +230,16 @@ def render_broker_account(event) -> str:
         if event.get("reason"):
             lines.append("Причина: " + escape(event.get("reason")))
         if event.get("open_positions"):
-            lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} — "
-                         "до стоп-заявок у брокера стоп без контура не проверяется")
+            stops = event.get("broker_stops")
+            if stops is None:
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} — "
+                             "стоп без контура не проверяется")
+            elif stops >= event.get("open_positions"):
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} · "
+                             f"стоп-заявок у брокера: {stops} — позиции защищены без контура")
+            else:
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} · "
+                             f"стоп-заявок у брокера: {stops} — ⚠️ не у всех позиций стоп у брокера")
     return "\n".join(lines)
 
 
