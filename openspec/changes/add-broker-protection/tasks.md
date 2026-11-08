@@ -1,8 +1,9 @@
 ## 1. Разведка стоп-заявок
 
-- [ ] 1.1 `src/sandbox/probe_stops.py` и действие `probe-stops [инструмент] [--stop-ticks N] [--stop-wait МИН]` в `src/sandbox/__main__.py`: проверки П19–П24 по design.md решение 11, уборка как П15, отчёт и записи ответов в `data/sandbox/probe-…/`.
+- [x] 1.1 `src/sandbox/probe_stops.py` и действие `probe-stops [инструмент] [--stop-ticks N] [--stop-wait МИН]` в `src/sandbox/__main__.py`: проверки П19–П24 по design.md решение 11, уборка как П15, отчёт и записи ответов в `data/sandbox/probe-…/`.
 - [ ] 1.2 Фейковый шлюз (`tests/unit/broker_contour/fake_api.py`) дополнен стоп-заявками: `PostStopOrder` (ключ, дубликат), `GetStopOrders` по статусу и периоду, `CancelStopOrder` (в т.ч. исполненной), срабатывание с порождённой рыночной заявкой в стриме без `order_request_id`, `GetOrderState` по номеру биржи.
-- [ ] 1.3 Юнит-тесты `probe-stops` на фейковой песочнице: всё работает; стоп не сработал за ожидание — П22, П23 `не проверено`; торги закрыты — ни одной заявки.
+- [x] 1.3 Юнит-тесты `probe-stops` на фейковой песочнице: всё работает; стоп не сработал за ожидание — П22, П23 `не проверено`; торги закрыты — ни одной заявки.
+  Сделано 08.11: `tests/unit/sandbox/test_sandbox_probe_stops.py`, 10 тестов; фейковая песочница С1 (`tests/unit/sandbox/fakes.py`) дополнена ключом стоп-заявки, `exchange_order_id`, ценой в рублях, снятием исполненной.
 - [ ] 1.4 Прогон `python -m src.sandbox probe-stops` в торговое время — владелец. Ответы П19–П24 записаны в design.md (Open Questions) и в фикстуры.
 
 ## 2. Настройки и API брокера

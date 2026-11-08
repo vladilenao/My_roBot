@@ -42,12 +42,16 @@ class FakeBroker:
     reject_market: bool = False
     executes_stops: bool = True
     repeat_key: str = "same"  # same | new | error
+    repeat_stop_key: str = "error"  # same | new | error — повтор ключа стоп-заявки
+    stop_price_rub: bool = False  # GetStopOrders отдаёт стоп-цену в рублях за контракт (шаг 0.001 = 7.9 ₽)
+    cancel_executed_stop: str = "error"  # error | ok — снятие исполненной стоп-заявки
     margin_works: bool = True
     fail_operations: bool = False
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
+    stop_keys: dict = field(default_factory=dict)  # ключ -> stop_id
     operations: list = field(default_factory=list)
     calls: list = field(default_factory=list)
     stream: "queue.Queue" = field(default_factory=queue.Queue)
@@ -212,6 +216,8 @@ class _Api:
             if found is None:
                 raise RequestError(StatusCode.NOT_FOUND, "50005", SimpleNamespace(message="Order not found"))
             return found
+        if order_id not in self.b.orders:
+            raise RequestError(StatusCode.NOT_FOUND, "50005", SimpleNamespace(message="Order not found"))
         return self.b.orders[order_id]
 
     def orders__cancel_order(self, account_id="", order_id=""):
@@ -223,12 +229,22 @@ class _Api:
     # stop orders
     def stop_orders__post_stop_order(self, *, instrument_id="", quantity=0, stop_price=None, direction=None,
                                      account_id="", expiration_type=None, stop_order_type=None, order_id=""):
+        if order_id and order_id in self.b.stop_keys:
+            if self.b.repeat_stop_key == "error":
+                raise RequestError(StatusCode.INVALID_ARGUMENT, "30057", SimpleNamespace(message="Дубль ключа"))
+            if self.b.repeat_stop_key == "same":
+                return s.PostStopOrderResponse(stop_order_id=self.b.stop_keys[order_id], order_request_id=order_id)
+        level = quotation_to_decimal(stop_price)
+        shown = level / Decimal("0.001") * Decimal("7.9") if self.b.stop_price_rub else level
         stop = s.StopOrder(stop_order_id=self.b.next_id("stop"), instrument_uid=instrument_id,
                            lots_requested=quantity, direction=direction, order_type=stop_order_type,
-                           stop_price=money(quotation_to_decimal(stop_price)),
-                           status=s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE)
+                           stop_price=money(shown), status=s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE,
+                           exchange_order_id="")
+        stop.level = level  # для срабатывания фейка: цена в пунктах
         self.b.stops[stop.stop_order_id] = stop
-        return s.PostStopOrderResponse(stop_order_id=stop.stop_order_id)
+        if order_id:
+            self.b.stop_keys[order_id] = stop.stop_order_id
+        return s.PostStopOrderResponse(stop_order_id=stop.stop_order_id, order_request_id=order_id)
 
     def stop_orders__get_stop_orders(self, account_id="", status=None, from_=None, to=None):
         items = list(self.b.stops.values())
@@ -237,7 +253,12 @@ class _Api:
         return s.GetStopOrdersResponse(stop_orders=items)
 
     def stop_orders__cancel_stop_order(self, account_id="", stop_order_id=""):
-        self.b.stops[stop_order_id].status = s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED
+        stop = self.b.stops[stop_order_id]
+        if stop.status == s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED:
+            if self.b.cancel_executed_stop == "error":
+                raise RequestError(StatusCode.NOT_FOUND, "50006", SimpleNamespace(message="Стоп-заявка не найдена"))
+            return s.CancelStopOrderResponse()
+        stop.status = s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED
         return s.CancelStopOrderResponse()
 
     # market data / instruments
@@ -249,9 +270,11 @@ class _Api:
         if self.b.executes_stops:
             for stop in self.b.stops.values():
                 if stop.status == s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE \
-                        and price <= money_to_decimal(stop.stop_price):
+                        and price <= getattr(stop, "level", money_to_decimal(stop.stop_price)):
                     stop.status = s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED
-                    self.b.fill(stop.instrument_uid, stop.lots_requested, s.OrderDirection.ORDER_DIRECTION_SELL, "")
+                    order = self.b.fill(stop.instrument_uid, stop.lots_requested,
+                                        s.OrderDirection.ORDER_DIRECTION_SELL, "")
+                    stop.exchange_order_id = order.order_id
         return s.GetLastPricesResponse(last_prices=[s.LastPrice(price=quote(price), instrument_uid=instrument_id[0])])
 
     def market_data__get_order_book(self, instrument_id="", depth=0):

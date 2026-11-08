@@ -138,13 +138,16 @@ class _StreamState:
 
 
 class Probe:
+    CHECKS = CHECKS
+    TITLE = "Разведка песочницы"
+
     def __init__(self, gateway: SandboxGateway, settings: ProbeSettings, *, timing: ProbeTiming | None = None,
                  resolve: Callable[..., SandboxInstrument] = resolve_instrument):
         self.gateway = gateway
         self.settings = settings
         self.timing = timing or ProbeTiming()
         self._resolve = resolve
-        self.results = {code: CheckResult(code, title) for code, title in CHECKS}
+        self.results = {code: CheckResult(code, title) for code, title in self.CHECKS}
         self.account: RobotAccount | None = None
         self.instrument: SandboxInstrument | None = None
         self.started_at = self.timing.clock()
@@ -651,11 +654,10 @@ class Probe:
         name = self.instrument.short_name if self.instrument else self.settings.instrument
         finished = self.finished_at or self.timing.clock()
         lines = [
-            f"# Разведка песочницы: {name}",
+            f"# {self.TITLE}: {name}",
             "",
             f"Начало {self.started_at:%Y-%m-%d %H:%M:%S} UTC, конец {finished:%Y-%m-%d %H:%M:%S} UTC.",
-            f"Параметры: инструмент {self.settings.instrument}, --stop-ticks {self.settings.stop_ticks}, "
-            f"--stop-wait {self.settings.stop_wait_min:g}, --min-rub {self.settings.min_rub}.",
+            self._params_line(),
             "",
             "| № | Проверка | Итог | Подробность |",
             "|---|---|---|---|",
@@ -664,6 +666,10 @@ class Probe:
             detail = result.detail.replace("|", "/")
             lines.append(f"| {result.code} | {result.title} | {result.outcome} | {detail} |")
         return lines
+
+    def _params_line(self) -> str:
+        return (f"Параметры: инструмент {self.settings.instrument}, --stop-ticks {self.settings.stop_ticks}, "
+                f"--stop-wait {self.settings.stop_wait_min:g}, --min-rub {self.settings.min_rub}.")
 
     def write_report(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
