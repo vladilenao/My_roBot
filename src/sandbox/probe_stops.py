@@ -1,5 +1,9 @@
 """Разведка стоп-заявок песочницы: проверки П19–П24 на двух лотах (add-broker-protection, решение 11).
 
+П25–П26 (add-account-vs-emulation-report, решение 7) тем же прогоном проверяют,
+как песочница отдаёт комиссию покупки в операциях: есть ли в операции номера
+сделок биржи и связана ли с ней операция «комиссия брокера».
+
 Отвечает на вопросы, от которых зависит стоп у брокера в контуре «Песочница»:
 в чём цена стоп-заявки в ``GetStopOrders``, что отвечает повтор ключа, как
 снять и поставить стоп заново, что приносит стрим по заявке, порождённой
@@ -14,6 +18,9 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from t_tech.invest.schemas import (
+    GetOperationsByCursorRequest,
+    OperationState,
+    OperationType,
     OrderDirection,
     OrderExecutionReportStatus,
     OrderIdType,
@@ -25,7 +32,7 @@ from t_tech.invest.schemas import (
 )
 from t_tech.invest.utils import decimal_to_quotation, money_to_decimal
 
-from src.sandbox.actions import STATUS_NAMES, active_stop_orders, describe_fill, new_key, price
+from src.sandbox.actions import STATUS_NAMES, active_stop_orders, describe_fill, new_key, price, rub
 from src.sandbox.gateway import BrokerCallError
 from src.sandbox.probe import NO, SKIPPED, STOP_TOUCH_GRACE, YES, Probe, floor_to_step
 
@@ -35,6 +42,8 @@ STOP_CHECKS = (
     ("П3", "Инструмент и торги"),
     ("П5", "Стрим исполнений"),
     ("П10", "Покупка 2 лотов по рынку"),
+    ("П25", "Номер сделки в операции"),
+    ("П26", "Комиссия связана с операцией"),
     ("П19", "Стоп-заявка на объём"),
     ("П20", "Повтор ключа стоп-заявки"),
     ("П21", "Снять и поставить"),
@@ -87,12 +96,14 @@ class StopProbe(Probe):
         if not self._step("П10", self._buy):
             self._skip(codes[4:], "позиции нет")
             return
+        self._step("П25", self._check_fee_operations)
+        self._skip(["П26"], "проверка операций прервана")
         if not self._step("П19", self._place_first):
-            self._skip(codes[5:], "стоп-заявки нет")
+            self._skip(codes[codes.index("П20"):], "стоп-заявки нет")
             return
         self._step("П20", self._repeat_key)
         if not self._step("П21", self._replace):
-            self._skip(codes[7:], "новой стоп-заявки нет")
+            self._skip(codes[codes.index("П22"):], "новой стоп-заявки нет")
             return
         if not self._step("П22", self._wait_trigger):
             self._skip(["П23", "П24"], "стоп-заявка не исполнена")
@@ -158,6 +169,76 @@ class StopProbe(Probe):
             return True
         self._set("П10", NO, f"{detail}; исполнено {lots} из {LOTS}, позиция {held}")
         return False
+
+    # --- П25–П26: комиссия в операциях --------------------------------------
+    def _buy_trade_ids(self) -> set[str]:
+        """Номера сделок биржи покупки: из стрима и из ``GetOrderState.stages``."""
+        ids = {trade.trade_id for item in self._stream.seen if item.order_id == self._buy_id
+               for trade in (item.trades or ()) if trade.trade_id}
+        try:
+            state = self.gateway.call("orders.get_order_state", account_id=self.account.account_id,
+                                      order_id=self._buy_id)
+            ids |= {stage.trade_id for stage in (state.stages or ()) if stage.trade_id}
+        except BrokerCallError:
+            pass
+        return ids
+
+    def _operations(self) -> list:
+        response = self.gateway.call("operations.get_operations_by_cursor", GetOperationsByCursorRequest(
+            account_id=self.account.account_id, instrument_id=self.instrument.uid,
+            from_=self.started_at - timedelta(minutes=1), to=self.timing.clock() + timedelta(minutes=1)))
+        return [item for item in response.items if item.state == OperationState.OPERATION_STATE_EXECUTED]
+
+    def _check_fee_operations(self) -> bool:
+        """П25 и П26: опрос операций раз в ``poll_secs`` до ``operations_wait_secs``."""
+        trade_ids = self._buy_trade_ids()
+        waited = 0.0
+        buy = fee = None
+        while True:
+            items = self._operations()
+            buys = [item for item in items if item.type == OperationType.OPERATION_TYPE_BUY]
+            buy = next((item for item in buys if trade_ids & self._operation_trades(item)), None) \
+                or (buys[-1] if buys else None)
+            if buy is not None:
+                fee = next((item for item in items if item.type == OperationType.OPERATION_TYPE_BROKER_FEE
+                            and item.parent_operation_id and item.parent_operation_id == buy.id), None)
+            if fee is not None or waited >= self.timing.operations_wait_secs:
+                break
+            self.timing.sleep(self.timing.poll_secs)
+            waited += self.timing.poll_secs
+        if buy is None:
+            self._set("П25", NO, f"операции покупки не видно за {self.timing.operations_wait_secs:g} с")
+            self._set("П26", NO, f"операции не видно за {self.timing.operations_wait_secs:g} с")
+            return False
+        found = trade_ids & self._operation_trades(buy)
+        listed = len(self._operation_trades(buy))
+        detail = (f"в операции покупки номеров сделок {listed}, из них сделок покупки из стрима и stages "
+                  f"{len(found)} из {len(trade_ids)}")
+        self._set("П25", YES if trade_ids and found == trade_ids else NO, detail)
+        self._set_fee_link(buy, fee, waited, items)
+        return True
+
+    @staticmethod
+    def _operation_trades(item) -> set[str]:
+        trades = getattr(getattr(item, "trades_info", None), "trades", None)
+        return {trade.num for trade in trades if trade.num} if isinstance(trades, list) else set()
+
+    def _set_fee_link(self, buy, fee, waited: float, items: list) -> None:
+        field = abs(money_to_decimal(buy.commission)) if buy.commission and buy.commission.currency else None
+        field_text = f"поле commission покупки {rub(field)}" if field is not None else "поля commission у покупки нет"
+        if fee is None:
+            loose = [item for item in items if item.type == OperationType.OPERATION_TYPE_BROKER_FEE]
+            other = (f"; операций «комиссия брокера» без ссылки на покупку: {len(loose)}" if loose else "")
+            self._set("П26", NO, f"«комиссии брокера» со ссылкой на покупку нет за "
+                                 f"{self.timing.operations_wait_secs:g} с; {field_text}{other}")
+            return
+        amount = abs(money_to_decimal(fee.payment))
+        same = ("совпадают" if field is not None and field == amount
+                else "не совпадают" if field is not None else "сравнить не с чем")
+        children = getattr(buy, "child_operations", None)
+        children = len(children) if isinstance(children, list) else 0
+        self._set("П26", YES, f"«комиссия брокера» {rub(amount)} со ссылкой на покупку через {waited:g} с; "
+                              f"{field_text}, {same}; дочерних операций у покупки {children}")
 
     # --- П19–П21 ---------------------------------------------------------
     def _place_first(self) -> bool:

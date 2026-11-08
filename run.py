@@ -394,6 +394,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
     server.trading = _contour_trading(state_dir, sandbox)
+    server.comparison = _contour_comparison(server.trading, core_state)
     server.indicators = _indicators_view()
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
@@ -454,6 +455,21 @@ def _contour_trading(state_dir, sandbox):
         views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
                                      catalog=catalog, broker_db=lambda: sandbox.directory / BROKER_DATABASE_FILE),
     }
+
+
+def _contour_comparison(trading: dict, core_state):
+    """Песочница против эмуляции по журналам контуров (add-account-vs-emulation-report)."""
+    from src.bot import control_views as views
+    from src.bot.comparison_view import ContourComparison
+    from src.broker_contour import SANDBOX
+    from src.broker_contour.bindings import binding_catalog
+
+    def members() -> set[str]:
+        desired = core_state.desired(SANDBOX)
+        return set() if desired is None else {member.key for member in desired.members if member.active}
+
+    return ContourComparison(emulation=trading[views.EMULATION], sandbox=trading[views.SANDBOX], members=members,
+                             catalog=binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES))
 
 
 def _binding_resolver(core):

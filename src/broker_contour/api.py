@@ -38,6 +38,11 @@ _DIRECTION = {"BUY": s.OrderDirection.ORDER_DIRECTION_BUY, "SELL": s.OrderDirect
 _STOP_DIRECTION = {"BUY": s.StopOrderDirection.STOP_ORDER_DIRECTION_BUY,
                    "SELL": s.StopOrderDirection.STOP_ORDER_DIRECTION_SELL}
 _STOP_SIDE = {value: key for key, value in _STOP_DIRECTION.items()}
+_TRADE_OPERATIONS = frozenset({
+    s.OperationType.OPERATION_TYPE_BUY, s.OperationType.OPERATION_TYPE_SELL,
+    s.OperationType.OPERATION_TYPE_BUY_MARGIN, s.OperationType.OPERATION_TYPE_SELL_MARGIN,
+})
+OPERATIONS_PAGE = 1000
 _STOP_STATUS = {
     s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE: "active",
     s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED: "executed",
@@ -98,6 +103,24 @@ class StopReport:
     status: str                   # active · executed · cancelled · expired · unknown
     exchange_order_id: str = ""
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class OperationReport:
+    """Операция счёта из ``GetOperationsByCursor`` (add-account-vs-emulation-report, решение 6).
+
+    ``kind`` — ``trade`` (покупка или продажа) или ``fee`` («комиссия брокера»); ``amount`` — модуль
+    суммы операции; ``commission`` — модуль поля комиссии или ``None``, если поле не задано;
+    ``trades`` — номера сделок биржи с количеством из ``trades_info``.
+    """
+
+    operation_id: str
+    parent_id: str
+    kind: str
+    at: datetime | None
+    amount: Decimal
+    commission: Decimal | None
+    trades: tuple[tuple[str, int], ...] = ()
 
 
 class OrderFailure(Exception):
@@ -172,6 +195,37 @@ def _rub(value) -> Decimal | None:
         return None
     amount = money_to_decimal(value)
     return amount if amount > 0 else None
+
+
+def _money_or_none(value) -> Decimal | None:
+    """Сумма с валютой; незаданное поле SDK или сумма без валюты — ``None``."""
+    if not isinstance(value, s.MoneyValue) or not value.currency:
+        return None
+    return abs(money_to_decimal(value))
+
+
+def _text(value) -> str:
+    """Строковое поле SDK; незаданное — служебный объект, а не пустая строка."""
+    return value if isinstance(value, str) else ""
+
+
+def _operation(item) -> OperationReport | None:
+    if getattr(item, "state", None) not in (None, s.OperationState.OPERATION_STATE_EXECUTED):
+        return None
+    kind = item.type
+    if kind == s.OperationType.OPERATION_TYPE_BROKER_FEE:
+        name = "fee"
+    elif kind in _TRADE_OPERATIONS:
+        name = "trade"
+    else:
+        return None
+    info = getattr(getattr(item, "trades_info", None), "trades", None)
+    trades = tuple((_text(trade.num), int(trade.quantity)) for trade in info if _text(trade.num)) \
+        if isinstance(info, list) else ()
+    return OperationReport(operation_id=_text(item.id), parent_id=_text(getattr(item, "parent_operation_id", "")),
+                           kind=name, at=_when(getattr(item, "date", None)),
+                           amount=_money_or_none(getattr(item, "payment", None)) or Decimal(0),
+                           commission=_money_or_none(getattr(item, "commission", None)), trades=trades)
 
 
 def report_from_state(state) -> OrderReport:
@@ -275,6 +329,28 @@ class TInvestApi:
                 item.stop_order_id, getattr(item, "instrument_uid", "") or "", _STOP_SIDE.get(item.direction, ""),
                 int(item.lots_requested), price, _STOP_STATUS.get(item.status, "unknown"),
                 getattr(item, "exchange_order_id", None) or "", _when(getattr(item, "create_date", None))))
+        return result
+
+    def operations(self, since: datetime, until: datetime, max_pages: int = 10) -> list[OperationReport]:
+        """Исполненные покупки, продажи и «комиссии брокера» счёта за период, не больше ``max_pages`` страниц."""
+        result: list[OperationReport] = []
+        cursor = ""
+        for _ in range(max_pages):
+            request = s.GetOperationsByCursorRequest(
+                account_id=self._account, from_=since, to=until, cursor=cursor, limit=OPERATIONS_PAGE,
+                operation_types=[*_TRADE_OPERATIONS, s.OperationType.OPERATION_TYPE_BROKER_FEE],
+                state=s.OperationState.OPERATION_STATE_EXECUTED, without_trades=False)
+            try:
+                response = self._gateway.call("operations.get_operations_by_cursor", request)
+            except BrokerCallError as exc:
+                raise classify(exc) from None
+            for item in response.items:
+                report = _operation(item)
+                if report is not None:
+                    result.append(report)
+            cursor = getattr(response, "next_cursor", "") or ""
+            if not getattr(response, "has_next", False) or not cursor:
+                break
         return result
 
     def last_price(self, uid: str) -> Decimal | None:

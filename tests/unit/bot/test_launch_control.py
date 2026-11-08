@@ -367,7 +367,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.8.0"
+        assert SPEC["info"]["version"] == "2.10.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -403,7 +403,7 @@ class TestContract:
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.8.0" in response.read().decode("utf-8")
+            assert "version: 2.10.0" in response.read().decode("utf-8")
 
     def test_schemas_use_only_openapi_keywords(self):
         """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""

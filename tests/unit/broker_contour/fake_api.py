@@ -41,6 +41,8 @@ class FakeApi:
         self.stop_failures: list[OrderFailure | str] = []  # «accepted-lost» — принята, ответ потерян
         self.cancel_stop_failures: list[OrderFailure] = []
         self.stop_price_rub = False                        # GetStopOrders отдаёт стоп-цену в рублях за контракт
+        self.operation_items: list = []                    # OperationReport счёта (add-account-vs-emulation-report)
+        self.operations_failure: OrderFailure | None = None
         self._seq = 0
         self._trade = 0
         self._stop = 0
@@ -122,6 +124,12 @@ class FakeApi:
         filled = OrderReport(order_id, None, "fill", report.lots, report.lots, report.instrument_uid, (trade,))
         self.orders[f"stop-fill:{order_id}"] = filled
         return filled
+
+    def operations(self, since, until, max_pages=10):
+        self.calls.append(("operations", since, until, max_pages))
+        if self.operations_failure is not None:
+            raise self.operations_failure
+        return [item for item in self.operation_items if item.at is None or since <= item.at <= until]
 
     def last_price(self, uid):
         return self.prices.get(uid)

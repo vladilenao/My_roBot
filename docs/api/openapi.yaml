@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.8.0
+  version: 2.10.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -34,6 +34,9 @@ info:
       привязок участников эмуляции и песочницы.
     * `broker_stop` у позиций песочницы (2.8.0) — стоп-заявка у брокера:
       стоит, ставится или стоп держит контур.
+    * `/api/v1/sandbox/comparison` (2.10.0) — песочница против эмуляции:
+      пары сделок по ключу сигнала, расхождения, причины сделок без пары.
+      Номер 2.9.0 занят предохранителями С6 в соседней ветке.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -708,6 +711,7 @@ paths:
                       target: {href: /api/v1/sandbox/target}
                       bindings: {href: /api/v1/sandbox/bindings}
                       reconcile: {href: /api/v1/sandbox/reconcile}
+                      comparison: {href: /api/v1/sandbox/comparison}
                       log: {href: /api/v1/sandbox/log}
                     _actions:
                       - {name: stop, title: Остановить, method: PUT, href: /api/v1/sandbox/target, body: {mode: no_entries}}
@@ -987,6 +991,110 @@ paths:
         - $ref: '#/components/parameters/TradesTo'
       responses:
         '200': {$ref: '#/components/responses/Performance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/sandbox/comparison:
+    get:
+      tags: [Песочница]
+      summary: Песочница против эмуляции
+      description: |
+        Сравнение сделок песочницы и эмуляции по одним и тем же сигналам
+        (2.10.0, add-account-vs-emulation-report): только чтение журналов
+        сделок обоих контуров, ответ есть и при остановленных контурах.
+
+        Пара — сделки двух контуров с одинаковым ключом сигнала (привязка,
+        инструмент, ТФ, бар, сторона). Сделка без пары — с причиной из журнала
+        другого контура: отказ решения, отказ брокера или отмена входа, `entry-pending`
+        (вход ещё не исполнен), `not-seen` (сигнала в контуре не было). В отчёт
+        входят только привязки песочницы: текущего состава и её сделок за период.
+
+        Период — по времени сигнала, правила как у `…/performance`, по
+        умолчанию `day`. `summary` — по всему периоду и фильтрам, без `limit`.
+      operationId: getSandboxComparison
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - name: from
+          in: query
+          required: false
+          description: Начало периода по времени сигнала — момент ISO 8601 с зоной; только вместе с `to`.
+          schema: {type: string, format: date-time}
+        - name: to
+          in: query
+          required: false
+          description: Конец периода по времени сигнала, не входит.
+          schema: {type: string, format: date-time}
+        - name: binding
+          in: query
+          required: false
+          description: Только сигналы одной привязки. Привязки нет ни в конфигурации, ни в песочнице — `400`.
+          schema: {type: string, minLength: 1, example: future-si-ma-raw}
+        - $ref: '#/components/parameters/TradeInstrument'
+        - name: limit
+          in: query
+          required: false
+          description: Сколько элементов отдать, новые сверху по времени сигнала.
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+      responses:
+        '200':
+          description: Пары, сделки без пары и сводка.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Comparison'}
+              example:
+                currency: RUB
+                as_of: '2026-11-09T12:00:00Z'
+                period: {name: day, from: '2026-11-08T16:00:00Z', to: '2026-11-09T12:00:00Z'}
+                summary:
+                  pairs: 1
+                  emulation_only: 1
+                  sandbox_only: 0
+                  missing_reasons: [{contour: sandbox, code: contour-stopping, label: остановка контура, count: 1}]
+                  diffs: {entry_price: 1}
+                  entry_steps: {count: 1, mean: '2', max_abs: '2'}
+                  exit_steps: {count: 1, mean: '-4', max_abs: '4'}
+                  paired_result:
+                    count: 1
+                    emulation: {result_r: '-1.02', net_per_lot: '-124.00'}
+                    sandbox: {result_r: '-0.98', net_per_lot: '-119.98'}
+                  sandbox_fees: {broker: 2, estimated: 0}
+                items:
+                  - signal:
+                      binding: {id: future-si-ma-raw, strategy: ma_cloud, timeframe: 5m}
+                      instrument: Si-12.26
+                      timeframe: 5m
+                      side: long
+                      at: '2026-11-09T07:10:00Z'
+                    kind: pair
+                    emulation:
+                      id: t_5d2c0e9a1b7f4c33
+                      state: closed
+                      entry: {at: '2026-11-09T07:15:00Z', price: '92410', lots: 1}
+                      exit: {at: '2026-11-09T07:44:00Z', price: '92296', kind: stop, code: STOP, label: стоп}
+                      net: '-124.00'
+                      net_per_lot: '-124.00'
+                      result_r: '-1.02'
+                      fees: '10.00'
+                      fees_source: configured
+                    sandbox:
+                      id: t_9a41f0c2d6e85b17
+                      state: closed
+                      entry: {at: '2026-11-09T07:15:20Z', price: '92412', lots: 1}
+                      exit: {at: '2026-11-09T07:43:37Z', price: '92300', kind: stop, code: STOP, label: стоп}
+                      net: '-119.98'
+                      net_per_lot: '-119.98'
+                      result_r: '-0.98'
+                      fees: '7.98'
+                      fees_source: broker
+                    diffs: [{code: entry_price, label: цена входа, value: '2'}]
+                    steps_unknown: false
+                earlier: false
+                _links:
+                  self: {href: /api/v1/sandbox/comparison}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
@@ -3579,6 +3687,173 @@ components:
           type: string
           nullable: true
           description: Нетто в начальных рисках; `null`, если риск неизвестен.
+    ComparisonSide:
+      type: object
+      additionalProperties: false
+      required: [id, state, entry, exit, net, net_per_lot, result_r, fees, fees_source]
+      description: Сделка одного контура в отчёте сравнения.
+      properties:
+        id: {type: string}
+        state: {type: string, enum: [open, closed]}
+        entry:
+          type: object
+          additionalProperties: false
+          required: [at, price, lots]
+          description: Первый вход, средняя цена входа, наибольший объём.
+          properties:
+            at: {type: string, format: date-time}
+            price: {$ref: '#/components/schemas/DecimalPrice'}
+            lots: {type: integer, minimum: 0}
+        exit:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [at, price, kind, code, label]
+          description: Последний выход и средняя цена выхода; `null` у открытой сделки.
+          properties:
+            at: {type: string, format: date-time}
+            price: {$ref: '#/components/schemas/DecimalPrice'}
+            kind: {$ref: '#/components/schemas/ExitKind'}
+            code: {type: string}
+            label: {type: string}
+        net:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          description: Нетто; у открытой — реализованное с комиссиями, без переоценки.
+        net_per_lot:
+          allOf: [{$ref: '#/components/schemas/RubAmount'}]
+          nullable: true
+          description: Нетто на лот наибольшего объёма — лоты контуров разные, сравнивается он.
+        result_r: {type: string, nullable: true}
+        fees: {$ref: '#/components/schemas/RubAmount'}
+        fees_source: {$ref: '#/components/schemas/FeesSource'}
+    ComparisonDiff:
+      type: object
+      additionalProperties: false
+      required: [code, label, value]
+      properties:
+        code: {type: string, enum: [entry_price, entry_time, lots, exit_kind, exit_price, exit_time, closed_one_side]}
+        label: {type: string}
+        value:
+          description: |
+            `entry_price`, `exit_price` — разница в шагах цены строкой, плюс —
+            песочница хуже по стороне сделки; `entry_time`, `exit_time` —
+            секунды «песочница − эмуляция»; `lots`, `exit_kind` — объект
+            `{emulation, sandbox}`; `closed_one_side` — контур закрытой стороны.
+    ComparisonItem:
+      type: object
+      additionalProperties: false
+      required: [signal, kind, emulation, sandbox]
+      properties:
+        signal:
+          type: object
+          additionalProperties: false
+          required: [binding, instrument, timeframe, side, at]
+          properties:
+            binding: {$ref: '#/components/schemas/TradeBinding'}
+            instrument: {type: string, nullable: true}
+            timeframe: {type: string, nullable: true}
+            side: {$ref: '#/components/schemas/TradeSide'}
+            at: {type: string, format: date-time, description: Время сигнала — `created_at` сделки.}
+        kind: {type: string, enum: [pair, emulation_only, sandbox_only]}
+        emulation:
+          allOf: [{$ref: '#/components/schemas/ComparisonSide'}]
+          nullable: true
+        sandbox:
+          allOf: [{$ref: '#/components/schemas/ComparisonSide'}]
+          nullable: true
+        diffs:
+          type: array
+          description: Только у пары; пусто, если расхождений нет.
+          items: {$ref: '#/components/schemas/ComparisonDiff'}
+        steps_unknown: {type: boolean, description: 'Только у пары: шага цены нет, ценовые расхождения не считались.'}
+        missing_reason:
+          type: object
+          additionalProperties: false
+          required: [contour, code, label]
+          description: Только у сделки без пары — почему в другом контуре сделки нет.
+          properties:
+            contour: {type: string, enum: [emulation, sandbox]}
+            code: {type: string, description: 'Код отказа решения или отмены входа, `entry-pending` или `not-seen`.'}
+            label: {type: string}
+    ComparisonSteps:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [count, mean, max_abs]
+      properties:
+        count: {type: integer, minimum: 1}
+        mean: {$ref: '#/components/schemas/DecimalPrice'}
+        max_abs: {$ref: '#/components/schemas/DecimalPrice'}
+    ComparisonTotal:
+      type: object
+      additionalProperties: false
+      required: [result_r, net_per_lot]
+      properties:
+        result_r: {$ref: '#/components/schemas/DecimalPrice'}
+        net_per_lot: {$ref: '#/components/schemas/RubAmount'}
+    ComparisonSummary:
+      type: object
+      additionalProperties: false
+      required: [pairs, emulation_only, sandbox_only, missing_reasons, diffs, entry_steps, exit_steps, paired_result, sandbox_fees]
+      properties:
+        pairs: {type: integer, minimum: 0}
+        emulation_only: {type: integer, minimum: 0}
+        sandbox_only: {type: integer, minimum: 0}
+        missing_reasons:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [contour, code, label, count]
+            properties:
+              contour: {type: string, enum: [emulation, sandbox]}
+              code: {type: string}
+              label: {type: string}
+              count: {type: integer, minimum: 1}
+        diffs:
+          type: object
+          description: Число пар по коду расхождения.
+          additionalProperties: {type: integer, minimum: 1}
+        entry_steps: {$ref: '#/components/schemas/ComparisonSteps'}
+        exit_steps: {$ref: '#/components/schemas/ComparisonSteps'}
+        paired_result:
+          type: object
+          additionalProperties: false
+          required: [count, emulation, sandbox]
+          description: Пары, закрытые с обеих сторон.
+          properties:
+            count: {type: integer, minimum: 0}
+            emulation: {$ref: '#/components/schemas/ComparisonTotal'}
+            sandbox: {$ref: '#/components/schemas/ComparisonTotal'}
+        sandbox_fees:
+          type: object
+          additionalProperties: false
+          required: [broker, estimated]
+          description: Исполнения сделок песочницы отчёта по источнику комиссии.
+          properties:
+            broker: {type: integer, minimum: 0}
+            estimated: {type: integer, minimum: 0}
+    Comparison:
+      type: object
+      additionalProperties: false
+      required: [currency, as_of, period, summary, items, earlier, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        as_of: {type: string, format: date-time}
+        period:
+          type: object
+          additionalProperties: false
+          required: [name, from, to]
+          properties:
+            name: {type: string, enum: [day, week, month, all, custom]}
+            from: {type: string, format: date-time, nullable: true}
+            to: {type: string, format: date-time}
+        summary: {$ref: '#/components/schemas/ComparisonSummary'}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ComparisonItem'}
+        earlier: {type: boolean, description: За периодом с фильтрами остались элементы сверх `limit`.}
+        _links: {$ref: '#/components/schemas/Links'}
     TradePage:
       type: object
       additionalProperties: false

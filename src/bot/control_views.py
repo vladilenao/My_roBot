@@ -28,6 +28,7 @@ SANDBOX_BINDINGS = SANDBOX + "/bindings"
 SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
 SANDBOX_RECONCILE = SANDBOX + "/reconcile"
 SANDBOX_LOG = SANDBOX + "/log"
+SANDBOX_COMPARISON = SANDBOX + "/comparison"
 # Позиции, сделки и итоги контура по журналу сделок (add-contour-trades-api); счёт — только у эмуляции.
 TRADING_PARTS = ("positions", "trades", "performance")
 EMULATION_ACCOUNT = EMULATION + "/account"

@@ -70,6 +70,9 @@ class MarketDataExportServer:
         # Позиции, сделки и итоги контуров по журналу (src.bot.trades_view.ContourTrades, add-contour-trades-api):
         # адрес контура → ресурсы; контура нет в словаре — 404.
         self.trading: dict = {}
+        # Отчёт «Песочница против эмуляции» (src.bot.comparison_view.ContourComparison,
+        # add-account-vs-emulation-report) или None — ресурс отвечает 404.
+        self.comparison = None
         # Индикаторы стратегий привязок на свечах базы (src.bot.indicators_view.IndicatorsView, add-indicators-api)
         # или None — ресурс отвечает 404.
         self.indicators = None
@@ -238,6 +241,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self._trading_get(path, query):
             return
+        if path == views.SANDBOX_COMPARISON and server.comparison is not None:
+            self._comparison_get(query)
+            return
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_get(path, query)
             return
@@ -339,6 +345,15 @@ class _Handler(BaseHTTPRequestHandler):
         except TradesError as exc:
             self._problem(exc.status, exc.code, exc.detail)
         return True
+
+    def _comparison_get(self, query: dict[str, list[str]]) -> None:
+        """Песочница против эмуляции по журналам контуров (add-account-vs-emulation-report)."""
+        from src.bot.trades_view import TradesError
+
+        try:
+            self._json(HTTPStatus.OK, self.export_server.comparison.report(query))
+        except TradesError as exc:
+            self._problem(exc.status, exc.code, exc.detail)
 
     def _candles_get(self, path: str, query: dict[str, list[str]]) -> None:
         """Свечи рыночной базы ядра (add-candles-api): только чтение, без брокера."""

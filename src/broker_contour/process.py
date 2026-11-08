@@ -75,6 +75,7 @@ class BrokerContour:
         self._trading_factory = trading_factory
         self._bus = bus
         self._core_link = "ok"
+        self._holder: dict | None = None     # брокер, менеджер и комиссии контура с заявками
         self._capital: Decimal | None = None
         settings.directory.mkdir(parents=True, exist_ok=True)
         self._gateway_factory = gateway_factory
@@ -221,6 +222,7 @@ class BrokerContour:
         from src.broker_contour.api import TInvestApi
         from src.broker_contour.broker import ExitPolicy, TInvestBroker
         from src.broker_contour.control import BrokerControl, assignment_index
+        from src.broker_contour.fees import FeeSync
         from src.broker_contour.orders import OrderLedger
         from src.broker_contour.stops import StopLedger
         from src.broker_contour.stream import OrderStream
@@ -240,6 +242,7 @@ class BrokerContour:
         self._capital = admitted.snapshot.rub
         self._account(admitted.snapshot)
         holder: dict = {}
+        self._holder = holder
 
         def broker_factory(storage):
             def journal_has(execution_id: str) -> bool:
@@ -252,6 +255,7 @@ class BrokerContour:
                                    journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
                                    stops=stops)
             holder["broker"] = broker
+            holder["fees"] = FeeSync(api, lambda: storage.connection)   # add-account-vs-emulation-report
             return broker
 
         strategies: tuple[dict, dict] = ({}, {})
@@ -392,3 +396,17 @@ class BrokerContour:
         by_name = {short: uid for uid, short in names.items()}
         manager.freeze_instruments({broker.key_for(by_name.get(item, item)) for item in report["frozen"]})
         self._write(frozen=report["frozen"], last_reconcile_at=report["at"])
+        self._sync_fees(manager)
+
+    def _sync_fees(self, manager) -> None:
+        """Настоящие комиссии из операций брокера в журнал сделок (add-account-vs-emulation-report)."""
+        fees = self._holder.get("fees") if self._holder is not None else None
+        if fees is None:
+            return
+        try:
+            adjusted = sum(1 for event in fees.run(self._clock()) if manager.consume(event))
+        except Exception as exc:  # noqa: BLE001 — комиссии не должны останавливать сверку и торговлю
+            log.warning("Комиссии из операций не проведены (%s)", type(exc).__name__)
+            return
+        if adjusted:
+            log.info("Комиссии брокера проведены по %d исполнениям", adjusted)

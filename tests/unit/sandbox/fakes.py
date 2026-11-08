@@ -47,6 +47,7 @@ class FakeBroker:
     cancel_executed_stop: str = "error"  # error | ok — снятие исполненной стоп-заявки
     margin_works: bool = True
     fail_operations: bool = False
+    fee_operation: str = "linked"  # linked | unlinked | none — «комиссия брокера» к операции сделки
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
@@ -92,11 +93,18 @@ class FakeBroker:
         self.orders[order.order_id] = order
         kind = s.OperationType.OPERATION_TYPE_BUY if sign > 0 else s.OperationType.OPERATION_TYPE_SELL
         executed = s.OperationState.OPERATION_STATE_EXECUTED
-        self.operations.append(s.OperationItem(type=kind, state=executed, instrument_uid=uid,
-                                               commission=money("-1.5"), payment=money(-price)))
-        self.operations.append(s.OperationItem(type=s.OperationType.OPERATION_TYPE_BROKER_FEE, state=executed,
-                                               instrument_uid=uid, commission=s.MoneyValue(currency="", units=0, nano=0),
-                                               payment=money("-1.5")))
+        operation_id = self.next_id("op")
+        trades = s.OperationItemTrades(trades=[s.OperationItemTrade(num=stage.trade_id, date=NOW, quantity=stage.quantity,
+                                                                    price=money(price)) for stage in order.stages])
+        self.operations.append(s.OperationItem(id=operation_id, type=kind, state=executed, instrument_uid=uid,
+                                               commission=money("-1.5"), payment=money(-price), trades_info=trades,
+                                               quantity=lots, date=NOW))
+        if self.fee_operation != "none":
+            self.operations.append(s.OperationItem(
+                id=self.next_id("op"), type=s.OperationType.OPERATION_TYPE_BROKER_FEE, state=executed,
+                parent_operation_id=operation_id if self.fee_operation == "linked" else "",
+                instrument_uid=uid, commission=s.MoneyValue(currency="", units=0, nano=0),
+                payment=money("-1.5"), date=NOW))
         self.push(order)
         return order
 

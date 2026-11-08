@@ -1,4 +1,7 @@
-"""Разведка стоп-заявок П19–П24 на фейковой песочнице (add-broker-protection, задача 1.3)."""
+"""Разведка стоп-заявок П19–П24 и комиссий П25–П26 на фейковой песочнице.
+
+add-broker-protection, задача 1.3; add-account-vs-emulation-report, задача 1.2.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from src.sandbox.probe_stops import StopProbe
 from tests.unit.sandbox.fakes import ACCOUNT_ID, NOW, TOKEN, FakeBroker, FakeClient, robot_account
 
 STOP_CODES = ("П19", "П20", "П21", "П22", "П23", "П24")
+FEE_CODES = ("П25", "П26")
 
 
 class FakeTime:
@@ -135,7 +139,7 @@ def test_market_buy_rejected_skips_stop_checks():
     broker = _broker(reject_market=True)
     probe, _ = _probe(broker)
     assert probe.results["П10"].outcome != YES
-    for check in STOP_CODES:
+    for check in STOP_CODES + FEE_CODES:
         assert probe.results[check].outcome == SKIPPED
 
 
@@ -167,3 +171,33 @@ def test_probe_stops_rejects_bad_wait(tmp_path):
     code = command.main(["probe-stops", "--stop-wait", "0"], token=TOKEN, out=lines.append, base_dir=tmp_path)
     assert code == 2
     assert lines == ["Ошибка параметров: --stop-wait должен быть больше нуля"]
+
+
+def test_fee_operation_linked_to_buy():
+    broker = _broker(prices=["3.000", "2.990"])
+    probe, _ = _probe(broker)
+    assert probe.results["П25"].outcome == YES
+    assert "из них сделок покупки из стрима и stages 1 из 1" in probe.results["П25"].detail
+    fee = probe.results["П26"].detail
+    assert probe.results["П26"].outcome == YES
+    assert "«комиссия брокера» 1.50 ₽ со ссылкой на покупку через 0 с" in fee
+    assert "поле commission покупки 1.50 ₽, совпадают" in fee
+
+
+def test_fee_operation_without_link():
+    broker = _broker(prices=["3.000", "2.990"], fee_operation="unlinked")
+    probe, _ = _probe(broker)
+    assert probe.results["П25"].outcome == YES
+    assert probe.results["П26"].outcome == NO
+    detail = probe.results["П26"].detail
+    assert "со ссылкой на покупку нет за 60 с" in detail
+    assert "без ссылки на покупку: 1" in detail
+    assert probe.results["П22"].outcome == YES   # стоп-заявки проверяются дальше
+
+
+def test_operations_failure_does_not_stop_stop_checks():
+    broker = _broker(prices=["3.000", "2.990"], fail_operations=True)
+    probe, _ = _probe(broker)
+    assert probe.results["П25"].outcome not in (YES, SKIPPED)
+    assert probe.results["П26"].outcome == SKIPPED and probe.results["П26"].detail
+    assert probe.results["П22"].outcome == YES

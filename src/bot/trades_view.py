@@ -61,7 +61,7 @@ _KIND_BY_CODE = {
 
 _TRADE_ROWS = """
 SELECT t.trade_id, t.assignment_id, t.instrument_id, t.side, t.phase, t.plan_json, t.price_step, t.step_cost,
-       t.created_at, p.quantity, p.average_price, p.realized_pnl, p.fees, p.updated_at
+       t.created_at, t.signal_id, p.quantity, p.average_price, p.realized_pnl, p.fees, p.updated_at
 FROM trades t JOIN positions p ON p.trade_id = t.trade_id
 """
 _FILL_TIMES = """
@@ -377,6 +377,44 @@ class _Journal:
             })
         items.sort(key=lambda item: (item["opened_at"], item["id"]), reverse=True)
         return items
+
+    def side(self, trade_id: str) -> dict | None:
+        """Сторона пары отчёта сравнения (add-account-vs-emulation-report); ``None`` — нет исполнения входа."""
+        trade = self.rows().get(trade_id)
+        card = None if trade is None else self._exporter.trade_card(trade)
+        if card is None:
+            return None
+        entries, exits = card["entries"], card["exits"]
+        lots = int(card["summary"]["max_quantity"] or 0)
+        gross, fees = _decimal(trade["realized_pnl"]) or _ZERO, _decimal(trade["fees"]) or _ZERO
+        closed = str(trade["phase"]) == "CLOSED" and int(trade["quantity"] or 0) == 0 and bool(exits)
+        last = exits[-1] if exits else None
+        _opened, _closed, sources = self._times.get(trade_id, (None, None, None))
+        return {
+            "id": trade_ref(trade_id),
+            "state": "closed" if closed else "open",
+            "entry": {"at": _iso(_utc(entries[0]["executed_at"])), "price": _price(_average(entries), trade),
+                      "lots": lots},
+            "exit": None if not closed or last is None else {
+                "at": _iso(_utc(last["executed_at"])), "price": _price(_average(exits), trade),
+                "kind": exit_kind(last["action_type"], last["code"]), "code": last["code"],
+                "label": reason_label(last["reason"])},
+            "net": _money(gross - fees),
+            "net_per_lot": _money((gross - fees) / lots) if lots else None,
+            "result_r": card["summary"]["result_r"] or None,
+            "fees": _money(fees),
+            "fees_source": _fees_source(tuple((sources or "unknown").split(","))),
+        }
+
+    def query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Запрос внутри той же транзакции чтения."""
+        return self._connection.execute(sql, params).fetchall()
+
+    def name(self, ticker: str) -> str | None:
+        return self._names.get(ticker)
+
+    def binding(self, assignment_id: str, trade_id: str) -> dict:
+        return self._binding(assignment_id, trade_id)
 
     def _head(self, trade: dict) -> dict:
         trade_id = str(trade["trade_id"])
