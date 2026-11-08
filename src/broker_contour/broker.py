@@ -26,6 +26,7 @@ from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeSour
 from src.broker_contour.api import OrderFailure, OrderReport
 from src.broker_contour.orders import (ACCEPTED, CANCELLED, CANCELLING, FILLED, PARTIAL, REJECTED, SENDING, UNKNOWN,
                                        LedgerExecution, LedgerOrder, OrderLedger, order_key)
+from src.broker_contour.stops import StopKeeping, StopLedger
 from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, exit_limit, fill_average, in_band,
                                        target_limit, to_step, trade_lots, trade_price, with_margin)
 from src.events.event import Event
@@ -39,7 +40,7 @@ log = get_logger(__name__)
 
 _STATE = {"new": ACCEPTED, "partial": PARTIAL, "fill": FILLED, "cancelled": CANCELLED, "rejected": REJECTED}
 ENTRY_KINDS = ("entry", "add")
-EXIT_KINDS = ("exit", "stop", "emergency")
+EXIT_KINDS = ("exit", "stop", "emergency", "broker_stop")
 CANCEL_CONFIRM_SECS = 10
 SYNC_EVERY_SECS = 60
 MARGIN_EVERY = timedelta(days=1)
@@ -54,6 +55,7 @@ class ExitPolicy:
     requote_secs: int = 15
     attempts: int = 3
     retry_secs: int = 60
+    stop_place_secs: int = 30     # стоп-заявка у брокера должна стать активной за этот срок (С4)
 
 
 @dataclass
@@ -101,12 +103,13 @@ class ExitJob:
     rejected_reported: bool = False
 
 
-class TInvestBroker(BrokerPort):
+class TInvestBroker(StopKeeping, BrokerPort):
     def __init__(self, api, ledger: OrderLedger, *, contour: str, policy: ExitPolicy = ExitPolicy(),
                  publish: Callable[[Event], None] = lambda event: None,
                  journal_has: Callable[[str], bool] = lambda execution_id: False,
                  entry_ttl: Callable[[str], int] = lambda timeframe: 3600,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 stops: StopLedger | None = None):
         self._api = api
         self._ledger = ledger
         ledger.clock = clock
@@ -137,6 +140,7 @@ class TInvestBroker(BrokerPort):
         self._last_sync: datetime | None = None
         self.fills_since_capital = False
         self.stream_link = "ok"
+        self._init_stops(stops)     # стоп у брокера (add-broker-protection); None — стоп держит контур, как на С3
 
     # --- карточки ---------------------------------------------------------
     def set_contracts(self, contracts: Mapping[str, object]) -> None:
@@ -291,6 +295,8 @@ class TInvestBroker(BrokerPort):
         existing = self._ledger.get(key)
         if existing is not None:
             return self._entry_answer(action, existing, now)
+        if isinstance(action, AddToTrade) and not self.stop_in_sync(view.plan.trade_id):
+            return self._outcome(action, now, ExecutionStatus.REJECT, "stop-pending")
         card = self._card_for(view.plan.instrument_id)
         if card is None:
             return self._outcome(action, now, ExecutionStatus.REJECT, "no-contract-card")
@@ -392,6 +398,7 @@ class TInvestBroker(BrokerPort):
             row = (self._ledger.get(report.key) if report.key else None) or (
                 self._ledger.by_broker_id(report.broker_order_id) if report.broker_order_id else None)
             if row is None:
+                self.note_stranger(report)
                 return False
             self._apply_report(row, report, self._clock())
             return True
@@ -502,6 +509,8 @@ class TInvestBroker(BrokerPort):
                     row = self._ledger.update(row.key, state=UNKNOWN)
                 self._sync.add(row.key)
             self._synchronize(now, force=True)
+            self.recover_stops(now)
+            self._synchronize(now, force=True)    # заявки стопов, исполненных за простой
 
     def _synchronize(self, now: datetime, *, force: bool = False) -> None:
         due = force or self._last_sync is None or (now - self._last_sync).total_seconds() >= SYNC_EVERY_SECS
@@ -529,7 +538,10 @@ class TInvestBroker(BrokerPort):
 
     def _refresh(self, row: LedgerOrder, now: datetime) -> None:
         try:
-            report = self._api.order_by_key(row.key)
+            report = (self._api.order_by_exchange_id(row.broker_order_id) if row.kind == "broker_stop"
+                      else self._api.order_by_key(row.key))
+            if report is not None and row.kind == "broker_stop":
+                report = replace(report, key=row.key)
         except OrderFailure as failure:
             log.warning("Состояние заявки не прочитано: %s", failure.kind)
             self._sync.add(row.key)
@@ -564,6 +576,7 @@ class TInvestBroker(BrokerPort):
             for row in self._ledger.orders(live=True):
                 if row.cancel_requested and row.state in (ACCEPTED, PARTIAL):
                     self._request_cancel(row, now)
+            self.keep_stops(now)
             for trade_id in list(self._jobs):
                 self._pump(trade_id, now)
             for view in list(self._views.values()):
@@ -586,6 +599,8 @@ class TInvestBroker(BrokerPort):
                     job = self._jobs.get(view.plan.trade_id)
                     if job is not None and job.kind == "stop":
                         continue
+                    if self.broker_stop_covers(view.plan.trade_id):
+                        continue      # стоп стоит у брокера на весь остаток: условие держит он (решение 4)
                     triggered, _ = stop_triggered(view.plan.side, view.confirmed_stop, bar)
                     if triggered:
                         log.info("Стоп %s %s по минуте %s: выход стоп-лимитом", view.plan.trade_id,
@@ -593,10 +608,16 @@ class TInvestBroker(BrokerPort):
                         self._start_stop(view, moment)
             self.service(self._clock())
 
-    def _start_stop(self, view: TradeView, moment: datetime) -> None:
+    _CONFIRMED = object()
+
+    def _start_stop(self, view: TradeView, moment: datetime, *, job_id: str | None = None, base=_CONFIRMED,
+                    reason: str = "protective", attempt: int = 0) -> None:
+        """Выход по стопу: условие контура (база — стоп), стоп не поставлен (база — рынок) или сработавшая
+        стоп-заявка брокера (её рыночная заявка — попытка 0, остаток добирает цикл)."""
         trade_id = view.plan.trade_id
-        job = ExitJob(f"{trade_id}:pv:stop:{moment.isoformat()}", trade_id, "stop", None, base=view.confirmed_stop,
-                      reference=view.confirmed_stop, reason="protective")
+        job = ExitJob(job_id or f"{trade_id}:pv:stop:{moment.isoformat()}", trade_id, "stop", None,
+                      base=view.confirmed_stop if base is self._CONFIRMED else base,
+                      reference=view.confirmed_stop, reason=reason, attempt=attempt)
         current = self._jobs.get(trade_id)
         if current is not None:   # стоп важнее сигнального выхода: тот ждёт и потом проверит остаток
             self._queued.setdefault(trade_id, []).insert(0, current)
@@ -658,7 +679,8 @@ class TInvestBroker(BrokerPort):
         if job.retry_after is not None and now < job.retry_after:
             return
         busy = sum(row.remaining for row in self._ledger.orders(trade_id=trade_id, live=True, kinds=("target",)))
-        lots = min(wanted, view.position - busy)
+        # Стоп у брокера и заявка выхода вместе не больше остатка (add-broker-protection, решение 3).
+        lots = min(wanted, view.position - busy, view.position - self.stop_lots_live(trade_id))
         if lots <= 0:
             return        # ждём подтверждения снятия заявок целей
         card = self._card_for(view.plan.instrument_id)
@@ -933,7 +955,7 @@ class TInvestBroker(BrokerPort):
             pending = {self._ledger.get(e.key).instrument_uid for e in self._ledger.pending_executions()
                        if not self._journal_has(e.execution_id)}
             return pending | {row.instrument_uid for row in self._ledger.orders(live=True)
-                              if row.state in (SENDING, UNKNOWN, CANCELLING)}
+                              if row.state in (SENDING, UNKNOWN, CANCELLING)} | self.stop_in_flight_uids(self._clock())
 
     def live_orders(self) -> list[LedgerOrder]:
         return self._ledger.orders(live=True)
@@ -953,7 +975,8 @@ class TInvestBroker(BrokerPort):
     def busy(self) -> bool:
         """Есть ли открытые позиции или незавершённые заявки — контур ещё не может завершиться."""
         with self._lock:
-            return any(view.position > 0 for view in self._views.values()) or bool(self._ledger.orders(live=True))
+            return any(view.position > 0 for view in self._views.values()) or bool(self._ledger.orders(live=True)) \
+                or self.live_stop_count() > 0
 
     # --- служебное ------------------------------------------------------------
     def _notify(self, kind: str, row: LedgerOrder, **fields) -> None:

@@ -1410,9 +1410,15 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 отправлена снова тем же ключом; `cancelling` — отмена отправлена; `requoted` —
 лимит выхода перевыставлен (`attempt` — номер попытки); `exit_rejected` —
 брокер отклонил выход или заявку цели; `emergency_market` — лимит выхода не
-исполнился, выход по рынку. `order` — вид заявки: `entry`, `add`, `target`,
-`stop`, `exit`, `emergency`. `broker_order` — только последние четыре символа
-номера заявки брокера; номер счёта и ключ не публикуются. Цена — десятичная
+исполнился, выход по рынку. Стоп у брокера (add-broker-protection): `stop_placed` —
+стоп-заявка активна (`replaced` — пересоздана на новый объём или цену, `reason` —
+`entry`, `add`, `target`, `reduce`, `move`, `restart`); `stop_triggered` — стоп
+сработал у брокера (`exchange_order` — последние четыре символа порождённой
+заявки); `stop_failed` — стоп не принят, контур выходит; `stop_removed` — стоп
+снят перед выходом контура. `order` — вид заявки: `entry`, `add`, `target`,
+`stop`, `exit`, `emergency`, `broker_stop` (стоп-заявка у брокера и порождённая
+ею заявка). `broker_order` — только последние четыре символа номера заявки или
+стоп-заявки брокера; номер счёта и ключ не публикуются. Цена — десятичная
 строка в пунктах. Строка дописывается в карточку своей сделки в канале контура.
 
 ```json
@@ -1464,6 +1470,12 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
       "type": "number"
     },
     "reason": {
+      "type": "string"
+    },
+    "replaced": {
+      "type": "boolean"
+    },
+    "exchange_order": {
       "type": "string"
     }
   },

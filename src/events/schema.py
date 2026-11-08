@@ -40,7 +40,7 @@ _OPTIONAL: dict[EventType, tuple[str, ...]] = {
                                "generation", "mismatches", "frozen", "unfrozen", "reason", "orders_enabled",
                                "open_positions"),
     EventType.BROKER_ORDER: ("order", "order_type", "side", "lots", "price", "broker_order", "state", "attempt",
-                             "reason"),
+                             "reason", "replaced", "exchange_order"),
     EventType.MARKET_DATA_STATUS: ("phase", "break_kind", "last_due", "next_event", "schedule",
                                   "received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
                                  "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete",
@@ -162,6 +162,7 @@ _JSON_TYPES: dict[str, str] = {
     "orders_enabled": "boolean",
     "open_positions": "number",
     "attempt": "number",
+    "replaced": "boolean",
 }
 
 

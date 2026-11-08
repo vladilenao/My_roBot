@@ -146,6 +146,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_sandbox_exit_offset_steps": int,
     "contours_sandbox_exit_requote_secs": int,
     "contours_sandbox_exit_requote_attempts": int,
+    "contours_sandbox_stop_place_secs": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -1052,12 +1053,13 @@ _CONTOUR_KEYS = {
     "emulation": {"telegram_channel_env"},
     # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
     "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
-                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts"},
+                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs"},
 }
 _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_exit_offset_steps": (0, 100),
     "contours_sandbox_exit_requote_secs": (5, 300),
     "contours_sandbox_exit_requote_attempts": (1, 10),
+    "contours_sandbox_stop_place_secs": (5, 300),
 }
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 

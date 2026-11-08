@@ -26,7 +26,7 @@ SENDING, ACCEPTED, PARTIAL, FILLED = "sending", "accepted", "partial", "filled"
 REJECTED, CANCELLING, CANCELLED, UNKNOWN = "rejected", "cancelling", "cancelled", "unknown"
 TERMINAL = frozenset({FILLED, REJECTED, CANCELLED})
 IN_FLIGHT = frozenset({SENDING, UNKNOWN, CANCELLING})
-KINDS = ("entry", "add", "target", "stop", "exit", "emergency")
+KINDS = ("entry", "add", "target", "stop", "exit", "emergency", "broker_stop")
 SUPERSEDED = 2                  # ``consumed`` перекрытого исполнения
 REFUSED = 3                     # ``consumed`` исполнения, которое журнал сделок не принял
 
@@ -142,6 +142,10 @@ class OrderLedger:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def connection(self) -> tuple[sqlite3.Connection, threading.RLock]:
+        """Соединение и замок журнала: журнал стоп-заявок (``stops.StopLedger``) пишет в ту же базу."""
+        return self._conn, self._lock
 
     @staticmethod
     def _order(row) -> LedgerOrder:

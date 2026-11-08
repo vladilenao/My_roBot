@@ -192,7 +192,7 @@ def _run_broker_contour(kind: str) -> int:
     from src.broker_contour.process import BrokerContour, BrokerContourSettings
     from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_SANDBOX_EXIT_OFFSET_STEPS,
                             CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
-                            CONTOUR_SANDBOX_ORDERS, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                            CONTOUR_SANDBOX_ORDERS, CONTOUR_SANDBOX_STOP_PLACE_SECS, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                             NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
     from src.events.bus import EventBus
     from src.notifier.factory import close_channels
@@ -221,7 +221,7 @@ def _run_broker_contour(kind: str) -> int:
     settings = BrokerContourSettings(
         orders=CONTOUR_SANDBOX_ORDERS,
         exit_policy=ExitPolicy(CONTOUR_SANDBOX_EXIT_OFFSET_STEPS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
-                               CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS),
+                               CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_SANDBOX_STOP_PLACE_SECS),
         contour_id=kind, broker=kind, directory=directory, core_db=data_dir / CORE_DATABASE_FILE,
         version=__version__, token=TINKOFF_SANDBOX_TOKEN, token_env="TINKOFF_SANDBOX_TOKEN",
         bot_token=sandbox_bot_token(), bot_env=CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,

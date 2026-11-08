@@ -96,3 +96,17 @@ def test_sandbox_orders_and_exit_settings(tmp_path):
     loaded = _load(tmp_path, "[contours.sandbox]\norders = false\nexit_offset_steps = 0\nexit_requote_attempts = 10\n")
     assert loaded["contours_sandbox_orders"] is False
     assert (loaded["contours_sandbox_exit_offset_steps"], loaded["contours_sandbox_exit_requote_attempts"]) == (0, 10)
+
+
+def test_sandbox_stop_place_secs(tmp_path):
+    """add-broker-protection: срок постановки стоп-заявки у брокера — 30 с по умолчанию, 5–300."""
+    import pytest
+
+    from src import config
+    from src.config_loader import ConfigError
+
+    assert config._DEFAULTS["contours_sandbox_stop_place_secs"] == 30
+    assert _load(tmp_path, "[contours.sandbox]\nstop_place_secs = 300\n")["contours_sandbox_stop_place_secs"] == 300
+    for bad in ("stop_place_secs = 2", "stop_place_secs = 301", 'stop_place_secs = "30"'):
+        with pytest.raises(ConfigError, match="stop_place_secs"):
+            _load(tmp_path, f"[contours.sandbox]\n{bad}\n")

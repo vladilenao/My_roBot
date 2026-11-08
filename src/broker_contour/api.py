@@ -22,6 +22,9 @@ from src.sandbox.gateway import BrokerCallError
 # Обрыв или тайм-аут: брокер мог принять заявку — её ищут по ключу (design.md, решение 8).
 TRANSPORT_CODES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "UNKNOWN", "CANCELLED", "ABORTED"})
 DUPLICATE_DETAILS = "30057"
+# Отказ «инструмент недоступен для торгов»: торги закрыты — стоп-заявку ставить позже, без выхода
+# (add-broker-protection, решение 2; код уточняет разведка стоп-заявок вне сессии).
+MARKET_CLOSED_DETAILS = frozenset({"30079"})
 EPOCH = datetime(1970, 1, 2, tzinfo=timezone.utc)
 
 _STATUS = {
@@ -32,6 +35,15 @@ _STATUS = {
     s.OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_REJECTED: "rejected",
 }
 _DIRECTION = {"BUY": s.OrderDirection.ORDER_DIRECTION_BUY, "SELL": s.OrderDirection.ORDER_DIRECTION_SELL}
+_STOP_DIRECTION = {"BUY": s.StopOrderDirection.STOP_ORDER_DIRECTION_BUY,
+                   "SELL": s.StopOrderDirection.STOP_ORDER_DIRECTION_SELL}
+_STOP_SIDE = {value: key for key, value in _STOP_DIRECTION.items()}
+_STOP_STATUS = {
+    s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE: "active",
+    s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED: "executed",
+    s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED: "cancelled",
+    s.StopOrderStatusOption.STOP_ORDER_STATUS_EXPIRED: "expired",
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +82,24 @@ class OrderReport:
         return self.status in {"fill", "cancelled", "rejected"}
 
 
+@dataclass(frozen=True)
+class StopReport:
+    """Стоп-заявка у брокера из ``GetStopOrders``.
+
+    ``stop_price`` — как прислал брокер: у фьючерса это может быть рубли за контракт, а не пункты
+    (разведка П19); брокер контура сравнивает оба прочтения. Нашего ключа у стоп-заявки в ответе нет.
+    """
+
+    stop_order_id: str
+    instrument_uid: str
+    side: str                     # BUY · SELL
+    lots: int
+    stop_price: Decimal | None
+    status: str                   # active · executed · cancelled · expired · unknown
+    exchange_order_id: str = ""
+    created_at: datetime | None = None
+
+
 class OrderFailure(Exception):
     """Отказ вызова заявки: ``unknown`` — судьба неизвестна, ``duplicate`` — ключ уже был,
     ``rate_limited`` — повторы шлюза исчерпаны, ``not_found`` — по ключу пусто, ``rejected`` — отказ брокера."""
@@ -94,6 +124,8 @@ def classify(error: BrokerCallError) -> OrderFailure:
         kind = "duplicate"
     elif error.code == "NOT_FOUND":
         kind = "not_found"
+    elif error.details in MARKET_CLOSED_DETAILS:
+        kind = "market_closed"
     elif error.code in TRANSPORT_CODES or not error.code.isupper():
         kind = "unknown"  # gRPC-статус обрыва или исключение транспорта по имени класса
     else:
@@ -205,6 +237,45 @@ class TInvestApi:
             raise
         report = report_from_state(state)
         return report if report.key else replace(report, key=key)
+
+    def order_by_exchange_id(self, order_id: str) -> OrderReport | None:
+        """``GetOrderState`` по номеру биржи — заявка, порождённая стоп-заявкой; ``None`` — не найдена."""
+        try:
+            state = self._call("orders.get_order_state", account_id=self._account, order_id=order_id,
+                               order_id_type=s.OrderIdType.ORDER_ID_TYPE_EXCHANGE)
+        except OrderFailure as failure:
+            if failure.kind == "not_found":
+                return None
+            raise
+        return report_from_state(state)
+
+    # --- стоп-заявки (add-broker-protection) ---------------------------------
+    def post_stop(self, uid: str, side: str, lots: int, stop_price: Decimal, key: str) -> str:
+        """``STOP_LOSS`` «до отмены» на сторону выхода; стоп-цена в пунктах. Ответ — номер стоп-заявки."""
+        from t_tech.invest.utils import decimal_to_quotation
+
+        response = self._call(
+            "stop_orders.post_stop_order", instrument_id=uid, quantity=lots,
+            stop_price=decimal_to_quotation(stop_price), direction=_STOP_DIRECTION[side], account_id=self._account,
+            expiration_type=s.StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            stop_order_type=s.StopOrderType.STOP_ORDER_TYPE_STOP_LOSS, order_id=key)
+        return response.stop_order_id
+
+    def cancel_stop(self, stop_order_id: str) -> None:
+        self._call("stop_orders.cancel_stop_order", account_id=self._account, stop_order_id=stop_order_id)
+
+    def stop_orders(self, since: datetime, until: datetime) -> list[StopReport]:
+        """Все стоп-заявки счёта за период: активные, исполненные, снятые, истёкшие."""
+        response = self._call("stop_orders.get_stop_orders", account_id=self._account,
+                              status=s.StopOrderStatusOption.STOP_ORDER_STATUS_ALL, from_=since, to=until)
+        result = []
+        for item in response.stop_orders:
+            price = money_to_decimal(item.stop_price) if getattr(item, "stop_price", None) is not None else None
+            result.append(StopReport(
+                item.stop_order_id, getattr(item, "instrument_uid", "") or "", _STOP_SIDE.get(item.direction, ""),
+                int(item.lots_requested), price, _STOP_STATUS.get(item.status, "unknown"),
+                getattr(item, "exchange_order_id", None) or "", _when(getattr(item, "create_date", None))))
+        return result
 
     def last_price(self, uid: str) -> Decimal | None:
         response = self._call("market_data.get_last_prices", instrument_id=[uid])
