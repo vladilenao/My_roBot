@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.8.0
+  version: 2.9.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -34,6 +34,8 @@ info:
       привязок участников эмуляции и песочницы.
     * `broker_stop` у позиций песочницы (2.8.0) — стоп-заявка у брокера:
       стоит, ставится или стоп держит контур.
+    * Предохранители песочницы (2.9.0): `current.guards` и
+      `POST /api/v1/sandbox/guards/reset`.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -881,6 +883,53 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '412': {$ref: '#/components/responses/RevisionChanged'}
         '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/sandbox/guards/reset:
+    post:
+      tags: [Песочница]
+      summary: Снять предохранитель «отказы брокера подряд»
+      description: |
+        Сброс через желаемое состояние ядра (2.9.0, add-account-guards): поколение сброса +1, контур
+        на ближайшей границе тика снимает запрет входов и обнуляет счётчик отказов. Сброс без
+        сработавшего предохранителя принимается и ничего не меняет. `daily_loss` командой не
+        снимается — он снимается сам с началом следующего торгового дня.
+      operationId: resetSandboxGuards
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [guards]
+              properties:
+                guards:
+                  type: array
+                  minItems: 1
+                  items: {type: string, enum: [daily_loss, broker_rejects]}
+            example: {guards: [broker_rejects]}
+      responses:
+        '202':
+          description: Поколение сброса записано.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Sandbox'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`NOT_RUNNING` — процесса песочницы нет; `GUARD_NOT_RESETTABLE` — в списке `daily_loss`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example:
+                type: 'urn:my-robot:problem:guard-not-resettable'
+                title: Предохранитель снимается сам
+                status: 409
+                code: GUARD_NOT_RESETTABLE
+                detail: Предохранитель «дневной убыток» снимается сам с началом следующего торгового дня.
 
   /api/v1/sandbox/reconcile:
     get:
@@ -2406,7 +2455,8 @@ components:
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
                  CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
-                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE]
+                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE,
+                 GUARD_NOT_RESETTABLE]
         rejections:
           type: array
           description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
@@ -2902,7 +2952,7 @@ components:
       type: object
       nullable: true
       additionalProperties: false
-      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link, account_at, execution_holds]
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link, account_at, execution_holds, guards]
       description: Текущее состояние из `status.json` контура.
       properties:
         state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
@@ -2963,6 +3013,32 @@ components:
               minutes: {type: integer, minimum: 0}
               executed: {type: string, format: date-time, nullable: true, description: Последняя исполненная минута.}
               received: {type: string, format: date-time, nullable: true, description: Последняя полученная минута.}
+        guards:
+          type: array
+          description: |
+            Сработавшие предохранители (2.9.0, add-account-guards); пусто — всё чисто. Пока предохранитель
+            действует, новые входы и доборы запрещены, выходы, стоп и цели у брокера работают.
+          items: {$ref: '#/components/schemas/SandboxGuard'}
+    SandboxGuard:
+      type: object
+      additionalProperties: false
+      required: [kind, since, until, detail]
+      properties:
+        kind:
+          type: string
+          enum: [daily_loss, broker_rejects]
+          description: '`daily_loss` — убыток торгового дня достиг лимита; `broker_rejects` — отказы брокера подряд.'
+        since: {type: string, format: date-time}
+        until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Когда снимется сам (начало следующего торгового дня, 19:00 МСК); `null` у `broker_rejects` — только командой.
+        detail:
+          type: object
+          description: |
+            `daily_loss`: `loss`, `limit`, `start_capital` (десятичные строки), `partial_day` (контур поднялся
+            посреди дня), `missing_prices` (инструменты без последней цены). `broker_rejects`: `count`, `reasons` (до трёх).
     BindingCard:
       type: object
       additionalProperties: false

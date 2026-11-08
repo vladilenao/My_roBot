@@ -109,7 +109,8 @@ class TInvestBroker(StopKeeping, BrokerPort):
                  journal_has: Callable[[str], bool] = lambda execution_id: False,
                  entry_ttl: Callable[[str], int] = lambda timeframe: 3600,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 stops: StopLedger | None = None):
+                 stops: StopLedger | None = None,
+                 order_outcome: Callable[[bool, str], None] = lambda accepted, reason: None):
         self._api = api
         self._ledger = ledger
         ledger.clock = clock
@@ -140,6 +141,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
         self._last_sync: datetime | None = None
         self.fills_since_capital = False
         self.stream_link = "ok"
+        self._order_outcome = order_outcome   # итог заявки входа и стоп-заявки — счётчик отказов (add-account-guards)
         self._init_stops(stops)     # стоп у брокера (add-broker-protection); None — стоп держит контур, как на С3
 
     # --- карточки ---------------------------------------------------------
@@ -315,6 +317,8 @@ class TInvestBroker(StopKeeping, BrokerPort):
 
     def _entry_answer(self, action, row: LedgerOrder, now: datetime) -> ExecutionEvent:
         if row.state == REJECTED:
+            if not row.reported and _broker_reject(row.reason):
+                self._order_outcome(False, row.reason)
             self._ledger.update(row.key, reported=1)
             return self._outcome(action, now, ExecutionStatus.REJECT, row.reason or "broker-rejected")
         reason = "broker-unknown" if row.state in (UNKNOWN, SENDING) else "accepted"
@@ -351,6 +355,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
         self._apply_report(row, replace(report, key=row.key), now)
         row = self._ledger.get(row.key)
         if row.kind in ENTRY_KINDS and row.state in (ACCEPTED, PARTIAL, FILLED):
+            self._order_outcome(True, "")
             self._publish(Event.broker_event(EventType.ORDER_ACCEPTED, trade_id=row.trade_id,
                                              instrument=self._display(row.instrument_uid), bar_time=now,
                                              order_id=row.broker_order_id, status="ack", reason="accepted"))
@@ -826,6 +831,8 @@ class TInvestBroker(StopKeeping, BrokerPort):
         view = self._views.get(row.trade_id)
         if row.state == REJECTED:
             status, reason = ExecutionStatus.REJECT, row.reason or "broker-rejected"
+            if _broker_reject(row.reason):
+                self._order_outcome(False, row.reason)          # поздний отказ брокера (стрим, поиск по ключу)
         else:
             status = ExecutionStatus.CANCEL
             reason = row.reason if row.reason == "entry-undelivered" else (
@@ -959,6 +966,11 @@ class TInvestBroker(StopKeeping, BrokerPort):
             return pending | {row.instrument_uid for row in self._ledger.orders(live=True)
                               if row.state in (SENDING, UNKNOWN, CANCELLING)} | self.stop_in_flight_uids(self._clock())
 
+    def last_closes(self) -> dict[str, Decimal]:
+        """Закрытие последней минуты ядра по ключу инструмента контура (предохранитель дневного убытка)."""
+        with self._lock:
+            return dict(self._last_close)
+
     def live_orders(self) -> list[LedgerOrder]:
         return self._ledger.orders(live=True)
 
@@ -1001,6 +1013,11 @@ class TInvestBroker(StopKeeping, BrokerPort):
         return ExecutionEvent(execution_id=execution_id, order_id=command_id, command_id=command_id,
                               trade_id=trade_id, status=status, filled_quantity=0, price=None, fee=Decimal("0"),
                               timestamp=now, reason=reason, fee_source=FeeSource.UNKNOWN)
+
+
+def _broker_reject(reason: str | None) -> bool:
+    """Отказ, который видел брокер: ``broker:<код>`` или исчерпанный повтор частоты; проверки до отправки — нет."""
+    return bool(reason) and (reason.startswith("broker:") or reason == "rate-limited")
 
 
 def _utc(moment: datetime) -> datetime:

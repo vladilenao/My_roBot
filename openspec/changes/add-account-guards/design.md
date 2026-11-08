@@ -101,7 +101,7 @@
   - `kind`, `since`;
   - `until` (у `daily_loss`; у `broker_rejects` — `null`);
   - `detail`: у дневного убытка — `loss`, `limit`, `start_capital`, `partial_day`; у отказов — `count` и `reasons`.
-- `_actions` получает `guards_reset`, когда `broker_rejects` сработал.
+- `_actions` получает `guards-reset`, когда `broker_rejects` сработал.
 - `POST /api/v1/sandbox/guards/reset`:
   - `202` — поколение записано;
   - `400` — тело не объект, неизвестные поля, пустой список, неизвестный вид;

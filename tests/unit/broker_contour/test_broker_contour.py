@@ -292,6 +292,9 @@ class FakeManager:
     def hold_entries(self, held):
         pass
 
+    def guard_entries(self, reason, active):
+        self.guards = getattr(self, "guards", {}) | {reason: active}
+
     def stop_contour(self, mode):
         pass
 
@@ -353,6 +356,7 @@ def test_process_with_orders_recovers_reconciles_and_stops(tmp_path):
                  and _status(tmp_path).get("stream_link") == "ok" and _status(tmp_path).get("members"))
     status = _status(tmp_path)
     assert status["orders_enabled"] is True and status["trades"] == 0 and status["orders_in_flight"] == 0
+    assert status["guards"] == [] and parts[0].manager.guards == {"daily-loss": False, "broker-rejects": False}
     assert status["members"][0]["state"] == "rejected", "привязка С2 без инструмента не торгует"
     assert parts[0].manager.frozen == set() and parts[0].manager.dispatched > 0
     started = next(event for event in collector.events if event.get("kind") == "started")

@@ -147,6 +147,8 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_sandbox_exit_requote_secs": int,
     "contours_sandbox_exit_requote_attempts": int,
     "contours_sandbox_stop_place_secs": int,
+    "contours_sandbox_max_daily_loss_pct": (int, float),
+    "contours_sandbox_max_rejects_in_row": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -249,7 +251,9 @@ def app_dir() -> Path:
     return _root_dir()
 
 
-def _type_name(expected: type) -> str:
+def _type_name(expected: type | tuple) -> str:
+    if isinstance(expected, tuple):
+        return "число"
     return {str: "строка", int: "целое число", dict: "таблица"}.get(
         expected, expected.__name__
     )
@@ -620,8 +624,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
         if key in _SANDBOX_EXIT_RANGES:
             low, high = _SANDBOX_EXIT_RANGES[key]
             if isinstance(value, bool) or not low <= value <= high:
+                kind = "числом" if key == "contours_sandbox_max_daily_loss_pct" else "целым числом"
                 raise ConfigError(f"{path}: [contours.sandbox] {key.removeprefix('contours_sandbox_')} должен быть "
-                                  f"целым числом от {low} до {high}, получено {value!r}")
+                                  f"{kind} от {low} до {high}, получено {value!r}")
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
         if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
@@ -1053,13 +1058,16 @@ _CONTOUR_KEYS = {
     "emulation": {"telegram_channel_env"},
     # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
     "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
-                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs"},
+                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
+                "max_daily_loss_pct", "max_rejects_in_row"},
 }
 _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_exit_offset_steps": (0, 100),
     "contours_sandbox_exit_requote_secs": (5, 300),
     "contours_sandbox_exit_requote_attempts": (1, 10),
     "contours_sandbox_stop_place_secs": (5, 300),
+    "contours_sandbox_max_daily_loss_pct": (0, 50),
+    "contours_sandbox_max_rejects_in_row": (1, 20),
 }
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 

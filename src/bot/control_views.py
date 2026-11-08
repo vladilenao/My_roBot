@@ -28,6 +28,9 @@ SANDBOX_BINDINGS = SANDBOX + "/bindings"
 SANDBOX_REMOVE = SANDBOX_BINDINGS + "/remove"
 SANDBOX_RECONCILE = SANDBOX + "/reconcile"
 SANDBOX_LOG = SANDBOX + "/log"
+# Предохранители контура на брокере (add-account-guards): сброс «отказов подряд».
+SANDBOX_GUARDS_RESET = SANDBOX + "/guards/reset"
+GUARD_KINDS = ("daily_loss", "broker_rejects")
 # Позиции, сделки и итоги контура по журналу сделок (add-contour-trades-api); счёт — только у эмуляции.
 TRADING_PARTS = ("positions", "trades", "performance")
 EMULATION_ACCOUNT = EMULATION + "/account"
@@ -51,6 +54,7 @@ PROBLEM_TITLES = {
     "STOPPING": "Останавливается",
     "NOT_RUNNING": "Не работает",
     "MODE_CONFLICT": "Режим не вернуть",
+    "GUARD_NOT_RESETTABLE": "Предохранитель снимается сам",
     "CORE_NOT_READY": "Ядро не готово",
     "CONTOUR_DIR_BUSY": "Папка контура занята",
     "REVISION_CHANGED": "Целевое состояние уже изменилось",
@@ -149,12 +153,13 @@ def member_action_list(name: str, names) -> list[dict]:
     return [_action(action, *table[action]) for action in names]
 
 
-def sandbox_actions(*, alive: bool, mode: str | None, can_start: bool) -> tuple[str, ...]:
+def sandbox_actions(*, alive: bool, mode: str | None, can_start: bool, guards_reset: bool = False) -> tuple[str, ...]:
     """Команды песочницы, которые сервер примет сейчас; состав меняется и без процесса."""
     if alive:
+        reset = ("guards-reset",) if guards_reset else ()
         if mode in (None, MODE_ON):
-            return ("stop", "stop-close-all", "add-bindings")
-        return ("stop-close-all", "add-bindings") if mode == NO_ENTRIES else ("add-bindings",)
+            return ("stop", "stop-close-all", "add-bindings", *reset)
+        return (("stop-close-all", "add-bindings") if mode == NO_ENTRIES else ("add-bindings",)) + reset
     return ("start", "add-bindings") if can_start else ("add-bindings",)
 
 
@@ -164,6 +169,8 @@ def sandbox_action_list(names) -> list[dict]:
         "stop": ("Остановить", "PUT", SANDBOX_TARGET, {"mode": NO_ENTRIES}),
         "stop-close-all": ("Остановить, закрыть свои сделки", "PUT", SANDBOX_TARGET, {"mode": CLOSE_ALL}),
         "add-bindings": ("Добавить привязки", "POST", SANDBOX_BINDINGS, {"bindings": []}),
+        "guards-reset": ("Снять предохранитель «отказы брокера подряд»", "POST", SANDBOX_GUARDS_RESET,
+                         {"guards": ["broker_rejects"]}),
     }
     return [_action(name, *table[name]) for name in names]
 

@@ -8,7 +8,7 @@
 - `until`: начало следующего торгового дня у `daily_loss`, `null` у `broker_rejects`;
 - `detail`: у дневного убытка — `loss`, `limit`, `start_capital` десятичными строками и `partial_day`; у отказов — `count` и `reasons` (до трёх).
 
-`_actions` ДОЛЖЕН содержать `guards_reset`, когда сработал `broker_rejects`.
+`_actions` ДОЛЖЕН содержать `guards-reset`, когда сработал `broker_rejects`.
 
 `POST /api/v1/sandbox/guards/reset` с телом `{"guards": ["broker_rejects"]}` ДОЛЖЕН увеличивать поколение сброса в желаемом состоянии контура и записывать команду в журнал команд ядра. Ответы:
 
@@ -22,7 +22,7 @@
 #### Scenario: Сработавший предохранитель в состоянии
 - **GIVEN** у песочницы сработал `broker_rejects` после трёх отказов
 - **WHEN** приходит `GET /api/v1/sandbox`
-- **THEN** `current.guards` содержит `broker_rejects` с `count = 3` и причинами, `_actions` содержит `guards_reset`
+- **THEN** `current.guards` содержит `broker_rejects` с `count = 3` и причинами, `_actions` содержит `guards-reset`
 
 #### Scenario: Сброс отказов
 - **GIVEN** сработал `broker_rejects`

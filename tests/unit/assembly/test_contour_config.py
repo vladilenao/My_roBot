@@ -110,3 +110,21 @@ def test_sandbox_stop_place_secs(tmp_path):
     for bad in ("stop_place_secs = 2", "stop_place_secs = 301", 'stop_place_secs = "30"'):
         with pytest.raises(ConfigError, match="stop_place_secs"):
             _load(tmp_path, f"[contours.sandbox]\n{bad}\n")
+
+
+def test_sandbox_guard_settings(tmp_path):
+    """add-account-guards: дневной убыток 3% капитала и три отказа подряд по умолчанию."""
+    import pytest
+
+    from src import config
+    from src.config_loader import ConfigError
+
+    assert (config._DEFAULTS["contours_sandbox_max_daily_loss_pct"],
+            config._DEFAULTS["contours_sandbox_max_rejects_in_row"]) == (3.0, 3)
+    loaded = _load(tmp_path, "[contours.sandbox]\nmax_daily_loss_pct = 0.5\nmax_rejects_in_row = 1\n")
+    assert (loaded["contours_sandbox_max_daily_loss_pct"], loaded["contours_sandbox_max_rejects_in_row"]) == (0.5, 1)
+    assert _load(tmp_path, "[contours.sandbox]\nmax_daily_loss_pct = 2\n")["contours_sandbox_max_daily_loss_pct"] == 2
+    for bad in ("max_daily_loss_pct = 60", "max_daily_loss_pct = -1", "max_rejects_in_row = 0",
+                "max_rejects_in_row = 21", 'max_rejects_in_row = "3"', 'max_daily_loss_pct = "3"'):
+        with pytest.raises(ConfigError, match="max_"):
+            _load(tmp_path, f"[contours.sandbox]\n{bad}\n")

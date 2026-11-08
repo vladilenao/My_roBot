@@ -389,6 +389,12 @@ def _broker_account(event: Event, stamp: str) -> Block:
         return Block(stamp, label, f"Сверка: расхождение · заморожены {frozen}", role="warning")
     if kind == "reconcile_cleared":
         return Block(stamp, label, "Сверка: расхождение устранено", role="muted")
+    if kind in ("guard_tripped", "guard_cleared"):
+        from src.notifier.telegram_templates import GUARD_TITLES
+        title = GUARD_TITLES.get(event.get("guard"), event.get("guard") or "предохранитель")
+        if kind == "guard_tripped":
+            return Block(stamp, label, f"Предохранитель: {title} — новые входы запрещены", role="warning")
+        return Block(stamp, label, f"Предохранитель снят: {title}", role="muted")
     if kind in ("execution_hold", "execution_resumed"):
         names = ", ".join(f"{item['name']} {item['minutes']} мин" for item in event.get("holds") or ()) or "—"
         if kind == "execution_hold":

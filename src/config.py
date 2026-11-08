@@ -112,6 +112,8 @@ _DEFAULTS = {
     "contours_sandbox_exit_requote_secs": 15,
     "contours_sandbox_exit_requote_attempts": 3,
     "contours_sandbox_stop_place_secs": 30,
+    "contours_sandbox_max_daily_loss_pct": 3.0,
+    "contours_sandbox_max_rejects_in_row": 3,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -205,6 +207,8 @@ CONTOUR_SANDBOX_EXIT_OFFSET_STEPS = _CONFIG["contours_sandbox_exit_offset_steps"
 CONTOUR_SANDBOX_EXIT_REQUOTE_SECS = _CONFIG["contours_sandbox_exit_requote_secs"]
 CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_sandbox_exit_requote_attempts"]
 CONTOUR_SANDBOX_STOP_PLACE_SECS = _CONFIG["contours_sandbox_stop_place_secs"]
+CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT = _CONFIG["contours_sandbox_max_daily_loss_pct"]
+CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW = _CONFIG["contours_sandbox_max_rejects_in_row"]
 
 
 def telegram_channel_id() -> str | None:

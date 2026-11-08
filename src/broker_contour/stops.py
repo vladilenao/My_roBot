@@ -331,6 +331,7 @@ class StopKeeping:
             self._stop_failed(row, failure, now)
             return
         self._stop_closed.discard(trade_id)
+        self._order_outcome(True, "")
         self._activated(self._stops.update(row.key, state=ACTIVE, stop_order_id=stop_id))
 
     def _stop_failed(self, row: StopRow, failure: OrderFailure, now: datetime) -> None:
@@ -345,6 +346,7 @@ class StopKeeping:
             log.info("Стоп-заявка %s: торги закрыты, повтор через минуту, стоп держит контур", row.trade_id)
         else:
             log.warning("Стоп-заявка %s отклонена: %s", row.trade_id, failure)
+            self._order_outcome(False, failure.reason)
 
     def _cancel_stop(self, row: StopRow, now: datetime, *, removing: bool) -> bool:
         """``True`` — снятие подтверждено сразу, можно ставить новую."""
