@@ -56,7 +56,8 @@ _KIND_BY_CODE = {
     "intraday-session-end": "session_end",
     **dict.fromkeys(("contract-expiring", "contract-rollover"), "expiry"),
     **dict.fromkeys(("contour-stopping", "contour-stop", "instrument-removing", "instrument-remove",
-                     "binding-removing", "binding-remove", "core-lost", "instrument-frozen"), "contour"),
+                     "binding-removing", "binding-remove", "core-lost", "instrument-frozen",
+                     "daily-loss", "broker-rejects"), "contour"),
 }
 
 _TRADE_ROWS = """

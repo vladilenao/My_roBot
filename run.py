@@ -192,6 +192,7 @@ def _run_broker_contour(kind: str) -> int:
     from src.broker_contour.process import BrokerContour, BrokerContourSettings
     from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_SANDBOX_EXIT_OFFSET_STEPS,
                             CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
+                            CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
                             CONTOUR_SANDBOX_ORDERS, CONTOUR_SANDBOX_STOP_PLACE_SECS, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                             NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
     from src.events.bus import EventBus
@@ -220,6 +221,7 @@ def _run_broker_contour(kind: str) -> int:
     signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
     settings = BrokerContourSettings(
         orders=CONTOUR_SANDBOX_ORDERS,
+        max_daily_loss_pct=CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, max_rejects_in_row=CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
         exit_policy=ExitPolicy(CONTOUR_SANDBOX_EXIT_OFFSET_STEPS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
                                CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_SANDBOX_STOP_PLACE_SECS),
         contour_id=kind, broker=kind, directory=directory, core_db=data_dir / CORE_DATABASE_FILE,

@@ -1285,7 +1285,11 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 «Счёт». `kind`: `started` — допуск пройден; `reconcile_alarm` — сверщик нашёл
 расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
 нет; `stopped` — штатный выход (`broker_stops` — сколько стоп-заявок осталось у
-брокера, add-broker-protection). `account` — только последние четыре символа
+брокера, add-broker-protection); `guard_tripped` — сработал предохранитель
+(`guard`: `daily_loss` или `broker_rejects`, `guard_detail` — убыток, лимит и
+капитал на начало дня или число отказов и причины, `since`, `until`);
+`guard_cleared` — предохранитель снят (`reason`: `new-day` или `command`),
+add-account-guards. `account` — только последние четыре символа
 номера счёта. Деньги — десятичные строки. Инструменты — короткие имена.
 Доставляется в канал своего контура, каналам эмуляции не отправляется.
 
@@ -1400,6 +1404,18 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
     },
     "broker_stops": {
       "type": "number"
+    },
+    "guard": {
+      "type": "string"
+    },
+    "guard_detail": {
+      "type": "object"
+    },
+    "since": {
+      "type": "string"
+    },
+    "until": {
+      "type": "string"
     }
   },
   "additionalProperties": false

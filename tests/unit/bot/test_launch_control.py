@@ -399,7 +399,7 @@ class TestContract:
                     text = exc.read().decode("utf-8")
                 assert "Эндпоинт не найден" not in text, (method, path)
 
-    def test_openapi_route_serves_2_8_0(self, server):
+    def test_openapi_route_serves_2_9_0(self, server):
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:

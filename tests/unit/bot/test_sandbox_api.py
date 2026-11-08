@@ -297,3 +297,34 @@ def test_failed_batch_rejects_bindings_with_reason(tmp_path):
 
     assert status == 422 and payload["rejections"][0]["reason"] == "Инструмент привязки не определён: ConnectionError."
     assert store.desired("sandbox") is None
+
+
+def test_guards_in_current_and_reset_command(sandbox_server):
+    """Предохранители (add-account-guards): current.guards, _actions.guards-reset, POST guards/reset."""
+    from src.assembly.core_state import read_desired
+
+    srv, control, supervisor = sandbox_server
+    status, payload, headers = _call(srv, "POST", "/api/v1/sandbox/guards/reset", CONTROL_KEY,
+                                     {"guards": ["broker_rejects"]})
+    _problem(status, payload, headers, "NOT_RUNNING")
+    _call(srv, "PUT", "/api/v1/sandbox/target", CONTROL_KEY, {"mode": "on", "bindings": ["future-ng-macd"]})
+    supervisor.directory.mkdir(parents=True, exist_ok=True)
+    guard = {"kind": "broker_rejects", "since": "2026-10-30T09:20:00+00:00", "until": None,
+             "detail": {"count": 3, "reasons": ["broker:30042"]}}
+    write_status(supervisor.directory / "status.json", {"pid": 9021, "state": "running", "applied_generation": 1,
+                                                         "guards": [guard]})
+    status, payload, _ = _call(srv, "GET", "/api/v1/sandbox", CONTROL_KEY)
+    _check(payload, {"$ref": "#/components/schemas/Sandbox"})
+    assert payload["current"]["guards"] == [guard]
+    assert "guards-reset" in {action["name"] for action in payload["_actions"]}
+    for body in ({}, {"guards": []}, {"guards": ["other"]}, {"guards": ["broker_rejects"], "x": 1}):
+        status, payload, headers = _call(srv, "POST", "/api/v1/sandbox/guards/reset", CONTROL_KEY, body)
+        _problem(status, payload, headers, "INVALID_REQUEST")
+    status, payload, headers = _call(srv, "POST", "/api/v1/sandbox/guards/reset", CONTROL_KEY,
+                                     {"guards": ["daily_loss"]})
+    _problem(status, payload, headers, "GUARD_NOT_RESETTABLE")
+    assert read_desired(srv.sandbox._core_state.path, "sandbox").guards_reset == 0
+    status, payload, _ = _call(srv, "POST", "/api/v1/sandbox/guards/reset", CONTROL_KEY, {"guards": ["broker_rejects"]})
+    assert status == 202
+    _check(payload, {"$ref": "#/components/schemas/Sandbox"})
+    assert read_desired(srv.sandbox._core_state.path, "sandbox").guards_reset == 1

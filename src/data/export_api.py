@@ -404,20 +404,24 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _sandbox_command(self, path: str) -> None:
         from src.bot.launch_control import BadCommand
-        from src.bot.sandbox_control import parse_bindings, parse_sandbox_target
+        from src.bot.sandbox_control import parse_bindings, parse_guards_reset, parse_sandbox_target
 
         sandbox = self.export_server.sandbox
         if sandbox is None:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Песочница» недоступен в этом процессе.")
             return
-        routes = {("PUT", views.SANDBOX_TARGET), ("POST", views.SANDBOX_BINDINGS), ("POST", views.SANDBOX_REMOVE)}
+        routes = {("PUT", views.SANDBOX_TARGET), ("POST", views.SANDBOX_BINDINGS), ("POST", views.SANDBOX_REMOVE),
+                  ("POST", views.SANDBOX_GUARDS_RESET)}
         if (self.command, path) not in routes:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
         expected = _if_match(self.headers.get("If-Match"))
         try:
             body = self._read_json()
-            if path == views.SANDBOX_TARGET:
+            if path == views.SANDBOX_GUARDS_RESET:
+                status, payload = sandbox.reset_guards(parse_guards_reset(body))
+                headers = None
+            elif path == views.SANDBOX_TARGET:
                 mode, bindings = parse_sandbox_target(body)
                 status, payload = sandbox.put_target(mode, bindings, expected)
                 headers = views.etag((payload.get("target") or {}).get("revision")) if status < 400 else None

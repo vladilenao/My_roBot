@@ -26,6 +26,8 @@ REASON_LABELS = {
     "instrument-removing": "инструмент убирается из состава",
     "instrument-remove": "инструмент убран из состава",
     "core-lost": "нет связи с ядром",
+    "daily-loss": "дневной убыток превышен",
+    "broker-rejects": "отказы брокера подряд",
     "binding-removing": "привязка убирается из состава",
     "binding-remove": "привязка убрана из состава",
     "instrument-frozen": "инструмент заморожен сверкой",

@@ -177,6 +177,8 @@ def _history(visual, step, unit, offset):
 
 CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
 WHAT_LABELS = {"position": "позиция", "order": "заявки", "stop_order": "стоп-заявки"}
+# Предохранители контура на брокере (add-account-guards).
+GUARD_TITLES = {"daily_loss": "дневной убыток", "broker_rejects": "отказы брокера подряд"}
 
 
 def _money(value) -> str:
@@ -221,6 +223,27 @@ def render_broker_account(event) -> str:
     elif kind == "execution_resumed":
         lines = [f"<b>{title} · Исполнение возобновлено</b>"]
         lines.extend(escape(f"{item['name']}: после {item['minutes']} мин удержания") for item in event.get("holds") or ())
+    elif kind == "guard_tripped":
+        guard, detail = event.get("guard"), event.get("guard_detail") or {}
+        lines = [f"<b>{title} · ТРЕВОГА · Предохранитель: {GUARD_TITLES.get(guard, escape(str(guard)))}</b>"]
+        if guard == "daily_loss":
+            lines.append(f"Убыток дня {_money(detail.get('loss', 0))} при лимите {_money(detail.get('limit', 0))} "
+                         f"(капитал на начало дня {_money(detail.get('start_capital', 0))})")
+            if detail.get("partial_day"):
+                lines.append("Контур поднялся посреди дня: капитал — на момент подъёма.")
+            if detail.get("missing_prices"):
+                lines.append("Нет последней цены: " + escape(", ".join(detail["missing_prices"])))
+            lines.append("Новые входы и доборы запрещены до 19:00 МСК. Позиции сопровождаются, стопы у брокера.")
+        else:
+            lines.append(f"Отказов брокера подряд: {detail.get('count', 0)}")
+            lines.extend(escape(f"  {reason}") for reason in detail.get("reasons") or ())
+            lines.append("Новые входы и доборы запрещены. Выходы и стопы работают.")
+            lines.append("Снять: разобраться с причиной и отправить POST /api/v1/sandbox/guards/reset.")
+    elif kind == "guard_cleared":
+        guard = event.get("guard")
+        why = "новый торговый день" if event.get("reason") == "new-day" else "командой сброса"
+        lines = [f"<b>{title} · Предохранитель снят: {GUARD_TITLES.get(guard, escape(str(guard)))}</b>",
+                 f"Причина: {why}. Новые входы разрешены."]
     elif kind == "reconcile_cleared":
         lines = [f"<b>{title} · Расхождение устранено</b>", f"Счёт {account} совпадает с журналом контура."]
         if event.get("unfrozen"):

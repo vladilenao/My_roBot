@@ -61,6 +61,14 @@ def parse_bindings(body, *, remove: bool) -> tuple[tuple[str, ...], str]:
     return _ids(body["bindings"], required=True), mode
 
 
+def parse_guards_reset(body) -> tuple[str, ...]:
+    """Тело ``POST /api/v1/sandbox/guards/reset`` → виды предохранителей."""
+    if not isinstance(body, dict) or set(body) != {"guards"} or not isinstance(body["guards"], list) \
+            or not body["guards"] or any(item not in views.GUARD_KINDS for item in body["guards"]):
+        raise BadCommand("INVALID_REQUEST", "Тело — {\"guards\": [\"broker_rejects\"]}.")
+    return tuple(dict.fromkeys(body["guards"]))
+
+
 class SandboxControl:
     def __init__(self, *, kind: str, core_state, supervisor, share_strategies: dict, future_strategies: dict,
                  emulation_members=lambda: (), log_file: str = "bot_debug.log", resolve_binding=None) -> None:
@@ -125,6 +133,7 @@ class SandboxControl:
             "trades": status.get("trades") or 0, "orders_in_flight": status.get("orders_in_flight") or 0,
             "stream_link": status.get("stream_link"), "account_at": status.get("account_at"),
             "execution_holds": status.get("execution_holds") or [],
+            "guards": status.get("guards") or [],
         }
 
     def _launch(self, desired, process) -> dict | None:
@@ -167,8 +176,9 @@ class SandboxControl:
         state = self._state(desired, status, process)
         target = self._target(desired)
         can_start = self._supervisor.ready and not process["running"]
+        rejects = any(item.get("kind") == "broker_rejects" for item in (status or {}).get("guards") or ())
         actions = views.sandbox_actions(alive=process["running"], mode=(target or {}).get("mode"),
-                                        can_start=can_start)
+                                        can_start=can_start, guards_reset=rejects)
         return {
             "state": state, "target": target, "current": self._current(status),
             "launch": self._launch(desired, process),
@@ -340,6 +350,17 @@ class SandboxControl:
         if outcome.outcome == CONFLICT:
             return self._problem(HTTPStatus.CONFLICT, "MODE_CONFLICT", outcome.reason)
         return (int(HTTPStatus.ACCEPTED) if outcome.outcome == ACCEPTED else int(HTTPStatus.OK)), self.view()
+
+    def reset_guards(self, guards: tuple[str, ...]) -> tuple[int, dict]:
+        """Сброс предохранителя «отказы подряд» поколением в желаемом состоянии (add-account-guards)."""
+        if "daily_loss" in guards:
+            return self._problem(HTTPStatus.CONFLICT, "GUARD_NOT_RESETTABLE",
+                                 "Предохранитель «дневной убыток» снимается сам с началом следующего торгового дня.")
+        if not self._supervisor.snapshot()["running"]:
+            return self._problem(HTTPStatus.CONFLICT, "NOT_RUNNING", "Процесса песочницы нет — сбрасывать нечего.")
+        if self._core_state.record_guards_reset(self.kind, guards) is None:
+            return self._problem(HTTPStatus.CONFLICT, "NOT_RUNNING", "Песочница ещё не запускалась.")
+        return int(HTTPStatus.ACCEPTED), self.view()
 
     def change_bindings(self, ids: tuple[str, ...], *, remove: bool, mode: str, expected: int | None) -> tuple[int, dict]:
         with self._lock:

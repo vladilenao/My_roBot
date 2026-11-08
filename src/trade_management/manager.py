@@ -75,6 +75,10 @@ INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и за�
 STOP_COMMAND_RENEWED = "stop-command-renewed"
 # Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
 CORE_LOST = "core-lost"
+# Предохранители контура на брокере (add-account-guards): запрет новых входов и доборов по всему контуру.
+GUARD_DAILY_LOSS = "daily-loss"
+GUARD_BROKER_REJECTS = "broker-rejects"
+GUARD_REASONS = (GUARD_DAILY_LOSS, GUARD_BROKER_REJECTS)
 # Контур на брокере (add-tinvest-orders): снятие привязки, заморозка сверкой, капитал не прочитан.
 BINDING_REMOVING = "binding-removing"
 BINDING_REMOVE = "binding-remove"
@@ -353,6 +357,7 @@ class TradeManager:
         self._instrument_stops: dict[str, str] = {}
         # Запрет входов без связи с ядром (add-contour-recovery).
         self._core_lost = False
+        self._guards: set[str] = set()
         # Контур на брокере (add-tinvest-orders): капитал со счёта вместо журнала, снятие привязок,
         # инструменты, замороженные сверщиком. У эмуляции источника капитала нет.
         self._capital = capital_provider
@@ -1586,6 +1591,33 @@ class TradeManager:
             algorithm_version="contour-recovery",
         ))
 
+    def guard_entries(self, reason: str, active: bool) -> None:
+        """Запрет входов и доборов предохранителем контура (add-account-guards); причины ставятся и снимаются
+        по одной. Неисполненные входы, выходы, стоп и цели не трогаются."""
+        if reason not in GUARD_REASONS:
+            raise ValueError(f"unknown guard reason {reason!r}")
+        if active == (reason in self._guards):
+            return
+        if active:
+            self._guards.add(reason)
+        else:
+            self._guards.discard(reason)
+        log.info("Предохранитель %s: %s", reason, "новые входы запрещены" if active else "запрет снят")
+        self._traces.record(calculation_trace(
+            "contour.guard",
+            inputs={"active": MeasuredValue(active, "active")},
+            result=MeasuredValue(not active, "allowed"),
+            reason=reason,
+            formula="contour guard: no new entries or adds; pending entries and exits follow their plan",
+            links=TraceLinks(),
+            outcome=TraceOutcome.REJECTED if active else TraceOutcome.ACCEPTED,
+            algorithm_version="account-guards",
+        ))
+
+    @property
+    def guards(self) -> frozenset[str]:
+        return frozenset(self._guards)
+
     def _stop_trades(self, mode: str, reason: str, key: str | None, *,
                      assignment_id: str | None = None) -> tuple[TradeAction, ...]:
         submitted: list[TradeAction] = []
@@ -1666,6 +1698,9 @@ class TradeManager:
             return INSTRUMENT_FROZEN
         if self._core_lost:
             return CORE_LOST
+        for reason in GUARD_REASONS:
+            if reason in self._guards:
+                return reason
         return None
 
     def _contour_stop_trace(self, action: str | None, links: TraceLinks, *, mode: str | None = None,

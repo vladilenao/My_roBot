@@ -61,6 +61,8 @@ class BrokerContourSettings:
     step_secs: float = STEP_SECS
     orders: bool = False
     exit_policy: object = None
+    max_daily_loss_pct: float = 3.0       # предохранители (add-account-guards)
+    max_rejects_in_row: int = 3
 
 
 class BrokerContour:
@@ -77,6 +79,7 @@ class BrokerContour:
         self._core_link = "ok"
         self._holder: dict | None = None     # брокер, менеджер и комиссии контура с заявками
         self._capital: Decimal | None = None
+        self._guards_read: datetime | None = None
         settings.directory.mkdir(parents=True, exist_ok=True)
         self._gateway_factory = gateway_factory
         self._stop = stop
@@ -223,6 +226,7 @@ class BrokerContour:
         from src.broker_contour.broker import ExitPolicy, TInvestBroker
         from src.broker_contour.control import BrokerControl, assignment_index
         from src.broker_contour.fees import FeeSync
+        from src.broker_contour.guards import Guards, GuardStore
         from src.broker_contour.orders import OrderLedger
         from src.broker_contour.stops import StopLedger
         from src.broker_contour.stream import OrderStream
@@ -237,6 +241,10 @@ class BrokerContour:
         api = TInvestApi(gateway, account.account_id)
         ledger = OrderLedger(settings.directory / BROKER_DATABASE_FILE)
         stops = StopLedger(ledger)          # стоп у брокера (add-broker-protection)
+        guards = Guards(GuardStore(ledger), max_daily_loss_pct=settings.max_daily_loss_pct,
+                        max_rejects_in_row=settings.max_rejects_in_row, clock=self._clock,
+                        tripped=lambda state: self._guard_event(guards, state, None),
+                        cleared=lambda state, why: self._guard_event(guards, state, why))
         reconciler = Reconciler(store=store, notifier=self.notifier, account_tail=account.masked,
                                 every_secs=settings.reconcile_every_secs)
         self._capital = admitted.snapshot.rub
@@ -245,6 +253,7 @@ class BrokerContour:
         self._holder = holder
 
         def broker_factory(storage):
+            holder["storage"] = storage
             def journal_has(execution_id: str) -> bool:
                 return storage.connection.execute(
                     "SELECT 1 FROM fills WHERE execution_id=? UNION SELECT 1 FROM events WHERE event_id=?",
@@ -253,7 +262,7 @@ class BrokerContour:
             broker = TInvestBroker(api, ledger, contour=settings.contour_id,
                                    policy=settings.exit_policy or ExitPolicy(), publish=self._bus.publish,
                                    journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
-                                   stops=stops)
+                                   stops=stops, order_outcome=guards.order_outcome)
             holder["broker"] = broker
             holder["fees"] = FeeSync(api, lambda: storage.connection)   # add-account-vs-emulation-report
             return broker
@@ -276,6 +285,9 @@ class BrokerContour:
             contour.build()
             broker, manager = holder["broker"], contour.runtime.trade_manager
             holder["manager"] = manager
+            holder["guards"] = guards
+            guards.attach(manager)              # сработавшие предохранители — до первого тика (add-account-guards)
+            self._write(guards=guards.states())
             # До первого тика: «отправлена» без ответа и «неизвестно» — поиск по ключу; непроведённые
             # исполнения — в журнал; затем сверка (design.md решение 8).
             now = self._clock()
@@ -313,6 +325,26 @@ class BrokerContour:
         log.info("Контур %s остановлен: %s", settings.contour_id, reason)
         return 0
 
+    def _guards_tick(self, holder: dict) -> None:
+        """Предохранители на опросе: убыток дня (не чаще раза в 10 с) и поколение сброса из ядра."""
+        guards, broker, storage = holder.get("guards"), holder.get("broker"), holder.get("storage")
+        if guards is None or broker is None:
+            return
+        guards.evaluate_daily(self._capital, getattr(storage, "connection", None), broker.last_closes())
+        now = self._clock()
+        if self._guards_read is None or (now - self._guards_read).total_seconds() >= 10:
+            self._guards_read = now
+            desired = read_desired(self.settings.core_db, self.settings.contour_id)
+            guards.apply_reset(None if desired is None else desired.guards_reset)
+
+    def _guard_event(self, guards, state, why: str | None) -> None:
+        """Предохранитель сработал (``why is None``) или снят: сообщение в канал и ``guards`` в ``status.json``."""
+        if why is None:
+            self.notifier.guard_tripped(state.kind, state.detail, since=state.since, until=state.until)
+        else:
+            self.notifier.guard_cleared(state.kind, why)
+        self._write(guards=guards.states())
+
     @staticmethod
     def _positions_by_uid(snapshot: AccountSnapshot) -> dict[str, int]:
         """Знаковые лоты счёта по UID: снимок хранит короткие имена, ``names`` — их UID."""
@@ -348,6 +380,7 @@ class BrokerContour:
             except BrokerCallError as exc:
                 log.warning("Капитал после исполнения не прочитан (%s)", exc.code)
         broker.refresh_margins(now)
+        self._guards_tick(holder)
         if reconciler.due(now):
             self._reconcile_trading(reconciler, gateway, account, broker, manager)
         try:

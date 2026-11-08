@@ -71,5 +71,12 @@ class BrokerNotifier:
     def execution_resumed(self, items) -> None:
         self._publish("execution_resumed", holds=list(items))
 
+    def guard_tripped(self, guard: str, detail: dict, *, since: str | None, until: str | None) -> None:
+        """Сработал предохранитель (add-account-guards): тревога в канал контура."""
+        self._publish("guard_tripped", guard=guard, guard_detail=dict(detail), since=since, until=until)
+
+    def guard_cleared(self, guard: str, why: str) -> None:
+        self._publish("guard_cleared", guard=guard, reason=why)
+
     def stopped(self, reason: str, *, open_positions: int | None = None, broker_stops: int | None = None) -> None:
         self._publish("stopped", reason=reason, open_positions=open_positions, broker_stops=broker_stops)
