@@ -141,6 +141,11 @@ class TradingBot:
         self._binding_minimums: dict[str, int] = {}
         # Последний переданный менеджеру кадр графика по паре: (бар, длина).
         self._remembered_markets: dict[tuple[str, str], tuple] = {}
+        # Незакрытая свеча графика исполнения — из минуток кэша (fix-trade-close-accuracy).
+        configure_minutes = getattr(trade_manager, "configure_minute_source", None)
+        closed_minutes = getattr(data_cache, "closed_minutes", None)
+        if callable(configure_minutes) and callable(closed_minutes):
+            configure_minutes(closed_minutes)
 
         self._instruments = [
             i if isinstance(i, Instrument) else normalize_instrument(i)

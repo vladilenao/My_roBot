@@ -193,8 +193,12 @@ def render_png(scene):
             opening, close, high, low = (float(candle[k]) for k in ("open", "close", "high", "low"))
             color = GREEN if close >= opening else RED
             ax.plot([stamp, stamp], [low, high], color=color, linewidth=1.4)
-            ax.add_patch(Rectangle((stamp - period * .29, min(opening, close)), period * .58,
-                                   max(abs(close-opening), span * .005), color=color))
+            body = (stamp - period * .29, min(opening, close)), period * .58, max(abs(close-opening), span * .005)
+            if candle.get("through"):
+                # Незакрытая свеча из минуток: полый корпус.
+                ax.add_patch(Rectangle(*body, facecolor=BACKGROUND, edgecolor=color, linewidth=1.4, zorder=2))
+            else:
+                ax.add_patch(Rectangle(*body, color=color))
         colors = {"entry": BLUE, "stop": RED, "target": GREEN}
         # Separate nearly coincident labels while keeping the true price line.
         labels = []

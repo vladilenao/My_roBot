@@ -1316,6 +1316,26 @@ class MarketDataCache:
             self._pre_cutover_gaps[uid, timeframe] = unconfirmed
         return True
 
+    @_synchronized
+    def closed_minutes(self, instrument, since, until) -> list[dict]:
+        """Закрытые минутки 1m пары из памяти: открытие ``>= since``, закрытие ``<= until``.
+
+        Только для представления (незакрытая свеча графика исполнения,
+        fix-trade-close-accuracy): без сети, первичной загрузки и регистрации
+        пар — неизвестная пара даёт пустой список.
+        """
+        frame = self._frames.get(self._key(instrument, "1m"))
+        if frame is None or frame.empty:
+            return []
+        start, end = _naive(since), _naive(until) - pd.Timedelta(minutes=1)
+        stamps = _naive_series(frame["datetime"])
+        mask = (stamps >= start) & (stamps <= end)
+        if "is_complete" in frame.columns:
+            mask &= frame["is_complete"].astype(bool)
+        rows = frame[mask].sort_values("datetime")
+        return [{"datetime": row["datetime"], "open": row["open"], "high": row["high"], "low": row["low"],
+                 "close": row["close"]} for row in rows.to_dict("records")]
+
     def chart_breaks(self, instrument, timeframe, frame) -> dict:
         """Вид каждого разрыва окна для графика сделки.
 

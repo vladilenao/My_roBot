@@ -7,6 +7,7 @@ from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.notifier.templates.holds import data_reason
 from src.notifier.templates.orders import order_line
+from src.notifier.templates.console_view import number
 from src.events.visual import breaks_of, utc
 from src.trade_journal.reasons import REASON_LABELS
 
@@ -30,10 +31,13 @@ def price(value, step=None):
 
 
 def money(value, *, signed=False, units="RUB"):
+    """Деньги до копеек с разрядами, как в карточке плана и консоли: «+15 349,17 ₽», «−1 735,65 ₽»."""
     if value is None:
         return "неизвестно"
-    amount = price(value)
-    if signed and Decimal(str(value)) > 0:
+    amount = number(value)
+    if amount in {"−0", "0"}:
+        amount = "0"
+    elif signed and Decimal(str(value)) > 0:
         amount = "+" + amount
     return amount + (" ₽" if units == "RUB" else " в единицах цены")
 
@@ -67,6 +71,11 @@ def chart_notes(visual, offset=0):
         notes.append(f"расписание недоступно: {plural(unavailable, ('разрыв', 'разрыва', 'разрывов'))}")
     if market.get("history_limited") or market.get("stop_history_limited"):
         notes.append("неполная история исполнений")
+    for candle in market.get("candles", ()):
+        if candle.get("through"):
+            start = utc(candle["time"]) + timedelta(hours=offset)
+            through = utc(candle["through"]) + timedelta(hours=offset)
+            notes.append(f"свеча {start:%H:%M} не закрыта: по {through:%H:%M}")
     return notes
 
 
