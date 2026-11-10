@@ -210,16 +210,45 @@ class StoredScheduleSource:
     """Источник процесса контура: расписание пишет ядро, контур только читает (add-contour-process).
 
     Запросов в сеть нет: ``request`` и ``service`` ничего не делают, свежесть
-    расписания отвечает за ядро.
+    расписания отвечает за ядро. ``poll`` не чаще раза в ``poll_seconds``
+    сверяет метку расписания в базе: новые дни, версии, привязки и часовые
+    подтверждения ядра. Без него снимок календаря контура замерзал на моменте
+    запуска, и со второго дня расписание становилось «неизвестным».
     """
 
     source = BrokerScheduleSource.source
+
+    def __init__(self, store: MarketDataStore | None = None, *, poll_seconds: float = 60.0,
+                 clock=None) -> None:
+        import time as _time
+
+        self._store = store
+        self._poll = poll_seconds
+        self._clock = clock or _time.monotonic
+        self._lock = threading.Lock()
+        self._checked_at: float | None = None
+        self._marker: object = None
 
     def request(self, instrument_uid: str, now: datetime, *, force: bool = False) -> None:
         return None
 
     def service(self, now: datetime) -> bool:
         return False
+
+    def poll(self) -> bool:
+        """Истина, если расписание в базе изменилось с прошлой сверки (первая сверка — тоже истина)."""
+        marker_of = getattr(self._store, "schedule_marker", None)
+        if marker_of is None:
+            return False
+        moment = self._clock()
+        with self._lock:
+            if self._checked_at is not None and moment - self._checked_at < self._poll:
+                return False
+            self._checked_at = moment
+        marker = marker_of(source=self.source)
+        with self._lock:
+            changed, self._marker = marker != self._marker, marker
+        return changed
 
     def stale(self, exchange: str, now: datetime) -> bool:
         return False
@@ -633,7 +662,16 @@ class MarketCalendar:
             return PROVENANCE_BROKER if self._binding(instrument_uid) is not None else None
         return lookup(source=self._source.source, instrument_uid=instrument_uid)
 
+    def _follow_store(self) -> None:
+        """Снимок привязок и дней сбрасывается, когда источник видит новое в базе (контур)."""
+        poll = getattr(self._source, "poll", None)
+        if poll is not None and poll():
+            with self._lock:
+                self._bindings.clear()
+                self._records.clear()
+
     def _binding(self, instrument_uid: str) -> str | None:
+        self._follow_store()
         with self._lock:
             cached = self._bindings.get(instrument_uid)
         if cached is not None:
@@ -647,6 +685,7 @@ class MarketCalendar:
         return exchange
 
     def _days(self, exchange: str) -> tuple[StoredScheduleDay, ...]:
+        self._follow_store()
         with self._lock:
             cached = self._records.get(exchange)
         if cached is not None:

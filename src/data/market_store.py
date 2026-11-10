@@ -1021,6 +1021,20 @@ class MarketDataStore:
             ).fetchone()
         return None if row is None or row["last_confirmed_at"] is None else str(row["last_confirmed_at"])
 
+    def schedule_marker(self, *, source: str) -> tuple[str | None, str | None]:
+        """Дешёвая метка расписания источника для читателя (процесс контура).
+
+        Меняется при новой версии дня, новой привязке UID (общий счётчик
+        ``schedule_max_change_id``) и при подтверждении дней без изменений.
+        """
+        with self._lock, self._connect() as conn:
+            change = conn.execute("SELECT value FROM metadata WHERE key='schedule_max_change_id'").fetchone()
+            confirmed = conn.execute(
+                "SELECT MAX(last_confirmed_at) FROM trading_schedule_days WHERE source=?", (source,),
+            ).fetchone()
+        return (None if change is None else str(change[0]),
+                None if confirmed is None or confirmed[0] is None else str(confirmed[0]))
+
     @staticmethod
     def _next_schedule_change_id(conn: sqlite3.Connection) -> int:
         row = conn.execute("SELECT value FROM metadata WHERE key='schedule_max_change_id'").fetchone()
