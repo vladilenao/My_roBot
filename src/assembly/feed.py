@@ -94,7 +94,7 @@ class FeedMarketServices:
         self.timeline = timeline or MultiTimeframeScheduler(
             timeframes=_timeframes(), sleep_secs=SLEEP_SECONDS, catch_up_bars=CATCH_UP_BARS)
         self.market_calendar = market_calendar or MarketCalendar(
-            market_store, StoredScheduleSource(), schedule_max_age_secs=settings.schedule_max_age_secs)
+            market_store, StoredScheduleSource(market_store), schedule_max_age_secs=settings.schedule_max_age_secs)
         reconciler = MarketDataReconciler(
             market_store, source=SOURCE_TBANK, market_calendar=self.market_calendar,
             calendar_evidence=settings.calendar_evidence,
