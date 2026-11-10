@@ -72,6 +72,7 @@ class TradeView:
     cancel_command: str | None = None
     cancel_reason: str = ""
     entry_commands: dict[str, int] = field(default_factory=dict)   # команда входа → её лоты
+    restored: bool = False              # позиция взята из журнала при подъёме, а не из исполнения этого процесса
     opened_at: datetime | None = None   # первое исполнение входа: стоп не проверяется по минутам раньше него
 
     def __post_init__(self) -> None:
@@ -229,6 +230,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
             view = self._views.setdefault(plan.trade_id, TradeView(plan))
             if view.position or view.entry_quantity:
                 return
+            view.restored = state.quantity > 0
             view.position = state.quantity
             view.entry_quantity = getattr(recovered, "entry_quantity", None) or state.quantity
             view.average = state.average_price

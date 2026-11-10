@@ -337,6 +337,26 @@ def test_trade_without_stop_gets_one_after_restart(tmp_path):
     assert h2.stops.rows(trade_id="trade-ng-1")[-1].reason == "restart"
 
 
+def test_entry_waiting_through_restore_keeps_entry_reason(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.register_trade(_plan())
+    action = OpenTrade("trade-ng-1:entry", "trade-ng-1", 0, "signal", 2, EntryOrderType.LIMIT, D("2.8457"))
+    h.broker.submit(action, h.clock())
+    _resume(h, lots=0)                                             # restore застал лимит входа, рестарта не было
+    h.broker.ingest(h.api.fill(order_key(action.command_id), 2, "2.846"))
+    h.drain()
+    h.service()
+    assert h.stops.rows(trade_id="trade-ng-1")[-1].reason == "entry"
+
+
+def test_restore_between_fill_and_stop_keeps_entry_reason(tmp_path):
+    h = Harness(tmp_path)
+    h.filled()
+    _resume(h)                                                     # restore прошёл до первой постановки стопа
+    h.service()
+    assert h.stops.rows(trade_id="trade-ng-1")[-1].reason == "entry"
+
+
 def test_process_exit_leaves_stop_and_close_all_removes(tmp_path):
     h = Harness(tmp_path)
     h.filled(targets=False)

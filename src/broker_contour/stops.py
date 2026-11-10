@@ -377,7 +377,7 @@ class StopKeeping:
 
     def _stop_reason(self, view, previous: StopRow | None, want: WantedStop) -> str:
         if previous is None:
-            return "restart" if view.plan.trade_id in self._resumed else "entry"
+            return "restart" if view.restored else "entry"
         if previous.stop_price != want.price:
             return "move"
         if want.lots > previous.lots:
