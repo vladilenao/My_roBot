@@ -54,7 +54,7 @@ from src.trade_management.profiles.base import ManagementContext, PlanningContex
 from src.trade_management.notification import lifecycle_snapshot
 from src.trade_management import session_guard
 from src.trade_management.intraday_settings import IntradaySettings
-from src.events.visual import market_snapshot, utc
+from src.events.visual import market_snapshot, utc, with_forming_candle
 from src.scheduler.timing import CandleScheduler
 
 
@@ -310,6 +310,7 @@ class TradeManager:
         self._execution_observer = execution_observer
         self._visual_instruments = {}
         self._visual_markets = {}
+        self._minute_source = None   # (инструмент, с, по) → закрытые минутки для незакрытой свечи графика
         self._last_budget_alert = None
         self._profiles_config = dict(profiles_config or {})
         self._risk_limits = risk_limits or _DEFAULT_RISK_LIMITS
@@ -1156,6 +1157,25 @@ class TradeManager:
         """Runtime metadata, independent of the notification channel."""
         self._visual_instruments.update({instrument_key(i): i for i in instruments})
 
+    def configure_minute_source(self, source) -> None:
+        """Минутки из уже имеющихся данных для незакрытой свечи графика исполнения (fix-trade-close-accuracy)."""
+        self._minute_source = source
+
+    def _with_forming_candle(self, instrument, timeframe, market, as_of):
+        """Свеча, в которую попало исполнение после закрытия последней свечи окна; сбой — окно как есть."""
+        source, meta = self._minute_source, self._visual_instruments.get(instrument)
+        if source is None or meta is None or not market.get("candles"):
+            return market
+        last = utc(market["candles"][-1]["time"])
+        since = CandleScheduler(timeframe).bar_close(last)
+        if since >= utc(as_of):
+            return market
+        try:
+            return with_forming_candle(market, timeframe, source(meta, since, utc(as_of)), as_of)
+        except Exception as exc:  # noqa: BLE001 — график не должен мешать уведомлению
+            log.warning("График: незакрытая свеча не собрана (%s)", type(exc).__name__)
+            return market
+
     def remember_market(self, instrument, timeframe, frame, as_of, breaks=None):
         self._visual_instruments[instrument_key(instrument)] = instrument
         self._visual_markets[instrument_key(instrument), timeframe] = market_snapshot(frame, timeframe, as_of, breaks)
@@ -1199,6 +1219,7 @@ class TradeManager:
                     grid = CandleScheduler(timeframe)
                     market = dict(market, candles=tuple(c for c in market["candles"]
                                                        if utc(grid.bar_close(utc(c["time"]))) <= utc(event.timestamp)))
+                    market = self._with_forming_candle(instrument, timeframe, market, event.timestamp)
                 contract_for = getattr(self._broker, "contract_for", None)
                 meta = contract_for(instrument) if callable(contract_for) else None
                 details["visual"] = lifecycle_snapshot(connection, event,

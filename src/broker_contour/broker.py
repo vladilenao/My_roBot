@@ -47,6 +47,14 @@ MARGIN_EVERY = timedelta(days=1)
 MINUTE = timedelta(minutes=1)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 BY_ORDER = "tinvest-order:"    # исполнение без сделок биржи: tinvest-order:<номер заявки>:<итог lots_executed>
+_CENT = Decimal("0.01")
+
+
+def fee_share(total: Decimal | None, lots: int, of: int) -> Decimal | None:
+    """Доля комиссии заявки на ``lots`` из ``of`` исполненных лотов, до копейки; неизвестна — ``None``."""
+    if total is None or total <= 0 or lots <= 0 or of <= 0:
+        return None
+    return (total * lots / of).quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
@@ -573,8 +581,11 @@ class TInvestBroker(StopKeeping, BrokerPort):
                 if price <= 0:
                     price = average
             self.note_fill(row.instrument_uid)
+            # Комиссия заглушки — её доля в executed_commission заявки (fix-trade-close-accuracy):
+            # по операциям её не сопоставить, номера сделки биржи у заглушки нет.
+            fee = fee_share(report.executed_fee, rest, report.lots_executed)
             self._ledger.add_execution(LedgerExecution(
-                f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now))
+                f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now, fee=fee))
             self._apply_report(self._ledger.get(row.key), replace(report, trades=()), now)
 
     # --- обслуживание: выходы, цели, итоги ------------------------------------
@@ -863,8 +874,9 @@ class TInvestBroker(StopKeeping, BrokerPort):
             return None
         plan = view.plan
         # order_id — заявка журнала сделок: у неё id команды (у целей и стопа — синтезированной reducer'ом).
+        # fee=None — оценка менеджера по настройке; известная брокеру комиссия идёт как есть.
         common = dict(execution_id=execution.execution_id, trade_id=row.trade_id, filled_quantity=execution.lots,
-                      price=execution.price, fee=None, timestamp=execution.at, fee_source=FeeSource.BROKER)
+                      price=execution.price, fee=execution.fee, timestamp=execution.at, fee_source=FeeSource.BROKER)
         if row.kind in ENTRY_KINDS:
             done = self._done_through(row.trade_id, ENTRY_KINDS, lambda other: other.command_id == row.command_id,
                                       execution)

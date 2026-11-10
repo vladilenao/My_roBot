@@ -16,7 +16,7 @@ import threading
 import uuid
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 # Постоянное пространство имён ключей: тот же ``command_id`` даёт тот же ключ и после рестарта.
@@ -86,6 +86,7 @@ class LedgerExecution:
     price: Decimal                  # пункты
     at: datetime
     consumed: int = 0
+    fee: Decimal | None = None      # комиссия брокера, известная при исполнении (заглушка по ``executed_commission``)
 
 
 _COLUMNS = tuple(field.name for field in fields(LedgerOrder))
@@ -135,9 +136,13 @@ class OrderLedger:
                     price TEXT NOT NULL,
                     at TEXT NOT NULL,
                     consumed INTEGER NOT NULL DEFAULT 0,
-                    seq INTEGER NOT NULL
+                    seq INTEGER NOT NULL,
+                    fee TEXT
                 );
             """)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(broker_executions)")}
+            if "fee" not in columns:   # база до fix-trade-close-accuracy
+                self._conn.execute("ALTER TABLE broker_executions ADD COLUMN fee TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -216,9 +221,9 @@ class OrderLedger:
                 return False
             seq = self._conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM broker_executions").fetchone()[0]
             self._conn.execute(
-                "INSERT INTO broker_executions(execution_id,key,lots,price,at,consumed,seq) VALUES(?,?,?,?,?,0,?)",
+                "INSERT INTO broker_executions(execution_id,key,lots,price,at,consumed,seq,fee) VALUES(?,?,?,?,?,0,?,?)",
                 (execution.execution_id, execution.key, execution.lots, _text(execution.price),
-                 execution.at.isoformat(), seq))
+                 execution.at.isoformat(), seq, None if execution.fee is None else _text(execution.fee)))
         return True
 
     def executions(self, key: str) -> list[LedgerExecution]:
@@ -255,8 +260,15 @@ class OrderLedger:
         """Непроведённое исполнение перекрыто другим: ``lots`` > 0 — урезать до них, иначе убрать из объёма."""
         with self._lock, self._conn:
             if lots > 0:
-                self._conn.execute("UPDATE broker_executions SET lots=? WHERE execution_id=? AND consumed=0",
-                                   (lots, execution_id))
+                row = self._conn.execute("SELECT lots,fee FROM broker_executions WHERE execution_id=? AND consumed=0",
+                                         (execution_id,)).fetchone()
+                fee = None
+                if row is not None and row["fee"] is not None and row["lots"] > 0:
+                    # Комиссия заглушки урезается вместе с лотами.
+                    fee = _text((Decimal(row["fee"]) * lots / row["lots"]).quantize(Decimal("0.01"),
+                                                                                    rounding=ROUND_HALF_UP))
+                self._conn.execute("UPDATE broker_executions SET lots=?,fee=? WHERE execution_id=? AND consumed=0",
+                                   (lots, fee, execution_id))
             else:
                 self._conn.execute("UPDATE broker_executions SET consumed=? WHERE execution_id=? AND consumed=0",
                                    (SUPERSEDED, execution_id))
@@ -264,7 +276,8 @@ class OrderLedger:
     @staticmethod
     def _execution(row) -> LedgerExecution:
         return LedgerExecution(row["execution_id"], row["key"], row["lots"], Decimal(row["price"]),
-                               datetime.fromisoformat(row["at"]), row["consumed"])
+                               datetime.fromisoformat(row["at"]), row["consumed"],
+                               None if row["fee"] is None else Decimal(row["fee"]))
 
     # --- сводка -----------------------------------------------------------
     def in_flight_count(self) -> int:
