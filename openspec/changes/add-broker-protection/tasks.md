@@ -4,7 +4,8 @@
 - [x] 1.2 Фейковый шлюз (`tests/unit/broker_contour/fake_api.py`) дополнен стоп-заявками: `PostStopOrder` (ключ, дубликат), `GetStopOrders` по статусу и периоду, `CancelStopOrder` (в т.ч. исполненной), срабатывание с порождённой рыночной заявкой в стриме без `order_request_id`, `GetOrderState` по номеру биржи.
 - [x] 1.3 Юнит-тесты `probe-stops` на фейковой песочнице: всё работает; стоп не сработал за ожидание — П22, П23 `не проверено`; торги закрыты — ни одной заявки.
   Сделано 08.11: `tests/unit/sandbox/test_sandbox_probe_stops.py`, 10 тестов; фейковая песочница С1 (`tests/unit/sandbox/fakes.py`) дополнена ключом стоп-заявки, `exchange_order_id`, ценой в рублях, снятием исполненной.
-- [ ] 1.4 Прогон `python -m src.sandbox probe-stops` в торговое время — владелец. Ответы П19–П24 записаны в design.md (Open Questions) и в фикстуры.
+- [x] 1.4 Прогон `python -m src.sandbox probe-stops` в торговое время — владелец. Ответы П19–П24 записаны в design.md (Open Questions) и в фикстуры.
+  Сделано 10.11 (с OK владельца, в окне `no_entries` контура): `data/sandbox/probe-stops-20261110-063338`, ответы — в design.md, Open Questions. Фикстура повтора ключа `repeat_stop_key="new"` уже есть (`test_repeated_key_creates_second_stop`). П20 `нет` — открытый вопрос: решение 6, шаг 2 может оставить две стоп-заявки.
 
 ## 2. Настройки и API брокера
 
