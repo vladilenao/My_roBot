@@ -11,4 +11,5 @@
 
 ## 3. Проверка владельцем
 
-- [ ] 3.1 Тестовый робот: после перезапуска эмуляции ядро держит для RIZ6, SRZ6, GDZ6, SVZ6 таймфреймы их привязок, `GET /api/v1/emulation` (после вливания в `feature/contour-trades-api`) показывает их `bindings`. **Владелец проверяет после вливания в feature/contour-trades-api и перезапуска тестового робота.**
+- [x] 3.1 Тестовый робот: после перезапуска эмуляции ядро держит для RIZ6, SRZ6, GDZ6, SVZ6 таймфреймы их привязок, `GET /api/v1/emulation` (после вливания в `feature/contour-trades-api`) показывает их `bindings`. **Владелец проверяет после вливания в feature/contour-trades-api и перезапуска тестового робота.**
+  Проверено 11.11 на тестовом роботе (ветка feature/broker-protection, в неё влито): `GET /api/v1/emulation` — у RTS-12.26, SBRF-12.26, GOLD-12.26, SILV-12.26 по 3 привязки (flat 15m, macd 15m, ma 1h); в `contour_demand` эмуляции для RIZ6, SRZ6, GDZ6, SVZ6 — 15m, 1h и старшие 1d, 1w, плюс 1m.
