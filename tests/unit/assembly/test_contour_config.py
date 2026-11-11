@@ -128,3 +128,33 @@ def test_sandbox_guard_settings(tmp_path):
                 "max_rejects_in_row = 21", 'max_rejects_in_row = "3"', 'max_daily_loss_pct = "3"'):
         with pytest.raises(ConfigError, match="max_"):
             _load(tmp_path, f"[contours.sandbox]\n{bad}\n")
+
+
+# --- контур «Счёт» (add-account-contour) ---------------------------------------------
+
+def test_account_section_defaults():
+    from src import config
+
+    assert config._DEFAULTS["contours_account_telegram_bot_env"] == "TELEGRAM_ACCOUNT_BOT_TOKEN"
+    assert config._DEFAULTS["contours_account_telegram_channel_env"] == "TELEGRAM_ACCOUNT_CHANNEL_ID"
+    assert config._DEFAULTS["contours_account_reconcile_every_min"] == 1
+    assert config._DEFAULTS["contours_account_orders"] is False
+
+
+def test_account_section_values(tmp_path):
+    config = _load(tmp_path, '[contours.account]\ntelegram_channel_env = "ACCOUNT_CHANNEL"\nreconcile_every_min = 3\n'
+                             'orders = false\n')
+    assert config["contours_account_telegram_channel_env"] == "ACCOUNT_CHANNEL"
+    assert config["contours_account_reconcile_every_min"] == 3 and config["contours_account_orders"] is False
+
+
+@pytest.mark.parametrize("text, match", [
+    ("orders = true", "Р2"),
+    ('account_id = "2000123456"', "незнакомые ключи"),
+    ('bindings = ["future-ng-macd"]', "командами API с Р2"),
+    ("reconcile_every_min = 0", "от 1 до 60"),
+    ('telegram_bot_env = "bad name"', "имя переменной окружения"),
+])
+def test_account_section_rejected(tmp_path, text, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"[contours.account]\n{text}\n")

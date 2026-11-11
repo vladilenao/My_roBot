@@ -1,7 +1,9 @@
-"""Шлюз к песочнице Т-Инвест: единственная точка входа команды в SDK брокера.
+"""Шлюзы к Т-Инвест: единственная точка входа контура и команды в SDK брокера.
 
-Шлюз открывает ``SandboxClient`` только на адресе песочницы с токеном
-песочницы, ставит срок каждому запросу и пишет каждый вызов в записи разведки.
+``SandboxGateway`` открывает ``SandboxClient`` только на адресе песочницы с
+токеном песочницы, ``AccountGateway`` (add-account-contour) — обычный ``Client``
+на адресе брокера с токеном счёта и не пускает вызовы песочницы. Оба ставят
+срок каждому запросу и пишут каждый вызов в записи.
 Ошибку брокера он превращает в ``BrokerCallError`` с кодом gRPC и описанием
 брокера, не пропуская наружу объект исключения SDK целиком.
 """
@@ -14,7 +16,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import grpc
-from t_tech.invest.constants import INVEST_GRPC_API_SANDBOX
+from t_tech.invest import Client
+from t_tech.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
 from t_tech.invest.exceptions import RequestError
 from t_tech.invest.sandbox.client import SandboxClient
 
@@ -26,6 +29,8 @@ from src.sandbox.records import CallRecorder
 log = get_logger(__name__)
 
 SANDBOX_TARGET = INVEST_GRPC_API_SANDBOX
+ACCOUNT_TARGET = INVEST_GRPC_API
+SANDBOX_ONLY = "SANDBOX_ONLY"
 DEADLINE_SECS = 30
 # Песочница отвечает RESOURCE_EXHAUSTED и на частые заявки подряд, не только по
 # минутному лимиту (разведка 29.10: третья заявка за 200 мс). Повтор с тем же
@@ -75,23 +80,32 @@ def _default_client(token: str):
     return SandboxClient(token, interceptors=[RpcDeadline(DEADLINE_SECS)])
 
 
-class SandboxGateway:
-    """Сервисы ``SandboxClient`` за вызовом ``call("orders.post_order", ...)``."""
+def _account_client(token: str):
+    disable_broker_telemetry()
+    return Client(token, target=ACCOUNT_TARGET, interceptors=[RpcDeadline(DEADLINE_SECS)])
+
+
+class BrokerGateway:
+    """Сервисы клиента Т-Инвест за вызовом ``call("orders.post_order", ...)``; вид задаёт подкласс."""
+
+    LABEL = "Брокер"
+    TOKEN_ENV = "токен брокера"
+    _default_factory = staticmethod(_default_client)
 
     def __init__(self, token: str, *, client_factory: Callable[[str], Any] | None = None,
                  recorder: CallRecorder | None = None, monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
         if not token:
-            raise ValueError("Не задан TINKOFF_SANDBOX_TOKEN")
+            raise ValueError(f"Не задан {self.TOKEN_ENV}")
         self._token = token
-        self._client_factory = client_factory or _default_client
+        self._client_factory = client_factory or self._default_factory
         self._client = None
         self._services = None
         self.recorder = recorder
         self._monotonic = monotonic
         self._sleep = sleep
 
-    def __enter__(self) -> "SandboxGateway":
+    def __enter__(self) -> "BrokerGateway":
         self._client = self._client_factory(self._token)
         self._services = self._client.__enter__()
         return self
@@ -113,8 +127,12 @@ class SandboxGateway:
             target = getattr(target, name)
         return target
 
+    def _check(self, method: str) -> None:
+        """Вызов, недопустимый для вида шлюза, отклоняется до сети."""
+
     def call(self, method: str, *args, **kwargs):
         """Вызов сервиса; ``RESOURCE_EXHAUSTED`` повторяется до ``RATE_LIMIT_RETRIES`` раз."""
+        self._check(method)
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             started = self._monotonic()
             try:
@@ -124,19 +142,20 @@ class SandboxGateway:
                 self._record(method, args, kwargs, started, error=error)
                 if error.code == "RESOURCE_EXHAUSTED" and attempt < RATE_LIMIT_RETRIES:
                     delay = _rate_limit_wait(exc, attempt)
-                    log.warning("Песочница: %s — лимит запросов, повтор %d из %d через %g с",
+                    log.warning("%s: %s — лимит запросов, повтор %d из %d через %g с", self.LABEL,
                                 method, attempt + 1, RATE_LIMIT_RETRIES, delay)
                     self._sleep(delay)
                     continue
-                log.warning("Песочница: %s — %s", method, error)
+                log.warning("%s: %s — %s", self.LABEL, method, error)
                 raise error from None
             self._record(method, args, kwargs, started, response=response)
-            log.debug("Песочница: %s выполнен", method)
+            log.debug("%s: %s выполнен", self.LABEL, method)
             return response
         raise AssertionError("недостижимо")
 
     def stream(self, method: str, **kwargs) -> Iterator[Any]:
         """Сообщения стрима; каждое пишется в записи, сбой — ``BrokerCallError``."""
+        self._check(method)
         started = self._monotonic()
         try:
             for message in self._method(method)(**kwargs):
@@ -161,3 +180,28 @@ class SandboxGateway:
         else:
             entry["response"] = response
         self.recorder.write(entry)
+
+
+class SandboxGateway(BrokerGateway):
+    """Песочница Т-Инвест: ``SandboxClient`` на адресе песочницы, токен ``TINKOFF_SANDBOX_TOKEN``."""
+
+    LABEL = "Песочница"
+    TOKEN_ENV = "TINKOFF_SANDBOX_TOKEN"
+    _default_factory = staticmethod(_default_client)
+
+
+class AccountGateway(BrokerGateway):
+    """Брокерский счёт робота (add-account-contour): ``Client`` на адресе брокера, токен ``TINKOFF_TRADE_TOKEN``.
+
+    Сервис песочницы (``sandbox.*``) недоступен: вызов отклоняется до сети кодом ``SANDBOX_ONLY``.
+    """
+
+    LABEL = "Счёт"
+    TOKEN_ENV = "TINKOFF_TRADE_TOKEN"
+    _default_factory = staticmethod(_account_client)
+
+    def _check(self, method: str) -> None:
+        if method.split(".", 1)[0] == "sandbox":
+            error = BrokerCallError(method, SANDBOX_ONLY, "вызов песочницы недоступен на счёте")
+            self._record(method, (), {}, self._monotonic(), error=error)
+            raise error

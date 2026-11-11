@@ -48,6 +48,8 @@ class FakeBroker:
     margin_works: bool = True
     fail_operations: bool = False
     fee_operation: str = "linked"  # linked | unlinked | none — «комиссия брокера» к операции сделки
+    qualified: list = field(default_factory=lambda: ["derivative", "bond"])  # GetInfo «Счёта» (add-account-contour)
+    tariff_fails: bool = False
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
@@ -146,7 +148,12 @@ class _Api:
         self.b.rub += money_to_decimal(amount)
         return s.SandboxPayInResponse(balance=money(self.b.rub))
 
+    def users__get_info(self):
+        return s.GetInfoResponse(qualified_for_work_with=list(self.b.qualified), tariff="trader")
+
     def users__get_user_tariff(self):
+        if self.b.tariff_fails:
+            raise RequestError(StatusCode.UNAVAILABLE, "", SimpleNamespace(message=""))
         return s.GetUserTariffResponse(
             unary_limits=[s.UnaryLimit(limit_per_minute=100, methods=[
                 "tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"])],

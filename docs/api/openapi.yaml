@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.10.0
+  version: 2.11.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -94,6 +94,8 @@ tags:
     description: Прогоны истории — очередь, выполнение до конца, отчёт.
   - name: Песочница
     description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
+  - name: Счёт
+    description: Контур на брокерском счёте робота (2.11.0, add-account-contour) — до Р2 только чтение счёта и сверка.
   - name: Свечи
     description: Свечи рядов рыночной базы ядра для графиков UI — только чтение.
   - name: Индикаторы
@@ -1149,6 +1151,252 @@ paths:
         '503': {$ref: '#/components/responses/JournalUnavailable'}
 
   # ---------------------------------------------------------------- история
+  /api/v1/account:
+    get:
+      tags: [Счёт]
+      summary: Контур «Счёт»
+      description: |
+        Контур на брокерском счёте робота: общее, целевое и текущее состояние с
+        фактами допуска, запуск, процесс, состав и доступные действия. До Р2
+        контур только читает счёт и сверяет его с журналом. `ETag` — ревизия
+        целевого состояния.
+      operationId: getAccount
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур «Счёт».
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/target:
+    get:
+      tags: [Счёт]
+      summary: Целевое состояние «Счёта»
+      operationId: getAccountTarget
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Целевое состояние; `null` — контур ни разу не запускали.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradingTarget'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    put:
+      tags: [Счёт]
+      summary: Запустить или остановить «Счёт»
+      description: |
+        **Запустить** `{"mode": "on"}`; поле `bindings` — `400`, состав задаётся с Р2.
+
+        **Остановить** `{"mode": "no_entries"}` или `{"mode": "close_all", "confirm": true}`.
+        Без `confirm` у `close_all` — `409 CONFIRM_REQUIRED`. До Р2 оба режима
+        завершают процесс и позиции, заявки, стоп-заявки на счёте не трогают.
+      operationId: putAccountTarget
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountTargetRequest'}
+            examples:
+              start:
+                summary: Запустить на чтение
+                value: {mode: 'on'}
+              stop:
+                summary: Остановить
+                value: {mode: no_entries}
+      responses:
+        '202':
+          description: Целевое состояние записано новой ревизией; следить — `GET /api/v1/account`.
+          headers:
+            Location: {$ref: '#/components/headers/AccountLocation'}
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '200':
+          description: Повтор той же остановки; ревизия прежняя.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`CONFIRM_REQUIRED`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+
+  /api/v1/account/bindings:
+    get:
+      tags: [Счёт]
+      summary: Состав «Счёта» и все привязки конфигурации
+      description: До Р2 состав пуст; у привязок отметки, где каждая торгует (`emulation`, `sandbox`, `account`).
+      operationId: getAccountBindings
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состав и привязки.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Счёт]
+      summary: Добавить привязки (с Р2)
+      operationId: addAccountBindings
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsAddRequest'}
+      responses:
+        '409':
+          description: '`ACCOUNT_READ_ONLY` — состав «Счёта» меняется командами с Р2.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/bindings/remove:
+    post:
+      tags: [Счёт]
+      summary: Убрать привязки (с Р2)
+      operationId: removeAccountBindings
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BindingsRemoveRequest'}
+      responses:
+        '409':
+          description: '`ACCOUNT_READ_ONLY` — состав «Счёта» меняется командами с Р2.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/reconcile:
+    get:
+      tags: [Счёт]
+      summary: Последний отчёт сверщика «Счёта» и разведка комиссий
+      operationId: getAccountReconcile
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Отчёт; `null` — сверок ещё не было.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountReconcileReport'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/log:
+    get:
+      tags: [Счёт]
+      summary: Хвост лога «Счёта»
+      operationId: getAccountLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/positions:
+    get:
+      tags: [Счёт]
+      summary: Открытые позиции журнала «Счёта» (до Р2 пусто)
+      operationId: getAccountPositions
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradeInstrument'
+      responses:
+        '200': {$ref: '#/components/responses/Positions'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/account/trades:
+    get:
+      tags: [Счёт]
+      summary: Закрытые сделки за окно
+      description: |
+        Сделки в фазе `CLOSED` с исполненным входом, по `closed_at`, новые
+        сверху. Последние `limit` сделок окна `[from, to)`; `_links.earlier` —
+        предыдущая страница. Сделки с тем же `closed_at`, что у последней
+        отданной, идут в той же странице целиком. `ETag` — номер последнего
+        события журнала; `If-None-Match` с ним же → `304`.
+      operationId: getAccountTrades
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+        - $ref: '#/components/parameters/TradesLimit'
+        - $ref: '#/components/parameters/TradeInstrument'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200': {$ref: '#/components/responses/Trades'}
+        '304': {$ref: '#/components/responses/NotModified'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/account/performance:
+    get:
+      tags: [Счёт]
+      summary: Итоги периода и кривая результата
+      description: |
+        Итоги закрытых в периоде сделок, открытые позиции и кривая
+        накопленного нетто-результата. Без параметров — `day`: торговый день
+        с последних 19:00 МСК. `period` или пара `from`/`to`, не вместе.
+      operationId: getAccountPerformance
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+      responses:
+        '200': {$ref: '#/components/responses/Performance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
   /api/v1/history:
     get:
       tags: [История]
@@ -2022,6 +2270,9 @@ components:
     EmulationLocation:
       description: Адрес контура эмуляции.
       schema: {type: string, example: /api/v1/emulation}
+    AccountLocation:
+      description: Адрес контура «Счёт».
+      schema: {type: string, example: /api/v1/account}
     SandboxLocation:
       description: Адрес контура «Песочница».
       schema: {type: string, example: /api/v1/sandbox}
@@ -2563,7 +2814,7 @@ components:
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
                  CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
                  HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE,
-                 GUARD_NOT_RESETTABLE]
+                 GUARD_NOT_RESETTABLE, CONFIRM_REQUIRED, ACCOUNT_READ_ONLY]
         rejections:
           type: array
           description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
@@ -2637,10 +2888,19 @@ components:
             bindings: {type: integer, minimum: 0}
             frozen: {type: integer, minimum: 0}
             reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
+        account:
+          type: object
+          nullable: true
+          description: 'Контур «Счёт» (2.11.0); null — у ключа нет права на контуры.'
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            bindings: {type: integer, minimum: 0}
+            frozen: {type: integer, minimum: 0}
+            reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
         live:
           type: object
           nullable: true
-          description: Пока всегда null — контур «Счёт» не реализован.
+          description: Пока всегда null — зарезервировано.
         _links: {$ref: '#/components/schemas/Links'}
 
     # ------------------------------------------------------------------ свечи
@@ -3265,6 +3525,202 @@ components:
           type: array
           items: {type: string}
         skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
+        in_flight:
+          type: array
+          items: {type: string}
+          description: Инструменты с заявкой «в пути» или непроведённым исполнением — в этой сверке не сравнивались.
+
+    # ------------------------------------------------------------- счёт (2.11.0)
+    Account:
+      type: object
+      additionalProperties: false
+      required: [state, target, current, launch, process, bindings, _links, _actions]
+      description: |
+        Контур «Счёт» на брокерском счёте робота (add-account-contour). Те же части,
+        что у песочницы; до Р2 контур только читает счёт, состав пуст.
+      properties:
+        state: {$ref: '#/components/schemas/TradingState'}
+        target:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingTarget'}]
+          nullable: true
+        current:
+          type: object
+          allOf: [{$ref: '#/components/schemas/AccountCurrent'}]
+          nullable: true
+        launch:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingLaunch'}]
+          nullable: true
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        bindings:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    AccountCurrent:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link, account_at, execution_holds, guards, admission]
+      description: 'Текущее состояние из `status.json` контура «Счёт» — поля песочницы и `admission`. До Р2 `orders_enabled = false`, `trades`, `orders_in_flight`, `guards` пусты.'
+      properties:
+        state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        account: {type: string, nullable: true, description: 'Последние четыре символа номера счёта, например `…09c3`.'}
+        capital:
+          type: object
+          nullable: true
+          additionalProperties: false
+          properties:
+            rub: {type: string, description: 'Рубли на счёте из GetPositions, десятичная строка.'}
+            liquid_portfolio: {type: string, nullable: true, description: Из GetMarginAttributes; показывается рядом.}
+        positions:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, lots]
+            properties:
+              name: {type: string, description: Короткое имя контракта или тикер акции.}
+              lots: {type: integer}
+        orders: {type: integer, minimum: 0}
+        stop_orders: {type: integer, minimum: 0}
+        frozen:
+          type: array
+          items: {type: string}
+          description: Замороженные сверщиком инструменты коротким именем.
+        last_reconcile_at: {type: string, format: date-time, nullable: true}
+        account_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        core_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
+        orders_enabled: {type: boolean, description: 'Режим заявок: `true` — контур торгует привязками, `false` — только читает счёт.'}
+        trades: {type: integer, minimum: 0, description: Открытые сделки журнала контура.}
+        orders_in_flight: {type: integer, minimum: 0, description: Незавершённые заявки журнала заявок брокера.}
+        stream_link: {type: string, nullable: true, enum: [ok, lost, null], description: Стрим исполнений OrderStateStream.}
+        account_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Момент снимка счёта, на который верны `capital`, `positions`, `orders` и `stop_orders`
+            (2.6.0, fix-sandbox-restart-safety). Снимок берётся при старте, на каждой сверке
+            и перед остановкой процесса. У процесса, убитого без остановки, — момент последнего
+            снимка; `account_link: lost` у остановленного — снимок при остановке не прочитан.
+        execution_holds:
+          type: array
+          description: |
+            Инструменты со сделками, у которых исполнение 1m стоит дольше 5 минут: барьер покрытия
+            держит полученные минутки, и стоп по инструменту не проверяется (2.6.0,
+            fix-sandbox-restart-safety). Пусто — исполнение идёт.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, since, minutes, executed, received]
+            properties:
+              name: {type: string, description: Короткое имя контракта.}
+              since: {type: string, format: date-time, description: С какого момента процесс видит удержание.}
+              minutes: {type: integer, minimum: 0}
+              executed: {type: string, format: date-time, nullable: true, description: Последняя исполненная минута.}
+              received: {type: string, format: date-time, nullable: true, description: Последняя полученная минута.}
+        guards:
+          type: array
+          description: |
+            Сработавшие предохранители (2.9.0, add-account-guards); пусто — всё чисто. Пока предохранитель
+            действует, новые входы и доборы запрещены, выходы, стоп и цели у брокера работают.
+          items: {$ref: '#/components/schemas/SandboxGuard'}
+        admission: {$ref: '#/components/schemas/AccountAdmission'}
+    AccountAdmission:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [access_level, qualified_for_work_with, derivatives, tariff, limits, warnings]
+      description: Факты допуска «Счёта» к старту.
+      properties:
+        access_level: {type: string, enum: [full_access, read_only], description: Права токена на счёт.}
+        qualified_for_work_with:
+          type: array
+          items: {type: string}
+          description: Список допусков пользователя из GetInfo целиком.
+        derivatives: {type: boolean, description: Есть ли допуск к срочным контрактам.}
+        tariff: {type: string, nullable: true, description: Имя тарифа из GetInfo.}
+        limits:
+          type: object
+          nullable: true
+          additionalProperties: {type: integer}
+          description: Лимиты запросов в минуту из GetUserTariff по сервисам заявок, стоп-заявок и операций.
+        warnings:
+          type: array
+          items: {type: string}
+          description: Предупреждения, не мешающие старту на чтение (например, нет допуска к срочным контрактам).
+    AccountStartRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: ['on']}
+    AccountStopRequest:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [no_entries, close_all]}
+        confirm: {type: boolean, description: 'Обязателен и равен `true` для `close_all`.'}
+    AccountTargetRequest:
+      oneOf:
+        - {$ref: '#/components/schemas/AccountStartRequest'}
+        - {$ref: '#/components/schemas/AccountStopRequest'}
+    AccountReconcileReport:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [at, account, result, items, frozen, skipped_in_row, fee_probes]
+      properties:
+        at: {type: string, format: date-time}
+        account: {type: string, description: Последние четыре символа номера счёта.}
+        result: {type: string, enum: [ok, mismatch, skipped]}
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [instrument, what, account, journal]
+            properties:
+              instrument: {type: string, description: Короткое имя.}
+              what: {type: string, enum: [position, order, stop_order]}
+              account: {type: integer, description: 'Лоты позиции или число заявок на счёте.'}
+              journal: {type: integer, description: То же по журналу контура.}
+        frozen:
+          type: array
+          items: {type: string}
+        skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
+        in_flight:
+          type: array
+          items: {type: string}
+          description: Инструменты с заявкой «в пути» или непроведённым исполнением — в этой сверке не сравнивались.
+
+    # ------------------------------------------------------------- эмуляция
+        fee_probes:
+          type: array
+          maxItems: 10
+          description: Разведка комиссий на чужих сделках (П25–П26 на настоящем счёте), последние 10.
+          items: {$ref: '#/components/schemas/FeeProbe'}
+    FeeProbe:
+      type: object
+      additionalProperties: false
+      required: [at, instrument, operation, trades_info, broker_fee_linked, broker_fee, commission]
+      properties:
+        at: {type: string, format: date-time}
+        instrument: {type: string, description: Короткое имя.}
+        operation: {type: string, description: Номер операции сделки последними четырьмя символами.}
+        trades_info: {type: boolean, description: 'П25: в операции есть номера сделок биржи.'}
+        broker_fee_linked: {type: boolean, description: 'П26: «комиссия брокера» ссылается на операцию сделки.'}
+        broker_fee: {type: string, nullable: true, description: 'Сумма «комиссии брокера», десятичная строка.'}
+        commission: {type: string, nullable: true, description: Поле commission операции сделки.}
+        error: {type: string, nullable: true, description: Тип ошибки чтения операций.}
 
     # ------------------------------------------------------------- эмуляция
     Emulation:

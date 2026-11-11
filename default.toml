@@ -65,6 +65,12 @@ stop_place_secs = 30  # За сколько секунд стоп-заявка �
 max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — предохранитель выключен.
 max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/sandbox/guards/reset (1–20).
 
+[contours.account]
+telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Счёт».
+telegram_channel_env = "TELEGRAM_ACCOUNT_CHANNEL_ID"  # Имя переменной .env с id канала «Счёт».
+reconcile_every_min = 1  # Как часто сверять брокерский счёт робота с журналом контура, минут (1–60).
+orders = false  # До Р2 только чтение счёта; токен и номер счёта — TINKOFF_TRADE_TOKEN и TINKOFF_ACCOUNT_ID в .env.
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"

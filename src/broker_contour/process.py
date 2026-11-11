@@ -44,6 +44,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _first_start_note(admitted) -> str | None:
+    """Отпечаток записан сейчас, а счёт не пуст (add-account-contour): причина первой тревоги сверки."""
+    snapshot = admitted.snapshot
+    if not admitted.fingerprint_created or admitted.facts is None:
+        return None
+    names = sorted({name for name, _ in snapshot.holdings} | set(snapshot.orders) | set(snapshot.stop_orders))
+    return f"Счёт не пуст на первом старте: {', '.join(names)}" if names else None
+
+
+def _admission_card(facts: dict | None) -> dict:
+    """Права токена и предупреждения допуска «Счёта» для карточки старта."""
+    if facts is None:
+        return {}
+    return {"access_level": facts.get("access_level"), "warnings": list(facts.get("warnings") or ())}
+
+
 @dataclass(frozen=True)
 class BrokerContourSettings:
     contour_id: str
@@ -63,6 +79,8 @@ class BrokerContourSettings:
     exit_policy: object = None
     max_daily_loss_pct: float = 3.0       # предохранители (add-account-guards)
     max_rejects_in_row: int = 3
+    account_id: str | None = None         # номер счёта «Счёта» из окружения (add-account-contour); у песочницы нет
+    account_id_env: str | None = None
 
 
 class BrokerContour:
@@ -70,8 +88,14 @@ class BrokerContour:
 
     def __init__(self, settings: BrokerContourSettings, *, gateway_factory: Callable, bus, stop,
                  pid: int, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 trading_factory: Callable | None = None):
+                 trading_factory: Callable | None = None, find_account: Callable | None = None,
+                 read_facts: Callable | None = None, fee_probes_factory: Callable | None = None):
         self.settings = settings
+        # Вид контура задаёт сборка (add-account-contour): правило счёта, факты допуска, разведка комиссий.
+        self._find_account = find_account
+        self._read_facts = read_facts
+        self._fee_probes_factory = fee_probes_factory
+        self._fee_probes = None
         # ``trading_factory(trading, control, strategies)`` — торговая часть эмуляции (run.py);
         # нужна только при ``orders = true``.
         self._trading_factory = trading_factory
@@ -93,7 +117,7 @@ class BrokerContour:
                         "stop_orders": 0, "frozen": [], "last_reconcile_at": None, "account_link": None,
                         "core_link": "ok", "reason": None, "exited_at": None, "exit_reason": None,
                         "orders_enabled": settings.orders, "trades": 0, "orders_in_flight": 0,
-                        "stream_link": None, "account_at": None, "execution_holds": []}
+                        "stream_link": None, "account_at": None, "execution_holds": [], "admission": None}
         self._generation: int | None = None
 
     # --- status.json ------------------------------------------------------
@@ -116,14 +140,17 @@ class BrokerContour:
         settings = self.settings
         try:
             check_settings(token=settings.token, token_env=settings.token_env, bot_token=settings.bot_token,
-                           bot_env=settings.bot_env, channel_id=settings.channel_id, channel_env=settings.channel_env)
+                           bot_env=settings.bot_env, channel_id=settings.channel_id, channel_env=settings.channel_env,
+                           account_id=settings.account_id, account_id_env=settings.account_id_env)
         except AdmissionError as exc:
             return self._refuse(exc)
         store = BrokerStore(settings.directory / BROKER_DATABASE_FILE)
         try:
             with self._gateway_factory(settings.token) as gateway:
                 try:
-                    admitted = admit_account(gateway, store, broker=settings.broker)
+                    admitted = admit_account(gateway, store, broker=settings.broker,
+                                             **({"find_account": self._find_account} if self._find_account else {}),
+                                             read_facts=self._read_facts)
                 except AdmissionError as exc:
                     return self._refuse(exc)
                 if settings.orders:
@@ -148,10 +175,16 @@ class BrokerContour:
         self.notifier.account_tail = account.masked
         reconciler = Reconciler(store=store, notifier=self.notifier, account_tail=account.masked,
                                 every_secs=settings.reconcile_every_secs)
+        reconciler.note = _first_start_note(admitted)
+        if self._fee_probes_factory is not None:
+            self._fee_probes = self._fee_probes_factory(settings.directory / BROKER_DATABASE_FILE)
         desired = read_desired(settings.core_db, settings.contour_id)
         self._apply(desired)
         self._account(admitted.snapshot)
-        self.notifier.started(admitted.snapshot, bindings=len(self._status["members"]), generation=self._generation)
+        if admitted.facts is not None:
+            self._write(admission=admitted.facts)
+        self.notifier.started(admitted.snapshot, bindings=len(self._status["members"]), generation=self._generation,
+                              **_admission_card(admitted.facts))
         log.info("Контур %s запущен: счёт %s, поколение %s", settings.contour_id, account.masked, self._generation)
         self._reconcile(reconciler, gateway, account, admitted.snapshot)
         self._write(state=RUNNING, account=account.masked, account_link="ok")
@@ -218,6 +251,9 @@ class BrokerContour:
             self._account(snapshot)
         report = reconciler.run(now, snapshot, JournalView())
         self._write(frozen=report["frozen"], last_reconcile_at=report["at"])
+        if self._fee_probes is not None:
+            self._fee_probes.observe(now, snapshot)
+            self._fee_probes.run(gateway, account.account_id, now)
 
     # --- торговля привязками (add-tinvest-orders) -----------------------------
     def _serve_trading(self, gateway, store: BrokerStore, admitted) -> int:

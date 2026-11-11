@@ -2814,7 +2814,7 @@ components:
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
                  CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
                  HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE,
-                 GUARD_NOT_RESETTABLE]
+                 GUARD_NOT_RESETTABLE, CONFIRM_REQUIRED, ACCOUNT_READ_ONLY]
         rejections:
           type: array
           description: Только у `INSTRUMENTS_REJECTED` (инструменты) и `BINDINGS_REJECTED` (привязки песочницы).
@@ -2888,10 +2888,19 @@ components:
             bindings: {type: integer, minimum: 0}
             frozen: {type: integer, minimum: 0}
             reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
+        account:
+          type: object
+          nullable: true
+          description: 'Контур «Счёт» (2.11.0); null — у ключа нет права на контуры.'
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            bindings: {type: integer, minimum: 0}
+            frozen: {type: integer, minimum: 0}
+            reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
         live:
           type: object
           nullable: true
-          description: Пока всегда null — контур «Счёт» не реализован.
+          description: Пока всегда null — зарезервировано.
         _links: {$ref: '#/components/schemas/Links'}
 
     # ------------------------------------------------------------------ свечи
@@ -3516,6 +3525,10 @@ components:
           type: array
           items: {type: string}
         skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
+        in_flight:
+          type: array
+          items: {type: string}
+          description: Инструменты с заявкой «в пути» или непроведённым исполнением — в этой сверке не сравнивались.
 
     # ------------------------------------------------------------- счёт (2.11.0)
     Account:
@@ -3684,6 +3697,10 @@ components:
           type: array
           items: {type: string}
         skipped_in_row: {type: integer, minimum: 0, description: Сколько сверок подряд пропущено из-за недоступного счёта.}
+        in_flight:
+          type: array
+          items: {type: string}
+          description: Инструменты с заявкой «в пути» или непроведённым исполнением — в этой сверке не сравнивались.
 
     # ------------------------------------------------------------- эмуляция
         fee_probes:
@@ -3701,7 +3718,7 @@ components:
         operation: {type: string, description: Номер операции сделки последними четырьмя символами.}
         trades_info: {type: boolean, description: 'П25: в операции есть номера сделок биржи.'}
         broker_fee_linked: {type: boolean, description: 'П26: «комиссия брокера» ссылается на операцию сделки.'}
-        broker_fee: {type: string, nullable: true, description: Сумма «комиссии брокера», десятичная строка.}
+        broker_fee: {type: string, nullable: true, description: 'Сумма «комиссии брокера», десятичная строка.'}
         commission: {type: string, nullable: true, description: Поле commission операции сделки.}
         error: {type: string, nullable: true, description: Тип ошибки чтения операций.}
 

@@ -188,6 +188,8 @@ CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
 WHAT_LABELS = {"position": "позиция", "order": "заявки", "stop_order": "стоп-заявки"}
 # Предохранители контура на брокере (add-account-guards).
 GUARD_TITLES = {"daily_loss": "дневной убыток", "broker_rejects": "отказы брокера подряд"}
+# Права токена «Счёта» в карточке старта (add-account-contour).
+ACCESS_LABELS = {"read_only": "только чтение", "full_access": "полный доступ"}
 
 
 def _money(value) -> str:
@@ -215,6 +217,9 @@ def render_broker_account(event) -> str:
         lines.append(f"Привязок в составе: {event.get('bindings', 0)} · ревизия {event.get('generation', '—')}")
         if event.get("orders_enabled") is not None:
             lines.append("Режим: заявки к брокеру" if event.get("orders_enabled") else "Режим: только чтение счёта")
+        if event.get("access_level"):
+            lines.append("Токен: " + ACCESS_LABELS.get(event.get("access_level"), escape(str(event.get("access_level")))))
+        lines.extend("⚠ " + escape(str(item)) for item in event.get("warnings") or ())
     elif kind == "reconcile_alarm":
         lines = [f"<b>{title} · ТРЕВОГА · Сверка счёта</b>", f"Счёт {account}"]
         if event.get("reason"):
