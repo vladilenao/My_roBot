@@ -421,7 +421,8 @@ def test_actions_for_signal_rejects_duplicate_signal(tmp_path):
         assert admission.rejections[0].message == "дублирующий сигнал, сделка не взята в работу"
 
 
-def test_actions_for_signal_distinct_profiles_get_distinct_trade_ids(tmp_path):
+def test_actions_for_signal_distinct_profiles_second_is_instrument_busy(tmp_path):
+    """Связки одной стратегии с разными профилями — разные привязки: инструмент занимает первая."""
     assignment_a = SimpleNamespace(id="assignment-a", strategy="macd_rsi_stoch",
                                    management="levels_rr", filter_profile="basic_levels",
                                    priority=0, timeframe="15m")
@@ -447,15 +448,13 @@ def test_actions_for_signal_distinct_profiles_get_distinct_trade_ids(tmp_path):
             _context(price=100.0), timeframe="15m",
         )
         assert len(first) == 1
-        assert len(second) == 1
         assert first[0].trade_id == decision_a.event_id
-        assert second[0].trade_id == decision_b.event_id
-        assert first[0].trade_id != second[0].trade_id
+        assert len(second) == 0
+        assert [reason.code for reason in second.rejections] == ["instrument-busy"]
         rows = storage.connection.execute(
             "SELECT trade_id, phase FROM trades ORDER BY trade_id"
         ).fetchall()
-        assert {row[0] for row in rows} == {first[0].trade_id, second[0].trade_id}
-        assert {row[1] for row in rows} == {"ENTRY_PENDING"}
+        assert rows == [(first[0].trade_id, "ENTRY_PENDING")]
 
 
 def test_submit_plan_returns_false_for_existing_trade_id(tmp_path):

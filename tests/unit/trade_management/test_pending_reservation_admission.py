@@ -27,6 +27,8 @@ GO = 13540.45
 COMMITTED_MARGIN = Decimal("94783")
 META = ContractMeta(ticker="NGV6", price_step=1.0, step_cost=100.0, go_buy=GO, go_sell=GO)
 INSTRUMENT = SimpleNamespace(ticker="NGV6", short_name="NG")
+# Маржа занята входом другого инструмента: по NG вход другой привязки отклонил бы instrument-busy.
+OTHER_INSTRUMENT = "SIZ6"
 
 # Геометрия стопа закреплена: тест считает риск от своих же чисел.
 GEOMETRY = {"min_stop_atr": 0, "min_stop_ticks": 1, "stop_beyond_bar": 0, "max_stop_atr": None}
@@ -99,10 +101,11 @@ def _seed_pending_entry(
     risk_budget=Decimal("100000"),
     margin_budget=Decimal("100000"),
     quantity=7,
+    instrument_id="NGV6",
 ):
     """Оставить ACTIVE-резерв незаполненного входа, как после первого сигнала."""
     plan = TradePlan(
-        trade_id, assignment_id, "NGV6", "BUY", f"signal:{trade_id}",
+        trade_id, assignment_id, instrument_id, "BUY", f"signal:{trade_id}",
         Decimal("100"), Decimal("96"),
         (TargetPlan(f"tp:{trade_id}", Decimal("104"), Decimal("1")),),
         ProfileSnapshot("levels_rr", "1", {"buffer_ticks": 1}), NOW,
@@ -110,7 +113,7 @@ def _seed_pending_entry(
     command_id = f"{trade_id}:entry"
     reservation = ReservationCandidate(
         reservation_id=f"reservation:{trade_id}", trade_id=trade_id, order_id=command_id,
-        priority=0, assignment_id=assignment_id, instrument_id="NGV6",
+        priority=0, assignment_id=assignment_id, instrument_id=instrument_id,
         signal_id=f"signal:{trade_id}", risk_amount=risk, margin_amount=margin,
     )
     accepted = manager.submit_plan(
@@ -132,7 +135,7 @@ def test_second_entry_rejected_when_margin_committed_by_pending_order(tmp_path):
             per_trade=Decimal("2"), per_instrument=Decimal("100"),
             per_group={}, portfolio=Decimal("100"),
         ))
-        _seed_pending_entry(manager)
+        _seed_pending_entry(manager, instrument_id=OTHER_INSTRUMENT)
 
         admission = manager.actions_for_signal(
             _assignment("assignment-2"), _decision("signal-2"), INSTRUMENT,
@@ -229,7 +232,7 @@ def test_rejection_numbers_are_logged(tmp_path, caplog, setup, code):
     with Storage(tmp_path / "trades.sqlite3") as storage:
         manager = _manager(storage, balance=balance, limits=limits)
         if seed:
-            _seed_pending_entry(manager)
+            _seed_pending_entry(manager, instrument_id=OTHER_INSTRUMENT)
         with caplog.at_level(logging.INFO, logger="src.trade_management.manager"):
             manager.actions_for_signal(
                 _assignment("assignment-2"), _decision("signal-2"), INSTRUMENT,
