@@ -43,6 +43,7 @@ REASON_LABELS = {
     "risk-cap": "лимит риска",
     "duplicate-signal": "дублирующий сигнал",
     "opposite-exposure": "встречная позиция",
+    "instrument-busy": "инструмент занят другой привязкой",
     "opposite-signal-management": "управление по встречному сигналу",
     "raw-opposite-signal": "встречный сигнал",
     "ma40-opposite-close": "цена ушла за MA40",
