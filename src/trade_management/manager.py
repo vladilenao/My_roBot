@@ -1008,7 +1008,8 @@ class TradeManager:
         if status != "PENDING":
             return deny("order-state-unconfirmed")
         protected = self._confirmed_guard_close(connection, action, phase, revision, quantity)
-        if action.state_revision != revision and not protected:
+        if (action.state_revision != revision and not protected
+                and not self._revised_only_by_own_stop_moves(connection, action, revision)):
             return deny("stale-state-revision")
         if isinstance(action, OpenTrade):
             phase_valid = phase == TradePhase.ENTRY_PENDING and quantity == 0
@@ -1070,6 +1071,27 @@ class TradeManager:
         if isinstance(action, CloseTrade):
             return mode == CONTOUR_CLOSE_ALL
         return isinstance(action, CancelEntry) and mode is not None
+
+    @staticmethod
+    def _revised_only_by_own_stop_moves(connection, action, revision) -> bool:
+        """Ревизию выхода сменили только подтверждённые переносы стопа с той же ревизией (fix-exit-after-stop-confirm).
+
+        Профиль на одном баре ставит перенос стопа и выход с одной ревизией. Брокер контура подтверждает
+        стоп сразу при доставке, ``_confirm_stop`` повышает ревизию, и выход за ним иначе навсегда устаревает.
+        Перенос стопа не меняет остаток и фазу, на которых основан выход. Любое другое изменение — исполнение,
+        смена фазы, перенос стопа другого решения — даёт лишнее повышение, и выход остаётся устаревшим.
+        """
+        if not isinstance(action, (CloseTrade, ReduceTrade)) or revision <= action.state_revision:
+            return False
+        rows = connection.execute(
+            "SELECT e.payload_json, b.payload_json FROM events e JOIN orders o ON o.command_id=e.command_id "
+            "JOIN outbox b ON b.command_id=e.command_id "
+            "WHERE e.trade_id=? AND o.action_type='MOVESTOP' AND e.event_type='ACK'", (action.trade_id,),
+        ).fetchall()
+        confirmed = sum(1 for event, command in rows
+                        if "confirmed_stop" in json.loads(event)
+                        and json.loads(command).get("state_revision") == action.state_revision)
+        return confirmed == revision - action.state_revision
 
     def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
         """Proof существующего guard, не whitelist по строке reason."""
