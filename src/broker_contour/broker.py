@@ -27,8 +27,9 @@ from src.broker_contour.api import OrderFailure, OrderReport
 from src.broker_contour.orders import (ACCEPTED, CANCELLED, CANCELLING, FILLED, PARTIAL, REJECTED, SENDING, UNKNOWN,
                                        LedgerExecution, LedgerOrder, OrderLedger, order_key)
 from src.broker_contour.stops import StopKeeping, StopLedger
-from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, exit_limit, fill_average, in_band,
-                                       target_limit, to_step, trade_lots, trade_price, with_margin)
+from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, executed_lots, exit_limit,
+                                       fill_average, in_band, target_limit, to_step, trade_lots, trade_price,
+                                       with_margin)
 from src.events.event import Event
 from src.events.types import EventType
 from src.logging_setup import get_logger
@@ -418,7 +419,13 @@ class TInvestBroker(StopKeeping, BrokerPort):
             self._apply_report(row, report, self._clock())
             return True
 
+    def _in_lots(self, row: LedgerOrder, report: OrderReport) -> OrderReport:
+        """Отчёт с исполнением в лотах нашей заявки (песочница может прислать штуки)."""
+        lots = executed_lots(self._card_by_uid(row.instrument_uid), report.lots_executed, row.lots)
+        return report if lots == report.lots_executed else replace(report, lots_executed=lots)
+
     def _apply_report(self, row: LedgerOrder, report: OrderReport, now: datetime) -> None:
+        report = self._in_lots(row, report)
         card = self._card_by_uid(row.instrument_uid)
         known = self._ledger.executions(row.key)
         seen = {e.execution_id for e in known}
@@ -431,7 +438,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
                                                            trade_price(card, trade.price, trade.in_rub), trade.at))
             self._settle(row)
         values = self._executed(row)
-        if report.lots_executed > values["lots_executed"]:
+        if min(report.lots_executed, row.lots) > values["lots_executed"]:
             self._sync.add(row.key)   # сделки не пришли в этом отчёте — добрать из GetOrderState.stages
         if report.broker_order_id and (not report.temporary or not row.broker_order_id):
             values["broker_order_id"] = report.broker_order_id
@@ -564,16 +571,17 @@ class TInvestBroker(StopKeeping, BrokerPort):
             return
         if report is None:
             return
+        report = self._in_lots(row, report)
         self._apply_report(row, report, now)
         executed = sum(e.lots for e in self._ledger.executions(row.key))
-        if report.terminal and report.lots_executed > executed and not report.trades and report.executed_rub:
+        rest = min(report.lots_executed, row.lots) - executed
+        if report.terminal and rest > 0 and not report.trades and report.executed_rub:
             # Брокер сообщил исполнение без сделок биржи и в stages (в песочнице stages всегда пусты):
             # остаток проводится по средней заявки за вычетом уже известных сделок.
             card = self._card_by_uid(row.instrument_uid)
             known = self._ledger.executions(row.key)
             average = fill_average(card, report.executed_rub, report.lots_executed, report.initial_rub,
                                    report.lots_requested)
-            rest = min(report.lots_executed, row.lots) - executed
             price = average
             if known:
                 price = to_step((average * report.lots_executed - sum(e.price * e.lots for e in known)) / rest,

@@ -11,7 +11,8 @@ from src.broker.port import ExecutionStatus
 from src.broker_contour.api import OrderFailure
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import CANCELLED, CANCELLING, OrderLedger, order_key
-from src.broker_contour.prices import PriceCard, entry_limit, exit_limit, fill_average, points_from_rub, trade_lots
+from src.broker_contour.prices import (PriceCard, entry_limit, executed_lots, exit_limit, fill_average, points_from_rub,
+                                       trade_lots)
 from src.events.types import EventType
 from src.trade_management.actions import CancelEntry, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
 from src.trade_management.models import (CURRENT_ALGORITHM, CostSnapshot, ProfileSnapshot, TargetPlan, TradePlan)
@@ -524,3 +525,76 @@ def test_trading_bot_strategy_cache_grows_with_added_binding():
     future["NG"] = [Assignment("future-ng-macd", "macd_rsi_stoch", "levels_rr", timeframe="15m")]
     assert set(bot._strategy_cache) == {("macd_rsi_stoch", "15m")} and built == ["macd_rsi_stoch"]
     assert bot._strategy_cache and built == ["macd_rsi_stoch"], "уже построенная стратегия не пересоздаётся"
+
+
+# --- песочница 11.11: исполнение в штуках вместо лотов -------------------------
+def test_executed_lots_from_shares():
+    share = PriceCard("uid-gazp", D("0.01"), D("0.1"), lot=10, future=False)
+    assert executed_lots(share, 100, 10) == 10        # штуки: больше заявленного и кратно лоту
+    assert executed_lots(share, 10, 10) == 10
+    assert executed_lots(share, 7, 10) == 7
+    assert executed_lots(share, 15, 10) == 15         # не кратно лоту — число брокера как есть
+    assert executed_lots(PriceCard(NG, D("0.001"), D("8.08664")), 20, 10) == 20   # лот 1
+
+
+def _share_harness(tmp_path):
+    from src.portfolio import ContractMeta
+
+    h = Harness(tmp_path)
+    h.broker.set_contracts({NG: ContractMeta(NG, 0.01, 0.1, 0, 0)})     # акция, лот 10 (как GAZP)
+    return h
+
+
+def test_order_state_in_shares_after_stream_trade_does_not_divide_by_zero(tmp_path):
+    """Песочница 11.11, GAZP: сделка стрима провела 10 лотов, затем ``GetOrderState`` без ``stages``
+    отдал ``lots_executed=100`` (штуки) — досверка делила на нулевой остаток каждую секунду."""
+    from dataclasses import replace
+
+    h = _share_harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    h.broker.ingest(_stream_fill(h, key, 10, "116.82"))
+    assert _entry_lots(h.drain()) == 10
+    h.api.orders[key] = replace(h.api.orders[key], status="fill", lots_executed=100, trades=(),
+                                executed_rub=D("11682.00"), initial_rub=D("11682.00"), executed_fee=D("5.84"))
+    h.broker.resync(h.clock())
+    h.broker.service(h.clock.advance(1))
+    assert h.drain() == []                                      # лишнего исполнения нет
+    assert [e.lots for e in h.ledger.executions(key)] == [10]
+    row = h.ledger.get(key)
+    assert row.lots_executed == 10 and row.state == "filled"
+    assert h.broker.trade_state("trade-ng-1").position == 10
+
+
+def test_order_state_in_shares_without_trades_books_lots(tmp_path):
+    """Без сделок стрима остаток проводится по сумме заявки — в лотах, по цене штуки."""
+    from dataclasses import replace
+
+    h = _share_harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    h.api.orders[key] = replace(h.api.orders[key], status="fill", lots_executed=100, trades=(),
+                                executed_rub=D("11682.00"), initial_rub=D("11682.00"))
+    h.broker.resync(h.clock())
+    events = h.drain()
+    assert [(e.filled_quantity, e.price) for e in events] == [(10, D("116.82"))]
+    assert h.ledger.get(key).lots_executed == 10
+
+
+def test_order_state_over_order_lots_is_ignored_without_resync(tmp_path):
+    """Брокер исполнил больше лотов заявки, и это не штуки: исполнения нет, досверка не зацикливается."""
+    from dataclasses import replace
+
+    h = _share_harness(tmp_path)
+    action, _ = h.open(lots=10)
+    key = order_key(action.command_id)
+    h.broker.ingest(_stream_fill(h, key, 10, "116.82"))
+    h.drain()
+    over = replace(h.api.orders[key], status="fill", lots_executed=15, trades=(),
+                   executed_rub=D("1752.30"), initial_rub=D("1168.20"))
+    h.api.orders[key] = over
+    h.broker.ingest(over)                                       # стрим: «исполнена» с лишними лотами
+    for _ in range(3):
+        h.broker.service(h.clock.advance(1))
+    assert h.drain() == [] and [e.lots for e in h.ledger.executions(key)] == [10]
+    assert not [call for call in h.api.calls if call[0] == "state"]      # досверки по лишним лотам нет
