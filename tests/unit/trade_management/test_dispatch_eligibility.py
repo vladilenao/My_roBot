@@ -11,7 +11,7 @@ import pytest
 from src.broker import create_addressable_journal_broker
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus
 from src.trade_journal.storage import Storage
-from src.trade_management.actions import CancelEntry, CloseTrade, EntryOrderType, OpenTrade
+from src.trade_management.actions import CancelEntry, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
 from src.trade_management.actions import action_from_payload
 from src.trade_management.manager import DispatchDataEvidence, GAP_ENTRY_REASON, TradeManager
 from src.trade_management.models import ProfileSnapshot, TargetPlan, TradePlan
@@ -364,3 +364,90 @@ def test_entry_held_in_its_step_is_cancelled_on_next_step_instead_of_hanging(tmp
         assert storage.connection.execute("SELECT status FROM reservations").fetchone() == ("RELEASED",)
         assert status(storage, "open-A") == "UNDELIVERED"
         assert broker.actions == []                                # брокер о входе не узнал
+
+
+class ConfirmingBroker(AckBroker):
+    """Как брокер контура на T-Invest: перенос стопа подтверждается сразу, выход принимается."""
+    def submit(self, action, now):
+        self.actions.append(action)
+        reason = action.reason if isinstance(action, MoveStop) else "exit-accepted"
+        return ExecutionEvent(f"{action.command_id}:ack", action.command_id, action.command_id,
+            action.trade_id, ExecutionStatus.ACK, 0, None, Decimal(0), now, reason)
+
+
+def open_trade(storage, manager, quantity=3):
+    queue_entry(manager, "B")
+    manager.dispatch(NOW)
+    storage.connection.execute("UPDATE trades SET phase='OPEN'")
+    storage.connection.execute("UPDATE positions SET quantity=?,average_price='100'", (quantity,))
+    storage.connection.commit()
+
+
+def revision(storage):
+    return storage.connection.execute("SELECT state_revision FROM trades WHERE trade_id='trade-B'").fetchone()[0]
+
+
+EXITS = [ReduceTrade("trade-B:ma-partial-exit:1", "trade-B", 0, "ma10-or-cloud-partial-exit", 1),
+         CloseTrade("trade-B:ma40-exit:1", "trade-B", 0, "ma40-opposite-close")]
+
+
+@pytest.mark.parametrize("exit_action", EXITS, ids=["reduce", "close"])
+def test_exit_of_same_decision_is_delivered_after_its_stop_move_is_confirmed(tmp_path, exit_action):
+    """12.11: Si в песочнице — стоп и частичный выход одного бара, стоп подтверждён сразу, выход висел PENDING."""
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = ConfirmingBroker()
+        manager, _, _ = setup(storage, broker)
+        open_trade(storage, manager)
+        stop = MoveStop("trade-B:ma-cloud-stop:1", "trade-B", 0, "ma-cloud-protective-stop", Decimal(97))
+        assert manager.submit_action(stop)
+        assert manager.submit_action(exit_action)
+
+        manager.dispatch(NOW)
+
+        assert [action.command_id for action in broker.actions[1:]] == [stop.command_id, exit_action.command_id]
+        assert status(storage, exit_action.command_id) == "SENT"
+        assert exit_action.command_id not in manager.dispatch_block_reasons
+        assert revision(storage) == 1  # перенос стопа подтверждён и сменил ревизию
+
+
+def test_exit_stays_stale_when_revision_changed_beyond_its_stop_move(tmp_path):
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = ConfirmingBroker()
+        manager, _, _ = setup(storage, broker)
+        open_trade(storage, manager)
+        stop = MoveStop("trade-B:ma-cloud-stop:1", "trade-B", 0, "ma-cloud-protective-stop", Decimal(97))
+        reduce = EXITS[0]
+        assert manager.submit_action(stop)
+        assert manager.submit_action(reduce)
+        manager.dispatch(NOW, limit=1)                       # только перенос стопа
+        storage.connection.execute("UPDATE trades SET state_revision=state_revision+1")  # например, исполнение цели
+        storage.connection.commit()
+
+        manager.dispatch(NOW)
+
+        assert [action.command_id for action in broker.actions[1:]] == [stop.command_id]
+        assert status(storage, reduce.command_id) == "PENDING"
+        assert manager.dispatch_block_reasons[reduce.command_id] == "stale-state-revision"
+
+
+def test_stop_move_of_other_revision_does_not_refresh_old_exit(tmp_path):
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = ConfirmingBroker()
+        manager, _, _ = setup(storage, broker)
+        open_trade(storage, manager)
+        first = MoveStop("trade-B:ma-cloud-stop:1", "trade-B", 0, "ma-cloud-protective-stop", Decimal(97))
+        assert manager.submit_action(first)
+        manager.dispatch(NOW)                                # ревизия 1
+        second = MoveStop("trade-B:ma-cloud-stop:2", "trade-B", 1, "ma-cloud-protective-stop", Decimal(98))
+        assert manager.submit_action(second)
+        storage.connection.execute("UPDATE trades SET state_revision=0")  # выход «из прошлого» с ревизией 0
+        storage.connection.commit()
+        reduce = EXITS[0]
+        assert manager.submit_action(reduce)
+        storage.connection.execute("UPDATE trades SET state_revision=1")
+        storage.connection.commit()
+
+        manager.dispatch(NOW)  # second подтверждён на ревизии 1 — это не перенос решения с ревизией 0
+
+        assert status(storage, reduce.command_id) == "PENDING"
+        assert manager.dispatch_block_reasons[reduce.command_id] == "stale-state-revision"
