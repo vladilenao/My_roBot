@@ -38,6 +38,16 @@ class Worker:
         return True
 
 
+def wait_until(condition, timeout=5.0):
+    """Ждёт условие с запасом: на загруженном CI-раннере потоки идут медленнее."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def test_background_lanes_start_before_live_and_errors_are_isolated(monkeypatch):
     monkeypatch.setattr(LiveMarketDataPoller, "LANE_ERROR_PAUSE", 0.05)
     budget = RequestBudget(time.time, 0)
@@ -46,13 +56,12 @@ def test_background_lanes_start_before_live_and_errors_are_isolated(monkeypatch)
     worker = Worker()
     poller = LiveMarketDataPoller(cache, ["1m"], 0.05, worker=worker, lanes=[broken, healthy])
     poller.start_background()
-    assert healthy.started.wait(1) and broken.started.wait(1)
-    time.sleep(0.2)
+    assert healthy.started.wait(5) and broken.started.wait(5)
+    # сбой одной полосы не остановил другие
+    assert wait_until(lambda: healthy.steps > 1 and broken.steps > 1)
     assert worker.steps == 0                                  # живая полоса ещё не запущена
-    assert healthy.steps > 1 and broken.steps > 1             # сбой одной полосы не остановил другие
     poller.start()
-    time.sleep(0.1)
-    assert worker.steps > 0
+    assert wait_until(lambda: worker.steps > 0)
     poller.close()
     assert all(not thread.is_alive() for thread in poller._threads)
     assert healthy.lanes == {"evidence"} and broken.lanes == {"completeness"}
