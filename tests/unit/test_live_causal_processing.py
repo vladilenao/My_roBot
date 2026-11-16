@@ -331,3 +331,33 @@ def test_without_live_session_undelivered_increases_are_not_cancelled(tmp_path):
     runtime.post_tick({"1m"})
 
     manager.cancel_undelivered_increases.assert_not_called()
+
+
+def test_live_step_delivers_held_outbox_after_bars(tmp_path):
+    """fix-stop-command-freshness: команду остановки ставит граница тика, доставляет её сам шаг."""
+    cache, _, _ = live_cache(tmp_path, "1m")
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.dispatch.assert_called_once_with(datetime(2026, 10, 14, 4, 26, 39, tzinfo=timezone.utc))
+    names = [call[0] for call in manager.method_calls]
+    assert names.index("cancel_undelivered_increases") < names.index("dispatch")
+
+
+def test_without_live_session_step_does_not_dispatch(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    cache.live_session_enabled = False
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+
+    runtime.post_tick({"1m"})
+
+    manager.dispatch.assert_not_called()
+
+
+def test_step_dispatch_failure_does_not_fail_the_step(tmp_path):
+    cache, _, _ = live_cache(tmp_path, "1m")
+    runtime, manager = runtime_with_manager(cache, tmp_path)
+    manager.dispatch.side_effect = RuntimeError("database is locked")
+
+    assert runtime.post_tick({"1m"}) is True

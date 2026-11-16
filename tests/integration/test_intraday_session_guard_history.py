@@ -37,6 +37,9 @@ def _source(**kw):
 
 
 class _BuyEveryBar:
+    def required_history(self):
+        return 1
+
     def compute(self, frame):
         return frame
 

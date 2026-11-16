@@ -6,7 +6,7 @@ from src.market_context import (
     TrendAnalyzer,
 )
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import json
@@ -14,6 +14,7 @@ import json
 from src.decision import SignalFilter
 from src.bot import TradingBot
 from src.config import (
+    ANALYSIS_DEPTH,
     MARKET_DATA_SETTINGS,
     FUTURE_STRATEGIES,
     HEARTBEAT_EVERY_TICKS,
@@ -201,7 +202,10 @@ def _finish_history(
 
 
 def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live_waiter=None,
-             update_obligations=None, after_tick=None, control=None, forget=None) -> None:
+             update_obligations=None, after_tick=None, control=None, forget=None, strategies=None,
+             poll=None) -> None:
+    share_strategies, future_strategies = strategies or (SHARE_STRATEGIES, FUTURE_STRATEGIES)
+
     def post_tick(ready_tfs):
         # Желаемое ядра применяется на границе тика, до сопровождения и исполнения (add-control-api).
         if control is not None:
@@ -225,8 +229,8 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         strategy_map=_strategy_map(),
         data_cache=data_cache,
         timeline=timeline,
-        share_strategies=SHARE_STRATEGIES,
-        future_strategies=FUTURE_STRATEGIES,
+        share_strategies=share_strategies,
+        future_strategies=future_strategies,
         heartbeat_every_ticks=HEARTBEAT_EVERY_TICKS,
         tick_poll_secs=TICK_POLL_SECS,
         tick_timeout_secs=TICK_TIMEOUT_SECS,
@@ -244,6 +248,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
         contract_lifecycle=runtime.contract_lifecycle,
         action_executor=runtime.action_executor,
         run=session,
+        poll=poll,
     )
     if control is not None:
         control.start(runtime.trade_manager, _Roster(bot, runtime, data_cache, forget))
@@ -305,6 +310,70 @@ class _Roster:
             self._forget(instrument)
 
 
+# Сторож исполнения 1m (fix-sandbox-restart-safety): удержание на минуту-другую — норма тонкого
+# рынка (минута без сделок разрешается ядром за 1–3 мин), дольше порога — тревога.
+EXECUTION_HOLD_ALARM_SECS = 300
+EXECUTION_HOLD_REPEAT_SECS = 900
+
+
+class _ExecutionWatch:
+    """Барьер покрытия держит минуты инструмента со сделками дольше порога.
+
+    Пока исполнение 1m стоит, виртуальный стоп и переоценка по инструменту не работают,
+    поэтому удержание видно в журнале (повтор раз в ``repeat_secs``) и у владельца
+    (``report`` — канал и ``status.json`` контура на брокере). Удержание без сделок
+    последствий не имеет и тревоги не даёт.
+    """
+
+    def __init__(self, *, alarm_secs=EXECUTION_HOLD_ALARM_SECS, repeat_secs=EXECUTION_HOLD_REPEAT_SECS,
+                 report=None) -> None:
+        self._alarm = timedelta(seconds=alarm_secs)
+        self._repeat = timedelta(seconds=repeat_secs)
+        self._report = report
+        self._holds: dict[str, dict] = {}
+
+    @staticmethod
+    def _minutes(since, now) -> int:
+        return int((now - since).total_seconds() // 60)
+
+    def _view(self, hold, now) -> dict:
+        return {"name": hold["name"], "since": hold["since"].isoformat(), "minutes": self._minutes(hold["since"], now),
+                "executed": hold["executed"].isoformat() if hold["executed"] is not None else None,
+                "received": hold["received"].isoformat() if hold["received"] is not None else None}
+
+    def alarms(self, now) -> list[dict]:
+        return [self._view(hold, now) for hold in self._holds.values() if hold["alarmed"] is not None]
+
+    def observe(self, now, held: dict, tracked) -> None:
+        """``held``: ключ → (имя, последняя исполненная минута, последняя полученная); ``tracked(ключ)`` — есть сделки."""
+        raised, resumed = [], []
+        for key in [key for key in self._holds if key not in held]:
+            hold = self._holds.pop(key)
+            if hold["alarmed"] is not None:
+                log.info("Исполнение 1m %s возобновлено после %s мин удержания", hold["name"],
+                         self._minutes(hold["since"], now))
+                resumed.append(self._view(hold, now))
+        for key, (name, executed, received) in held.items():
+            hold = self._holds.setdefault(key, {"name": name, "since": now, "alarmed": None})
+            hold.update(executed=executed, received=received)
+            if now - hold["since"] < self._alarm:
+                continue
+            if hold["alarmed"] is None and not tracked(key):
+                continue
+            if hold["alarmed"] is None or now - hold["alarmed"] >= self._repeat:
+                if hold["alarmed"] is None:
+                    raised.append(self._view(hold, now))
+                hold["alarmed"] = now
+                log.warning("Исполнение 1m %s стоит %s мин: исполнена минута %s, получены свечи до %s — "
+                            "стоп и переоценка по инструменту не работают", name, self._minutes(hold["since"], now),
+                            executed, received)
+        if (raised or resumed) and self._report is not None:
+            try:
+                self._report(raised, resumed, self.alarms(now))
+            except Exception as exc:  # noqa: BLE001 — тревога не должна ронять исполнение
+                log.warning("Не удалось доставить тревогу исполнения (%s)", type(exc).__name__)
+
+
 class _UnsafeExecutionState(RuntimeError):
     """The in-memory simulator must be rebuilt from durable state."""
 
@@ -324,6 +393,7 @@ class _Runtime:
         # Финансовая часть (add-contour-membership): список допуска доставки и приём карточек контрактов.
         self.instruments = None
         self.on_contracts = None
+        self.broker = None
 
     def add_instrument(self, instrument, contracts=None) -> None:
         """Инструмент вошёл в состав на ходу: карточки, жизненный цикл, исполнение, алиасы."""
@@ -333,8 +403,9 @@ class _Runtime:
                 target.append(instrument)
         if self.storage is not None:
             self.execution_aliases.update({key: key, instrument.ticker: key})
-        if contracts and self.on_contracts is not None:
-            self.on_contracts(contracts)
+        if self.on_contracts is not None:
+            # И без карточек: имя нового инструмента нужно событиям исполнений (fix-contour-added-instrument-names).
+            self.on_contracts(contracts or {})
 
     def remove_instrument(self, instrument) -> None:
         """Инструмент вышел из состава: сделок по нему нет, исполнение его больше не ведёт."""
@@ -353,9 +424,25 @@ class _Runtime:
         return [target for index, target in enumerate(lists) if all(target is not other for other in lists[:index])]
 
 
+@dataclass(frozen=True)
+class BrokerTrading:
+    """Подстановки торговой части контура на брокере (add-tinvest-orders); у эмуляции и истории их нет.
+
+    ``broker_factory(storage)`` — брокер вместо симулятора; ``capital`` — капитал со счёта для допуска;
+    ``initial_deposit`` — стартовый счёт журнала; ``poll`` — работа между тиками (исполнения, сверка).
+    """
+
+    broker_factory: object
+    capital: object
+    initial_deposit: Decimal
+    poll: object = None
+    # ``execution_alarm(raised, resumed, holds)`` — тревога сторожа исполнения 1m (fix-sandbox-restart-safety).
+    execution_alarm: object = None
+
+
 def _build_runtime(
     instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None,
-    contracts=None,
+    contracts=None, broker_trading: BrokerTrading | None = None,
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -368,7 +455,7 @@ def _build_runtime(
         i if isinstance(i, Instrument) else normalize_instrument(i) for i in instruments
     ]
     historical = isinstance(clock, HistoricalClock)
-    if not trading_enabled() and not historical:
+    if not trading_enabled() and not historical and broker_trading is None:
         log.info("Торговый режим выключен — NotifyOnly.")
         return _Runtime()
 
@@ -377,6 +464,7 @@ def _build_runtime(
     from src.trade_management.manager import TradeManager
     from src.trade_management.notification import stop_move_fields
 
+    deposit = INITIAL_DEPOSIT if broker_trading is None else broker_trading.initial_deposit
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         storage = Storage(
@@ -386,16 +474,20 @@ def _build_runtime(
             audit_path=state_dir / AUDIT_FILE,
             audit_max_bytes=AUDIT_MAX_BYTES,
             audit_backup_count=AUDIT_BACKUP_COUNT,
-            initial_deposit=str(INITIAL_DEPOSIT),
+            initial_deposit=str(deposit),
             clock=clock,
         )
-        broker = create_addressable_journal_broker(
-            INITIAL_DEPOSIT,
-            CLEARING_TIMES,
-            contract_names=_instrument_names(instruments),
-        )
+        if broker_trading is not None:
+            broker = broker_trading.broker_factory(storage)
+            broker.set_names(_instrument_names(instruments))
+        else:
+            broker = create_addressable_journal_broker(
+                INITIAL_DEPOSIT,
+                CLEARING_TIMES,
+                contract_names=_instrument_names(instruments),
+            )
     except Exception as exc:
-        if historical:
+        if historical or broker_trading is not None:
             raise RuntimeError(f"Не удалось создать исторический симулятор/журнал: {exc}") from exc
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime()
@@ -437,7 +529,8 @@ def _build_runtime(
     trade_manager = TradeManager(
         storage,
         broker,
-        initial_balance=Decimal(str(INITIAL_DEPOSIT)),
+        initial_balance=Decimal(str(deposit)),
+        capital_provider=None if broker_trading is None else broker_trading.capital,
         budget_observer=lambda details: bus.publish(Event.broker_event(EventType.RISK_LIMIT_HIT, risk_scope="portfolio", **details)),
         execution_observer=publish_execution,
         profiles_config=TRADE_MANAGEMENT_PROFILES,
@@ -502,8 +595,12 @@ def _build_runtime(
         session.contract_lifecycle = lifecycle
 
     # Cursors advance only after executions and observations of a minute have
-    # committed. On restart SQLite provides the safe boundary of live state.
-    execution_cursors = storage.execution_bar_boundaries()
+    # committed. On restart SQLite provides the safe boundary of live state —
+    # read on the first bar, not here: the broker contour consumes fills that
+    # happened while it was down between build and the first tick
+    # (add-tinvest-orders 3.10).
+    execution_cursors = {}
+    cursors_loaded = []
     execution_closes = {}
     pending_bar = None
     # Live owner: каждая исполняемая минута закрепляется до симуляции, а после
@@ -511,6 +608,8 @@ def _build_runtime(
     pin_input = getattr(data_cache, "pin_execution_input", None)
     pinned_execution = getattr(data_cache, "live_session_enabled", False) is True and callable(pin_input)
     resumed_markers = set()
+    execution_watch = None if historical else _ExecutionWatch(
+        report=None if broker_trading is None else broker_trading.execution_alarm)
 
     def commit_bar(stamp, prices, addressed, broker_events):
         instrument_bar_times = {ticker: stamp for ticker in prices}
@@ -562,8 +661,13 @@ def _build_runtime(
             for uid, minute, ohlc in (drain_late() if callable(drain_late) else ()):
                 trade_manager.record_late_candle(journal_ids(uid), minute, ohlc,
                                                  observed_at=trade_manager._clock.now())
+            if not cursors_loaded:
+                execution_cursors.update(storage.execution_bar_boundaries())
+                cursors_loaded.append(True)
             batches = {}
             initial_boundaries = None
+            held = {}
+            seeded = False
             for instrument in lifecycle.execution_instruments():
                 try:
                     frame = data_cache.frame_for(instrument, "1m")
@@ -584,6 +688,14 @@ def _build_runtime(
                             initial_boundaries = storage.execution_bar_boundaries()
                         boundary = initial_boundaries.get(ticker, (stamps.max(), True))
                     last, inclusive = boundary
+                    if ticker not in execution_closes:
+                        # После рестарта цена позиции — закрытие последней исполненной минуты, как и до
+                        # рестарта: переоценка не ждёт новую минутку тихого инструмента, а удержанные
+                        # барьером минуты в неё не попадают (fix-sandbox-restart-safety).
+                        executed = frame.loc[stamps < last if inclusive else stamps <= last]
+                        if not executed.empty:
+                            execution_closes[ticker] = float(executed.sort_values("datetime")["close"].iloc[-1])
+                            seeded = True
                     if pinned_execution and ticker not in resumed_markers:
                         resumed_markers.add(ticker)
                         if not inclusive:
@@ -597,6 +709,10 @@ def _build_runtime(
                         # новый контракт покрытия; в таком случае оставляем
                         # исходный DataFrame.
                         if isinstance(protected, type(fresh)):
+                            if len(protected) < len(fresh):
+                                # Барьер держит полученные минуты: сторожу исполнения.
+                                held[ticker] = (names.get(ticker) or "контракт не указан", last,
+                                                to_aware_utc(fresh["datetime"].max()).to_pydatetime())
                             fresh = protected
                     skipped = getattr(data_cache, "source_absent_between", None)
                     absent = skipped(instrument, last, fresh) if callable(skipped) and not fresh.empty else []
@@ -615,6 +731,8 @@ def _build_runtime(
                                 # не перескакиваем минуту; healthy UID идут дальше.
                                 log.warning("Исполнение %s удержано перед %s: %s",
                                             _instrument_ticker(instrument), stamp, exc)
+                                held[ticker] = (names.get(ticker) or "контракт не указан", last,
+                                                to_aware_utc(fresh["datetime"].max()).to_pydatetime())
                                 break
                             values = tuple(float(pinned[key]) for key in ("open", "low", "high", "close"))
                         batches.setdefault(stamp, {})[ticker] = values
@@ -637,6 +755,22 @@ def _build_runtime(
                 pending_bar = (stamp, prices, addressed, broker_events)
                 commit_bar(*pending_bar)
                 pending_bar = None
+            if seeded and not batches:
+                trade_manager.mark_to_market(execution_closes)
+            if execution_watch is not None:
+                tracked = []
+
+                def has_trades(key):
+                    if not tracked:
+                        tracked.append(set(storage.execution_bar_boundaries()))
+                    return any(alias in tracked[0] for alias in journal_ids(key))
+                now = as_aware(trade_manager._clock.now())
+                if isinstance(now, datetime):
+                    execution_watch.observe(now, held, has_trades)
+            if live_dispatch:
+                # Команды остановки ставит граница тика, а не действие шага: без этой доставки
+                # их никто не отправит (fix-stop-command-freshness). Устаревшие увеличения уже сняты.
+                action_executor.submit(None, as_aware(trade_manager._clock.now()))
             return True
         except _UnsafeExecutionState:
             log.exception("Исполнение остановлено до восстановления из SQLite")
@@ -653,13 +787,17 @@ def _build_runtime(
         contract_lifecycle=lifecycle,
     )
     runtime.instruments = instruments
+    runtime.broker = broker
 
     def accept_contracts(metas):
         # Тот же словарь видит исполнение по барам: карточка нового контракта — сразу в работе.
-        contracts.update(metas)
-        broker.set_contracts(metas)
-        storage.set_contract_metadata(metas)
-        names = _instrument_names(runtime.execution_instruments or instruments)
+        if metas:
+            contracts.update(metas)
+            broker.set_contracts(metas)
+            storage.set_contract_metadata(metas)
+        # Тот же словарь читает publish_execution: инструмент, добавленный на ходу, подписан своим именем
+        # в карточках исполнений, а не «контракт не указан» (fix-contour-added-instrument-names).
+        names.update(_instrument_names(runtime.execution_instruments or instruments))
         storage.set_names(names)
         broker.set_names(names)
         trade_manager.configure_visual_context(runtime.execution_instruments or instruments)
@@ -839,7 +977,7 @@ def build_demand(runtime, instruments, data_cache) -> ContourDemand:
     for instrument in roster:
         key = instrument_key(instrument)
         for timeframe, count in obligation_requirements(
-                [t for t in trades if aliases.get(t.plan.instrument_id) == key]).items():
+                [t for t in trades if aliases.get(t.plan.instrument_id) == key], ANALYSIS_DEPTH).items():
             requests.append((instrument, timeframe, count))
         if key in boundaries:
             lowers.append((instrument, boundaries[key][0]))
@@ -865,6 +1003,11 @@ class ContourSettings:
     contracts: dict | None = None
     # Желаемое состояние ядра (add-control-api); None — процесс без управления (история).
     control: object = None
+    # Контур на брокере (add-tinvest-orders): стратегии привязок и подстановки торговой части.
+    strategies: tuple | None = None
+    broker_trading: BrokerTrading | None = None
+    # Готовая шина со своими каналами (контур на брокере); None — каналы эмуляции по настройкам.
+    bus: object = None
 
 
 class TradingContour:
@@ -886,16 +1029,20 @@ class TradingContour:
         # Отметки исполнения в рыночной базе пишутся под ключом контура.
         if hasattr(services.data_cache, "contour_id"):
             services.data_cache.contour_id = settings.kind
-        self.channels = build_channels(settings.channel_names, state_dir=settings.state_dir)
-        self.bus = EventBus()
-        self.bus.subscribe_all(self.channels)
+        if settings.bus is not None:
+            self.bus = settings.bus
+        else:
+            self.channels = build_channels(settings.channel_names, state_dir=settings.state_dir)
+            self.bus = EventBus()
+            self.bus.subscribe_all(self.channels)
         htf_provider = HtfFrameProvider(cache=services.data_cache, timeline=services.timeline)
-        PROFILES["triple_screen"] = TripleScreenFilter(provider=htf_provider, params=TRIPLE_SCREEN_PARAMS)
+        PROFILES["triple_screen"] = TripleScreenFilter(provider=htf_provider, params=TRIPLE_SCREEN_PARAMS,
+                                                       depth=ANALYSIS_DEPTH)
         cluster_gate = services.cluster_gate(settings.state_dir)
         self.runtime = _build_runtime(
             settings.instruments, services.data_cache, self.bus, settings.state_dir, clock=settings.clock,
             session=settings.session, client_provider=settings.client_provider, cluster_gate=cluster_gate,
-            contracts=settings.contracts,
+            contracts=settings.contracts, broker_trading=settings.broker_trading,
         )
         return self
 
@@ -908,7 +1055,8 @@ class TradingContour:
                  session=self.settings.session, live_waiter=live_waiter,
                  update_obligations=services.update_obligations if services.tracks_obligations else None,
                  after_tick=services.acknowledge_tick, control=self.settings.control,
-                 forget=getattr(services, "forget_instrument", None))
+                 forget=getattr(services, "forget_instrument", None), strategies=self.settings.strategies,
+                 poll=None if self.settings.broker_trading is None else self.settings.broker_trading.poll)
 
     def finish(self) -> None:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""

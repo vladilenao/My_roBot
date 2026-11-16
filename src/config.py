@@ -25,6 +25,8 @@ load_dotenv()  # загружает переменные из .env
 
 # Токены (секреты) — только из .env / переменных окружения, НЕ из robot.toml
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
+# Токен песочницы Т-Инвест: только команда песочницы и контур «Песочница» (add-sandbox-probe).
+TINKOFF_SANDBOX_TOKEN = os.getenv("TINKOFF_SANDBOX_TOKEN")
 MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 # Ключ управления запуском через локальный API (схема ControlToken); отдельно от экспортного.
 ROBOT_CONTROL_TOKEN = os.getenv("ROBOT_CONTROL_TOKEN")
@@ -56,6 +58,8 @@ _DEFAULTS = {
     "timeframe": "1h",
     "sleep_seconds": 3600,
     "heartbeat_every_ticks": 60,
+    # Глубина расчёта стратегий, фильтров и сопровождения (add-analysis-depth).
+    "analysis_depth": 150,
     "tick_poll_secs": 1,
     "tick_timeout_secs": 65,
     # Горизонт догона поздно опубликованных баров (в периодах ТФ) — управляет
@@ -100,6 +104,16 @@ _DEFAULTS = {
     # Одновременных прогонов истории, остальные ждут в очереди (add-history-contour).
     "contours_max_history_runs": 2,
     "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
+    "contours_sandbox_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
+    "contours_sandbox_telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
+    "contours_sandbox_reconcile_every_min": 1,
+    "contours_sandbox_orders": True,
+    "contours_sandbox_exit_offset_steps": 5,
+    "contours_sandbox_exit_requote_secs": 15,
+    "contours_sandbox_exit_requote_attempts": 3,
+    "contours_sandbox_stop_place_secs": 30,
+    "contours_sandbox_max_daily_loss_pct": 3.0,
+    "contours_sandbox_max_rejects_in_row": 3,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -156,6 +170,11 @@ if TIMEFRAME not in TIMEFRAMES:
 SLEEP_SECONDS = _CONFIG["sleep_seconds"]
 HEARTBEAT_EVERY_TICKS = _CONFIG["heartbeat_every_ticks"]
 
+# Глубина расчёта: окно последних свечей для стратегии, контекста фильтра,
+# старших ТФ triple_screen и сопровождения — одинаково в живом и историческом
+# цикле. Минимум допуска пары не меняет (src/history/warmup.py).
+ANALYSIS_DEPTH = _CONFIG["analysis_depth"]
+
 # Ожидание свежего закрытого бара после границы закрытия свечи
 # (у Tinkoff публикация бара происходит с задержкой до ~45+ сек).
 TICK_POLL_SECS = _CONFIG["tick_poll_secs"]
@@ -178,11 +197,33 @@ CONTOURS_HEARTBEAT_TIMEOUT_SECS = _CONFIG["contours_heartbeat_timeout_secs"]
 CONTOURS_AUTOSTART = _CONFIG["contours_autostart"]
 CONTOURS_MAX_HISTORY_RUNS = _CONFIG["contours_max_history_runs"]
 CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_emulation_telegram_channel_env"]
+# Контур «Песочница» (add-sandbox-contour): имена переменных .env бота и канала, частота сверки.
+CONTOUR_SANDBOX_TELEGRAM_BOT_ENV = _CONFIG["contours_sandbox_telegram_bot_env"]
+CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_sandbox_telegram_channel_env"]
+CONTOUR_SANDBOX_RECONCILE_EVERY_MIN = _CONFIG["contours_sandbox_reconcile_every_min"]
+# Торговля привязками заявками и выходы лимитом с перевыставлением (add-tinvest-orders).
+CONTOUR_SANDBOX_ORDERS = _CONFIG["contours_sandbox_orders"]
+CONTOUR_SANDBOX_EXIT_OFFSET_STEPS = _CONFIG["contours_sandbox_exit_offset_steps"]
+CONTOUR_SANDBOX_EXIT_REQUOTE_SECS = _CONFIG["contours_sandbox_exit_requote_secs"]
+CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_sandbox_exit_requote_attempts"]
+CONTOUR_SANDBOX_STOP_PLACE_SECS = _CONFIG["contours_sandbox_stop_place_secs"]
+CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT = _CONFIG["contours_sandbox_max_daily_loss_pct"]
+CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW = _CONFIG["contours_sandbox_max_rejects_in_row"]
 
 
 def telegram_channel_id() -> str | None:
     """Id канала Telegram контура эмуляции из переменной, названной в ``[contours.emulation]``."""
     return os.getenv(CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV) or None
+
+
+def sandbox_bot_token() -> str | None:
+    """Токен бота контура «Песочница» из переменной, названной в ``[contours.sandbox]`` (секрет)."""
+    return os.getenv(CONTOUR_SANDBOX_TELEGRAM_BOT_ENV) or None
+
+
+def sandbox_channel_id() -> str | None:
+    """Id канала контура «Песочница» из переменной, названной в ``[contours.sandbox]``."""
+    return os.getenv(CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV) or None
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
 MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]

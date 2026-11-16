@@ -54,7 +54,7 @@ from src.trade_management.profiles.base import ManagementContext, PlanningContex
 from src.trade_management.notification import lifecycle_snapshot
 from src.trade_management import session_guard
 from src.trade_management.intraday_settings import IntradaySettings
-from src.events.visual import market_snapshot, utc
+from src.events.visual import market_snapshot, utc, with_forming_candle
 from src.scheduler.timing import CandleScheduler
 
 
@@ -71,8 +71,19 @@ CONTOUR_STOP = "contour-stop"           # снятие входа и закры�
 # Снятие инструмента из состава контура (add-contour-membership).
 INSTRUMENT_REMOVING = "instrument-removing"   # отказ новому входу или добору по инструменту
 INSTRUMENT_REMOVE = "instrument-remove"       # снятие входа и закрытие позиции инструмента
+# Недоставленное закрытие остановки с устаревшей ревизией снято и поставлено заново (fix-stop-command-freshness).
+STOP_COMMAND_RENEWED = "stop-command-renewed"
 # Нет пульса ядра (add-contour-recovery): отказ новому входу или добору, остальное — по плану.
 CORE_LOST = "core-lost"
+# Предохранители контура на брокере (add-account-guards): запрет новых входов и доборов по всему контуру.
+GUARD_DAILY_LOSS = "daily-loss"
+GUARD_BROKER_REJECTS = "broker-rejects"
+GUARD_REASONS = (GUARD_DAILY_LOSS, GUARD_BROKER_REJECTS)
+# Контур на брокере (add-tinvest-orders): снятие привязки, заморозка сверкой, капитал не прочитан.
+BINDING_REMOVING = "binding-removing"
+BINDING_REMOVE = "binding-remove"
+INSTRUMENT_FROZEN = "instrument-frozen"
+ACCOUNT_UNAVAILABLE = "счёт недоступен"
 
 
 def _check_stop_mode(mode) -> None:
@@ -285,12 +296,15 @@ class TradeManager:
         intraday_settings: IntradaySettings | None = None,
         session_calendar: Callable[[object, datetime], object] | None = None,
         protection_timeframe: str = "1m",
+        capital_provider: Callable[[], Decimal | None] | None = None,
     ) -> None:
         self._storage = storage
         self._broker = broker
         # Кластерный фильтр входа (src.clusters.gate.ClusterGate); None — выключен.
         self._cluster_gate = cluster_gate
         self._clock = as_clock(clock)
+        # Стратегии привязок, прошедших допуск: подпись занявшей инструмент привязки в отказе instrument-busy.
+        self._assignment_strategies: dict[str, str] = {}
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
         self._post_fill_check = post_fill_check
@@ -298,6 +312,7 @@ class TradeManager:
         self._execution_observer = execution_observer
         self._visual_instruments = {}
         self._visual_markets = {}
+        self._minute_source = None   # (инструмент, с, по) → закрытые минутки для незакрытой свечи графика
         self._last_budget_alert = None
         self._profiles_config = dict(profiles_config or {})
         self._risk_limits = risk_limits or _DEFAULT_RISK_LIMITS
@@ -345,6 +360,12 @@ class TradeManager:
         self._instrument_stops: dict[str, str] = {}
         # Запрет входов без связи с ядром (add-contour-recovery).
         self._core_lost = False
+        self._guards: set[str] = set()
+        # Контур на брокере (add-tinvest-orders): капитал со счёта вместо журнала, снятие привязок,
+        # инструменты, замороженные сверщиком. У эмуляции источника капитала нет.
+        self._capital = capital_provider
+        self._assignment_stops: dict[str, str] = {}
+        self._frozen: frozenset[str] = frozenset()
 
     def initialize_account(self):
         """Начальный капитал прогона существует и при отсутствии сделок."""
@@ -714,8 +735,8 @@ class TradeManager:
             return False
         if isinstance(action, AddToTrade):
             row = self._storage.connection.execute(
-                "SELECT instrument_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
-            blocked = self._entry_block(row[0] if row else "")
+                "SELECT instrument_id, assignment_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            blocked = self._entry_block(row[0] if row else "", row[1] if row else None)
             if blocked is not None:
                 log.info("submit_action %s: добор отклонён — %s", action.trade_id, rejection_message(blocked))
                 self._traces.record(self._contour_stop_trace("AddToTrade", TraceLinks(trade_id=action.trade_id),
@@ -989,7 +1010,8 @@ class TradeManager:
         if status != "PENDING":
             return deny("order-state-unconfirmed")
         protected = self._confirmed_guard_close(connection, action, phase, revision, quantity)
-        if action.state_revision != revision and not protected:
+        if (action.state_revision != revision and not protected
+                and not self._revised_only_by_own_stop_moves(connection, action, revision)):
             return deny("stale-state-revision")
         if isinstance(action, OpenTrade):
             phase_valid = phase == TradePhase.ENTRY_PENDING and quantity == 0
@@ -1028,10 +1050,50 @@ class TradeManager:
             return True
         if not evidence.work_ready:
             return deny("work-input-unconfirmed")
-        if evidence.intent_current is not True:
+        if evidence.intent_current is not True and not self._stop_demands(connection, action, instrument):
             return deny("freshness-unconfirmed" if evidence.intent_current is None else "stale-intent")
         self.dispatch_block_reasons.pop(action.command_id, None)
         return True
+
+    def _stop_demands(self, connection, action, instrument) -> bool:
+        """Команду остановки делает актуальной действующий режим владельца, а не момент постановки.
+
+        Остановку применяет граница тика раньше начала шага, и каждый тик повторяет её:
+        по шагу такая команда всегда «создана раньше» (fix-stop-command-freshness).
+        """
+        if action.reason == CONTOUR_STOP:
+            mode = self._contour_stop
+        elif action.reason == INSTRUMENT_REMOVE:
+            mode = self._instrument_stops.get(instrument)
+        elif action.reason == BINDING_REMOVE:
+            row = connection.execute("SELECT assignment_id FROM trades WHERE trade_id=?", (action.trade_id,)).fetchone()
+            mode = self._assignment_stops.get(row[0]) if row else None
+        else:
+            return False
+        if isinstance(action, CloseTrade):
+            return mode == CONTOUR_CLOSE_ALL
+        return isinstance(action, CancelEntry) and mode is not None
+
+    @staticmethod
+    def _revised_only_by_own_stop_moves(connection, action, revision) -> bool:
+        """Ревизию выхода сменили только подтверждённые переносы стопа с той же ревизией (fix-exit-after-stop-confirm).
+
+        Профиль на одном баре ставит перенос стопа и выход с одной ревизией. Брокер контура подтверждает
+        стоп сразу при доставке, ``_confirm_stop`` повышает ревизию, и выход за ним иначе навсегда устаревает.
+        Перенос стопа не меняет остаток и фазу, на которых основан выход. Любое другое изменение — исполнение,
+        смена фазы, перенос стопа другого решения — даёт лишнее повышение, и выход остаётся устаревшим.
+        """
+        if not isinstance(action, (CloseTrade, ReduceTrade)) or revision <= action.state_revision:
+            return False
+        rows = connection.execute(
+            "SELECT e.payload_json, b.payload_json FROM events e JOIN orders o ON o.command_id=e.command_id "
+            "JOIN outbox b ON b.command_id=e.command_id "
+            "WHERE e.trade_id=? AND o.action_type='MOVESTOP' AND e.event_type='ACK'", (action.trade_id,),
+        ).fetchall()
+        confirmed = sum(1 for event, command in rows
+                        if "confirmed_stop" in json.loads(event)
+                        and json.loads(command).get("state_revision") == action.state_revision)
+        return confirmed == revision - action.state_revision
 
     def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
         """Proof существующего guard, не whitelist по строке reason."""
@@ -1080,7 +1142,16 @@ class TradeManager:
             row = self._storage.connection.execute("SELECT plan_json FROM trades WHERE trade_id=?", (event.trade_id,)).fetchone()
             snapshot = json.loads(row[0]).get("cost_snapshot") if row else None
             event = resolve_execution_fee(event, None if snapshot is None else Decimal(str(snapshot["commission"])))
-        applied = self._reducer.apply(event)
+        try:
+            applied = self._reducer.apply(event)
+        except ValueError as exc:
+            # Брокер на счёте (песочница) сообщает факт, который журнал не принял: брокер помечает его
+            # отвергнутым и откатывает своё представление, расхождение показывает сверка (add-tinvest-orders).
+            refuse = getattr(self._broker, "refuse_execution", None)
+            if not callable(refuse) or event.status not in {ExecutionStatus.FILL, ExecutionStatus.PARTIAL}:
+                raise
+            refuse(event, str(exc))
+            return False
         if not applied:
             return False
         stop_confirmed = event.status is ExecutionStatus.ACK and self._confirm_stop(event)
@@ -1109,6 +1180,25 @@ class TradeManager:
     def configure_visual_context(self, instruments):
         """Runtime metadata, independent of the notification channel."""
         self._visual_instruments.update({instrument_key(i): i for i in instruments})
+
+    def configure_minute_source(self, source) -> None:
+        """Минутки из уже имеющихся данных для незакрытой свечи графика исполнения (fix-trade-close-accuracy)."""
+        self._minute_source = source
+
+    def _with_forming_candle(self, instrument, timeframe, market, as_of):
+        """Свеча, в которую попало исполнение после закрытия последней свечи окна; сбой — окно как есть."""
+        source, meta = self._minute_source, self._visual_instruments.get(instrument)
+        if source is None or meta is None or not market.get("candles"):
+            return market
+        last = utc(market["candles"][-1]["time"])
+        since = CandleScheduler(timeframe).bar_close(last)
+        if since >= utc(as_of):
+            return market
+        try:
+            return with_forming_candle(market, timeframe, source(meta, since, utc(as_of)), as_of)
+        except Exception as exc:  # noqa: BLE001 — график не должен мешать уведомлению
+            log.warning("График: незакрытая свеча не собрана (%s)", type(exc).__name__)
+            return market
 
     def remember_market(self, instrument, timeframe, frame, as_of, breaks=None):
         self._visual_instruments[instrument_key(instrument)] = instrument
@@ -1153,6 +1243,7 @@ class TradeManager:
                     grid = CandleScheduler(timeframe)
                     market = dict(market, candles=tuple(c for c in market["candles"]
                                                        if utc(grid.bar_close(utc(c["time"]))) <= utc(event.timestamp)))
+                    market = self._with_forming_candle(instrument, timeframe, market, event.timestamp)
                 contract_for = getattr(self._broker, "contract_for", None)
                 meta = contract_for(instrument) if callable(contract_for) else None
                 details["visual"] = lifecycle_snapshot(connection, event,
@@ -1182,6 +1273,9 @@ class TradeManager:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
         self._session_instruments[instrument_key(instrument)] = instrument
+        strategy = getattr(assignment, "strategy", None)
+        if strategy:
+            self._assignment_strategies[assignment.id] = str(strategy)
         if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
             return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
@@ -1206,7 +1300,7 @@ class TradeManager:
             if owned is not None:
                 actions = self._manage_owned(owned, assignment, decision, instrument, frame, context, meta, timeframe)
                 return SignalAdmission(actions=actions)
-            blocked = self._entry_block(instrument_key(instrument))
+            blocked = self._entry_block(instrument_key(instrument), assignment.id)
             if blocked is not None:
                 log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, rejection_message(blocked))
                 self._traces.record(self._contour_stop_trace(
@@ -1215,9 +1309,9 @@ class TradeManager:
             session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
             if session_rejection is not None:
                 return SignalAdmission(rejections=(session_rejection,))
-            opposite_rejection = self._opposite_exposure_rejection(assignment, decision, instrument)
-            if opposite_rejection is not None:
-                return SignalAdmission(rejections=(opposite_rejection,))
+            busy_rejection = self._instrument_busy_rejection(assignment, decision, instrument)
+            if busy_rejection is not None:
+                return SignalAdmission(rejections=(busy_rejection,))
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except sqlite3.IntegrityError as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -1509,6 +1603,24 @@ class TradeManager:
         self._instrument_stops[key] = mode
         return self._stop_trades(mode, INSTRUMENT_REMOVE, key)
 
+    def stop_assignment(self, assignment_id: str, mode: str | None) -> tuple[TradeAction, ...]:
+        """Снятие привязки из состава контура на брокере: те же правила, только сделки этой привязки."""
+        _check_stop_mode(mode)
+        if mode != self._assignment_stops.get(assignment_id):
+            log.info("Снятие привязки %s: режим %s", assignment_id, mode or "снято")
+        if mode is None:
+            self._assignment_stops.pop(assignment_id, None)
+            return ()
+        self._assignment_stops[assignment_id] = mode
+        return self._stop_trades(mode, BINDING_REMOVE, None, assignment_id=assignment_id)
+
+    def freeze_instruments(self, keys) -> None:
+        """Инструменты, замороженные сверщиком: новые входы и доборы запрещены, выходы работают."""
+        frozen = frozenset(keys)
+        if frozen != self._frozen:
+            log.info("Заморозка сверкой: %s", ", ".join(sorted(frozen)) or "снята")
+        self._frozen = frozen
+
     def hold_entries(self, held: bool) -> None:
         """Запрет входов и доборов без связи с ядром; неисполненные входы и закрытия не трогаются."""
         held = bool(held)
@@ -1527,11 +1639,41 @@ class TradeManager:
             algorithm_version="contour-recovery",
         ))
 
-    def _stop_trades(self, mode: str, reason: str, key: str | None) -> tuple[TradeAction, ...]:
+    def guard_entries(self, reason: str, active: bool) -> None:
+        """Запрет входов и доборов предохранителем контура (add-account-guards); причины ставятся и снимаются
+        по одной. Неисполненные входы, выходы, стоп и цели не трогаются."""
+        if reason not in GUARD_REASONS:
+            raise ValueError(f"unknown guard reason {reason!r}")
+        if active == (reason in self._guards):
+            return
+        if active:
+            self._guards.add(reason)
+        else:
+            self._guards.discard(reason)
+        log.info("Предохранитель %s: %s", reason, "новые входы запрещены" if active else "запрет снят")
+        self._traces.record(calculation_trace(
+            "contour.guard",
+            inputs={"active": MeasuredValue(active, "active")},
+            result=MeasuredValue(not active, "allowed"),
+            reason=reason,
+            formula="contour guard: no new entries or adds; pending entries and exits follow their plan",
+            links=TraceLinks(),
+            outcome=TraceOutcome.REJECTED if active else TraceOutcome.ACCEPTED,
+            algorithm_version="account-guards",
+        ))
+
+    @property
+    def guards(self) -> frozenset[str]:
+        return frozenset(self._guards)
+
+    def _stop_trades(self, mode: str, reason: str, key: str | None, *,
+                     assignment_id: str | None = None) -> tuple[TradeAction, ...]:
         submitted: list[TradeAction] = []
         for recovered in self.restore():
             plan, state = recovered.plan, recovered.state
             if key is not None and plan.instrument_id != key:
+                continue
+            if assignment_id is not None and plan.assignment_id != assignment_id:
                 continue
             links = TraceLinks(assignment_id=plan.assignment_id, trade_id=plan.trade_id, signal_id=plan.signal_id)
             if state.phase is TradePhase.ENTRY_PENDING:
@@ -1541,6 +1683,7 @@ class TradeManager:
                 action = CancelEntry(command_id=uuid4().hex, trade_id=plan.trade_id,
                                      state_revision=state.state_revision, reason=reason)
             elif mode == CONTOUR_CLOSE_ALL and state.phase in _MANAGEABLE and state.quantity > 0:
+                self._renew_stale_stop_close(plan.trade_id, state.state_revision)
                 if self._open_order(plan.trade_id, "CLOSE"):
                     continue
                 log.info("%s: закрытие позиции %s", rejection_message(reason), plan.trade_id)
@@ -1554,11 +1697,34 @@ class TradeManager:
                 submitted.append(action)
         return tuple(submitted)
 
-    def contour_remainder(self, key: str | None = None) -> tuple[int, int]:
-        """Открытые позиции и неисполненные входы контура или одного инструмента."""
+    def _renew_stale_stop_close(self, trade_id: str, revision: int) -> None:
+        """Снять недоставленное закрытие остановки, чья ревизия устарела: его допуск уже не пропустит.
+
+        Брокер о нём не знает, поэтому снятие локальное: outbox → UNDELIVERED под guard
+        доставки, затем CANCEL заявки; фаза и ревизия сделки не меняются.
+        """
+        rows = self._storage.connection.execute(
+            "SELECT b.command_id, b.payload_json FROM orders o JOIN outbox b ON b.command_id=o.command_id "
+            "WHERE o.trade_id=? AND o.action_type='CLOSE' AND o.status='PENDING' AND b.status='PENDING' "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.command_id=o.command_id)", (trade_id,)).fetchall()
+        stale = [command_id for command_id, payload in rows
+                 if (data := json.loads(payload)).get("reason") in (CONTOUR_STOP, INSTRUMENT_REMOVE, BINDING_REMOVE)
+                 and data.get("state_revision") != revision]
+        now = as_aware(self._clock.now())
+        for command_id in self._storage.mark_outbox_undelivered(stale):
+            log.info("Недоставленное закрытие %s снято: ревизия сделки сменилась, закрытие ставится заново", trade_id)
+            self._enqueued_at.pop(command_id, None)
+            self.consume(ExecutionEvent(execution_id=f"{command_id}:{STOP_COMMAND_RENEWED}", command_id=command_id,
+                order_id=command_id, trade_id=trade_id, status=ExecutionStatus.CANCEL, filled_quantity=0,
+                price=None, fee=Decimal(0), timestamp=now, reason=STOP_COMMAND_RENEWED))
+
+    def contour_remainder(self, key: str | None = None, *, assignment_id: str | None = None) -> tuple[int, int]:
+        """Открытые позиции и неисполненные входы контура, одного инструмента или одной привязки."""
         positions = entries = 0
         for recovered in self.restore():
             if key is not None and recovered.plan.instrument_id != key:
+                continue
+            if assignment_id is not None and recovered.plan.assignment_id != assignment_id:
                 continue
             state = recovered.state
             if state.phase is TradePhase.ENTRY_PENDING:
@@ -1567,14 +1733,22 @@ class TradeManager:
                 positions += 1
         return positions, entries
 
-    def _entry_block(self, key: str) -> str | None:
-        """Причина отказа новому входу или добору: остановка контура, снятие инструмента, нет связи с ядром."""
+    def _entry_block(self, key: str, assignment_id: str | None = None) -> str | None:
+        """Причина отказа новому входу или добору: остановка контура, снятие инструмента или привязки,
+        заморозка сверкой, нет связи с ядром."""
         if self._contour_stop is not None:
             return CONTOUR_STOPPING
         if key in self._instrument_stops:
             return INSTRUMENT_REMOVING
+        if assignment_id is not None and assignment_id in self._assignment_stops:
+            return BINDING_REMOVING
+        if key in self._frozen:
+            return INSTRUMENT_FROZEN
         if self._core_lost:
             return CORE_LOST
+        for reason in GUARD_REASONS:
+            if reason in self._guards:
+                return reason
         return None
 
     def _contour_stop_trace(self, action: str | None, links: TraceLinks, *, mode: str | None = None,
@@ -1635,14 +1809,15 @@ class TradeManager:
         ))
         return False
 
-    def _opposite_exposure_rejection(self, assignment, decision, instrument):
-        """Недопуск входа против незавершённой сделки другой привязки (trade-management: «Отказ во встречном входе»).
+    def _instrument_busy_rejection(self, assignment, decision, instrument):
+        """Недопуск входа по инструменту, занятому другой привязкой (trade-management: «Владелец и жизненный цикл сделки»).
 
-        Счёт один, позиция по контракту у брокера общая, поэтому встречной
-        считается любая незавершённая сделка другого направления — с ожидающим
-        входом или с ненулевым объёмом — по тому же контракту или по другому
-        контракту того же семейства фьючерсов (переход BR-6.25 → BR-7.25).
-        Существующая сделка не закрывается.
+        Счёт один, позиция по инструменту у брокера общая (неттинг), поэтому на
+        инструмент — одна привязка-владелица. Инструмент — контракт или всё
+        семейство фьючерса (переход BR-6.25 → BR-7.25). Блокирует незавершённая
+        сделка — с ожидающим входом или с ненулевым объёмом:
+        встречная любой привязки — ``opposite-exposure``; в ту же сторону другой
+        привязки — ``instrument-busy``. Существующая сделка не меняется.
         """
         side = decision.signal_type.value
         names = self._storage.instrument_names()
@@ -1650,32 +1825,52 @@ class TradeManager:
         key = _exposure_key(own_id, getattr(instrument, "ticker", None),
                             getattr(instrument, "short_name", None), getattr(instrument, "family", None))
         rows = self._storage.connection.execute(
-            "SELECT t.trade_id, t.instrument_id, t.side FROM trades t LEFT JOIN positions p USING(trade_id) "
-            f"WHERE t.side<>? AND (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) ORDER BY t.created_at",
-            (side,),
+            "SELECT t.trade_id, t.assignment_id, t.instrument_id, t.side, t.plan_json FROM trades t "
+            f"LEFT JOIN positions p USING(trade_id) WHERE (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) "
+            "ORDER BY t.created_at",
         ).fetchall()
-        blocking = [(trade_id, instrument_id, other_side) for trade_id, instrument_id, other_side in rows
-                    if instrument_id == own_id
-                    or _exposure_key(instrument_id, instrument_id, names.get(instrument_id)) == key]
-        if not blocking:
-            return None
-        _, instrument_id, other_side = blocking[0]
-        contract = names.get(instrument_id)
-        message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
-                   f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+        exposure = [row for row in rows
+                    if row[2] == own_id or _exposure_key(row[2], row[2], names.get(row[2])) == key]
+        opposite = [row for row in exposure if row[3] != side]
+        if opposite:
+            blocking, reason = opposite, "opposite-exposure"
+            _, _, instrument_id, other_side, _ = blocking[0]
+            contract = names.get(instrument_id)
+            message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
+                       f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+            formula = "new entry side != side of an unfinished trade on the same contract or futures family -> reject"
+        else:
+            blocking = [row for row in exposure if row[1] != assignment.id]
+            if not blocking:
+                return None
+            reason = "instrument-busy"
+            _, owner_id, instrument_id, _, plan_json = blocking[0]
+            contract = names.get(instrument_id)
+            message = (f"{'по ' + contract + ' ' if contract else ''}уже ведёт сделку "
+                       f"{self._binding_label(owner_id, plan_json)}")
+            formula = "unfinished trade of another assignment on the same contract or futures family -> reject"
         log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, message)
         self._traces.record(calculation_trace(
-            "portfolio.opposite-exposure",
+            f"portfolio.{reason}",
             inputs={"signal": MeasuredValue(side, "side"),
                     "exposure_key": MeasuredValue(key, "exposure-key"),
                     "blocking_trades": MeasuredValue([row[0] for row in blocking], "trade-ids")},
             result=MeasuredValue(False, "allowed"),
-            reason="opposite-exposure",
-            formula="new entry side != side of an unfinished trade on the same contract or futures family -> reject",
+            reason=reason,
+            formula=formula,
             links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
             outcome=TraceOutcome.REJECTED,
         ))
-        return rejection_reason("opposite-exposure", message=message)
+        return rejection_reason(reason, message=message)
+
+    def _binding_label(self, assignment_id: str, plan_json: str) -> str:
+        """«стратегия · ТФ» занявшей привязки; стратегия неизвестна (после рестарта) — id привязки."""
+        try:
+            timeframe = json.loads(plan_json).get("timeframe") or ""
+        except (TypeError, ValueError, AttributeError):
+            timeframe = ""
+        name = self._assignment_strategies.get(assignment_id) or f"привязка {assignment_id}"
+        return f"{name} · {timeframe}" if timeframe else name
 
     def _open_order(self, trade_id: str, action_type: str, *, reason: str | None = None) -> bool:
         """Есть ли незавершённая заявка типа ``action_type`` (при ``reason`` — с этой причиной)."""
@@ -2253,7 +2448,7 @@ class TradeManager:
         state = self._budget_state(self._storage.connection)
         budget = state.base
         go = Decimal(str(meta.go_buy if plan.side == "BUY" else meta.go_sell))
-        used_risk, used_margin = state.used_risk, state.used_margin
+        used_risk, used_margin = state.used_risk, self._margin_in_use(state)
         risk_budget = state.limit
         free_risk = risk_budget - used_risk
         free_margin = budget - used_margin
@@ -2331,7 +2526,19 @@ class TradeManager:
             used_margin, candidate_margin, margin_budget,
         )
 
+    def _margin_in_use(self, state) -> Decimal:
+        """Занятое ГО: у капитала со счёта — только неисполненные входы, открытое брокер уже учёл в деньгах."""
+        return state.pending_margin if self._capital is not None else state.used_margin
+
+    def _account_capital(self) -> Decimal:
+        capital = self._capital()
+        if capital is None or not Decimal(capital).is_finite():
+            raise RiskStateUnknown(ACCOUNT_UNAVAILABLE)
+        return max(Decimal(0), Decimal(capital))
+
     def _budget_base(self) -> Decimal:
+        if self._capital is not None:
+            return self._account_capital()
         row = self._storage.connection.execute(
             "SELECT balance, equity FROM account WHERE account_id = 1"
         ).fetchone()
@@ -2348,8 +2555,11 @@ class TradeManager:
     def _known_budget_state(self, connection) -> _BudgetState:
         if self._equity_unknown:
             raise RiskStateUnknown("нет полной текущей переоценки счёта")
-        capital = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
-        base = max(Decimal(0), min(Decimal(capital[0]), Decimal(capital[1]))) if capital else max(Decimal(0), self._initial_balance)
+        if self._capital is not None:
+            base = self._account_capital()
+        else:
+            capital = connection.execute("SELECT balance,equity FROM account WHERE account_id=1").fetchone()
+            base = max(Decimal(0), min(Decimal(capital[0]), Decimal(capital[1]))) if capital else max(Decimal(0), self._initial_balance)
         pending_risk, pending_margin = self._active_reservation_totals(connection)
         if not base.is_finite() or not all(value.is_finite() and value >= 0 for value in (pending_risk, pending_margin)):
             raise RiskStateUnknown("некорректные суммы счёта/резервов")
@@ -2474,13 +2684,13 @@ class TradeManager:
         def risk_allowed(q):
             return self._budget_policy.portfolio_pct > 0 and budget.used_risk <= budget.limit and budget.used_risk+delta(q) <= budget.limit
         def allowed(q):
-            return risk_allowed(q) and budget.used_margin+go*q <= budget.base
+            return risk_allowed(q) and self._margin_in_use(budget)+go*q <= budget.base
         quantity = self._largest_allowed(allowed, maximum)
         if quantity <= 0:
             code = "risk-budget" if self._largest_allowed(risk_allowed, maximum) == 0 else "margin-committed-by-pending-orders" if budget.pending_margin > 0 else "margin-budget"
             raise ReservationRejected(code, used_risk=budget.used_risk, candidate_risk=delta(1), risk_budget=budget.limit,
                                       used_margin=budget.used_margin, candidate_margin=go, margin_budget=budget.base)
-        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if budget.used_margin+go*(quantity+1) > budget.base else
+        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if self._margin_in_use(budget)+go*(quantity+1) > budget.base else
                       "max-quantity" if current.quantity+quantity >= self._max_qty else action.limiting_constraint or "profile")
         selected = replace(action, quantity=quantity, requested_quantity=requested, limiting_constraint=constraint)
         self._traces.record_in_transaction(connection, calculation_trace(
@@ -2512,6 +2722,11 @@ class TradeManager:
             "FROM positions p JOIN trades t ON t.trade_id=p.trade_id WHERE p.quantity>0",
         ):
             if instrument not in prices or step is None or cost is None or average is None:
+                if self._capital is not None and instrument not in prices and None not in (step, cost, average):
+                    # Капитал допуска — со счёта брокера: переоценка журнала справочная, и неизвестная
+                    # цена одной позиции не запрещает входы всем инструментам (fix-sandbox-restart-safety).
+                    log.debug("переоценка журнала пропущена: нет цены %s", instrument)
+                    return False
                 self._equity_unknown = True
                 log.warning("нет полной переоценки: неизвестны цена/факторы открытой позиции")
                 return False
@@ -2696,7 +2911,7 @@ class TradeManager:
         if risk_budget is None or margin_budget is None:
             raise ValueError("reservation requires risk and margin budgets")
         state = self._budget_state(connection)
-        used_risk, used_margin = state.used_risk, state.used_margin
+        used_risk, used_margin = state.used_risk, self._margin_in_use(state)
         risk_budget = min(risk_budget, state.limit)
         margin_budget = min(margin_budget, state.base)
         if used_risk + candidate.risk_amount > risk_budget:

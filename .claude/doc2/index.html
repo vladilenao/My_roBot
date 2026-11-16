@@ -1,0 +1,1035 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Робот на реальном счёте</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Unbounded:wght@500;700&display=swap">
+<style>
+/* Layout: одна колонка «от общего к частному»; ярус глубины в каждом заголовке, схемы шире текста */
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --surface-2:#e8ecf1; --fg:#17212d; --muted:#5a6678; --line:#ccd3dd;
+  --key:#2f3f99; --key-soft:#e3e7f8;
+  --real:#9c5d06; --real-soft:#fbefd9; --real-line:#d9a24a;
+  --sim:#28687a; --sim-soft:#dcedf1; --sim-line:#6fb0c0;
+  --bad:#ad3329; --bad-soft:#f8e0dc; --ok:#2b744a; --ok-soft:#dcf0e3;
+  --display:"Unbounded","Golos Text",system-ui,sans-serif;
+  --body:"Golos Text",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#10141a; --surface:#181e27; --surface-2:#212935; --fg:#e5e9ef; --muted:#9aa5b5; --line:#343e4c;
+  --key:#9aa8ff; --key-soft:#232a4d;
+  --real:#f1aa45; --real-soft:#35270f; --real-line:#8a6222;
+  --sim:#72c3d4; --sim-soft:#132e36; --sim-line:#2f6f7e;
+  --bad:#ff7d6e; --bad-soft:#3d1c19; --ok:#73d39d; --ok-soft:#14321f;
+  color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#10141a; --surface:#181e27; --surface-2:#212935; --fg:#e5e9ef; --muted:#9aa5b5; --line:#343e4c;
+  --key:#9aa8ff; --key-soft:#232a4d;
+  --real:#f1aa45; --real-soft:#35270f; --real-line:#8a6222;
+  --sim:#72c3d4; --sim-soft:#132e36; --sim-line:#2f6f7e;
+  --bad:#ff7d6e; --bad-soft:#3d1c19; --ok:#73d39d; --ok-soft:#14321f;
+  color-scheme:dark}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;line-height:1.55;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:0 64px}
+.wrap{max-width:1000px;margin:0 auto}
+.prose{max-width:68ch}
+h1,h2,h3{text-wrap:balance;margin:0}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(28px,5vw,44px);line-height:1.12;letter-spacing:-.01em}
+h2{font-family:var(--display);font-weight:500;font-size:clamp(20px,3vw,26px);line-height:1.25}
+h3{font-size:17px;font-weight:600}
+p{margin:0}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:var(--surface-2);padding:.08em .35em;border-radius:4px}
+a{color:var(--key)}
+a:focus-visible{outline:2px solid var(--key);outline-offset:2px}
+
+header.top{padding-block:40px 8px;display:grid;gap:18px}
+.lead{font-size:19px;max-width:62ch}
+nav.toc{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:14px;padding-block:10px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+nav.toc a{color:var(--muted);text-decoration:none}
+nav.toc a:hover{color:var(--fg)}
+nav.toc b{font-family:var(--mono);font-weight:500;font-size:12px;color:var(--key);margin-right:4px}
+.pre{border:1.5px solid var(--key);background:var(--key-soft);border-radius:12px;padding:14px 16px;font-size:15px;display:grid;gap:4px}
+.pre b{color:var(--key)}
+
+section{padding-block:44px 8px;display:grid;gap:18px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--key)}
+.muted{color:var(--muted)}
+.small{font-size:14px}
+
+.fig{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;overflow-x:auto}
+.fig svg{display:block;width:100%;min-width:760px;height:auto}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;color:var(--muted);padding:10px 4px 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:14px;height:14px;border-radius:3px;border:1.5px solid}
+.sw.sim{background:var(--sim-soft);border-color:var(--sim)}
+.sw.real{background:var(--real-soft);border-color:var(--real)}
+.sw.key{background:var(--key-soft);border-color:var(--key)}
+.sw.now{background:var(--surface);border-color:var(--line)}
+
+/* SVG */
+svg text{font-family:var(--body);fill:var(--fg)}
+svg .t{font-size:14.5px;font-weight:600}
+svg .s{font-size:12.5px;fill:var(--muted)}
+svg .r{font-size:13.5px}
+svg .m{font-family:var(--mono);font-size:12px;fill:var(--fg)}
+svg .lbl{font-size:12.5px;fill:var(--muted);paint-order:stroke;stroke:var(--surface);stroke-width:5px;stroke-linejoin:round}
+svg .lbl.real{fill:var(--real)} svg .lbl.sim{fill:var(--sim)} svg .lbl.bad{fill:var(--bad)} svg .lbl.ok{fill:var(--ok)} svg .lbl.key{fill:var(--key)}
+svg .n rect{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+svg .n.sim rect{fill:var(--sim-soft);stroke:var(--sim)}
+svg .n.real rect{fill:var(--real-soft);stroke:var(--real)}
+svg .n.realx rect{fill:var(--real-soft);stroke:var(--real);stroke-width:2.5}
+svg .n.key rect{fill:var(--key-soft);stroke:var(--key)}
+svg .n.ext rect{fill:var(--surface-2);stroke:var(--real);stroke-dasharray:6 4}
+svg .n.ok rect{fill:var(--ok-soft);stroke:var(--ok)}
+svg .n.bad rect{fill:var(--bad-soft);stroke:var(--bad)}
+svg .n.warn rect{fill:var(--real-soft);stroke:var(--real);stroke-dasharray:5 3}
+svg .e{fill:none;stroke:var(--muted);stroke-width:1.6}
+svg .e.real{stroke:var(--real)} svg .e.sim{stroke:var(--sim)} svg .e.bad{stroke:var(--bad)} svg .e.key{stroke:var(--key)}
+svg .e.ret{stroke-dasharray:6 4}
+svg .ah{fill:var(--muted)} svg .ah.real{fill:var(--real)} svg .ah.sim{fill:var(--sim)} svg .ah.bad{fill:var(--bad)} svg .ah.key{fill:var(--key)}
+svg .life{stroke:var(--line);stroke-width:1.5;stroke-dasharray:3 5}
+svg .num circle{fill:var(--key-soft);stroke:var(--key)}
+svg .num text{font-family:var(--mono);font-size:11px;fill:var(--key);font-weight:500}
+svg .band{fill:var(--surface-2)}
+svg .lvl{stroke-width:1.4;stroke-dasharray:6 5;fill:none}
+svg .price{fill:none;stroke:var(--fg);stroke-width:2.2;stroke-linejoin:round}
+
+/* setup */
+.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:820px){.split{grid-template-columns:minmax(0,1fr)}}
+pre.code{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.6;color:var(--fg)}
+pre.code .c{color:var(--muted)} pre.code .k{color:var(--key)} pre.code .v{color:var(--sim)}
+.ladder{display:grid;gap:8px}
+.step{display:grid;grid-template-columns:72px minmax(0,1fr);gap:12px;align-items:start;padding:12px 14px;border-radius:10px;border:1px solid var(--line);background:var(--surface)}
+.step .tag{font-family:var(--mono);font-size:13px;font-weight:500;padding:3px 8px;border-radius:6px;text-align:center;border:1.5px solid}
+.tag.real{color:var(--real);background:var(--real-soft);border-color:var(--real)}
+.tag.half{color:var(--real);background:var(--surface);border-color:var(--real-line);border-style:dashed}
+.tag.ro{color:var(--key);background:var(--key-soft);border-color:var(--key)}
+.step p{font-size:14.5px}
+.step .money{display:block;font-size:12.5px;color:var(--muted);margin-top:2px}
+ul.rules{margin:0;padding-left:20px;display:grid;gap:6px;font-size:15px}
+.tasks{margin:0;padding-left:22px;display:grid;gap:8px;font-size:15px}
+.tasks li::marker{font-family:var(--mono);color:var(--key)}
+
+/* tables */
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px}
+th,td{text-align:left;vertical-align:top;padding:11px 14px;border-bottom:1px solid var(--line)}
+th{font-size:12px;font-family:var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;background:var(--surface-2)}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:1px 7px;border-radius:99px;border:1px solid;white-space:nowrap}
+.pill.bad{color:var(--bad);border-color:var(--bad);background:var(--bad-soft)}
+.pill.ok{color:var(--ok);border-color:var(--ok);background:var(--ok-soft)}
+.pill.real{color:var(--real);border-color:var(--real);background:var(--real-soft)}
+.pill.key{color:var(--key);border-color:var(--key);background:var(--key-soft)}
+
+.reuse{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media (max-width:700px){.reuse{grid-template-columns:minmax(0,1fr)}}
+.reuse div{border-radius:12px;padding:14px 16px;border:1.5px solid var(--line);background:var(--surface);display:grid;gap:8px;align-content:start}
+.reuse div.mine{border-color:var(--real-line);background:var(--real-soft)}
+.reuse h3{font-size:15.5px}
+.reuse div.mine h3{color:var(--real)}
+.reuse ul{margin:0;padding-left:18px;display:grid;gap:4px;font-size:14.5px}
+
+/* truth */
+.truth{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch}
+.tr{flex:1 1 200px;border-radius:10px;padding:12px 14px;border:1.5px solid var(--line);background:var(--surface);display:grid;gap:2px;font-size:14px}
+.tr b{font-size:15px}
+.tr.r1{border-color:var(--real);background:var(--real-soft)}
+.tr.r2{border-color:var(--key);background:var(--key-soft)}
+.tr.r3{border-style:dashed}
+.arrow{align-self:center;color:var(--muted);font-family:var(--mono);font-size:13px}
+@media (max-width:680px){.arrow{display:none}}
+.when{display:flex;flex-wrap:wrap;gap:8px;font-size:14px}
+.when span{background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:3px 12px}
+
+/* telegram mock */
+.tg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;align-items:start}
+@media (max-width:900px){.tg{grid-template-columns:minmax(0,1fr)}}
+.chan{font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:6px}
+.msg{background:var(--surface);border:1px solid var(--line);border-radius:14px 14px 14px 4px;padding:12px 14px;display:grid;gap:8px;font-size:14px;box-shadow:0 1px 0 var(--line)}
+.msg .hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-family:var(--mono);font-size:11.5px;font-weight:500;padding:2px 8px;border-radius:5px;letter-spacing:.04em}
+.badge.sim{background:var(--sim-soft);color:var(--sim);border:1px solid var(--sim)}
+.badge.real{background:var(--real);color:var(--surface)}
+.badge.bad{background:var(--bad);color:var(--surface)}
+.badge.ok{background:var(--ok);color:var(--surface)}
+.msg .ttl{font-weight:600}
+.msg .lv{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.tl{display:grid;gap:4px;margin:0;padding:0;list-style:none;border-left:2px solid var(--real-line);padding-left:10px}
+.tl li{font-size:13.5px;display:grid;grid-template-columns:62px minmax(0,1fr);gap:6px}
+.tl time{font-family:var(--mono);font-size:12px;color:var(--muted);padding-top:1px}
+.tl .x{color:var(--bad)}
+.msg .foot{font-size:12.5px;color:var(--muted)}
+
+/* nuances */
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media (max-width:700px){.cards{grid-template-columns:minmax(0,1fr)}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:grid;gap:6px;align-content:start}
+.card .row{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.card p{font-size:14.5px}
+.card .pain{color:var(--muted)}
+.stage{font-family:var(--mono);font-size:12px;color:var(--key);white-space:nowrap}
+
+.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:760px){.facts{grid-template-columns:minmax(0,1fr)}}
+.fact{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:14.5px;display:grid;gap:4px;align-content:start}
+.fact b{font-size:15px}
+.fact .src{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.policy{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px}
+@media (max-width:760px){.policy{grid-template-columns:minmax(0,1fr)}}
+.policy div{border-left:3px solid var(--ok);padding:4px 0 4px 12px;font-size:14.5px}
+.policy b{display:block;margin-bottom:2px}
+
+/* roadmap */
+.road{display:grid}
+.stg{display:grid;grid-template-columns:58px minmax(0,1fr);gap:14px;position:relative;padding-bottom:18px}
+.stg::before{content:"";position:absolute;left:28px;top:44px;bottom:0;width:2px;background:var(--line)}
+.stg:last-child::before{display:none}
+.stg .no{width:56px;height:44px;border-radius:10px;display:grid;place-items:center;font-family:var(--display);font-weight:700;font-size:16px;background:var(--surface);border:1.5px solid var(--line);color:var(--muted)}
+.stg.ro .no{border-color:var(--sim);color:var(--sim);background:var(--sim-soft)}
+.stg.rl .no{border-color:var(--real);color:var(--real);background:var(--real-soft)}
+.stg .body{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:grid;gap:10px}
+.stg .hdr{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;justify-content:space-between}
+.stg .chg{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.stg .g3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;font-size:14px}
+@media (max-width:760px){.stg .g3{grid-template-columns:minmax(0,1fr)}}
+.stg .g3 b{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:500;margin-bottom:2px}
+.money-line{font-size:13px;color:var(--muted)}
+.road-grp{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:6px 0 12px 72px}
+.road-grp.sb{color:var(--sim)} .road-grp.lv{color:var(--real)}
+.stg .g3 code{word-break:break-word}
+
+/* tests */
+.pyr{display:grid;gap:8px}
+.lay{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr) auto;gap:14px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+@media (max-width:700px){.lay{grid-template-columns:minmax(0,1fr)}}
+.bar{height:14px;border-radius:4px;background:var(--key-soft);border:1px solid var(--key)}
+.lay p{font-size:14.5px}
+.lay h3{font-size:15px}
+
+/* decisions */
+.done{display:flex;flex-wrap:wrap;gap:8px}
+.done span{background:var(--ok-soft);border:1px solid var(--ok);color:var(--fg);border-radius:8px;padding:6px 12px;font-size:14px}
+.done span::before{content:"✓ ";color:var(--ok);font-weight:700}
+.q{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px 20px}
+@media (max-width:700px){.q{grid-template-columns:minmax(0,1fr)}}
+.q h3{font-size:15.5px}
+.q .rec{font-size:14.5px;border-left:3px solid var(--key);padding-left:12px}
+.q .rec b{color:var(--key);font-weight:600}
+footer{padding-block:40px 0;font-size:13px;color:var(--muted)}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto!important}}
+html{scroll-behavior:smooth}
+</style>
+
+<div class="wrap">
+
+<header class="top">
+  <div class="eyebrow">Техническое видение · My_roBot × Т-Инвест · документ 2 из 2 · версия 14 · 08.11.2026</div>
+  <h1>Робот на реальном счёте</h1>
+  <p class="lead">Контур «Счёт» подключается к готовому ядру как ещё один вид торгового контура, рядом с эмуляцией и историей. Он торгует только переданными ему привязками на брокерском счёте робота, а правду о заявках, позициях и деньгах говорит брокер.</p>
+  <div class="pre"><b>Сначала документ 1</b><span>Здесь считается готовым всё из <a href="https://claude.ai/artifact/RtP6kF6edSsnJZfZr3bwS7">«Ядра и контуров робота»</a>: постоянное ядро, API управления, контуры отдельными процессами, команды через желаемое состояние с поколениями, свечи из ленты изменений, свой канал Telegram у контура, состав на ходу, подъём после рестарта.</span></div>
+  <div class="pre"><b>Сначала песочница, потом счёт</b><span>Торговля на брокере строится один раз, а запускается двумя видами контура из одного кода. Контур «Песочница» торгует в песочнице Т-Инвест (настоящий API и котировки, виртуальные деньги), контур «Счёт» — на брокерском счёте робота. Этапы С1–С7 доводят всё до конца в песочнице, этапы Р1–Р2 поднимают рядом контур «Счёт». Песочница после этого остаётся стендом. Каждый этап — отдельный change в OpenSpec с проверкой руками.</span></div>
+  <div class="pre"><b>Что нового в версии 14</b><span>С1–С3 сделаны: С3 в архиве с 06.11, дефекты после его проверки закрывает <code>fix-sandbox-restart-safety</code>. На С3 вошли выходы лимитом и команды остановки <code>no_entries</code> и <code>close_all</code>, поэтому С5 растворён в С3 и С4. Капитал песочницы — рубли на счёте. Разделы «Стоп и цели» и «Разведка» сверены с кодом С3. Новый раздел — <a href="#c4">план С4</a> со схемой; три вопроса к нему решены 08.11.</span></div>
+  <nav class="toc" aria-label="Разделы">
+    <a href="#map"><b>1</b>Место в ядре</a>
+    <a href="#setup"><b>1</b>Настройка</a>
+    <a href="#commands"><b>1</b>Команды</a>
+    <a href="#money"><b>1</b>Деньги</a>
+    <a href="#restart"><b>2</b>Рестарт</a>
+    <a href="#inside"><b>2</b>Путь команды</a>
+    <a href="#order"><b>2</b>Жизнь заявки</a>
+    <a href="#truth"><b>2</b>Кто прав</a>
+    <a href="#tg"><b>2</b>Telegram</a>
+    <a href="#protect"><b>3</b>Стоп и цели</a>
+    <a href="#nuance"><b>3</b>Нюансы</a>
+    <a href="#probe"><b>4</b>Разведка</a>
+    <a href="#switch"><b>4</b>Переход</a>
+    <a href="#road"><b>4</b>Этапы</a>
+    <a href="#c4"><b>4</b>План С4</a>
+    <a href="#tests"><b>4</b>Тесты</a>
+    <a href="#decide"><b>4</b>Решения</a>
+  </nav>
+  <p class="small muted">Цифра у раздела означает ярус: 1 система целиком, 2 одна заявка, 3 тонкие места, 4 план работ.</p>
+</header>
+
+<section id="map">
+  <div class="eyebrow">Ярус 1 · система</div>
+  <h2>Контур «Счёт» в ядре</h2>
+  <div class="fig">
+    <svg viewBox="0 0 960 420" role="img" aria-label="Ядро обслуживает три вида контуров; контур «Счёт» сам ходит в Т-Инвест за заявками, стопами, операциями и портфелем, котировки получает от ядра">
+      <defs>
+        <marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="mr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+      </defs>
+      <g class="n key"><rect x="20" y="20" width="920" height="110" rx="12"/><text x="40" y="50" class="t">Ядро, из документа 1</text>
+        <text x="40" y="82" class="r">свечи и полосы · календарь · арбитр квот котировок · кластеры · паттерны</text>
+        <text x="40" y="106" class="r">API управления · core.sqlite3 · пульс · котировки по токену только на чтение</text></g>
+      <path class="e" d="M160 130V176" marker-end="url(#m)"/><path class="e" d="M470 130V176" marker-end="url(#m)"/><path class="e real" d="M790 130V176" marker-end="url(#mr)"/>
+      <g class="n sim"><rect x="20" y="180" width="280" height="90" rx="10"/><text x="160" y="210" text-anchor="middle" class="t">Контур «Эмуляция»</text><text x="160" y="232" text-anchor="middle" class="s">симулятор, initial_deposit</text><text x="160" y="252" text-anchor="middle" class="s">канал «Сигналы»</text></g>
+      <g class="n"><rect x="340" y="180" width="260" height="90" rx="10"/><text x="470" y="210" text-anchor="middle" class="t">Прогоны истории</text><text x="470" y="232" text-anchor="middle" class="s">эмулятор :8100</text><text x="470" y="252" text-anchor="middle" class="s">без уведомлений</text></g>
+      <g class="n realx"><rect x="640" y="180" width="300" height="90" rx="10"/><text x="790" y="210" text-anchor="middle" class="t">Контур «Счёт»</text><text x="790" y="232" text-anchor="middle" class="s">TInvestBroker, капитал со счёта</text><text x="790" y="252" text-anchor="middle" class="s">канал и бот «Счёт» · токен торговли</text></g>
+      <path class="e real" d="M790 270V326" marker-end="url(#mr)"/>
+      <g class="n ext"><rect x="500" y="330" width="440" height="70" rx="10"/><text x="720" y="358" text-anchor="middle" class="t">Т-Инвест API</text><text x="720" y="380" text-anchor="middle" class="s">заявки, стоп-заявки, операции, портфель</text></g>
+      <text x="40" y="345" class="lbl">Контур «Счёт» получает свечи от ядра, как и эмуляция.</text>
+      <text x="40" y="367" class="lbl">В Т-Инвест он ходит только за тем, чего у ядра нет.</text>
+    </svg>
+    <div class="legend"><span><i class="sw key"></i>ядро</span><span><i class="sw sim"></i>эмуляция без изменений</span><span><i class="sw real"></i>контур «Счёт», этот документ</span></div>
+  </div>
+  <div class="reuse">
+    <div><h3>Берём готовым из документа 1</h3><ul>
+      <li>запуск и остановку через API, команды через желаемое состояние с поколениями, <code>status.json</code></li>
+      <li>свечи из ленты изменений ядра и свой checkpoint</li>
+      <li>свою папку, лог, блокировку и канал Telegram</li>
+      <li>подъём после рестарта в прежнем состоянии</li>
+      <li>состав на ходу: команды <code>add</code> и <code>remove</code></li>
+      <li>квоты котировок: их делит арбитр ядра</li>
+    </ul></div>
+    <div class="mine"><h3>Добавляет контур «Счёт»</h3><ul>
+      <li><code>TInvestBroker</code> под портом <code>BrokerPort</code> вместо симулятора</li>
+      <li>капитал и ГО со счёта</li>
+      <li>сверщик счёта с журналом</li>
+      <li>стоп и цели у брокера, правило одного стопа</li>
+      <li>второй вид контура из того же кода — «Песочница», постоянный стенд перед счётом</li>
+      <li>режим «только чтение» и предохранители</li>
+    </ul></div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="eyebrow">Ярус 1 · как включается</div>
+  <h2>Настройка контуров «Песочница» и «Счёт»</h2>
+  <div class="split">
+<pre class="code"><span class="k">[contours.sandbox]</span>              <span class="c"># с С2, заявки с С3</span>
+telegram_bot_env = <span class="v">"TELEGRAM_ACCOUNT_BOT_TOKEN"</span>
+telegram_channel_env = <span class="v">"TELEGRAM_SANDBOX_CHANNEL_ID"</span>
+reconcile_every_min = <span class="v">1</span>
+orders = <span class="v">true</span>
+exit_offset_steps = <span class="v">5</span>     <span class="c"># запас лимита выхода</span>
+exit_requote_secs = <span class="v">15</span>    <span class="c"># до перевыставления</span>
+exit_requote_attempts = <span class="v">3</span> <span class="c"># потом рынок</span>
+<span class="c"># будут: stop_place_secs (С4),</span>
+<span class="c"># max_daily_loss_rub, max_rejects_in_row (С6)</span>
+<span class="c"># состава здесь нет — только командами API</span>
+
+<span class="k">[contours.account]</span>              <span class="c"># Р1, тот же код</span>
+orders = <span class="v">false</span>       <span class="c"># true с Р2</span>
+telegram_bot_env = <span class="v">"TELEGRAM_ACCOUNT_BOT_TOKEN"</span>
+telegram_channel_env = <span class="v">"TELEGRAM_ACCOUNT_CHANNEL_ID"</span>
+max_daily_loss_rub = <span class="v">3000</span>
+max_rejects_in_row = <span class="v">3</span>
+reconcile_every_min = <span class="v">5</span>
+
+<span class="c"># .env, новые переменные</span>
+<span class="c"># TINKOFF_SANDBOX_TOKEN        токен песочницы (С1)</span>
+<span class="c"># TELEGRAM_ACCOUNT_BOT_TOKEN   бот «Счёт», общий</span>
+<span class="c"># TELEGRAM_SANDBOX_CHANNEL_ID  канал «Песочница»</span>
+<span class="c"># TELEGRAM_ACCOUNT_CHANNEL_ID  канал «Счёт»</span>
+<span class="c"># TINKOFF_TRADE_TOKEN          токен торговли (Р1)</span>
+<span class="c"># TINKOFF_ACCOUNT_ID           номер счёта робота (Р1)</span></pre>
+    <ul class="rules">
+      <li><b>Брокер задаёт вид контура, а не параметр.</b> Ядро читает котировки старым <code>TINKOFF_TOKEN</code>. Контур «Песочница» ходит в <code>sandbox-invest-public-api</code> с <code>TINKOFF_SANDBOX_TOKEN</code> и сам находит или открывает счёт песочницы. Контур «Счёт» ходит в боевой API с <code>TINKOFF_TRADE_TOKEN</code> по счёту <code>TINKOFF_ACCOUNT_ID</code>; эти две переменные получает только его процесс. Переключить брокера правкой настройки или командой API нельзя.</li>
+      <li><b>Свой состав у каждого.</b> «Песочница» и «Счёт» торгуют только перечисленными привязками — <code>id</code> из <code>[strategies.*]</code>, то есть парой «инструмент + стратегия». Состав задаётся только командами API и хранится в <code>core.sqlite3</code>, как у эмуляции; в <code>robot.toml</code> его нет. Составы эмуляции, песочницы и счёта друг на друга не влияют. Привязку можно держать в нескольких контурах сразу: тогда они служат друг другу тенью для сравнения.</li>
+      <li><b>Секреты.</b> Все новые переменные попадают в <code>secrets</code> логгера, номер счёта в логах маскируется.</li>
+      <li><b>Отдельный бот и два канала</b>, «Песочница» и «Счёт»: завести бота, создать каналы, добавить бота администратором с правом публикации, вписать токен бота и id каналов в <code>.env</code>. Свой бот — это свои лимиты Telegram: сигналы эмуляции не задерживают сообщения о деньгах.</li>
+    </ul>
+  </div>
+  <div class="reuse" aria-label="Два независимых состава">
+    <div><h3>Эмуляция · состав по инструментам</h3><ul>
+      <li>22 инструмента, у каждого все его стратегии из <code>[strategies.*]</code></li>
+      <li>сигналы в канал «Сигналы», виртуальный <code>initial_deposit</code></li>
+      <li>меняется командами <code>/api/v1/emulation/instruments</code></li>
+    </ul></div>
+    <div class="mine"><h3>Счёт · состав по привязкам</h3><ul>
+      <li>например, 5 инструментов и 1 стратегия: 5 <code>id</code> вида <code>share-sber-macd-4h-triple</code></li>
+      <li>сигналы только этих привязок, в канал «Счёт», капитал со счёта</li>
+      <li>привязки переводятся на счёт по одной командой <code>/api/v1/account/bindings</code>, сначала пройдя песочницу</li>
+      <li>у контура «Песочница» такой же свой состав: <code>/api/v1/sandbox/bindings</code></li>
+    </ul></div>
+  </div>
+  <div class="ladder">
+    <div class="step"><span class="tag ro">С2</span><p><b>«Песочница», только чтение.</b> Контур читает виртуальный счёт: капитал, позиции, заявки, стоп-заявки, операции. Сверщик работает, ни одной заявки.<span class="money">ловит расхождения учёта до первой заявки · денег нет</span></p></div>
+    <div class="step"><span class="tag half">С3–С7</span><p><b>«Песочница», заявки.</b> Настоящий API и котировки, виртуальный счёт. Песочница исполняет и обычные заявки, и стоп-заявки. Здесь же ловятся ошибки построения заявки: лоты, шаг цены, коридор, ГО.<span class="money">заявка уходит в песочницу · денег нет</span></p></div>
+    <div class="step"><span class="tag ro">Р1</span><p><b>«Счёт», только чтение.</b> Второй вид контура из того же кода, <code>orders = false</code>. «Песочница» продолжает работать рядом.<span class="money">ни одной заявки · сверка на настоящем счёте</span></p></div>
+    <div class="step"><span class="tag real">Р2</span><p><b>«Счёт», заявки.</b> <code>orders = true</code>. Исход решает брокер.<span class="money">заявка уходит на биржу · деньги настоящие</span></p></div>
+  </div>
+  <h3>Что контур проверит до первого тика</h3>
+  <ol class="tasks">
+    <li>Отпечаток счёта в базе контура совпадает с текущим: вид брокера и хеш номера счёта. «Песочница» дополнительно находит или открывает свой счёт, «Счёт» проходит допуск из раздела «Переход». Иначе контур не стартует, без тихого отката.</li>
+    <li>Бот и канал контура заданы. Сделки без уведомлений недопустимы.</li>
+    <li>Капитал прочитан со счёта.</li>
+    <li>Сверка счёта с журналом прошла. При расхождении контур стартует с замороженными входами.</li>
+  </ol>
+  <h3>Квоты</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Сервис Т-Инвест</th><th class="num">Лимит на пользователя</th><th>Кто тратит</th></tr></thead>
+      <tbody>
+        <tr><td>Котировки, инструменты, подписки стрима</td><td class="num">600 · 200 · 100 /мин</td><td>Только ядро, через свой арбитр, сразу на все контуры. Делить вручную не нужно.</td></tr>
+        <tr><td>Заявки</td><td class="num">100 /мин</td><td>Контур «Счёт». У песочницы свои лимиты: 200/мин на заявки, стоп-заявки и операции. Частые заявки подряд она отклоняет кодом <code>RESOURCE_EXHAUSTED</code>, повтор через секунду проходит.</td></tr>
+        <tr><td>Стоп-заявки, из них GetStopOrders</td><td class="num">50 · 60 /мин</td><td>Контур «Счёт», опрос не чаще 30 в минуту.</td></tr>
+        <tr><td>Операции и портфель</td><td class="num">200 /мин</td><td>Контур «Счёт»: сверка, капитал, комиссии.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="prose small muted">Лимиты песочницы разведка С1 прочитала через <code>GetUserTariff</code>: заявки, стоп-заявки и операции по 200 в минуту, <code>OrderStateStream</code> до 16 стримов. Ловушки схемы с двумя отдельными роботами здесь не возникают. Группу кластеров, паттерны и квоты котировок ведёт одно ядро, а сервисы, которые тратит контур «Счёт», ядро не использует.</p>
+</section>
+
+<section id="commands">
+  <div class="eyebrow">Ярус 1 · управление</div>
+  <h2>Команды контура «Счёт»</h2>
+  <p class="prose">Ресурс <code>/api/v1/account</code> устроен как <code>/api/v1/emulation</code> после П8: то же желаемое состояние, те же коды ответов, те же <code>ETag</code> и номер ревизии. Отличие одно: всё, что может открыть или закрыть позицию, требует <code>"confirm": "account"</code>. У контура «Песочница» тот же набор команд под <code>/api/v1/sandbox</code>, <code>confirm</code> там не нужен.</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Запрос</th><th>Что происходит</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/v1/account</code></td><td>Состояние контура: брокер (песочница или счёт), режим чтения или заявок, капитал, состав, открытые позиции, последняя сверка.</td></tr>
+        <tr><td><code>PUT /api/v1/account/target</code><br><code>{"mode": "on", "bindings": [...], "confirm": "account"}</code></td><td>Запуск контура со стартовым составом привязок, он может быть пустым. Без <code>confirm</code> запрос отклоняется. Контур «Счёт» один: если он уже работает, состав меняется командами ниже.</td></tr>
+        <tr><td><code>POST /api/v1/account/bindings</code><br><code>{"bindings": [...], "confirm": "account"}</code></td><td>Перевести привязку на счёт. Она начинает торговать на ближайшей границе тика и делит капитал счёта с остальными. Неизвестный <code>id</code> отклоняется целиком, как неизвестный инструмент у эмуляции.</td></tr>
+        <tr><td><code>POST /api/v1/account/bindings/remove</code><br><code>{"bindings": [...], "mode": "no_entries"}</code></td><td>Снять привязку со счёта: неисполненные входы снимаются у брокера, открытые позиции ведутся до закрытия со стопом и целями у брокера.</td></tr>
+        <tr><td><code>POST /api/v1/account/bindings/remove</code><br><code>{"bindings": [...], "mode": "close_all", "confirm": "account"}</code></td><td>Снять привязку и закрыть её позиции по правилам «закрыть всё».</td></tr>
+        <tr><td><code>PUT /api/v1/account/target</code><br><code>{"mode": "no_entries"}</code></td><td>Остановить весь контур, больше не входить. Неисполненные лимитные входы снимаются у брокера. Открытые позиции сопровождаются, стоп и цели остаются у брокера. После последнего выхода контур завершается сам.</td></tr>
+        <tr><td><code>PUT /api/v1/account/target</code><br><code>{"mode": "close_all", "confirm": "account"}</code></td><td>Остановить весь контур и закрыть всё. Снять входы, выйти из каждой позиции, после выхода снять её стоп и цели. Пока позиция не закрыта, стоп у брокера остаётся.</td></tr>
+        <tr><td><code>GET /api/v1/account/bindings</code></td><td>Состав счёта и все привязки из конфига с отметкой, где каждая торгует: на счёте, в эмуляции, там и там. По этому списку удобно выбирать, что переводить дальше.</td></tr>
+        <tr><td><code>GET /api/v1/account/reconcile</code></td><td>Последний отчёт сверщика: что совпало, что расходится, какие инструменты заморожены.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="prose small muted">Ручные действия в песочнице — пополнить счёт, купить или продать лоты «как человек», чтобы проверить сверщик, — делает не API робота, а команда песочницы из С1. В приложении Т-Инвест песочницы не видно.</p>
+</section>
+
+<section id="money">
+  <div class="eyebrow">Ярус 1 · деньги</div>
+  <h2>Капитал контура берётся со счёта</h2>
+  <p class="prose">Эмуляция остаётся на <code>initial_deposit</code>. В контуре «Счёт» капиталом для риска служат деньги на счёте робота, и учитываются только его сделки. Сигнал публикуется в канал до допуска, поэтому его видно, даже если денег на сделку не хватило.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 320" role="img" aria-label="Допуск сигнала в контуре «Счёт»: публикация в канал, капитал со счёта, проверка ГО, лимитная заявка или отказ">
+      <defs>
+        <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="gr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+        <marker id="gb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah bad"/></marker>
+      </defs>
+      <g class="n"><rect x="380" y="20" width="200" height="56" rx="9"/><text x="480" y="44" text-anchor="middle" class="t">Сигнал привязки</text><text x="480" y="63" text-anchor="middle" class="s">прошёл фильтр входа</text></g>
+      <g class="n"><rect x="660" y="20" width="260" height="56" rx="9"/><text x="790" y="44" text-anchor="middle" class="t">Канал «Счёт»</text><text x="790" y="63" text-anchor="middle" class="s">сигнал виден всегда</text></g>
+      <path class="e" d="M580 48H656" marker-end="url(#g)"/>
+      <g class="n key"><rect x="40" y="120" width="260" height="64" rx="9"/><text x="170" y="146" text-anchor="middle" class="t">Капитал = счёт</text><text x="170" y="166" text-anchor="middle" class="s">один снимок на весь тик</text></g>
+      <g class="n real"><rect x="360" y="120" width="240" height="64" rx="9"/><text x="480" y="146" text-anchor="middle" class="t">Допуск сделки</text><text x="480" y="166" text-anchor="middle" class="s">лимиты от капитала счёта</text></g>
+      <g class="n real"><rect x="660" y="120" width="260" height="64" rx="9"/><text x="790" y="146" text-anchor="middle" class="t">ГО из GetFuturesMargin</text><text x="790" y="166" text-anchor="middle" class="s">хватает ГО на этот объём?</text></g>
+      <path class="e" d="M480 76V116" marker-end="url(#g)"/>
+      <path class="e" d="M300 152H356" marker-end="url(#g)"/>
+      <path class="e real" d="M600 152H656" marker-end="url(#gr)"/>
+      <g class="n bad"><rect x="360" y="236" width="240" height="60" rx="9"/><text x="480" y="261" text-anchor="middle" class="t">Сделки нет</text><text x="480" y="280" text-anchor="middle" class="s">причина дописана к сигналу</text></g>
+      <g class="n real"><rect x="660" y="236" width="260" height="60" rx="9"/><text x="790" y="261" text-anchor="middle" class="t">Лимитная заявка</text><text x="790" y="280" text-anchor="middle" class="s">по плановой цене, с TTL</text></g>
+      <path class="e bad" d="M700 184V210H480V232" marker-end="url(#gb)"/>
+      <text x="590" y="204" text-anchor="middle" class="lbl bad">нет</text>
+      <path class="e real" d="M840 184V232" marker-end="url(#gr)"/>
+      <text x="850" y="214" class="lbl real">да</text>
+    </svg>
+  </div>
+  <ul class="rules prose">
+    <li><b>Откуда число.</b> Решено на С3: капитал песочницы — рубли на счёте из <code>GetPositions</code>. Песочница при покупке фьючерса списывает полную цену контракта, поэтому <code>liquid_portfolio</code> (1 023 916 ₽ при 1 000 000 ₽) больше денег на счёте; он показывается рядом в статусе и сообщении о старте. Для настоящего счёта поле выбираем заново на Р1 по цифре в приложении.</li>
+    <li><b>Хватает ли ГО.</b> <code>GetMaxLots</code> для фьючерса бесполезен: без плеча 0 лотов, с плечом 1,28 млн. Допуск считает сам контур: ГО на контракт из <code>GetFuturesMargin</code> (NG: 6 228 ₽ на покупку) умножить на лоты и сравнить со свободными деньгами.</li>
+    <li><b>Когда обновляется.</b> До первого тика, по стриму портфеля, после каждого своего исполнения и после клиринга.</li>
+    <li><b>Один снимок на тик.</b> Кандидаты тика допускаются пакетом по приоритету и видят один и тот же капитал.</li>
+    <li><b>Счёт недоступен.</b> Новые входы останавливаются, в канал уходит предупреждение. Стопы и цели уже стоят у брокера.</li>
+    <li><b>Пополнение или вывод.</b> Новый размер сделок сразу, без правки конфига.</li>
+  </ul>
+  <p class="prose small muted">Деньги в журнале и на счёте до копейки сходиться не будут: брокер дважды в день начисляет вариационную маржу, а робот считает PnL по сделкам. Поэтому капитал всегда берётся у брокера, а PnL отдельной сделки считает журнал.</p>
+</section>
+
+<section id="restart">
+  <div class="eyebrow">Ярус 2 · перезапуск</div>
+  <h2>Рестарт: сначала счёт, потом всё остальное</h2>
+  <p class="prose">Ядро поднимает контур «Счёт» первым, раньше песочницы и эмуляции. Пока робот был выключен, у брокера могли сработать стопы и цели, поэтому до первого тика контур читает счёт и приводит журнал в соответствие.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 440" role="img" aria-label="Рестарт: ядро запускает контур «Счёт» первым; он читает позиции, заявки, стоп-заявки и операции, сверяет с журналом, при необходимости пересоздаёт стоп, сообщает в канал и делает первый тик">
+      <defs>
+        <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="rk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah key"/></marker>
+        <marker id="rr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+      </defs>
+      <g class="n key"><rect x="45" y="14" width="150" height="40" rx="8"/><text x="120" y="39" text-anchor="middle" class="t">Ядро</text></g>
+      <g class="n real"><rect x="285" y="14" width="150" height="40" rx="8"/><text x="360" y="39" text-anchor="middle" class="t">Контур «Счёт»</text></g>
+      <g class="n ext"><rect x="525" y="14" width="150" height="40" rx="8"/><text x="600" y="39" text-anchor="middle" class="t">Т-Инвест</text></g>
+      <g class="n"><rect x="765" y="14" width="150" height="40" rx="8"/><text x="840" y="39" text-anchor="middle" class="t">Канал «Счёт»</text></g>
+      <line class="life" x1="120" y1="54" x2="120" y2="425"/><line class="life" x1="360" y1="54" x2="360" y2="425"/><line class="life" x1="600" y1="54" x2="600" y2="425"/><line class="life" x1="840" y1="54" x2="840" y2="425"/>
+      <g class="num"><circle cx="22" cy="90" r="10"/><text x="22" y="94" text-anchor="middle">1</text></g>
+      <path class="e key" d="M120 83H160V101H124" marker-end="url(#rk)"/><text x="170" y="96" class="lbl key">данные подняты, счёт работал</text>
+      <g class="num"><circle cx="22" cy="140" r="10"/><text x="22" y="144" text-anchor="middle">2</text></g>
+      <path class="e key" d="M120 140H356" marker-end="url(#rk)"/><text x="238" y="132" text-anchor="middle" class="lbl key">запуск первым</text>
+      <g class="num"><circle cx="22" cy="185" r="10"/><text x="22" y="189" text-anchor="middle">3</text></g>
+      <path class="e real" d="M360 185H596" marker-end="url(#rr)"/><text x="480" y="177" text-anchor="middle" class="lbl real">позиции, заявки, стоп-заявки, операции</text>
+      <g class="num"><circle cx="22" cy="230" r="10"/><text x="22" y="234" text-anchor="middle">4</text></g>
+      <path class="e real ret" d="M600 230H364" marker-end="url(#rr)"/><text x="480" y="222" text-anchor="middle" class="lbl real">факт счёта</text>
+      <g class="num"><circle cx="22" cy="275" r="10"/><text x="22" y="279" text-anchor="middle">5</text></g>
+      <path class="e" d="M360 268H400V286H364" marker-end="url(#r)"/><text x="410" y="281" class="lbl">сверка: пропущенные исполнения в журнал</text>
+      <g class="num"><circle cx="22" cy="320" r="10"/><text x="22" y="324" text-anchor="middle">6</text></g>
+      <path class="e real" d="M360 320H596" marker-end="url(#rr)"/><text x="480" y="312" text-anchor="middle" class="lbl real">стоп на остаток, если объём не тот</text>
+      <g class="num"><circle cx="22" cy="365" r="10"/><text x="22" y="369" text-anchor="middle">7</text></g>
+      <path class="e" d="M360 365H836" marker-end="url(#r)"/><text x="600" y="357" text-anchor="middle" class="lbl">восстановлен: 2 позиции, стопы на месте</text>
+      <g class="num"><circle cx="22" cy="410" r="10"/><text x="22" y="414" text-anchor="middle">8</text></g>
+      <path class="e" d="M360 403H400V421H364" marker-end="url(#r)"/><text x="410" y="416" class="lbl">капитал прочитан, первый тик; ядро запускает эмуляцию</text>
+    </svg>
+  </div>
+  <p class="prose small muted">Если на шаге 5 сверщик находит расхождение, которое нельзя провести автоматически, контур поднимается с замороженными входами по этому инструменту, а в канал уходит тревога. Защита и выходы при этом работают.</p>
+</section>
+
+<section id="inside">
+  <div class="eyebrow">Ярус 2 · внутри контура</div>
+  <h2>Путь команды в контуре «Счёт»</h2>
+  <p class="prose">Белые блоки уже есть в коде и одинаковы у эмуляции и счёта. При сборке контура «Счёт» на место симулятора встаёт адаптер счёта, а исполнения приходят из стрима в тот же <code>consume</code>.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 520" role="img" aria-label="Путь команды в контуре «Счёт»: стратегии, план и outbox, dispatch, broker.submit, TInvestBroker, API, стрим исполнений в consume, шина событий, сверщик">
+      <defs>
+        <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+      </defs>
+      <g class="n"><rect x="20" y="20" width="380" height="60" rx="9"/><text x="210" y="45" text-anchor="middle" class="t">Стратегии и фильтр</text><text x="210" y="65" text-anchor="middle" class="s">свечи из ленты изменений ядра</text></g>
+      <g class="n"><rect x="20" y="104" width="380" height="60" rx="9"/><text x="210" y="129" text-anchor="middle" class="t">TradeManager: план и команда</text><text x="210" y="149" text-anchor="middle" class="s">одна транзакция SQLite: план + строка в outbox</text></g>
+      <g class="n"><rect x="20" y="188" width="380" height="60" rx="9"/><text x="210" y="213" text-anchor="middle" class="t">TradeManager.dispatch</text><text x="210" y="233" text-anchor="middle" class="s">забирает команду из outbox, отмечает SENT</text></g>
+      <g class="n"><rect x="20" y="272" width="380" height="60" rx="9"/><text x="210" y="297" text-anchor="middle" class="t">broker.submit(команда)</text><text x="210" y="317" text-anchor="middle" class="s">брокер выбран при сборке контура</text></g>
+      <g class="n"><rect x="20" y="356" width="380" height="60" rx="9"/><text x="210" y="381" text-anchor="middle" class="t">TradeManager.consume(событие)</text><text x="210" y="401" text-anchor="middle" class="s">reducer пишет позицию и PnL в SQLite</text></g>
+      <g class="n"><rect x="20" y="440" width="380" height="60" rx="9"/><text x="210" y="465" text-anchor="middle" class="t">Шина событий</text><text x="210" y="485" text-anchor="middle" class="s">канал «Счёт» · status.json · CSV</text></g>
+      <path class="e" d="M210 80V100" marker-end="url(#a)"/>
+      <path class="e" d="M210 164V184" marker-end="url(#a)"/>
+      <path class="e" d="M210 248V268" marker-end="url(#a)"/>
+      <path class="e" d="M210 332V352" marker-end="url(#a)"/>
+      <path class="e" d="M210 416V436" marker-end="url(#a)"/>
+      <g class="n real"><rect x="470" y="272" width="220" height="60" rx="9"/><text x="580" y="297" text-anchor="middle" class="t">TInvestBroker</text><text x="580" y="317" text-anchor="middle" class="s">ACK или отказ сразу</text></g>
+      <path class="e real" d="M400 302H466" marker-end="url(#ar)"/>
+      <g class="n ext"><rect x="740" y="216" width="200" height="150" rx="9"/><text x="840" y="240" text-anchor="middle" class="t">Т-Инвест API</text>
+        <text x="754" y="266" class="m">PostOrder</text><text x="754" y="286" class="m">PostStopOrder</text><text x="754" y="306" class="m">OrderStateStream</text><text x="754" y="326" class="m">GetStopOrders</text><text x="754" y="346" class="m">GetMarginAttributes</text></g>
+      <path class="e real" d="M690 302H736" marker-end="url(#ar)"/>
+      <path class="e real ret" d="M840 366V394H404" marker-end="url(#ar)"/>
+      <text x="620" y="386" text-anchor="middle" class="lbl real">стрим исполнений</text>
+      <g class="n key"><rect x="740" y="440" width="200" height="60" rx="9"/><text x="840" y="465" text-anchor="middle" class="t">Сверщик</text><text x="840" y="485" text-anchor="middle" class="s">счёт ↔ SQLite</text></g>
+      <path class="e real" d="M900 366V436" marker-end="url(#ar)"/>
+      <text x="726" y="476" text-anchor="end" class="lbl bad">расхождение → заморозка новых входов</text>
+    </svg>
+  </div>
+  <div class="prose" style="display:grid;gap:10px">
+    <p><b>Outbox</b> — таблица исходящих команд в <code>trades.sqlite3</code> контура. План и строка «отправить заявку» пишутся одной транзакцией, поэтому при падении команда не потеряется, а статус SENT не даст отправить её второй раз.</p>
+    <p><b>Шина</b> получает событие в самом конце: <code>consume</code> сначала записывает результат в SQLite и только потом публикует событие для канала.</p>
+  </div>
+</section>
+
+<section id="order">
+  <div class="eyebrow">Ярус 2 · одна заявка</div>
+  <h2>Жизнь заявки на счёте</h2>
+  <p class="prose">Сегодня <code>ExecutionStatus</code> знает ACK, PARTIAL, FILL, REJECT и CANCEL. Для счёта нужны ещё три промежуточных состояния, их хранит outbox: «отправлена», «неизвестно» и «снимается». Главное из них «неизвестно»: ответ брокера потерялся, и повторять вслепую нельзя.</p>
+  <p class="prose"><b>Как сделано на С3.</b> Промежуточные состояния хранит не outbox, а журнал заявок брокера в <code>broker.sqlite3</code> контура: outbox доставляет команду адаптеру, журнал ведёт жизнь заявки у брокера. У каждого факта один владелец, <code>TradeManager</code> и эмуляция не менялись. Ключ заявки — <code>uuid5(command_id)</code>.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 380" role="img" aria-label="Автомат состояний заявки">
+      <defs>
+        <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="bb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah bad"/></marker>
+      </defs>
+      <g class="n"><rect x="20" y="150" width="140" height="50" rx="9"/><text x="90" y="172" text-anchor="middle" class="t">Создана</text><text x="90" y="190" text-anchor="middle" class="s">в outbox</text></g>
+      <g class="n real"><rect x="200" y="150" width="140" height="50" rx="9"/><text x="270" y="172" text-anchor="middle" class="t">Отправлена</text><text x="270" y="190" text-anchor="middle" class="s">ждём ответ</text></g>
+      <g class="n"><rect x="380" y="150" width="140" height="50" rx="9"/><text x="450" y="172" text-anchor="middle" class="t">Принята</text><text x="450" y="190" text-anchor="middle" class="s">ACK</text></g>
+      <g class="n"><rect x="560" y="150" width="140" height="50" rx="9"/><text x="630" y="172" text-anchor="middle" class="t">Частично</text><text x="630" y="190" text-anchor="middle" class="s">PARTIAL</text></g>
+      <g class="n ok"><rect x="780" y="150" width="140" height="50" rx="9"/><text x="850" y="172" text-anchor="middle" class="t">Исполнена</text><text x="850" y="190" text-anchor="middle" class="s">FILL</text></g>
+      <g class="n warn"><rect x="200" y="20" width="140" height="56" rx="9"/><text x="270" y="44" text-anchor="middle" class="t">Неизвестно</text><text x="270" y="63" text-anchor="middle" class="s">тайм-аут, обрыв</text></g>
+      <g class="n bad"><rect x="200" y="280" width="140" height="50" rx="9"/><text x="270" y="302" text-anchor="middle" class="t">Отклонена</text><text x="270" y="320" text-anchor="middle" class="s">REJECT</text></g>
+      <g class="n real"><rect x="470" y="280" width="140" height="50" rx="9"/><text x="540" y="302" text-anchor="middle" class="t">Снимается</text><text x="540" y="320" text-anchor="middle" class="s">отмена ушла</text></g>
+      <g class="n"><rect x="700" y="280" width="160" height="50" rx="9"/><text x="780" y="302" text-anchor="middle" class="t">Снята</text><text x="780" y="320" text-anchor="middle" class="s">CANCEL, остаток 0+</text></g>
+      <path class="e" d="M160 175H196" marker-end="url(#b)"/>
+      <path class="e" d="M340 175H376" marker-end="url(#b)"/>
+      <path class="e" d="M520 175H556" marker-end="url(#b)"/>
+      <path class="e" d="M700 175H776" marker-end="url(#b)"/>
+      <path class="e" d="M470 150V112H850V146" marker-end="url(#b)"/>
+      <text x="650" y="106" text-anchor="middle" class="lbl">сразу целиком</text>
+      <path class="e" d="M235 150V80" marker-end="url(#b)"/>
+      <text x="227" y="122" text-anchor="end" class="lbl">тайм-аут</text>
+      <path class="e" d="M305 80V146" marker-end="url(#b)"/>
+      <text x="313" y="112" class="lbl">не нашли:</text><text x="313" y="127" class="lbl">повтор с тем</text><text x="313" y="142" class="lbl">же ключом</text>
+      <path class="e" d="M340 48H420V146" marker-end="url(#b)"/>
+      <text x="348" y="40" class="lbl">GetOrderState по ключу нашёл</text>
+      <path class="e bad" d="M270 200V276" marker-end="url(#bb)"/>
+      <text x="278" y="244" class="lbl bad">отказ брокера</text>
+      <path class="e" d="M500 200V276" marker-end="url(#b)"/>
+      <path class="e" d="M590 200V276" marker-end="url(#b)"/>
+      <text x="600" y="246" class="lbl">TTL, отмена плана</text>
+      <path class="e" d="M610 305H696" marker-end="url(#b)"/>
+      <path class="e bad ret" d="M540 330V360H940V175H924" marker-end="url(#bb)"/>
+      <text x="740" y="354" text-anchor="middle" class="lbl bad">гонка: исполнилась раньше отмены</text>
+    </svg>
+  </div>
+  <p class="prose small muted">Ключ идемпотентности заявки в API (<code>order_id</code> в PostOrder и PostStopOrder) равен нашему <code>command_id</code>. Поэтому после обрыва робот спрашивает брокера по ключу (<code>GetOrderState</code> с типом номера <code>ORDER_ID_TYPE_REQUEST</code>) и только потом решает. Разведка С1: повтор того же ключа второй заявки не создаёт, но брокер отвечает ошибкой 30057, а не прежней заявкой, поэтому «повтор с тем же ключом» на схеме — только для заявки, которую поиск по ключу не нашёл. Стрим присылает сначала событие с временным номером заявки, поэтому исполнения сопоставляются по <code>order_request_id</code>, то есть по нашему ключу. Ветка «гонка» означает, что запрошенная отмена не гарантирует нулевого исполнения: reducer принимает fill и после неё.</p>
+
+  <h3>Вход по шагам</h3>
+  <div class="fig">
+    <svg viewBox="0 0 960 600" role="img" aria-label="Последовательность сообщений при входе в сделку на счёте">
+      <defs>
+        <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="cr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+      </defs>
+      <g class="n key"><rect x="45" y="14" width="150" height="40" rx="8"/><text x="120" y="39" text-anchor="middle" class="t">Контур</text></g>
+      <g class="n"><rect x="285" y="14" width="150" height="40" rx="8"/><text x="360" y="39" text-anchor="middle" class="t">SQLite · outbox</text></g>
+      <g class="n real"><rect x="525" y="14" width="150" height="40" rx="8"/><text x="600" y="39" text-anchor="middle" class="t">Т-Инвест</text></g>
+      <g class="n"><rect x="765" y="14" width="150" height="40" rx="8"/><text x="840" y="39" text-anchor="middle" class="t">Канал «Счёт»</text></g>
+      <line class="life" x1="120" y1="54" x2="120" y2="585"/><line class="life" x1="360" y1="54" x2="360" y2="585"/><line class="life" x1="600" y1="54" x2="600" y2="585"/><line class="life" x1="840" y1="54" x2="840" y2="585"/>
+      <g class="num"><circle cx="24" cy="95" r="11"/><text x="24" y="99" text-anchor="middle">1</text></g>
+      <path class="e" d="M120 95H356" marker-end="url(#c)"/><text x="238" y="87" text-anchor="middle" class="lbl">план и команда в outbox</text>
+      <g class="num"><circle cx="24" cy="140" r="11"/><text x="24" y="144" text-anchor="middle">2</text></g>
+      <path class="e real" d="M120 140H596" marker-end="url(#cr)"/><text x="360" y="132" text-anchor="middle" class="lbl real">PostOrder · лимит · ключ = command_id</text>
+      <g class="num"><circle cx="24" cy="185" r="11"/><text x="24" y="189" text-anchor="middle">3</text></g>
+      <path class="e real ret" d="M600 185H124" marker-end="url(#cr)"/><text x="360" y="177" text-anchor="middle" class="lbl real">принята, номер заявки</text>
+      <g class="num"><circle cx="24" cy="230" r="11"/><text x="24" y="234" text-anchor="middle">4</text></g>
+      <path class="e" d="M120 230H356" marker-end="url(#c)"/><text x="238" y="222" text-anchor="middle" class="lbl">ACK: команда принята</text>
+      <g class="num"><circle cx="24" cy="275" r="11"/><text x="24" y="279" text-anchor="middle">5</text></g>
+      <path class="e" d="M120 275H836" marker-end="url(#c)"/><text x="720" y="267" text-anchor="middle" class="lbl">карточка: принято брокером</text>
+      <g class="num"><circle cx="24" cy="330" r="11"/><text x="24" y="334" text-anchor="middle">6</text></g>
+      <path class="e real ret" d="M600 330H124" marker-end="url(#cr)"/><text x="360" y="322" text-anchor="middle" class="lbl real">OrderStateStream: 2 лота по 2,846</text>
+      <g class="num"><circle cx="24" cy="375" r="11"/><text x="24" y="379" text-anchor="middle">7</text></g>
+      <path class="e" d="M120 375H356" marker-end="url(#c)"/><text x="238" y="367" text-anchor="middle" class="lbl">FILL: позиция и средняя</text>
+      <g class="num"><circle cx="24" cy="420" r="11"/><text x="24" y="424" text-anchor="middle">8</text></g>
+      <path class="e real" d="M120 420H596" marker-end="url(#cr)"/><text x="360" y="412" text-anchor="middle" class="lbl real">PostStopOrder: стоп на остаток и цели</text>
+      <g class="num"><circle cx="24" cy="465" r="11"/><text x="24" y="469" text-anchor="middle">9</text></g>
+      <path class="e real ret" d="M600 465H124" marker-end="url(#cr)"/><text x="360" y="457" text-anchor="middle" class="lbl real">приняты, номера стоп-заявок → SQLite</text>
+      <g class="num"><circle cx="24" cy="510" r="11"/><text x="24" y="514" text-anchor="middle">10</text></g>
+      <path class="e" d="M120 510H836" marker-end="url(#c)"/><text x="720" y="502" text-anchor="middle" class="lbl">вход исполнен, стоп и цели у брокера</text>
+      <g class="num"><circle cx="24" cy="560" r="11"/><text x="24" y="564" text-anchor="middle">11</text></g>
+      <path class="e real ret" d="M600 560H124" marker-end="url(#cr)"/><text x="360" y="552" text-anchor="middle" class="lbl real">позже, операции: настоящая комиссия → FeeAdjustment</text>
+    </svg>
+  </div>
+  <p class="prose small muted">Сплошная стрелка означает запрос, пунктир означает ответ или событие стрима. Между шагами 7 и 9 позиция живёт без стопа у брокера. Если стоп не принят за отведённое время, контур выходит по рынку и шлёт тревогу. Рыночная заявка от самого контура — только этот аварийный выход. Входа по рынку нет.</p>
+</section>
+
+<section id="truth">
+  <div class="eyebrow">Ярус 2 · источник истины</div>
+  <h2>Кто прав, когда данные расходятся</h2>
+  <div class="truth">
+    <div class="tr r1"><b>Счёт Т-Инвест</b><span>позиции, заявки, сделки, комиссии, деньги. Всегда прав.</span></div>
+    <div class="arrow">поправляет →</div>
+    <div class="tr r2"><b>Журнал контура «Счёт»</b><span>учёт по <code>trade_id</code>. Подстраивается под счёт.</span></div>
+    <div class="arrow">сравнивается с →</div>
+    <div class="tr r3"><b>Тень в эмуляции</b><span>та же привязка в контуре эмуляции, если её там оставили. Только для отчёта.</span></div>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Что видит сверщик</th><th>Вероятная причина</th><th>Что делает контур</th></tr></thead>
+      <tbody>
+        <tr><td>Позиция есть в журнале, на счёте нет</td><td>стоп или цель сработали, пока робот был выключен</td><td>дочитывает операции и проводит выход как факт <span class="pill ok">авто</span></td></tr>
+        <tr><td>На счёте позиция больше или с другим знаком, чем по журналу</td><td>потерянное исполнение или перезакрытие (см. ярус 3)</td><td>замораживает входы по инструменту, шлёт тревогу, сам не выравнивает <span class="pill bad">человек</span></td></tr>
+        <tr><td>В журнале «отправлена», у брокера по ключу пусто</td><td>заявка не дошла</td><td>повтор с тем же ключом, если сигнал ещё не устарел, иначе отмена плана <span class="pill ok">авто</span></td></tr>
+        <tr><td>У брокера активная заявка с нашим ключом, в журнале её нет</td><td>сбой между ответом и записью</td><td>восстанавливает заявку в журнале <span class="pill ok">авто</span></td></tr>
+        <tr><td>У открытой позиции нет стопа у брокера или его объём не равен остатку</td><td>стоп снят, истёк, не принят, не пересоздан после цели</td><td>пересоздаёт стоп на остаток немедленно, при отказе выходит по рынку <span class="pill real">срочно</span></td></tr>
+        <tr><td>Цена или комиссия отличаются от оценки</td><td>проскальзывание, тариф</td><td>поправка через <code>FeeAdjustment</code>, решения не пересчитываются <span class="pill ok">авто</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="when"><span>при старте контура, до первого тика</span><span>каждые <code>reconcile_every_min</code></span><span>после переподключения стрима</span><span>после каждого отказа брокера</span></div>
+  <p class="prose small muted">Заморозка запрещает только новые входы и доборы. Выходы, сокращения и защита продолжают работать. Счёт принадлежит только роботу, поэтому любая незнакомая заявка на нём тоже считается расхождением.</p>
+</section>
+
+<section id="tg">
+  <div class="eyebrow">Ярус 2 · что видно человеку</div>
+  <h2>Канал «Счёт»</h2>
+  <p class="prose">У контура «Счёт» свой бот и свой канал. Статусы живой сделки дописываются в ту же корневую карточку через правку сообщения, как уже сделано для навигации. Отказ, тревога сверки и сообщение о восстановлении после рестарта приходят отдельными сообщениями.</p>
+  <div class="tg">
+    <div><div class="chan">канал «Счёт»</div>
+    <article class="msg" aria-label="Пример карточки живой сделки">
+      <div class="hd"><span class="badge real">СЧЁТ</span><span class="ttl">NG · LONG · 15m</span></div>
+      <div class="lv">macd_rsi_stoch · levels_rr · NGX6</div>
+      <div>Вход 2,845 · стоп 2,812 · цель 2,911<br>2 лота, риск 0,6% капитала счёта</div>
+      <ul class="tl">
+        <li><time>10:15:01</time><span>отправлено в Т-Инвест, лимит 2,845</span></li>
+        <li><time>10:15:01</time><span>принято брокером, заявка …7f3a</span></li>
+        <li><time>10:15:34</time><span>исполнено 2 из 2 по 2,846</span></li>
+        <li><time>10:15:35</time><span>стоп 2,812 и цель 2,911 стоят у брокера</span></li>
+      </ul>
+      <div class="foot">Комиссия: оценка, уточнится по операциям</div>
+    </article></div>
+    <div><div class="chan">канал «Счёт»</div>
+    <article class="msg" aria-label="Пример сообщения о восстановлении после рестарта">
+      <div class="hd"><span class="badge ok">СТАРТ</span><span class="ttl">Контур «Счёт» восстановлен</span></div>
+      <ul class="tl">
+        <li><time>08:59:41</time><span>за простой: цель 1 по SI, 1 лот</span></li>
+        <li><time>08:59:42</time><span>стоп SI пересоздан на остаток 1</span></li>
+        <li><time>08:59:43</time><span>открыто 2 позиции, стопы на месте</span></li>
+      </ul>
+      <div class="foot">Капитал прочитан, входы разрешены</div>
+    </article></div>
+    <div><div class="chan">канал «Счёт»</div>
+    <article class="msg" aria-label="Пример тревоги сверки">
+      <div class="hd"><span class="badge bad">ТРЕВОГА</span><span class="ttl">Сверка счёта</span></div>
+      <div>NG: на счёте −1 лот, по журналу 0.</div>
+      <ul class="tl">
+        <li><time>09:00:00</time><span class="x">новые входы по NG заморожены</span></li>
+        <li><time>09:00:00</time><span>выходы и стопы работают</span></li>
+      </ul>
+      <div class="foot">Снять заморозку: выровнять позицию и перезапустить сверку</div>
+    </article></div>
+  </div>
+</section>
+
+<section id="protect">
+  <div class="eyebrow">Ярус 3 · самое острое место</div>
+  <h2>Стоп и цели у брокера</h2>
+  <p class="prose">После исполнения входа контур выставляет у брокера заявки на цели (с С3 — обычные лимитные, дневные) и стоп-заявку (с С4) и хранит их номера в журнале заявок <code>broker.sqlite3</code>. Что для этого даёт API, проверено по SDK <code>t-tech-investments 1.49.3</code> из <code>.venv</code>:</p>
+  <div class="facts">
+    <div class="fact"><b>Своего стрима у стоп-заявок нет</b><span>Их состояние видно только запросом <code>GetStopOrders</code>: активна, исполнена, снята, истекла.</span><span class="src">services.py: get_stop_orders</span></div>
+    <div class="fact"><b>Срабатывание видно в стриме заявок</b><span>Сработавшая стоп-заявка порождает обычную биржевую заявку. Её исполнение приходит в <code>OrderStateStream</code>, а номер появляется в поле <code>exchange_order_id</code> стоп-заявки.</span><span class="src">schemas.py: StopOrder.exchange_order_id · подтверждено в песочнице</span></div>
+    <div class="fact"><b>Связки OCO нет</b><span>Цель и стоп ничего не знают друг о друге. Уменьшать стоп после цели должен контур. Ключ идемпотентности у стоп-заявок есть, но <code>GetStopOrders</code> его не возвращает: у <code>StopOrder</code> нет поля с нашим ключом. Потерянный ответ ищется по инструменту, стороне, объёму и цене.</span><span class="src">schemas.py: PostStopOrderRequest.order_id</span></div>
+  </div>
+  <p class="prose"><b>В песочнице стоп-заявки исполняются.</b> Разведка С1 29.10: <code>STOP_LOSS</code> на продажу 1 лота NG сработал, песочница сама выставила рыночную продажу (её номер — <code>exchange_order_id</code> стоп-заявки), стрим принёс «новая», затем «исполнена», а <code>GetStopOrders</code> показал «исполнена». Имитация срабатывания контуром не нужна: всё из этого раздела проверяется в песочнице по-настоящему.</p>
+
+  <h3>Цель сработала: как контур это узнаёт</h3>
+  <div class="fig">
+    <svg viewBox="0 0 960 400" role="img" aria-label="Последовательность: стрим сообщает исполнение заявки цели, контур узнаёт её по ключу, пересоздаёт стоп на остаток, сообщает в канал">
+      <defs>
+        <marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="dr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+      </defs>
+      <g class="n key"><rect x="55" y="14" width="150" height="40" rx="8"/><text x="130" y="39" text-anchor="middle" class="t">Контур</text></g>
+      <g class="n real"><rect x="445" y="14" width="150" height="40" rx="8"/><text x="520" y="39" text-anchor="middle" class="t">Т-Инвест</text></g>
+      <g class="n"><rect x="775" y="14" width="150" height="40" rx="8"/><text x="850" y="39" text-anchor="middle" class="t">Канал «Счёт»</text></g>
+      <line class="life" x1="130" y1="54" x2="130" y2="385"/><line class="life" x1="520" y1="54" x2="520" y2="385"/><line class="life" x1="850" y1="54" x2="850" y2="385"/>
+      <g class="num"><circle cx="24" cy="90" r="11"/><text x="24" y="94" text-anchor="middle">1</text></g>
+      <path class="e real ret" d="M520 90H134" marker-end="url(#dr)"/><text x="325" y="82" text-anchor="middle" class="lbl real">стрим: исполнена заявка цели 1, 1 лот</text>
+      <g class="num"><circle cx="24" cy="135" r="11"/><text x="24" y="139" text-anchor="middle">2</text></g>
+      <path class="e" d="M130 128H170V146H134" marker-end="url(#d)"/><text x="180" y="141" class="lbl">по order_request_id: наш ключ — цель 1 этой сделки</text>
+            <g class="num"><circle cx="24" cy="225" r="11"/><text x="24" y="229" text-anchor="middle">3</text></g>
+      <path class="e" d="M130 218H170V236H134" marker-end="url(#d)"/><text x="180" y="231" class="lbl">reducer: цель 1 взята, остаток 1 лот</text>
+      <g class="num"><circle cx="24" cy="275" r="11"/><text x="24" y="279" text-anchor="middle">4</text></g>
+      <path class="e real" d="M130 275H516" marker-end="url(#dr)"/><text x="325" y="267" text-anchor="middle" class="lbl real">CancelStopOrder: старый стоп на 2 лота</text>
+      <g class="num"><circle cx="24" cy="320" r="11"/><text x="24" y="324" text-anchor="middle">5</text></g>
+      <path class="e real" d="M130 320H516" marker-end="url(#dr)"/><text x="325" y="312" text-anchor="middle" class="lbl real">PostStopOrder: стоп на 1 лот</text>
+      <g class="num"><circle cx="24" cy="365" r="11"/><text x="24" y="369" text-anchor="middle">6</text></g>
+      <path class="e" d="M130 365H846" marker-end="url(#d)"/><text x="685" y="357" text-anchor="middle" class="lbl">цель 1 взята, стоп пересоздан на остаток</text>
+    </svg>
+  </div>
+
+  <p class="prose">Шаги 4 и 5 делает контур, и только с С4: до него стопа у брокера нет. Если в момент срабатывания цели он не работает, стоп остаётся на прежний объём, и тогда получается вот что:</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 320" role="img" aria-label="Сценарий перезакрытия: цель продала один лот, стоп на два лота продал два, позиция стала короткой">
+      <rect class="band" x="380" y="18" width="380" height="228" rx="6"/>
+      <text x="570" y="40" text-anchor="middle" class="lbl">контур не работает: стоп не уменьшен</text>
+      <path class="lvl" style="stroke:var(--ok)" d="M40 70H920"/><text x="916" y="62" text-anchor="end" class="lbl ok">цель 1 · 1 лот</text>
+      <path class="lvl" style="stroke:var(--muted)" d="M40 150H920"/><text x="916" y="142" text-anchor="end" class="lbl">вход · 2 лота</text>
+      <path class="lvl" style="stroke:var(--bad)" d="M40 225H920"/><text x="916" y="217" text-anchor="end" class="lbl bad">стоп · 2 лота</text>
+      <polyline class="price" points="40,150 120,138 200,110 270,84 330,70 400,96 470,128 540,160 610,192 680,214 720,225 790,236 860,232 920,238"/>
+      <circle cx="330" cy="70" r="7" style="fill:var(--ok)"/>
+      <text x="300" y="52" text-anchor="middle" class="lbl ok">продан 1 лот, остаток 1</text>
+      <circle cx="720" cy="225" r="7" style="fill:var(--bad)"/>
+      <text x="720" y="258" text-anchor="middle" class="lbl bad">стоп продал 2 лота</text>
+      <rect x="40" y="272" width="290" height="30" rx="5" style="fill:var(--ok-soft);stroke:var(--ok)"/><text x="185" y="292" text-anchor="middle" class="s" style="fill:var(--ok)">позиция +2</text>
+      <rect x="330" y="272" width="390" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--line)"/><text x="525" y="292" text-anchor="middle" class="s">позиция +1</text>
+      <rect x="720" y="272" width="200" height="30" rx="5" style="fill:var(--bad-soft);stroke:var(--bad)"/><text x="820" y="292" text-anchor="middle" class="s" style="fill:var(--bad)">−1: случайный шорт</text>
+    </svg>
+  </div>
+  <div class="policy">
+    <div><b>Стоп всегда на весь остаток</b>После любого частичного выхода контур первым делом пересоздаёт стоп, потом делает всё остальное.</div>
+    <div><b>Перенос стопа</b>Идёт как «снять старый, поставить новый» с проверкой остатка. Короткое окно без стопа лучше двух стопов на один объём.</div>
+    <div><b>Опрос стоп-заявок</b>Раз стрима у них нет, сверщик опрашивает <code>GetStopOrders</code> при каждом незнакомом исполнении и по расписанию, не чаще 30 раз в минуту.</div>
+    <div><b>Срок жизни</b>Стоп ставится с <code>GOOD_TILL_CANCEL</code> и переживает конец сессии и остановку робота (переживает ли ночь в песочнице — проверка П24). Цели — обычные лимитные заявки: брокер снимает их вечером, контур ставит заново после открытия торгов (так с С3, решено 08.11). Стоп снимает сам контур при выходе из сделки.</div>
+    <div><b>Старт после простоя</b>Сверщик до первого тика сравнивает остаток с объёмом стопа и целей у брокера и срезает лишнее. Перезакрытие, которое уже случилось, он покажет тревогой.</div>
+  </div>
+</section>
+
+<section id="nuance">
+  <div class="eyebrow">Ярус 3 · остальные тонкие места</div>
+  <h2>Нюансы и ответы на них</h2>
+  <div class="cards">
+    <div class="card"><div class="row"><h3>Неттинг позиции</h3><span class="stage">С3</span></div><p class="pain">Счёт видит одну позицию на инструмент, у контура на нём может быть несколько сделок.</p><p>Каждая сделка ведёт свои заявки по своим ключам, исполнения разносятся по номеру заявки. Встречные сделки по семейству уже запрещены, и для счёта это обязательно.</p></div>
+    <div class="card"><div class="row"><h3>Асинхронность</h3><span class="stage">С3</span></div><p class="pain">Сегодня <code>submit</code> сразу возвращает итог исполнения.</p><p>Адаптер отдаёт только ACK или отказ. Исполнения кладёт в очередь поток стрима, а тик забирает их через существующий <code>drain_addressed_events</code>.</p></div>
+    <div class="card"><div class="row"><h3>Лоты, шаг цены, коридор</h3><span class="stage">С3</span></div><p class="pain">Цена фьючерса в пунктах, у каждой бумаги свой шаг и лот, биржа режет цены вне коридора.</p><p>Адаптер округляет до <code>min_price_increment</code>, переводит количество в лоты и проверяет коридор до отправки. Цены заявок и исполнений фьючерса брокер возвращает в рублях за контракт (NG: 23 960 ₽ при цене 2.962), а журнал ведёт пункты — адаптер переводит рубли в пункты через стоимость шага. Ошибки построения ловит песочница, денег они не стоят.</p></div>
+    <div class="card"><div class="row"><h3>Стоп срабатывает иначе</h3><span class="stage">С7</span></div><p class="pain">Брокер исполняет стоп по последней цене внутри минуты, симулятор по закрытым 1m-барам.</p><p>Результаты счёта и тени будут расходиться, и это нормально. Расхождение попадает в отчёт, а не в логику.</p></div>
+    <div class="card"><div class="row"><h3>Клиринг, сессии биржи, экспирация</h3><span class="stage">С3</span></div><p class="pain">Календарь уже не пускает входы, но брокер всё равно может отказать.</p><p>Отказ входа отменяет план и снимает резерв без повторов. Повторы только для выходов и защиты, после открытия торгов.</p></div>
+    <div class="card"><div class="row"><h3>Окно без стопа</h3><span class="stage">С4</span></div><p class="pain">Между исполнением входа и принятием стоп-заявки проходит время.</p><p>Срок на постановку стопа. Не успел или получил отказ: выход по рынку и тревога в канал.</p></div>
+    <div class="card"><div class="row"><h3>Доборы и сокращения</h3><span class="stage">С4</span></div><p class="pain">Каждый добор меняет объём, который должен закрывать стоп.</p><p>Добор считается завершённым только после того, как стоп пересоздан на новый остаток. До этого следующий добор не допускается.</p></div>
+    <div class="card"><div class="row"><h3>Стоп у контура и у брокера</h3><span class="stage">С4</span></div><p class="pain">На С3 условие стопа проверяет контур по закрытой минуте. Если оставить его рядом со стоп-заявкой, выйдут оба.</p><p>Пока стоп у брокера не принят, условие держит контур, как на С3. Принят — контур по минутам стоп не проверяет и только ведёт стоп-заявку.</p></div>
+    <div class="card"><div class="row"><h3>Ядро на рестарте</h3><span class="stage">С2</span></div><p class="pain">Обновление робота перезапускает ядро, и на это время контур остаётся без свечей.</p><p>Позиции в паузе защищают стопы у брокера. После старта контур «Счёт» поднимается первым и сверяется до первого тика. Ядро подхватывает живой процесс контура только той же версии.</p></div>
+  </div>
+</section>
+
+<section id="probe">
+  <div class="eyebrow">Ярус 4 · факты</div>
+  <h2>Что показала разведка С1</h2>
+  <p class="prose">Команда песочницы <code>python -m src.sandbox probe</code> 29.10 прошла три раза на одном лоте NG-11.26, 30.10 — ещё раз на NG и SBER. Прогон 29.10 дал «да» по всем 15 проверкам. Ниже — что выяснилось и куда это ведёт.</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Вопрос</th><th>Ответ песочницы</th><th>Что меняет</th></tr></thead>
+      <tbody>
+        <tr><td>Торгуются ли фьючерсы</td><td>Да: лимитные и рыночные заявки по NG принимаются и исполняются</td><td>С3–С7 идут на фьючерсах, как задумано</td></tr>
+        <tr><td>Исполняет ли стоп-заявки</td><td>Да: стоп сработал, песочница выставила рыночную продажу, <code>GetStopOrders</code> — «исполнена»</td><td>С4 проверяется по-настоящему, имитация стопа не нужна <span class="pill ok">проще</span></td></tr>
+        <tr><td>Стрим исполнений</td><td><code>OrderStateStream</code> подтверждает подписку, приносит «снята» и «исполнена»; сначала шлёт событие с временным номером заявки</td><td>С3: сопоставлять по <code>order_request_id</code></td></tr>
+        <tr><td>Поиск по ключу</td><td><code>GetOrderState</code> с <code>ORDER_ID_TYPE_REQUEST</code> находит заявку по нашему ключу</td><td>С3: восстановление после обрыва — поиск по ключу</td></tr>
+        <tr><td>Повтор того же ключа</td><td>Второй заявки нет, но ответ — ошибка 30057 «дубликат», а не прежняя заявка</td><td>С3: не повторять вслепую, сначала искать по ключу</td></tr>
+        <tr><td>Лимит частоты</td><td><code>RESOURCE_EXHAUSTED</code> на третью заявку за 200 мс при лимите 200/мин; повтор через 1 с проходит</td><td>С3: повтор тем же ключом, как в шлюзе команды</td></tr>
+        <tr><td>Цены фьючерса</td><td>В рублях за контракт, а не в пунктах (стоимость шага NG 8,09 ₽)</td><td>С3: перевод рублей в пункты для журнала</td></tr>
+        <tr><td>Комиссия</td><td>11,97 ₽ за контракт в ответе заявки и в операциях; в операциях она дважды — полем покупки и операцией «комиссия брокера»</td><td>С7: брать одну из двух</td></tr>
+        <tr><td>ГО и <code>GetMaxLots</code></td><td><code>GetMaxLots</code> по фьючерсу бесполезен; ГО даёт <code>GetFuturesMargin</code> (NG 6 228 ₽)</td><td>С3: допуск по ГО считает контур</td></tr>
+        <tr><td>Капитал</td><td><code>GetMarginAttributes</code> работает, <code>liquid_portfolio</code> 1 023 916 ₽ при 1 000 000 ₽; покупка контракта списала со счёта полную цену 23 960 ₽, а не ГО</td><td>С3: капитал — рубли из <code>GetPositions</code> <span class="pill ok">решено</span></td></tr>
+        <tr><td>Исполнение за простой</td><td><code>stages</code> в <code>GetOrderState</code> всегда пусты; сделки за простой видны только суммой <code>executed_order_price</code> (30.10)</td><td>С3: средняя по сумме заявки — прочтение, ближайшее к цене лота заявки</td></tr>
+        <tr><td>Стоп-лимит, ключ, ночь</td><td>Проверен только <code>STOP_LOSS</code> на 1 лот в течение получаса</td><td>С4: разведка П19–П24 <span class="pill real">проверить</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="prose small muted">Отчёты и все ответы API трёх прогонов лежат в <code>data/sandbox/probe-…/</code>; из них на С3 собираются фикстуры фейкового шлюза. Спека команды — <code>openspec/specs/broker-sandbox</code>.</p>
+</section>
+
+<section id="switch">
+  <div class="eyebrow">Ярус 4 · переход</div>
+  <h2>Переход от песочницы к счёту</h2>
+  <p class="prose">Один контур с переключателем «песочница или счёт» опасен: журнал песочницы оказался бы на настоящем счёте, и сверщик принял бы её позиции за закрытые стопами. Поэтому счёт не заменяет песочницу, а поднимается рядом с ней вторым видом контура из того же кода, с чистым журналом. Песочница остаётся стендом: через неё проходит каждая привязка и каждая новая версия робота.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 420" role="img" aria-label="Три контура рядом: эмуляция, песочница и счёт; привязка переходит из эмуляции в песочницу и из песочницы на счёт; у песочницы и счёта свои папки с отпечатком счёта и свои брокеры; журналы не смешиваются">
+      <defs>
+        <marker id="w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="wr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+        <marker id="ws" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah sim"/></marker>
+      </defs>
+      <g class="n sim"><rect x="20" y="20" width="240" height="96" rx="10"/><text x="140" y="48" text-anchor="middle" class="t">Эмуляция</text><text x="140" y="70" text-anchor="middle" class="s">все привязки 22 инструментов</text><text x="140" y="90" text-anchor="middle" class="s">initial_deposit · «Сигналы»</text></g>
+      <g class="n key"><rect x="360" y="20" width="240" height="96" rx="10"/><text x="480" y="48" text-anchor="middle" class="t">Контур «Песочница»</text><text x="480" y="70" text-anchor="middle" class="s">вид sandbox · свой состав</text><text x="480" y="90" text-anchor="middle" class="s">канал «Песочница»</text></g>
+      <g class="n realx"><rect x="700" y="20" width="240" height="96" rx="10"/><text x="820" y="48" text-anchor="middle" class="t">Контур «Счёт»</text><text x="820" y="70" text-anchor="middle" class="s">вид account · свой состав</text><text x="820" y="90" text-anchor="middle" class="s">канал «Счёт»</text></g>
+      <path class="e sim" d="M260 68H356" marker-end="url(#ws)"/><text x="308" y="56" text-anchor="middle" class="lbl sim">привязка</text><text x="308" y="88" text-anchor="middle" class="lbl sim">bindings</text>
+      <path class="e real" d="M600 68H696" marker-end="url(#wr)"/><text x="648" y="56" text-anchor="middle" class="lbl real">неделя ок</text><text x="648" y="88" text-anchor="middle" class="lbl real">+ confirm</text>
+      <path class="e" d="M140 116V176" marker-end="url(#w)"/><path class="e key" d="M480 116V176" marker-end="url(#w)"/><path class="e real" d="M820 116V176" marker-end="url(#wr)"/>
+      <g class="n"><rect x="20" y="180" width="240" height="70" rx="9"/><text x="140" y="208" text-anchor="middle" class="m">contours/emulation/</text><text x="140" y="230" text-anchor="middle" class="s">журнал эмуляции</text></g>
+      <g class="n"><rect x="360" y="180" width="240" height="70" rx="9"/><text x="480" y="208" text-anchor="middle" class="m">contours/sandbox/</text><text x="480" y="230" text-anchor="middle" class="s">отпечаток: песочница · …a1</text></g>
+      <g class="n"><rect x="700" y="180" width="240" height="70" rx="9"/><text x="820" y="208" text-anchor="middle" class="m">contours/account/</text><text x="820" y="230" text-anchor="middle" class="s">отпечаток: боевой · …7f</text></g>
+      <path class="e bad ret" d="M604 215H696"/><text x="650" y="208" text-anchor="middle" class="lbl bad">✕</text>
+      <path class="e" d="M140 250V306" marker-end="url(#w)"/><path class="e key" d="M480 250V306" marker-end="url(#w)"/><path class="e real" d="M820 250V306" marker-end="url(#wr)"/>
+      <g class="n"><rect x="20" y="310" width="240" height="66" rx="9"/><text x="140" y="337" text-anchor="middle" class="t">JournalBroker</text><text x="140" y="358" text-anchor="middle" class="s">брокера нет</text></g>
+      <g class="n ext"><rect x="360" y="310" width="240" height="66" rx="9"/><text x="480" y="337" text-anchor="middle" class="t">Песочница Т-Инвест</text><text x="480" y="358" text-anchor="middle" class="s">TINKOFF_SANDBOX_TOKEN</text></g>
+      <g class="n ext"><rect x="700" y="310" width="240" height="66" rx="9"/><text x="820" y="337" text-anchor="middle" class="t">Брокерский счёт робота</text><text x="820" y="358" text-anchor="middle" class="s">TINKOFF_TRADE_TOKEN</text></g>
+      <text x="480" y="406" text-anchor="middle" class="lbl bad">журналы песочницы и счёта не смешиваются: чужой отпечаток — контур не стартует</text>
+    </svg>
+    <div class="legend"><span><i class="sw sim"></i>эмуляция</span><span><i class="sw key"></i>контур «Песочница», стенд</span><span><i class="sw real"></i>контур «Счёт», настоящие деньги</span></div>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th></th><th>Контур «Песочница»</th><th>Контур «Счёт»</th></tr></thead>
+      <tbody>
+        <tr><td>вид и API</td><td><code>sandbox</code>, <code>/api/v1/sandbox</code></td><td><code>account</code>, <code>/api/v1/account</code></td></tr>
+        <tr><td>брокер</td><td>песочница Т-Инвест</td><td>брокерский счёт робота</td></tr>
+        <tr><td>токен</td><td><code>TINKOFF_SANDBOX_TOKEN</code></td><td><code>TINKOFF_TRADE_TOKEN</code> и <code>TINKOFF_ACCOUNT_ID</code></td></tr>
+        <tr><td>состав</td><td>свои привязки</td><td>свои привязки, независимо от песочницы</td></tr>
+        <tr><td>журнал</td><td><code>data/contours/sandbox/</code></td><td><code>data/contours/account/</code></td></tr>
+        <tr><td>стоп-заявки</td><td>исполняет песочница</td><td>исполняет биржа</td></tr>
+        <tr><td><code>confirm</code></td><td>не нужен</td><td>на всё, что открывает или закрывает позицию</td></tr>
+        <tr><td>канал</td><td>«Песочница», бот общий</td><td>«Счёт»</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="prose"><b>Отпечаток счёта.</b> При первом старте контур записывает в свою базу вид брокера и хеш номера счёта. Если при следующем старте отпечаток другой, контур не стартует. Так журнал одного счёта не может продолжиться на другом.</p>
+  <h3>Допуск контура «Счёт» к старту</h3>
+  <ol class="tasks">
+    <li>Токен видит ровно один счёт, это <code>TINKOFF_ACCOUNT_ID</code>, и у счёта <code>access_level</code> с полным доступом. Видит больше — контур не стартует.</li>
+    <li><code>GetInfo</code> подтверждает, что пользователю разрешены срочные контракты (<code>qualified_for_work_with</code>). В песочнице этого не увидеть, а без допуска брокер отказывает во входах по фьючерсам.</li>
+    <li>Тариф прочитан через <code>GetUserTariff</code>, комиссии известны.</li>
+    <li>Бот и канал «Счёт» заданы.</li>
+    <li>На первом старте счёт пуст: нет позиций, заявок и стоп-заявок. Иначе тревога и заморозка входов: счётом владеет только робот.</li>
+  </ol>
+  <h3>Порядок перехода</h3>
+  <ol class="tasks">
+    <li><b>Песочница готова.</b> Отчёт С7 за неделю без необъяснённых расхождений, хаос-сценарии С3–С4 пройдены, предохранители С6 срабатывают.</li>
+    <li><b>Р1, счёт только на чтение.</b> Открыть счёт робота, выпустить токен только на него, положить деньги. Контур «Счёт» стартует с <code>orders = false</code>. Сделка руками в приложении видна сверщику, капитал в API совпадает с приложением. Неделя без ложных тревог.</li>
+    <li><b>Р2, первая привязка.</b> Привязка, которая неделю торговала в песочнице без расхождений, переводится на счёт с <code>confirm</code>. Песочница продолжает торговать ею же, отчёт сравнивает три стороны: эмуляцию, песочницу и счёт.</li>
+    <li><b>Дальше по одной.</b> Каждая следующая привязка проходит путь эмуляция → песочница → счёт.</li>
+  </ol>
+  <p class="prose"><b>Откат.</b> <code>PUT /api/v1/account/target {"mode": "no_entries"}</code> прекращает новые входы. Открытые позиции доживают со стопами у брокера, песочница и эмуляция работают дальше. Журнал счёта не трогается, повторный старт продолжает с того же места.</p>
+</section>
+
+<section id="road">
+  <div class="eyebrow">Ярус 4 · план работ</div>
+  <h2>Этапы</h2>
+  <p class="prose">Каждый этап — отдельный change в OpenSpec: спека, реализация, архив, ветка от <code>origin/release/*</code>. Код контура на брокере пишется на С2–С6 под видом «Песочница», а Р1 поднимает из него второй вид, «Счёт». Этап закончен, когда его можно проверить руками по колонке «Проверяю руками». Первые семь этапов идут в песочнице, настоящие деньги появляются только на Р2.</p>
+  <div class="road">
+    <div class="stg "><div class="no">С0</div><div class="body">
+      <div class="hdr"><h3>Подготовка</h3><span class="chg">без кода</span></div>
+      <div class="g3"><div><b>Делаем</b>Завести отдельного бота, каналы «Песочница» и «Счёт», выпустить токен для песочницы.</div><div><b>Проверяю руками</b>Бот публикует тестовое сообщение в оба канала.</div><div><b>Готово, когда</b>в <code>.env</code> есть <code>TINKOFF_SANDBOX_TOKEN</code>, <code>TELEGRAM_ACCOUNT_BOT_TOKEN</code>, <code>TELEGRAM_SANDBOX_CHANNEL_ID</code>, <code>TELEGRAM_ACCOUNT_CHANNEL_ID</code>.</div></div>
+    </div></div>
+    <div class="road-grp sb">Контур «Песочница» · денег нет</div>
+    <div class="stg ro"><div class="no">С1</div><div class="body">
+      <div class="hdr"><h3>Разведка песочницы <span class="pill ok">сделано 29.10</span></h3><span class="chg">add-sandbox-probe</span></div>
+      <div class="g3"><div><b>Делаем</b>Команда песочницы: найти или открыть счёт, пополнить, купить или продать лоты руками. Разведка на фьючерсе NG: лимитная заявка и отмена, заявка по рынку, позиция, операции и комиссия, <code>OrderStateStream</code>, стоп-заявка. Ответы API записываются фикстурами для фейкового шлюза.</div><div><b>Проверяю руками</b>Запускаю разведку и читаю отчёт «умеет / не умеет» по каждому пункту.</div><div><b>Готово, когда</b>на каждый вопрос есть ответ. Ответы — в разделе «Разведка»: фьючерсы торгуются, стрим работает, стоп-заявки исполняются.</div></div>
+    </div></div>
+    <div class="stg ro"><div class="no">С2</div><div class="body">
+      <div class="hdr"><h3>Контур «Песочница», только чтение <span class="pill ok">сделано 29.10</span></h3><span class="chg">add-sandbox-contour</span></div>
+      <div class="g3"><div><b>Делаем</b>Код контура на брокере и его первый вид <code>sandbox</code> отдельным процессом, <code>orders = false</code>. Ресурс <code>/api/v1/sandbox</code> и свой состав привязок <code>/api/v1/sandbox/bindings</code>. Отпечаток счёта в базе контура. Чтение капитала, позиций, заявок, стоп-заявок, операций. Сверщик с отчётом в канал и в <code>/reconcile</code>. Подъём после рестарта раньше эмуляции.</div><div><b>Проверяю руками</b>Запускаю контур: в канале «старт, капитал 1 000 000». Покупаю командой песочницы 1 лот NG: тревога «на счёте +1, по журналу 0, входы по NG заморожены». Перезапускаю робота: «Песочница» поднимается раньше эмуляции, тревога на месте.</div><div><b>Готово, когда</b><code>GET /api/v1/sandbox/bindings</code> показывает, где торгует каждая привязка; сверщик видит каждую ручную сделку в песочнице, а <code>GET /api/v1/sandbox</code> показывает тот же капитал, что команда песочницы.</div></div>
+    </div></div>
+    <div class="stg ro"><div class="no">С3</div><div class="body">
+      <div class="hdr"><h3>Входы и выходы заявками <span class="pill ok">сделано 06.11</span></h3><span class="chg">add-tinvest-orders</span></div>
+      <div class="g3"><div><b>Делаем</b><code>TInvestBroker</code> под <code>BrokerPort</code>: вход лимитом с TTL, журнал заявок в <code>broker.sqlite3</code>, стрим с сопоставлением по <code>order_request_id</code>, поиск по ключу после обрыва. Рубли в пункты, ГО по <code>GetFuturesMargin</code>, капитал — рубли на счёте. Цели — лимитные заявки у брокера, стоп по минуте проверяет контур, все выходы — лимит с запасом, перевыставление, аварийный рынок. <code>no_entries</code> и <code>close_all</code> для контура и привязки.</div><div><b>Проверено руками</b>02–05.11 на Si, NG, ED: вход, стоп-лимит контуром, цели у брокера, <code>kill -9</code> при живых целях без дублей, ручная сделка ловится сверкой, <code>close_all</code> доводит до <code>stopped</code>.</div><div><b>Хвост</b><code>fix-sandbox-restart-safety</code>: исполнение после рестарта, привязки пакетом, снимок счёта при остановке. Код готов, ждут проверки 5.1–5.3 на тестовом роботе.</div></div>
+    </div></div>
+    <div class="stg ro"><div class="no">С4</div><div class="body">
+      <div class="hdr"><h3>Стоп у брокера <span class="pill key">следующий</span></h3><span class="chg">add-broker-protection</span></div>
+      <div class="g3"><div><b>Делаем</b>Разведка стоп-заявок. Стоп-заявка на весь остаток после входа, пересоздание после цели, добора, сокращения и переноса. Срабатывание по стриму, <code>GetStopOrders</code> и <code>exchange_order_id</code>. Сверка стопов до первого тика. Подробно — <a href="#c4">план С4</a>.</div><div><b>Проверяю руками</b>Стоп срабатывает у брокера при живом и при убитом контуре. Цель взята — стоп пересоздан на остаток. Продаю часть позиции, пока контур убит: после подъёма стоп срезан. <code>close_all</code> снимает стоп.</div><div><b>Готово, когда</b>в каждом сценарии у открытой позиции ровно один стоп на весь остаток, а после закрытия на счёте нет ни одной стоп-заявки.</div></div>
+    </div></div>
+    <div class="stg ro" style="opacity:.62"><div class="no">С5</div><div class="body">
+      <div class="hdr"><h3>Остановка по правилам счёта <span class="pill ok">вошёл в С3 и С4</span></h3><span class="chg">отдельного change нет</span></div>
+      <div class="g3"><div><b>Сделано на С3</b><code>no_entries</code> и <code>close_all</code> для всего контура и для одной привязки; выход по «закрыть всё» лимитом с перевыставлением и аварийным рынком (проверка 7.6).</div><div><b>Уходит в С4</b>Снять стоп-заявку при <code>close_all</code>; при <code>no_entries</code> и остановке процесса позиция доживает со стопом у брокера.</div><div><b>Номер</b>С5 оставлен пустым, чтобы не сдвигать С6, С7 и ссылки в спеках.</div></div>
+    </div></div>
+    <div class="stg ro"><div class="no">С6</div><div class="body">
+      <div class="hdr"><h3>Предохранители</h3><span class="chg">add-account-guards</span></div>
+      <div class="g3"><div><b>Делаем</b>Дневной убыток, отказы подряд, расхождение сверки. Тревоги в канал контура.</div><div><b>Проверяю руками</b>Пополняю песочницу на маленькую сумму и ставлю <code>max_rejects_in_row = 1</code>: на первом отказе по ГО входы заморожены, пришла тревога.</div><div><b>Готово, когда</b>каждый предохранитель срабатывает в песочнице и снимается понятным действием.</div></div>
+    </div></div>
+    <div class="stg ro"><div class="no">С7</div><div class="body">
+      <div class="hdr"><h3>Песочница против эмуляции</h3><span class="chg">add-account-vs-emulation-report</span></div>
+      <div class="g3"><div><b>Делаем</b>Отчёт по одним и тем же сигналам: цена и время входа и выхода, причины расхождений. Настоящие комиссии из операций.</div><div><b>Проверяю руками</b>Через неделю в песочнице открываю отчёт и вижу пары сделок и расхождения.</div><div><b>Готово, когда</b>по отчёту видно, что песочница ведёт себя как эмуляция или почему нет.</div></div>
+    </div></div>
+    <div class="road-grp lv">Контур «Счёт» · брокерский счёт робота</div>
+    <div class="stg rl"><div class="no">Р1</div><div class="body">
+      <div class="hdr"><h3>Контур «Счёт», только чтение</h3><span class="chg">add-account-contour</span></div>
+      <div class="g3"><div><b>Делаем</b>Второй вид контура <code>account</code> из того же кода, <code>orders = false</code>, ресурс <code>/api/v1/account</code> с <code>confirm</code>. Допуск к старту из раздела «Переход». Подъём первым после рестарта, раньше песочницы и эмуляции.</div><div><b>Проверяю руками</b>Делаю сделку руками в приложении Т-Инвест: сверщик её видит. Капитал в API совпадает с цифрой в приложении. Подменяю номер счёта в <code>.env</code>: контур не стартует по отпечатку.</div><div><b>Готово, когда</b>неделя чтения настоящего счёта без ложных тревог.</div></div>
+    </div></div>
+    <div class="stg rl"><div class="no">Р2</div><div class="body">
+      <div class="hdr"><h3>Первые привязки на счёте</h3><span class="chg">enable-live-trading</span></div>
+      <div class="g3"><div><b>Делаем</b><code>orders = true</code>, первая привязка из песочницы с обычным размером по риску, остальные по одной командой <code>/api/v1/account/bindings</code>. Отчёт С7 сравнивает эмуляцию, песочницу и счёт.</div><div><b>Проверяю руками</b>Живые сделки под присмотром. Здесь же впервые по-настоящему срабатывают стоп-заявки.</div><div><b>Готово, когда</b>две недели без ручного вмешательства и без расхождений.</div></div>
+      <p class="money-line">Первые настоящие деньги.</p>
+    </div></div>
+  </div>
+</section>
+
+<section id="c4">
+  <div class="eyebrow">Ярус 4 · следующий этап</div>
+  <h2>План С4: стоп у брокера</h2>
+  <p class="prose">После С3 цели уже стоят у брокера, а стоп проверяет сам контур по закрытой минуте. Пока процесс контура не работает (убит, ядро обновляется, нет свечей), позицию защищают только цели. С4 переносит стоп к брокеру стоп-заявкой, и позиция защищена без контура. Change — <code>add-broker-protection</code>.</p>
+  <div class="fig">
+    <svg viewBox="0 0 960 460" role="img" aria-label="Жизнь стоп-заявки: вход исполнен, стоп-заявка на весь остаток, пересоздание при изменении остатка, срабатывание у брокера, сверка после простоя, отказ ведёт к выходу и тревоге">
+      <defs>
+        <marker id="s4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker>
+        <marker id="s4r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah real"/></marker>
+        <marker id="s4b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah bad"/></marker>
+      </defs>
+      <g class="n"><rect x="20" y="20" width="200" height="56" rx="9"/><text x="120" y="44" text-anchor="middle" class="t">Вход исполнен</text><text x="120" y="63" text-anchor="middle" class="s">или добор, и частично</text></g>
+      <g class="n real"><rect x="260" y="20" width="200" height="56" rx="9"/><text x="360" y="44" text-anchor="middle" class="t">PostStopOrder</text><text x="360" y="63" text-anchor="middle" class="s">на весь остаток · GTC</text></g>
+      <g class="n key"><rect x="500" y="20" width="200" height="56" rx="9"/><text x="600" y="44" text-anchor="middle" class="t">Стоп у брокера</text><text x="600" y="63" text-anchor="middle" class="s">одна стоп-заявка на сделку</text></g>
+      <g class="n warn"><rect x="260" y="150" width="200" height="56" rx="9"/><text x="360" y="174" text-anchor="middle" class="t">Не принят</text><text x="360" y="193" text-anchor="middle" class="s">отказ или нет ответа</text></g>
+      <g class="n bad"><rect x="260" y="280" width="200" height="56" rx="9"/><text x="360" y="304" text-anchor="middle" class="t">Выход и тревога</text><text x="360" y="323" text-anchor="middle" class="s">цикл выхода С3</text></g>
+      <g class="n"><rect x="500" y="150" width="200" height="56" rx="9"/><text x="600" y="174" text-anchor="middle" class="t">Остаток изменился</text><text x="600" y="193" text-anchor="middle" class="s">цель, добор, перенос</text></g>
+      <g class="n"><rect x="500" y="280" width="200" height="56" rx="9"/><text x="600" y="304" text-anchor="middle" class="t">После простоя</text><text x="600" y="323" text-anchor="middle" class="s">сверка до первого тика</text></g>
+      <g class="n real"><rect x="740" y="150" width="200" height="56" rx="9"/><text x="840" y="174" text-anchor="middle" class="t">Сработал у брокера</text><text x="840" y="193" text-anchor="middle" class="s">заявка без нашего ключа</text></g>
+      <g class="n"><rect x="740" y="280" width="200" height="56" rx="9"/><text x="840" y="304" text-anchor="middle" class="t">GetStopOrders</text><text x="840" y="323" text-anchor="middle" class="s">exchange_order_id → сделка</text></g>
+      <g class="n ok"><rect x="740" y="390" width="200" height="56" rx="9"/><text x="840" y="414" text-anchor="middle" class="t">Сделка закрыта</text><text x="840" y="433" text-anchor="middle" class="s">цели сняты, строка в карточке</text></g>
+      <path class="e" d="M220 48H256" marker-end="url(#s4)"/>
+      <path class="e real" d="M460 48H496" marker-end="url(#s4r)"/>
+      <path class="e bad" d="M360 76V146" marker-end="url(#s4b)"/><text x="370" y="116" class="lbl bad">нет ответа или отказ</text>
+      <path class="e bad" d="M360 206V276" marker-end="url(#s4b)"/>
+      <path class="e" d="M570 76V146" marker-end="url(#s4)"/>
+      <path class="e key" d="M630 146V80" marker-end="url(#s4)"/><text x="640" y="116" class="lbl key">снять → поставить</text>
+      <path class="e real" d="M700 40H840V146" marker-end="url(#s4r)"/><text x="772" y="32" text-anchor="middle" class="lbl real">сработал</text>
+      <path class="e real" d="M840 206V276" marker-end="url(#s4r)"/>
+      <path class="e" d="M840 336V386" marker-end="url(#s4)"/>
+      <path class="e" d="M700 308H736" marker-end="url(#s4)"/>
+    </svg>
+  </div>
+
+  <h3 style="margin-top:22px">Что было после С3 и что даёт С4</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th></th><th>После С3</th><th>После С4</th></tr></thead>
+      <tbody>
+        <tr><td>Стоп</td><td>Условие по закрытой минуте в контуре; сработал — лимит с запасом, перевыставление, рынок</td><td>Стоп-заявка <code>STOP_LOSS</code> у брокера на весь остаток, <code>GOOD_TILL_CANCEL</code>: сработал — брокер выходит рыночной заявкой. Условие у контура — только пока стоп у брокера не принят</td></tr>
+        <tr><td>Цели</td><td>Дневные лимитные заявки; после открытия торгов контур ставит их заново</td><td>Без изменений: дневные лимиты, тейк-профита GTC нет</td></tr>
+        <tr><td>Контур не работает</td><td>Позицию защищают только цели</td><td>Стоп у брокера. После подъёма контур до первого тика сверяет стопы и проводит то, что сработало за простой</td></tr>
+        <tr><td>Сверщик</td><td>Любая стоп-заявка на счёте — расхождение</td><td>Стоп-заявки сравниваются с журналом: у сделки ровно одна, объём равен остатку, цена равна стопу плана</td></tr>
+        <tr><td>Остановка</td><td><code>close_all</code> — выход лимитным циклом; <code>no_entries</code> — позицию ведёт контур</td><td><code>close_all</code> сначала снимает стоп и цели, потом выходит; при <code>no_entries</code> и остановке процесса позиция доживает со стопом у брокера</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="margin-top:22px">Работы по шагам</h3>
+  <div class="cards">
+    <div class="card"><div class="row"><h3>1. Разведка стоп-заявок</h3><span class="stage">П19–П24</span></div><p class="pain">Разведка С1 проверила только <code>STOP_LOSS</code> на 1 лот в течение получаса.</p><p>Дополнить <code>python -m src.sandbox probe</code>. Нужно выяснить:</p><ul class="rules"><li>сколько ждёт рыночная заявка стопа и одна ли у неё сделка;</li><li>что стрим даёт по заявке, порождённой стопом: <code>order_request_id</code>, номер;</li><li>находит ли её <code>GetOrderState</code> с <code>ORDER_ID_TYPE_EXCHANGE</code>;</li><li>что отвечает повтор <code>PostStopOrder</code> тем же ключом;</li><li>что отвечает снятие уже исполненного стопа;</li><li>в чём цена стопа в <code>GetStopOrders</code>, в рублях или пунктах;</li><li>переживает ли GTC-стоп ночь (П24, руками утром).</li></ul></div>
+    <div class="card"><div class="row"><h3>2. Журнал стоп-заявок</h3><span class="stage">broker.sqlite3</span></div><p class="pain">Без журнала стоп-заявку не найти после рестарта: нашего ключа в ней нет.</p><p>Стоп-заявка — строка журнала заявок вида <code>stop</code>: ключ <code>uuid5(command_id)</code>, номер стоп-заявки, цена, объём, <code>exchange_order_id</code>. Состояния: отправлена, активна, снимается, снята, исполнена, истекла, неизвестно.</p></div>
+    <div class="card"><div class="row"><h3>3. Постановка и пересоздание</h3><span class="stage">ядро С4</span></div><p class="pain">Каждое изменение остатка меняет объём, который должен закрывать стоп.</p><p>Стоп ставится после исполнения входа и пересоздаётся после цели, добора, сокращения и <code>MoveStop</code>: снять старый, дождаться подтверждения, поставить новый. Частичный вход — стоп на исполненное. Следующий добор не допускается, пока стоп не пересоздан. Срок <code>stop_place_secs</code>: не принят — выход и тревога.</p></div>
+    <div class="card"><div class="row"><h3>4. Срабатывание</h3><span class="stage">стрим</span></div><p class="pain">Стрима у стоп-заявок нет, а заявка стопа приходит в стрим без нашего ключа.</p><p>Незнакомая заявка в стриме → <code>GetStopOrders</code> → совпал <code>exchange_order_id</code> → защитные исполнения сделки <code>&lt;trade&gt;:pv:stop:&lt;стоп-заявка&gt;:&lt;сделка биржи&gt;</code>, цели снимаются. Рыночная заявка стопа обычно исполняется сразу; если остаток не закрыт, дальше идёт цикл выхода С3. Опрос — при незнакомой заявке и на сверке, не чаще 30 раз в минуту.</p></div>
+    <div class="card"><div class="row"><h3>5. Подъём после простоя</h3><span class="stage">до первого тика</span></div><p class="pain">Пока контура не было, стоп мог сработать, а ответ на постановку мог потеряться.</p><p>Исполненные за простой стопы → сделки через <code>GetOrderState</code> по номеру биржи → факт выхода. Стоп с потерянным ответом ищется по инструменту, стороне, объёму и цене. Лишнее снимается, недостающее ставится. Только потом сверка и первый тик.</p></div>
+    <div class="card"><div class="row"><h3>6. Сверщик</h3><span class="stage">reconcile</span></div><p class="pain">Сейчас сверщик видит в любой стоп-заявке расхождение.</p><p>Стоп-заявки берутся из журнала. Нет стопа или объём не равен остатку — пересоздать сразу, без тревоги. Чужая стоп-заявка — тревога и заморозка входов по инструменту.</p></div>
+    <div class="card"><div class="row"><h3>7. Остановка</h3><span class="stage">бывший С5</span></div><p class="pain"><code>close_all</code> на С3 не знает про стоп у брокера.</p><p><code>close_all</code> и снятие привязки с <code>close_all</code>: снять стоп и цели, потом выход. Сокращение сначала уменьшает стоп на свой объём. <code>no_entries</code>, Ctrl+C и <code>kill</code>: стоп остаётся у брокера, сообщение <code>stopped</code> называет число стопов у брокера.</p></div>
+    <div class="card"><div class="row"><h3>8. Канал и API</h3><span class="stage">2.8.0</span></div><p class="pain">Человек должен видеть, стоит ли стоп у брокера.</p><p>Строки карточки: «стоп у брокера 2.812 · 10 лотов, стоп-заявка …ab12», «стоп перенесён», «стоп пересоздан на остаток 5», «стоп сработал у брокера», «стоп не принят — выход». В <code>GET /api/v1/sandbox</code> и в позициях контура у сделки есть стоп у брокера: цена, лоты, состояние. OpenAPI 2.8.0. Показ в UI — отдельно, в репозитории UI.</p></div>
+  </div>
+
+  <h3 style="margin-top:22px">Ручные проверки</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Сценарий</th><th>Что должно быть</th></tr></thead>
+      <tbody>
+        <tr><td>Вход исполнен</td><td>В карточке строка «стоп у брокера», <code>python -m src.sandbox account</code> показывает одну стоп-заявку на весь объём</td></tr>
+        <tr><td>Стоп сработал при живом контуре</td><td>Позиция закрыта, цели сняты, в карточке «стоп сработал у брокера», лишних заявок нет, сверка <code>ok</code></td></tr>
+        <tr><td>Стоп сработал, пока контур убит</td><td>После подъёма сделка закрыта как факт, цели сняты, стоп-заявок нет, тревог нет</td></tr>
+        <tr><td>Цель взята</td><td>Одна стоп-заявка на остаток, строка «стоп пересоздан на остаток»</td></tr>
+        <tr><td>Стратегия перенесла стоп</td><td>Одна стоп-заявка на новой цене</td></tr>
+        <tr><td>Контур убит, часть позиции продана командой песочницы</td><td>После подъёма тревога по позиции, стоп срезан до остатка на счёте</td></tr>
+        <tr><td><code>close_all</code> и <code>no_entries</code></td><td><code>close_all</code>: на счёте нет ни позиций, ни заявок, ни стоп-заявок. <code>no_entries</code>: позиция доживает со стопом у брокера, после выхода контур <code>stopped</code></td></tr>
+        <tr><td>Ночь</td><td>Утром у открытой позиции та же стоп-заявка (П24)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="policy" style="margin-top:18px">
+    <div><b>Перед стартом С4</b>Пройти проверки 5.1–5.3 <code>fix-sandbox-restart-safety</code> на тестовом роботе и заархивировать его. Иначе рестарт в проверках С4 упрётся в старый дефект.</div>
+    <div><b>Ветка</b>Код С3 и всё, что после него, ещё не в release: он в <code>feature/indicators-api</code>, в <code>origin/release/*</code> его нет. Либо сначала влить PR в релизную ветку и взять С4 от <code>origin/release/*</code>, либо взять С4 от вершины <code>feature/indicators-api</code> с <code>--no-track</code>.</div>
+    <div><b>Вне С4</b>Автоподъём упавшего контура ядром. Свечи песочницы без эмуляции: лента ядра идёт, пока надзирается эмуляция. Предохранители — С6, настоящие комиссии — С7.</div>
+    <div><b>Квоты</b>Каждое изменение остатка или стопа — две операции со стоп-заявками. Опрос <code>GetStopOrders</code> — не чаще 30 в минуту. У песочницы 200 в минуту, у счёта 50: укладываемся.</div>
+  </div>
+</section>
+
+<section id="tests">
+  <div class="eyebrow">Ярус 4 · проверка</div>
+  <h2>Как тестируем</h2>
+  <p class="prose">Всё, что не требует сети, живёт в <code>tests/unit/</code> и бежит в CI. Тесты с песочницей требуют токен, поэтому идут отдельной меткой вручную. Каждый этап заканчивается ручной проверкой из плана.</p>
+  <div class="pyr">
+    <div class="lay"><div class="bar" style="width:22%"></div><div><h3>Первая живая привязка</h3><p>Обычный размер, под присмотром. Первые срабатывания стоп-заявок на настоящем счёте.</p></div><span class="stage">Р2</span></div>
+    <div class="lay"><div class="bar" style="width:38%"></div><div><h3>Хаос</h3><p>Обрыв контура, ядра и стрима в каждой точке пути заявки и пересоздания стопа. В песочнице это делается руками без риска. После рестарта сверка должна дать ноль расхождений.</p></div><span class="stage">С2–С5</span></div>
+    <div class="lay"><div class="bar" style="width:54%"></div><div><h3>Контрактные в песочнице</h3><p>Настоящие ответы API: форматы, коды отказов, поведение стрима и стоп-заявок. Разведка записывает их, они становятся фикстурами для фейкового шлюза.</p></div><span class="stage">С1, С3</span></div>
+    <div class="lay"><div class="bar" style="width:72%"></div><div><h3>Проверки старта</h3><p>Контур не стартует без бота и канала и с чужим отпечатком счёта. «Счёт» ещё и без <code>confirm</code>, с токеном только на чтение, с токеном на несколько счетов, без допуска к срочным контрактам, с непустым счётом на первом старте.</p></div><span class="stage">С2, Р1</span></div>
+    <div class="lay"><div class="bar" style="width:100%"></div><div><h3>Юнит-тесты с фейковым шлюзом</h3><p>Сценарии: принята, частично, отказ, тайм-аут, повтор ключа, обрыв стрима, исполнение после отмены, срабатывание цели и стопа, перезакрытие, обе команды остановки, добавление и снятие привязки при открытой позиции.</p></div><span class="stage">С1–Р2</span></div>
+  </div>
+</section>
+
+<section id="decide">
+  <div class="eyebrow">Ярус 4 · решения</div>
+  <h2>Что решено и что осталось</h2>
+  <div class="done">
+    <span>робот = постоянное ядро и торговые контуры по запросу</span>
+    <span>«Счёт» — вид контура, отдельный процесс</span>
+    <span>сначала переход из документа 1, потом «Счёт»</span>
+    <span>после рестарта «Счёт» поднимается первым и сверяется</span>
+    <span>эмуляция продолжает открытые сделки после рестарта</span>
+    <span>две команды остановки: no_entries и close_all</span>
+    <span>один контур каждого вида, состав меняется на ходу: add и remove</span>
+    <span>команды через желаемое состояние с поколениями, API /api/v1 с ключом в заголовке</span>
+    <span>свой канал у каждого контура, отдельный бот у «Песочницы» и «Счёта»</span>
+    <span>эмуляция на initial_deposit, «Счёт» на деньгах счёта</span>
+    <span>отдельный брокерский счёт, им владеет только робот</span>
+    <span>стоп и цели у брокера, цели не снимаются при остановке робота</span>
+    <span>вход только лимитными заявками</span>
+    <span>без обязательного этапа с одним лотом</span>
+    <span>сначала песочница Т-Инвест, брокерский счёт только на Р1–Р2</span>
+    <span>песочница и счёт — два вида контура из одного кода, брокер задаёт вид, а не параметр</span>
+    <span>песочница остаётся стендом после перехода; путь привязки: эмуляция → песочница → счёт</span>
+    <span>журнал привязан к счёту отпечатком, песочница и счёт не смешиваются</span>
+    <span>ступени shadow нет: её работу делает песочница</span>
+    <span>у «Песочницы» и «Счёта» свой состав из привязок, независимый от эмуляции; ресурсы /api/v1/sandbox и /api/v1/account по образцу /api/v1/emulation</span>
+    <span>песочница торгует фьючерсами и исполняет стоп-заявки (разведка С1)</span>
+    <span>состав контура на брокере — только командами API, не в robot.toml</span>
+    <span>надзор ядра за контуром на брокере — свой поток, цикл эмуляции не меняется</span>
+    <span>команды в Telegram вне MVP</span>
+    <span>капитал песочницы — рубли на счёте из GetPositions, liquid_portfolio рядом (С3)</span>
+    <span>все выходы — лимит с запасом, перевыставление, рынок только аварийно; так же и «закрыть всё» (С3)</span>
+    <span>жизнь заявки у брокера — журнал заявок broker.sqlite3, outbox не меняется (С3)</span>
+    <span>С5 растворён в С3 и С4, номер не переиспользуется</span>
+    <span>стоп у брокера — STOP_LOSS: сработал — рыночная заявка; STOP_LIMIT не берём, на гэпе он может не исполниться без контура (08.11)</span>
+    <span>цели — дневные лимиты, как на С3; тейк-профит GTC не берём: без OCO он удлиняет окно перезакрытия (08.11)</span>
+    <span>перед любым выходом контура стоп уменьшается на объём выхода, при полном выходе снимается; исключение — цели (08.11)</span>
+  </div>
+  <p class="prose" style="margin-top:14px">Открытых вопросов сейчас нет. Новые появятся по итогам разведки П19–П24.</p>
+</section>
+
+<footer>Опирается на документ 1 «Ядро и контуры робота» и текущий код: <code>TradeManager.dispatch</code> и <code>consume</code>, outbox, <code>BrokerPort</code>, <code>ExecutionEvent</code>, <code>FeeAdjustment</code>, <code>request_budget</code>. Свойства API, включая SandboxService, сверены с SDK t-tech-investments 1.49.3, разведкой песочницы 29–30.10 и кодом С3 (архив 06.11), лимиты с документацией Т-Инвест «Лимитная политика».</footer>
+</div>
+
+
+
+
+</body></html>

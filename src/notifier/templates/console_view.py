@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.holds import UNKNOWN_SCHEDULE, data_reason
+from src.notifier.templates.orders import order_line
 from src.trade_journal.reasons import reason_label
 
 COLORS = {"buy": "\x1b[32m", "sell": "\x1b[35m", "warning": "\x1b[33m",
@@ -379,6 +380,40 @@ def _system(event: Event, stamp: str) -> Block | None:
     return None
 
 
+def _broker_account(event: Event, stamp: str) -> Block:
+    """Контур на брокере (add-sandbox-contour): одна строка в консоли ядра."""
+    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    kind = event.get("kind")
+    if kind == "reconcile_alarm":
+        frozen = ", ".join(event.get("frozen") or ()) or "—"
+        return Block(stamp, label, f"Сверка: расхождение · заморожены {frozen}", role="warning")
+    if kind == "reconcile_cleared":
+        return Block(stamp, label, "Сверка: расхождение устранено", role="muted")
+    if kind in ("guard_tripped", "guard_cleared"):
+        from src.notifier.telegram_templates import GUARD_TITLES
+        title = GUARD_TITLES.get(event.get("guard"), event.get("guard") or "предохранитель")
+        if kind == "guard_tripped":
+            return Block(stamp, label, f"Предохранитель: {title} — новые входы запрещены", role="warning")
+        return Block(stamp, label, f"Предохранитель снят: {title}", role="muted")
+    if kind in ("execution_hold", "execution_resumed"):
+        names = ", ".join(f"{item['name']} {item['minutes']} мин" for item in event.get("holds") or ()) or "—"
+        if kind == "execution_hold":
+            return Block(stamp, label, f"Исполнение стоит: {names} — стоп не проверяется", role="warning")
+        return Block(stamp, label, f"Исполнение возобновлено: {names}", role="muted")
+    if kind == "started":
+        return Block(stamp, label, f"Контур запущен · счёт {event.get('account')}", role="muted")
+    return Block(stamp, label, "Контур остановлен" + (f" · {event.get('reason')}" if event.get("reason") else ""),
+                 role="muted")
+
+
+def _broker_order(event: Event, stamp: str) -> Block:
+    """Заявка контура на брокере (add-tinvest-orders): одна строка в консоли."""
+    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    alarm = event.get("kind") in {"exit_rejected", "emergency_market", "stop_failed"}
+    return Block(stamp, label, f"{_name(event)} · " + order_line(event).replace("⚠️ ", ""),
+                 role="warning" if alarm else "muted")
+
+
 def status_row(event: Event, anchor: datetime) -> str:
     state = event.get("data_state")
     value = _name(event)
@@ -445,6 +480,10 @@ def render(event: Event, *, now: datetime | None = None,
     if event.type is EventType.MARKET_DATA_STATUS:
         return render_status_group((event,), width=width, color=color)
     stamp = when(event, now)
+    if event.type is EventType.BROKER_ACCOUNT:
+        return _broker_account(event, stamp).render(width=width, color=color)
+    if event.type is EventType.BROKER_ORDER:
+        return _broker_order(event, stamp).render(width=width, color=color)
     if event.type is EventType.DECISION:
         block = _decision(event, stamp)
     elif event.type is EventType.SIGNAL:

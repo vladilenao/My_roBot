@@ -24,14 +24,18 @@ def management_requirement(parameters):
     return max(15, parameters.get("atr_period", 14)+1, parameters.get("ma_slow_period", 0)+1)
 
 
-def obligation_requirements(trades):
-    """ТФ сопровождения сохранённых сделок: удаление привязки их не отменяет."""
+def obligation_requirements(trades, depth=0):
+    """ТФ сопровождения сохранённых сделок: удаление привязки их не отменяет.
+
+    ``depth`` — глубина расчёта: кадр сопровождения не короче окна привязок,
+    одинаково в живом и историческом цикле (add-analysis-depth).
+    """
     requirements = {}
     for trade in trades:
         plan = trade.plan
         if not plan.timeframe:
             continue
-        count = management_requirement(dict(plan.profile.parameters))
+        count = max(management_requirement(dict(plan.profile.parameters)), depth)
         requirements[plan.timeframe] = max(requirements.get(plan.timeframe, 0), count)
     if requirements:
         requirements["1m"] = max(requirements.get("1m", 0), 1)
@@ -52,12 +56,25 @@ def binding_requirements(binding, strategy, profiles, triple_screen, ladder):
     return required
 
 
-def live_data_requirements(bindings, strategies, profiles, triple_screen, ladder, *, saved_requirements=None):
+def binding_depths(binding, strategy, profiles, triple_screen, ladder, depth):
+    """Глубина расчёта привязки по ТФ: окно и цель прогрева, не условие допуска.
+
+    Минимум допуска — ``binding_requirements``; глубина не меньше его и не
+    меньше ``depth`` (``[robot] analysis_depth``), чтобы EMA/RMA индикаторов
+    и тренда сходились одинаково в живом и историческом цикле.
+    """
+    return {tf: max(count, depth)
+            for tf, count in binding_requirements(binding, strategy, profiles, triple_screen, ladder).items()}
+
+
+def live_data_requirements(bindings, strategies, profiles, triple_screen, ladder, *, saved_requirements=None,
+                           depth=0):
     """Union требований одного UID для main-thread roster, без финансовой БД.
 
     Сохранённые потребности сопровождения передаёт вызывающая composition из
     своего ledger/lifecycle; удалённая входная привязка не удаляет этот ТФ.
-    Один UID/ТФ имеет максимальный необходимый прогрев, не копию на binding.
+    Один UID/ТФ имеет максимальный необходимый прогрев, не копию на binding;
+    прогрев идёт до глубины расчёта ``depth``.
     """
     requirements = {"1m": 1}
     for timeframe, count in (saved_requirements or {}).items():
@@ -66,6 +83,6 @@ def live_data_requirements(bindings, strategies, profiles, triple_screen, ladder
         requirements[timeframe] = max(requirements.get(timeframe, 0), count)
     for binding in bindings:
         strategy = get_strategy(binding.strategy, strategies[binding.strategy])
-        for tf, count in binding_requirements(binding, strategy, profiles, triple_screen, ladder).items():
+        for tf, count in binding_depths(binding, strategy, profiles, triple_screen, ladder, depth).items():
             requirements[tf] = max(requirements.get(tf, 0), count)
     return requirements

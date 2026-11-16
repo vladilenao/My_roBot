@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from src.strategies.indicators.chart import IndicatorChart
+
 
 class BaseSignalEnum:
     """Базовый контракт для Enum-ов сигналов индикаторов.
@@ -44,6 +46,11 @@ class Indicator(ABC):
     @abstractmethod
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
+
+    @property
+    @abstractmethod
+    def chart(self) -> IndicatorChart:
+        """Описание отрисовки для графика UI (add-indicators-api)."""
 
     @abstractmethod
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -40,6 +40,7 @@ _SECTIONS: dict[str, dict[str, str]] = {
         "sleep_seconds": "sleep_seconds",
         "heartbeat_every_ticks": "heartbeat_every_ticks",
         "data_dir": "data_dir",
+        "analysis_depth": "analysis_depth",
     },
     "tick": {
         "poll_secs": "tick_poll_secs",
@@ -123,6 +124,7 @@ _EXPECTED_TYPES: dict[str, type] = {
     "timeframe": str,
     "sleep_seconds": int,
     "heartbeat_every_ticks": int,
+    "analysis_depth": int,
     "tick_poll_secs": int,
     "tick_timeout_secs": int,
     "tick_catch_up_bars": int,
@@ -137,6 +139,16 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_queue_maxsize": int,
     "market_structure_retention_days": int,
     "contours_emulation_telegram_channel_env": str,
+    "contours_sandbox_telegram_bot_env": str,
+    "contours_sandbox_telegram_channel_env": str,
+    "contours_sandbox_reconcile_every_min": int,
+    "contours_sandbox_orders": bool,
+    "contours_sandbox_exit_offset_steps": int,
+    "contours_sandbox_exit_requote_secs": int,
+    "contours_sandbox_exit_requote_attempts": int,
+    "contours_sandbox_stop_place_secs": int,
+    "contours_sandbox_max_daily_loss_pct": (int, float),
+    "contours_sandbox_max_rejects_in_row": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -239,7 +251,9 @@ def app_dir() -> Path:
     return _root_dir()
 
 
-def _type_name(expected: type) -> str:
+def _type_name(expected: type | tuple) -> str:
+    if isinstance(expected, tuple):
+        return "число"
     return {str: "строка", int: "целое число", dict: "таблица"}.get(
         expected, expected.__name__
     )
@@ -596,11 +610,23 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [market_structure] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
-        if key == "contours_emulation_telegram_channel_env" and not _ENV_NAME.fullmatch(value):
+        if key in ("contours_emulation_telegram_channel_env", "contours_sandbox_telegram_bot_env",
+                   "contours_sandbox_telegram_channel_env") and not _ENV_NAME.fullmatch(value):
+            kind, option = key.removeprefix("contours_").split("_", 1)
             raise ConfigError(
-                f"{path}: [contours.emulation] telegram_channel_env — имя переменной окружения "
+                f"{path}: [contours.{kind}] {option} — имя переменной окружения "
                 f"(заглавные латинские буквы, цифры и _), получено {value!r}"
             )
+        if key == "contours_sandbox_reconcile_every_min" and (isinstance(value, bool) or not 1 <= value <= 60):
+            raise ConfigError(f"{path}: [contours.sandbox] reconcile_every_min должен быть целым числом от 1 до 60, "
+                              f"получено {value!r}")
+        # Выходы лимитом (add-tinvest-orders): запас в шагах, пауза и число перевыставлений.
+        if key in _SANDBOX_EXIT_RANGES:
+            low, high = _SANDBOX_EXIT_RANGES[key]
+            if isinstance(value, bool) or not low <= value <= high:
+                kind = "числом" if key == "contours_sandbox_max_daily_loss_pct" else "целым числом"
+                raise ConfigError(f"{path}: [contours.sandbox] {key.removeprefix('contours_sandbox_')} должен быть "
+                                  f"{kind} от {low} до {high}, получено {value!r}")
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
         if key in ("contours_feed_poll_secs", "contours_heartbeat_secs", "contours_heartbeat_timeout_secs") and (
@@ -678,6 +704,9 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             raise ConfigError(f"{path}: [{key}] должен быть непустой строкой")
         if key in {"audit_max_bytes", "audit_backup_count"} and value < 0:
             raise ConfigError(f"{path}: [{key}] должен быть неотрицательным целым числом")
+        if key == "analysis_depth" and (isinstance(value, bool) or not 50 <= value <= 1000):
+            raise ConfigError(f"{path}: [robot] analysis_depth должен быть целым числом от 50 до 1000, "
+                              f"получено {value!r}")
         if key == "tick_catch_up_bars" and (isinstance(value, bool) or value < 0):
             raise ConfigError(
                 f"{path}: [tick] catch_up_bars должен быть неотрицательным целым числом"
@@ -954,9 +983,10 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
                     f"{path}: [contours] market_feed удалён — контур эмуляции всегда читает ленту ядра "
                     f"отдельным процессом (add-contour-process); удалите эту строку"
                 )
-            emulation = mapping.pop("emulation", None)
-            if emulation is not None:
-                flat.update(_parse_contour_section("emulation", emulation, path))
+            for kind in _CONTOUR_KEYS:
+                contour = mapping.pop(kind, None)
+                if contour is not None:
+                    flat.update(_parse_contour_section(kind, contour, path))
         allowed_keys = _SECTIONS[section]
         for key, value in mapping.items():
             if section == "notifier" and isinstance(value, dict):
@@ -1024,7 +1054,21 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
                 raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
 
 
-_CONTOUR_KEYS = {"telegram_channel_env"}
+_CONTOUR_KEYS = {
+    "emulation": {"telegram_channel_env"},
+    # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
+    "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
+                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
+                "max_daily_loss_pct", "max_rejects_in_row"},
+}
+_SANDBOX_EXIT_RANGES = {
+    "contours_sandbox_exit_offset_steps": (0, 100),
+    "contours_sandbox_exit_requote_secs": (5, 300),
+    "contours_sandbox_exit_requote_attempts": (1, 10),
+    "contours_sandbox_stop_place_secs": (5, 300),
+    "contours_sandbox_max_daily_loss_pct": (0, 50),
+    "contours_sandbox_max_rejects_in_row": (1, 20),
+}
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -1032,10 +1076,16 @@ def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
     """Секция ``[contours.<вид>]``: строгие ключи, плоские имена ``contours_<вид>_<ключ>``."""
     if not isinstance(value, dict):
         raise ConfigError(f"{path}: [contours.{kind}] должна быть таблицей")
-    unknown = set(value) - _CONTOUR_KEYS
+    if kind == "sandbox" and "bindings" in value:
+        raise ConfigError(
+            f"{path}: [contours.sandbox] bindings не задаётся в конфиге — состав песочницы задаётся командой "
+            f"PUT /api/v1/sandbox/target или POST /api/v1/sandbox/bindings"
+        )
+    allowed = _CONTOUR_KEYS[kind]
+    unknown = set(value) - allowed
     if unknown:
         raise ConfigError(
-            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(_CONTOUR_KEYS)}"
+            f"{path}: [contours.{kind}] незнакомые ключи {sorted(unknown)}; допустимые: {sorted(allowed)}"
         )
     return {f"contours_{kind}_{key}": item for key, item in value.items()}
 

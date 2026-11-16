@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-vite-5174",
+      "runtimeExecutable": "/Users/vladilenaosipova/PycharmProjects/UI/frontend/node_modules/.bin/vite",
+      "runtimeArgs": ["/Users/vladilenaosipova/PycharmProjects/UI/frontend", "--port", "5174", "--strictPort"],
+      "port": 5174
+    }
+  ]
+}

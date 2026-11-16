@@ -7,7 +7,9 @@ from functools import partial
 from uuid import uuid4
 import pandas as pd
 
-from src.config import TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, TIMEFRAMES, CATCH_UP_BARS, CLEARING_TIMES
+from src.config import (ANALYSIS_DEPTH, TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, TIMEFRAMES, CATCH_UP_BARS,
+                        CLEARING_TIMES)
+from src.data.analysis_window import analysis_window
 from src.data.live_state import LivePairState, StatusCadence
 from src.events.event import Event
 from src.history.warmup import binding_requirements
@@ -42,6 +44,8 @@ class LiveAnalysis:
         self.states = {}
         self.cursors = {}
         self.requirements = {}
+        self.depths = {}
+        self.depth = getattr(bot, "_analysis_depth", ANALYSIS_DEPTH)
         self.settings = bot._market_data_settings
         self.cadence = StatusCadence(self.settings.status_repeat_interval_secs)
         self.clearing_times = tuple(CLEARING_TIMES)
@@ -60,6 +64,21 @@ class LiveAnalysis:
                 TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS, tuple(TIMEFRAMES))
         return self.requirements[binding.id]
 
+    def _depths(self, binding):
+        """Глубина расчёта по ТФ: окно и цель прогрева; допуск — ``_required``."""
+        if binding.id not in self.depths:
+            required = self._required(binding)
+            self.depths[binding.id] = {tf: max(count, self.depth) for tf, count in required.items()}
+        return self.depths[binding.id]
+
+    def _window(self, instrument, tf, frame, minimum, depth):
+        """Окно расчёта до глубины; допуск минимума проверен ``_quality``."""
+        return analysis_window(self.cache, instrument, tf, frame, minimum, depth)
+
+    def _analysis_frame(self, instrument, binding, frame):
+        tf = binding.timeframe
+        return self._window(instrument, tf, frame, self._required(binding)[tf], self._depths(binding)[tf])
+
     def _context(self, instrument, tf, frame):
         if self.bot._context_cache is None:
             return None
@@ -77,11 +96,12 @@ class LiveAnalysis:
         if not self.cache.coverage_for(instrument, binding.timeframe, frame.tail(work)):
             return "Неразрешённый пробел в диапазоне прогрева"
         close = self.timeline.grid(binding.timeframe).bar_close(frame["datetime"].iloc[-1])
+        depths = self._depths(binding)
         for tf, count in requirements.items():
             if tf == binding.timeframe:
                 continue
             if prepare:
-                higher = self.cache.prepare_live_history(instrument, tf, count, max_close=close)
+                higher = self.cache.prepare_live_history(instrument, tf, depths[tf], max_close=close)
             else:
                 higher = self.cache.frame_for(instrument, tf)
             if not higher.empty:
@@ -117,10 +137,23 @@ class LiveAnalysis:
         if not callable(ready):
             return None
         last_minute = pd.Timestamp(close) - pd.Timedelta(minutes=1)
-        if ready(instrument, last_minute):
+        if ready(instrument, last_minute) and self._executed(instrument, last_minute):
             return None
         # Граница — закрытие бара, как у bar_time; фразу соберёт шаблон канала.
         return {"kind": "execution_barrier", "through": _utc_moment(close)}
+
+    def _executed(self, instrument, last_minute):
+        """По контракту с обязательствами допуск требует исполненную минуту, а не полученную.
+
+        Минуту и бар приносит фоновый фид и во время тика, уже после прохода
+        исполнения; без этой проверки сигнал прошёл бы анализ и получил
+        окончательный отказ допуска (fix-signal-awaits-execution).
+        """
+        obligations = getattr(self.bot._trade_manager, "contract_has_obligations", None)
+        processed = getattr(self.cache, "execution_processed", None)
+        if not callable(obligations) or not callable(processed) or obligations(instrument_key(instrument)) is not True:
+            return True
+        return processed(instrument, last_minute)
 
     def _ingestion(self, instrument, tf):
         """Технический срез owner для market_data_status (design 11, задача 8.3)."""
@@ -170,7 +203,7 @@ class LiveAnalysis:
 
     def _calculate(self, instrument, binding, frame):
         tf = binding.timeframe
-        frame = frame.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
+        frame = self._analysis_frame(instrument, binding, frame)
         strategy = self.bot._strategy_cache[binding.strategy, tf]
         ta = strategy.compute(frame)
         raw = strategy.decide(ta, timeframe=tf)
@@ -204,13 +237,14 @@ class LiveAnalysis:
                                         max_close=self._warmup_close(instrument, self.bot._protection_timeframe))
         for tf in sorted({a.timeframe for a in self.bot._strategies_for(instrument)}):
             for binding in self._bindings(instrument, tf):
-                for need_tf, count in self._required(binding).items():
+                for need_tf, count in self._depths(binding).items():
                     self.cache.prepare_live_history(instrument, need_tf, count,
                                                     max_close=self._warmup_close(instrument, need_tf))
         # ТФ планов открытых сделок загружаются с прогревом их профилей,
         # даже если привязок на этом ТФ в конфигурации не осталось.
         for tf, count in self.bot._management_needs(instrument).items():
-            self.cache.prepare_live_history(instrument, tf, count, max_close=self._warmup_close(instrument, tf))
+            self.cache.prepare_live_history(instrument, tf, max(count, self.depth),
+                                            max_close=self._warmup_close(instrument, tf))
 
     def bootstrap(self):
         """Стартовый пакет состояний имеет явную границу для консольной группировки."""
@@ -253,7 +287,7 @@ class LiveAnalysis:
             required = max([*(self._required(a)[tf] for a in bindings), needs.get(tf, 0)])
             rows, frame, reason = [], pd.DataFrame(), ""
             try:
-                frame = self.cache.prepare_live_history(instrument, tf, required,
+                frame = self.cache.prepare_live_history(instrument, tf, max(required, self.depth),
                                                         max_close=self._warmup_close(instrument, tf))
             except Exception as exc:
                 reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
@@ -310,7 +344,7 @@ class LiveAnalysis:
         """
         reason = ""
         try:
-            frame = self.cache.prepare_live_history(instrument, tf, required,
+            frame = self.cache.prepare_live_history(instrument, tf, max(required, self.depth),
                                                     max_close=self._warmup_close(instrument, tf))
         except Exception as exc:
             reason = str(exc).replace(instrument.ticker, self.bot._display_name(instrument))
@@ -322,7 +356,7 @@ class LiveAnalysis:
         self.cursors[self._management_cursor(instrument, tf)] = frame["datetime"].iloc[-1] if not frame.empty else None
         return frame
 
-    def _manage_unbound(self, instrument, tf, frame, required, managed, execution_complete):
+    def _manage_unbound(self, instrument, tf, frame, required, managed, execution_complete, depth=None):
         """Сопровождение сделок на ТФ плана без привязок по новому текущему бару.
 
         Решения принимает менеджер только на закрытии бара этого ТФ и только
@@ -346,7 +380,8 @@ class LiveAnalysis:
             return
         management_key = instrument_key(instrument), tf, stamp
         if management_key not in managed:
-            self.bot._manage(instrument, [], frame.tail(required).reset_index(drop=True).copy(), None, tf)
+            window = self._window(instrument, tf, frame, required, depth or required)
+            self.bot._manage(instrument, [], window, None, tf)
             managed.add(management_key)
         self.cursors[key] = stamp
 
@@ -519,7 +554,8 @@ class LiveAnalysis:
                     self.bot._remember_market(instrument, tf, frame)
                     if not bindings:
                         # ТФ плана открытой сделки без привязок: только сопровождение.
-                        self._manage_unbound(instrument, tf, frame, needs[tf], managed, execution_complete)
+                        self._manage_unbound(instrument, tf, frame, needs[tf], managed, execution_complete,
+                                             depth=max(needs[tf], self.depth))
                         continue
                     for binding in bindings:
                         cursor_key = binding.id, instrument_key(instrument)
@@ -553,13 +589,15 @@ class LiveAnalysis:
                                     analysis_mode="live" if current else "historical")
                                 # Информационный старый результат не вызывает manage/actions_for_signal.
                                 if current and execution_complete:
-                                    work_frame = asof.tail(self._required(binding)[tf]).reset_index(drop=True).copy()
+                                    work_frame = self._analysis_frame(instrument, binding, asof)
                                     management_key = instrument_key(instrument), tf, stamp
                                     if management_key not in managed:
                                         # Кадр сопровождения покрывает и прогрев профилей
-                                        # открытых сделок этого ТФ, а не только привязки.
-                                        depth = max(self._required(binding)[tf], needs.get(tf, 0))
-                                        management_frame = asof.tail(depth).reset_index(drop=True).copy()
+                                        # открытых сделок этого ТФ, а не только привязки;
+                                        # окно — до глубины расчёта, как у истории.
+                                        minimum = max(self._required(binding)[tf], needs.get(tf, 0))
+                                        management_frame = self._window(instrument, tf, asof, minimum,
+                                                                        max(minimum, self.depth))
                                         self.bot._manage(instrument, bindings, management_frame, context, tf)
                                         managed.add(management_key)
                                     # Решение публикуется перед своим допуском: ПЛАН/ОТКЛОНЕНО

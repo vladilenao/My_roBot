@@ -22,6 +22,12 @@ from src.config import (
     FUTURE_STRATEGIES,
     SHARE_STRATEGIES,
     TINKOFF_TOKEN,
+    TINKOFF_SANDBOX_TOKEN,
+    sandbox_bot_token,
+    sandbox_channel_id,
+    CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
+    CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
+    CONTOUR_SANDBOX_RECONCILE_EVERY_MIN,
     LOGGING_SERVICE_UID,
     LOGGING_FILE,
     LOGGING_LEVEL,
@@ -79,7 +85,8 @@ from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
 log = get_logger(__name__)
 
 _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
-            MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD)
+            MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD,
+            TINKOFF_SANDBOX_TOKEN, sandbox_bot_token())
 
 
 def main(argv=None):
@@ -109,10 +116,14 @@ def _run_contour(kind: str, args=()) -> int:
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
+    from src.broker_contour import SANDBOX
+
     if kind == MODE_HISTORY:
         return _run_history_contour(args[0] if args else "")
+    if kind == SANDBOX:
+        return _run_broker_contour(kind)
     if kind != MODE_EMULATION:
-        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION} и {MODE_HISTORY}.")
+        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION}, {MODE_HISTORY} и {SANDBOX}.")
         return 2
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -168,6 +179,121 @@ def _run_contour(kind: str, args=()) -> int:
         contour.close()
     log.info("Контур %s остановлен: %s", kind, stop.reason or "цикл завершён")
     return 0
+
+
+def _run_broker_contour(kind: str) -> int:
+    """Процесс контура на брокере (add-sandbox-contour): на С2 — песочница, только чтение счёта."""
+    import signal
+
+    from src.assembly.process import LaunchFileError, StdinStop, read_launch
+    from src.assembly.pulse import CorePulse
+    from src.broker_contour.broker import ExitPolicy
+    from src.broker_contour.notify import build_channels
+    from src.broker_contour.process import BrokerContour, BrokerContourSettings
+    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_SANDBOX_EXIT_OFFSET_STEPS,
+                            CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
+                            CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
+                            CONTOUR_SANDBOX_ORDERS, CONTOUR_SANDBOX_STOP_PLACE_SECS, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
+    from src.events.bus import EventBus
+    from src.notifier.factory import close_channels
+    from src.sandbox.gateway import SandboxGateway
+
+    data_dir = runtime_dir()
+    directory = contour_dir(data_dir, kind)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        acquire_runtime_lock(directory)
+    except RuntimeLockError as exc:
+        print(str(exc))
+        return 1
+    setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE), secrets=_SECRETS,
+                  **_log_settings(False, None))
+    log.info("Контур %s v%s запущен", kind, __version__)
+    try:
+        launch = read_launch(directory, kind)
+    except LaunchFileError as exc:
+        log.error("%s", exc)
+        print(str(exc))
+        return 2
+    stop = StdinStop()
+    stop.start()
+    signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    settings = BrokerContourSettings(
+        orders=CONTOUR_SANDBOX_ORDERS,
+        max_daily_loss_pct=CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, max_rejects_in_row=CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
+        exit_policy=ExitPolicy(CONTOUR_SANDBOX_EXIT_OFFSET_STEPS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
+                               CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_SANDBOX_STOP_PLACE_SECS),
+        contour_id=kind, broker=kind, directory=directory, core_db=data_dir / CORE_DATABASE_FILE,
+        version=__version__, token=TINKOFF_SANDBOX_TOKEN, token_env="TINKOFF_SANDBOX_TOKEN",
+        bot_token=sandbox_bot_token(), bot_env=CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
+        channel_id=sandbox_channel_id(), channel_env=CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
+        reconcile_every_secs=CONTOUR_SANDBOX_RECONCILE_EVERY_MIN * 60)
+    bus, channels = EventBus(), []
+    if settings.bot_token and settings.channel_id:
+        channels = build_channels(bot_token=settings.bot_token, channel_id=settings.channel_id, directory=directory,
+                                  cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
+                                  request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
+                                  max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                                  contour=kind, orders=settings.orders)
+        bus.subscribe_all(channels)
+    contour = BrokerContour(settings, gateway_factory=SandboxGateway, bus=bus, stop=stop, pid=os.getpid(),
+                            trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
+    pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
+                      timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
+    pulse.start()
+    try:
+        return contour.run()
+    finally:
+        pulse.close()
+        close_channels(channels)
+
+
+class _BrokerTradingPart:
+    """Торговая часть контура на брокере: ``TradingContour`` эмуляции на ленте ядра (add-tinvest-orders)."""
+
+    def __init__(self, contour, services):
+        self._contour, self._services = contour, services
+
+    @property
+    def runtime(self):
+        return self._contour.runtime
+
+    def build(self):
+        self._contour.build()
+
+    def waiter(self):
+        return self._services.serve(self._contour.demand())
+
+    def run(self, waiter):
+        self._contour.run(waiter)
+
+    def close(self):
+        self._services.close()
+        self._contour.close()
+
+
+def _broker_trading_factory(kind: str, directory: Path, data_dir: Path, launch: dict, stop, bus):
+    """Фабрика торговой части: инструменты и карточки контрактов привязок — из ``launch.json`` ядра."""
+
+    def factory(trading, control, strategies):
+        from src.assembly.contracts import contracts_from_payload, instrument_from_payload
+        from src.assembly.feed import FeedMarketServices
+        from src.bot.run_session import StoppableRunSession
+        from src.data.market_store import MarketDataStore
+
+        instruments = [instrument_from_payload(item) for item in launch.get("instruments") or ()]
+        services = FeedMarketServices(MarketDataStore(data_dir / MARKET_DATA_DATABASE_FILE), contour_id=kind,
+                                      data_dir=data_dir, tracks_obligations=True,
+                                      poll_seconds=CONTOURS_FEED_POLL_SECS)
+        contour = TradingContour(ContourSettings(
+            kind=kind, state_dir=directory, channel_names=None, clock=None,
+            session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
+            contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
+            strategies=strategies, broker_trading=trading, bus=bus), services)
+        return _BrokerTradingPart(contour, services)
+
+    return factory
 
 
 def _run_history_contour(name: str) -> int:
@@ -246,7 +372,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     pulse = CorePulseWriter(core_state, pid=os.getpid(), version=__version__, interval=CONTOURS_HEARTBEAT_SECS)
     pulse.start()
     control = LaunchControl(core_state=core_state, contour_dir=contour_dir(state_dir, MODE_EMULATION),
-                            log_file=LOGGING_FILE)
+                            log_file=LOGGING_FILE, share_strategies=SHARE_STRATEGIES,
+                            future_strategies=FUTURE_STRATEGIES)
     control.accept_commands()
     history = HistoryRuns(core_state, state_dir, max_runs=CONTOURS_MAX_HISTORY_RUNS, version=__version__,
                           heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, share_strategies=SHARE_STRATEGIES,
@@ -259,6 +386,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     core.starter = CoreStarter(core, token_required=client_provider is None)
     control.core_status = core.core_snapshot
     control.contour_busy = lambda: _contour_busy(state_dir)
+    sandbox = _sandbox_supervisor(state_dir, core_state)
     try:
         server = core.start_control_api(control)
     except OSError as exc:
@@ -266,12 +394,18 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
              f"({type(exc).__name__}) — порт занят другим процессом?")
         pulse.stop()
         return 2
+    server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
+    server.trading = _contour_trading(state_dir, sandbox)
+    server.comparison = _contour_comparison(server.trading, core_state)
+    server.indicators = _indicators_view()
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
     history.start()
     code = 0
     try:
         if core.starter.run():
+            # Контур на брокере — раньше эмуляции (add-sandbox-contour): после рестарта он поднимается первым.
+            sandbox.recover()
             code = _serve_emulation(state_dir, core, core_state, control, client_provider)
         else:
             _wait_for_ctrl_c()
@@ -281,8 +415,125 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         # «Остановлено» в пульсе — раньше ожидания прогонов: подхваченные прогоны узнают об остановке из него.
         pulse.stop()
         history.close()
+        sandbox.stop()
         core.close()
     return code
+
+
+def _sandbox_supervisor(state_dir, core_state):
+    """Надзиратель контура «Песочница»: свой поток ядра рядом с эмуляцией (add-sandbox-contour)."""
+    from src.assembly.broker_supervisor import BrokerContourSupervisor
+    from src.broker_contour import SANDBOX
+
+    return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
+                                   autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
+                                   heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _indicators_view():
+    """Индикаторы стратегий привязок на свечах базы ядра (add-indicators-api): та же конфигурация и глубина,
+    что у живого анализа."""
+    from src.bot.indicators_view import IndicatorsView
+    from src.config import ANALYSIS_DEPTH, TIMEFRAMES, TRADE_MANAGEMENT_PROFILES, TRIPLE_SCREEN_PARAMS
+
+    return IndicatorsView(share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
+                          strategy_map=_strategy_map(), profiles=TRADE_MANAGEMENT_PROFILES,
+                          triple_screen=TRIPLE_SCREEN_PARAMS, ladder=tuple(TIMEFRAMES), depth=ANALYSIS_DEPTH)
+
+
+def _contour_trading(state_dir, sandbox):
+    """Позиции, сделки и итоги эмуляции и песочницы по журналам контуров (add-contour-trades-api)."""
+    from src.bot import control_views as views
+    from src.bot.trades_view import ContourTrades
+    from src.broker_contour.bindings import binding_catalog
+    from src.broker_contour.store import BROKER_DATABASE_FILE
+    from src.config import DATABASE_FILE, INITIAL_DEPOSIT
+
+    catalog = binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES)
+    emulation = contour_dir(state_dir, MODE_EMULATION) / DATABASE_FILE
+    return {
+        views.EMULATION: ContourTrades(base=views.EMULATION, journal=lambda: emulation, catalog=catalog,
+                                       initial_deposit=INITIAL_DEPOSIT),
+        views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
+                                     catalog=catalog, broker_db=lambda: sandbox.directory / BROKER_DATABASE_FILE),
+    }
+
+
+def _contour_comparison(trading: dict, core_state):
+    """Песочница против эмуляции по журналам контуров (add-account-vs-emulation-report)."""
+    from src.bot import control_views as views
+    from src.bot.comparison_view import ContourComparison
+    from src.broker_contour import SANDBOX
+    from src.broker_contour.bindings import binding_catalog
+
+    def members() -> set[str]:
+        desired = core_state.desired(SANDBOX)
+        return set() if desired is None else {member.key for member in desired.members if member.active}
+
+    return ContourComparison(emulation=trading[views.EMULATION], sandbox=trading[views.SANDBOX], members=members,
+                             catalog=binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES))
+
+
+def _binding_resolver(core):
+    """Инструмент привязки по правилам запуска эмуляции (add-tinvest-orders): акция — по тикеру, фьючерс —
+    ближайший контракт семейства с запасом до экспирации; карточка контракта — как у эмуляции.
+
+    Пакет привязок — один клиент, один каталог фьючерсов и маржа по разу на контракт
+    (fix-sandbox-restart-safety): по одной привязке 19 штук давали 76 запросов и упирались в квоту брокера."""
+
+    def resolve_one(card: dict, client, provider):
+        from src.assembly.contracts import _load_contracts_metadata, contracts_payload, instrument_payload
+        from src.bot.launch import ALL, resolve_emulation
+        from src.instruments import normalize_instrument
+        from src.instruments.model import instrument_key
+
+        assignments = {card["instrument"]: [card["id"]]}
+        share = card.get("instrument_type") == "share"
+        # «Все с привязками» из одной привязки: у фьючерса — ближайший контракт её семейства.
+        resolution = resolve_emulation([ALL], client, share_strategies=assignments if share else {},
+                                       future_strategies={} if share else assignments,
+                                       block_days=CONTRACT_EXPIRY_BLOCK_DAYS)
+        if not resolution.instruments:
+            reasons = [item.reason for item in resolution.rejections]
+            return reasons[0] if reasons else "Инструмент привязки не определён."
+        instrument = normalize_instrument(resolution.instruments[0])
+        contracts = _load_contracts_metadata([instrument], client_provider=provider)
+        own = {address: meta for address, meta in contracts.items()
+               if address in (instrument_key(instrument), instrument.ticker)}
+        return instrument_payload(instrument), contracts_payload(own) if own else None
+
+    def resolve(cards):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        from src.assembly.contracts import BatchClient
+
+        results = []
+        with core.client_provider.client_context() as raw_client:
+            budget = core.request_budget
+            client = BatchClient(raw_client if budget is None else budget.wrap_client(raw_client, lane="interactive"))
+            provider = SimpleNamespace(client_context=lambda: nullcontext(client))
+            for card in cards:
+                try:
+                    results.append(resolve_one(card, client, provider))
+                except Exception as exc:  # noqa: BLE001 — отказ одной привязки, не всего пакета
+                    results.append(f"Инструмент привязки не определён: {type(exc).__name__}.")
+        return results
+
+    return resolve
+
+
+def _sandbox_control(supervisor, core_state, resolve_binding=None):
+    from src.bot.sandbox_control import SandboxControl
+
+    def emulation_members():
+        desired = core_state.desired(MODE_EMULATION)
+        return () if desired is None else desired.members
+
+    return SandboxControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
+                          share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
+                          emulation_members=emulation_members, log_file=LOGGING_FILE,
+                          resolve_binding=resolve_binding)
 
 
 def _wait_for_ctrl_c() -> None:

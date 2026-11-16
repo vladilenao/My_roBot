@@ -9,10 +9,13 @@ import pytest
 from src.assembly.contour_control import write_status
 from src.assembly.core_state import CoreStateStore
 from src.bot.launch import Chosen, Rejection, SOURCE_API, SOURCE_CLI
+from src.bot import control_views as views
 from src.bot.launch_control import BadCommand, LaunchControl, parse_add, parse_history, parse_target
+from src.bot.trades_view import ContourTrades
 from src.data.export_api import MarketDataExportServer
 from src.data.market_store import MarketDataStore
 from src.history.report import MarketDataSync
+from src.strategies.contracts import Assignment
 from tests.unit.clusters.test_report import SPEC, _check
 
 CONTROL_KEY = "control-test-key"
@@ -20,6 +23,8 @@ EXPORT_KEY = "export-test-key"
 NG = Chosen("NG-12.26", "NG-12.26", "future", 52, "NG")
 NG_TUPLE = ("NG (Природный газ) — NG-12.26", "NGZ6", "future", "NG-12.26")
 COMMAND = '{"mode": "on", "instruments": ["NG-12.26"]}'
+NG_STRATEGIES = {"NG": [Assignment("future-ng-macd", "macd_rsi_stoch", "levels_rr", filter_profile="triple_screen",
+                                     timeframe="15m")]}
 INTERNAL_WORDS = {"desired", "actual", "generation", "applied_generation", "running", "stop_mode"}
 
 
@@ -320,7 +325,8 @@ class TestHome:
         _check(payload, {"$ref": "#/components/schemas/Home"})
         assert payload["emulation"] == {"state": "waiting_command", "instruments": 0, "open_positions": None}
         assert payload["history"] == {"max": 0, "running": 0, "queued": 0} and payload["live"] is None
-        assert set(payload["_links"]) == {"self", "core", "emulation", "history", "docs"}
+        assert payload["sandbox"] is None
+        assert set(payload["_links"]) == {"self", "core", "emulation", "history", "candles", "docs"}
 
     def test_export_key_sees_export_only(self, server):
         srv, _ = server
@@ -361,7 +367,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.0.0"
+        assert SPEC["info"]["version"] == "2.10.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -371,7 +377,8 @@ class TestContract:
     def test_every_operation_has_a_handler(self, history_server):
         """Ни одной операции контракта, на которую сервер ответил бы «Эндпоинт не найден»."""
         srv, _, _ = history_server
-        samples = {"{name}": "NG-12.26", "{run_id}": "20261024-101500", "{consumer_id}": "emulator"}
+        samples = {"{name}": "NG-12.26", "{run_id}": "20261024-101500", "{consumer_id}": "emulator",
+                   "{instrument}": "NG-12.26", "{timeframe}": "15m"}
         for path, item in SPEC["paths"].items():
             for method in ("get", "put", "post"):
                 if method not in item or path in ("/openapi.yaml", "/docs"):
@@ -392,18 +399,41 @@ class TestContract:
                     text = exc.read().decode("utf-8")
                 assert "Эндпоинт не найден" not in text, (method, path)
 
-    def test_openapi_route_serves_2_0_0(self, server):
+    def test_openapi_route_serves_2_9_0(self, server):
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.0.0" in response.read().decode("utf-8")
+            assert "version: 2.10.0" in response.read().decode("utf-8")
+
+    def test_schemas_use_only_openapi_keywords(self):
+        """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""
+        keywords = {"type", "format", "description", "nullable", "enum", "items", "properties", "required",
+                    "additionalProperties", "allOf", "oneOf", "anyOf", "$ref", "example", "pattern", "minimum",
+                    "maximum", "minLength", "maxLength", "minItems", "maxItems", "default", "discriminator",
+                    "title", "readOnly"}
+
+        def walk(schema, where):
+            if not isinstance(schema, dict):
+                return
+            assert set(schema) <= keywords, (where, set(schema) - keywords)
+            for name, child in (schema.get("properties") or {}).items():
+                walk(child, f"{where}.{name}")
+            for key in ("items", "additionalProperties"):
+                walk(schema.get(key), f"{where}[{key}]")
+            for key in ("allOf", "oneOf", "anyOf"):
+                for index, child in enumerate(schema.get(key) or []):
+                    walk(child, f"{where}.{key}[{index}]")
+
+        for name, schema in SPEC["components"]["schemas"].items():
+            walk(schema, name)
 
 
 # ── Остановка, повторный запуск, журнал, состав ──
 
 def _controlled(tmp_path, *, alive=True):
     store = CoreStateStore(tmp_path / "core.sqlite3")
-    control = LaunchControl(reply_timeout=2, core_state=store, contour_dir=tmp_path / "contours" / "emulation")
+    control = LaunchControl(reply_timeout=2, core_state=store, contour_dir=tmp_path / "contours" / "emulation",
+                            future_strategies=NG_STRATEGIES)
     control.mark_launched(SOURCE_API, [NG], COMMAND)
     store.record_launch("emulation", "emulation", [NG.payload()], source="api", command=COMMAND)
     if alive:
@@ -692,6 +722,18 @@ class TestMembershipApi:
         status, payload, headers = _call(srv, "GET", "/api/v1/emulation/instruments/GAZP", CONTROL_KEY)
         _problem(status, payload, headers, "NOT_FOUND")
 
+    def test_member_bindings_with_profiles(self, controlled_server):
+        """add-binding-profiles-api: привязки участника эмуляции с фильтром и управлением."""
+        srv, _, _ = controlled_server
+        status, member, _ = _call(srv, "GET", "/api/v1/emulation/instruments/NG-12.26", CONTROL_KEY)
+        assert status == 200 and member["bindings"] == [
+            {"id": "future-ng-macd", "strategy": "macd_rsi_stoch", "timeframe": "15m",
+             "filter": "triple_screen", "management": "levels_rr",
+             # add-indicators-api: индикаторы привязки на её таймфрейме для контракта участника.
+             "_links": {"indicators": {"href": "/api/v1/candles/NG-12.26/15m/indicators?binding=future-ng-macd"}}}]
+        status, payload, _ = _call(srv, "GET", "/api/v1/emulation", CONTROL_KEY)
+        assert payload["instruments"][0]["bindings"] == member["bindings"]
+
 
 class TestCoreApi:
     """GET /api/v1/core (add-contour-recovery) со ссылками."""
@@ -701,7 +743,10 @@ class TestCoreApi:
              "heartbeat": {"beat_at": "2026-10-24T09:00:05Z", "interval_secs": 5},
              "market_data": {"producer_id": "tbank-test", "max_change_id": 7,
                              "pairs": {"total": 2, "by_status": {"READY": 1, "BOOTSTRAPPING": 1}}},
-             "quotas": {"quotes": {"per_minute": 3, "ceiling": 180, "lanes": {"live": 3}, "retry_after": None}}}
+             "quotas": {"quotes": {"per_minute": 3, "ceiling": 180, "lanes": {"live": 3}, "retry_after": None}},
+             "lanes": {"live": {"state": "stalled", "step_started_at": "2026-10-24T08:50:00Z", "last_step_at": None},
+                       "evidence": {"state": "ok", "step_started_at": None,
+                                    "last_step_at": "2026-10-24T09:00:04Z"}}}
 
     def test_state_matches_contract(self, controlled_server):
         srv, _, _ = controlled_server
@@ -733,6 +778,9 @@ def history_server(tmp_path):
                         process_factory=FakeProcess, say=lambda line: None)
     control.history = queue
     srv = MarketDataExportServer(None, EXPORT_KEY, port=0, control=control, control_token=CONTROL_KEY)
+    srv.trading = {base: ContourTrades(base=base, journal=lambda: tmp_path / "no-journal.sqlite3", catalog={},
+                                       initial_deposit=deposit)
+                   for base, deposit in ((views.EMULATION, "100000"), (views.SANDBOX, None))}
     try:
         srv.start()
     except PermissionError:

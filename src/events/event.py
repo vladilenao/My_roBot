@@ -315,6 +315,25 @@ class Event:
         )
 
     @classmethod
+    def broker_account(cls, kind: str, *, contour: str, account: str, event_id: str, **fields: Any) -> "Event":
+        """Событие контура на брокере (add-sandbox-contour): ``started``, ``reconcile_alarm``,
+        ``reconcile_cleared``, ``execution_hold``, ``execution_resumed``, ``stopped``.
+        ``account`` — только последние символа номера."""
+        return cls._make(EventType.BROKER_ACCOUNT,
+                         payload={"kind": kind, "contour": contour, "account": account, "event_id": event_id,
+                                  **{key: value for key, value in fields.items() if value is not None}})
+
+    @classmethod
+    def broker_order(cls, kind: str, *, contour: str, trade_id: str, event_id: str, instrument: str = "",
+                     bar_time: Any = None, **fields: Any) -> "Event":
+        """Заявка контура на брокере (add-tinvest-orders): ``sent``, ``unknown``, ``found``, ``resent``,
+        ``cancelling``, ``requoted``, ``exit_rejected``, ``emergency_market``. Номер заявки — последние символы."""
+        return cls._make(EventType.BROKER_ORDER, instrument=instrument, bar_time=bar_time,
+                         payload={"kind": kind, "contour": contour, "trade_id": trade_id, "event_id": event_id,
+                                  **{key: _amount(value) if key == "price" else value
+                                     for key, value in fields.items() if value is not None}})
+
+    @classmethod
     def clearing_done(cls, *, balance: Any = None, positions: int = 0, bar_time: Any = None) -> "Event":
         """Сверка счёта завершена: снимок баланса и число открытых позиций."""
         return cls._make(

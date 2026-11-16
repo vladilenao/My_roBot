@@ -72,8 +72,8 @@ class TestBuildDemand:
         demand = contour.build_demand(runtime, [NG, SBER], cache)
         assert demand.instruments == (NG, SBER)
         assert demand.aliases["NGZ6"] == "uid-ng"
-        # Сопровождение держит ТФ плана с прогревом ATR и базовую 1m защиты.
-        assert set(demand.history_requests) == {(NG, "1h", 21), (NG, "1m", 1)}
+        # Сопровождение держит ТФ плана с глубиной расчёта (не меньше прогрева ATR) и базовую 1m защиты.
+        assert set(demand.history_requests) == {(NG, "1h", contour.ANALYSIS_DEPTH), (NG, "1m", 1)}
         assert demand.execution_lower[0][0] is NG
         assert demand.obligations is not None
         # Алиасы остаются у торговой части контура, ядро их в контур не пишет.

@@ -103,6 +103,9 @@ def historical_run(path, monkeypatch, future_price, *, calendar=False, drop_tail
     monkeypatch.setattr(contour, "INTRADAY_SETTINGS", IntradaySettings(enabled=False))
 
     class Strategy:
+        def required_history(self):
+            return 1
+
         def compute(self, frame):
             return frame
 

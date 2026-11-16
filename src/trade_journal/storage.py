@@ -41,6 +41,11 @@ from src.trade_management.audit import (
 BUSY_TIMEOUT_MS = 5_000
 
 
+def _minute_start(moment: datetime) -> datetime:
+    """Начало минуты события: граница исполнения 1m — по сетке минут, а не по секундам брокера."""
+    return as_aware(moment).replace(second=0, microsecond=0)
+
+
 @dataclass(frozen=True)
 class OutboxCommand:
     """A durable command intent ready to be submitted to a broker."""
@@ -555,6 +560,11 @@ class Storage:
         without an observation is included, but older bars cannot be applied
         to the already restored position/stop. Pending commands alone do not
         advance that boundary: earlier protection must still run first.
+
+        A broker fill, stop confirmation or submission happens inside a
+        minute, not on its start: the boundary is that minute's start, so
+        the minute grid of the 1m execution stays aligned after a restart
+        (fix-sandbox-restart-safety).
         """
         boundaries = {}
         instruments = self.connection.execute(
@@ -573,14 +583,14 @@ class Storage:
                 "JOIN trades t USING(trade_id) WHERE t.instrument_id=?", (instrument,),
             ):
                 if kind in ('FILL', 'PARTIAL') or json.loads(payload).get('confirmed_stop'):
-                    candidates.append((as_aware(datetime.fromisoformat(stamp)), True))
+                    candidates.append((_minute_start(datetime.fromisoformat(stamp)), True))
             if candidates:
                 latest = max(stamp for stamp, _ in candidates)
                 boundaries[instrument] = (latest, all(include for stamp, include in candidates if stamp == latest))
                 continue
             # No position has executed yet. Start at submission, not at the
             # warm-up history that happened before the order existed.
-            stamps = [as_aware(datetime.fromisoformat(stamp)) for (stamp,) in self.connection.execute(
+            stamps = [_minute_start(datetime.fromisoformat(stamp)) for (stamp,) in self.connection.execute(
                 "SELECT b.created_at FROM outbox b JOIN trades t USING(trade_id) "
                 "WHERE t.instrument_id=? AND t.phase NOT IN ('CLOSED','CANCELLED','REJECTED','ERROR')",
                 (instrument,),

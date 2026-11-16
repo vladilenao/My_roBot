@@ -99,6 +99,9 @@ class DeliveryRepository:
                 operation_id INTEGER PRIMARY KEY REFERENCES operations(operation_id),
                 namespace TEXT NOT NULL, first_failed_at TEXT NOT NULL,
                 next_attempt_at TEXT NOT NULL, retries INTEGER NOT NULL DEFAULT 0);
+            -- Строки заявки контура на брокере под корневой карточкой (add-tinvest-orders).
+            CREATE TABLE IF NOT EXISTS root_notes(namespace TEXT NOT NULL, trade_id TEXT NOT NULL,
+                line TEXT NOT NULL, created_at TEXT NOT NULL);
         """)
         with self.connection:
             if version < 2:
@@ -115,11 +118,18 @@ class DeliveryRepository:
             self.connection.execute("UPDATE attempt_history SET status='uncertain',finished_at=? WHERE status='attempting'", (now,))
             self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def claim_event(self, trade_id, event_key, sequence, revision):
+    def claim_event(self, trade_id, event_key, sequence, revision, *, ordered=True):
+        """Событие ещё не доставлялось и не устарело; ``ordered=False`` — только защита от повтора.
+
+        Строки жизни заявки (``broker_order``, ``order_accepted``) не несут ``visual`` и не являются
+        снимком сделки: их порядок карточек не касается, и номер сделки они не двигают.
+        """
         with self.connection:
             self.connection.execute("INSERT OR IGNORE INTO trades(namespace,trade_id) VALUES (?,?)", (self.namespace, trade_id))
             previous = self.connection.execute("SELECT sequence,revision FROM trades WHERE namespace=? AND trade_id=?", (self.namespace, trade_id)).fetchone()
             inserted = self.connection.execute("INSERT OR IGNORE INTO events VALUES (?,?,?)", (self.namespace, trade_id, event_key)).rowcount
+            if not ordered:
+                return bool(inserted)
             if not inserted or sequence < previous[0] or revision < previous[1]:
                 return False
             self.connection.execute("UPDATE trades SET sequence=?,revision=? WHERE namespace=? AND trade_id=?", (sequence, revision, self.namespace, trade_id))
@@ -329,6 +339,14 @@ class DeliveryRepository:
     def update_root_text(self, trade_id, text):
         with self.connection:
             self.connection.execute("UPDATE trades SET root_text=? WHERE namespace=? AND trade_id=?", (text, self.namespace, trade_id))
+
+    def add_note(self, trade_id, line):
+        with self.connection:
+            self.connection.execute("INSERT INTO root_notes VALUES (?,?,?,?)", (self.namespace, trade_id, line, _utc_now()))
+
+    def notes(self, trade_id):
+        return [row[0] for row in self.connection.execute(
+            "SELECT line FROM root_notes WHERE namespace=? AND trade_id=? ORDER BY rowid", (self.namespace, trade_id))]
 
     def close(self):
         self.connection.close()

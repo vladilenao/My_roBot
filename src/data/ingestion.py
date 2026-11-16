@@ -213,12 +213,16 @@ class IngestionWorker:
 
         H — граница начала согласования; более новые события stream уже
         принимаются owner и не сдвигают цель бесконечно (design 3).
+        ACK пары, которой ещё нет в кэше (снята до спроса контура), не
+        теряется: H отсчитывается от момента ACK, когда пара появится
+        (fix-stream-handoff-retired-pair).
         """
         key = self._pair_key(uid, timeframe)
+        acknowledged = _naive(acknowledged_at)
         if key is None:
+            self._handoffs[uid, timeframe] = (epoch, None, on_ready, acknowledged)
             return
-        horizon = self._cache.expected_live_open(key, _naive(acknowledged_at))
-        self._handoffs[uid, timeframe] = (epoch, horizon, on_ready)
+        self._handoffs[uid, timeframe] = (epoch, self._cache.expected_live_open(key, acknowledged), on_ready, None)
 
     def cancel_handoff(self, uid, timeframe):
         self._handoffs.pop((uid, timeframe), None)
@@ -382,10 +386,14 @@ class IngestionWorker:
         return False
 
     def _service_handoff(self, now):
-        for (uid, timeframe), (epoch, horizon, on_ready) in list(self._handoffs.items()):
+        for (uid, timeframe), (epoch, horizon, on_ready, acknowledged) in list(self._handoffs.items()):
             pair = self._pair(uid, timeframe)
             if pair is None or pair["history"] != "done":
                 continue
+            if acknowledged is not None:
+                # Пара зарегистрирована после ACK: H фиксируется от момента ACK один раз.
+                horizon = self._cache.expected_live_open(pair["key"], acknowledged)
+                self._handoffs[uid, timeframe] = (epoch, horizon, on_ready, None)
             grid = self._timeline.grid(timeframe)
             if horizon is not None:
                 last = pair["last_closed"]

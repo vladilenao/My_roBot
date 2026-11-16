@@ -59,6 +59,7 @@ class Desired:
     command: str | None = None
     updated_at: str | None = None
     members: tuple = ()
+    guards_reset: int = 0           # поколение сброса предохранителя «отказы подряд» (add-account-guards)
 
     def payload(self) -> dict:
         return {"running": self.running, "stop_mode": self.stop_mode, "generation": self.generation}
@@ -256,7 +257,8 @@ def _desired(conn, row) -> Desired | None:
         return None
     return Desired(row["contour_id"], row["kind"], row["desired"] == "running", row["stop_mode"],
                    int(row["generation"]), tuple(json.loads(row["instruments_json"])), row["source"],
-                   row["command"], row["updated_at"], _members(conn, row["contour_id"]))
+                   row["command"], row["updated_at"], _members(conn, row["contour_id"]),
+                   int(row["guards_reset"] or 0) if "guards_reset" in row.keys() else 0)
 
 
 def read_desired(path: Path, contour_id: str) -> Desired | None:
@@ -289,7 +291,8 @@ class CoreStateStore:
                     instruments_json TEXT NOT NULL,
                     source TEXT,
                     command TEXT,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    guards_reset INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS contour_commands (
                     command_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -336,6 +339,9 @@ class CoreStateStore:
                     sync_json TEXT
                 );
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(contours)")}
+            if "guards_reset" not in columns:      # база ядра до add-account-guards
+                conn.execute("ALTER TABLE contours ADD COLUMN guards_reset INTEGER NOT NULL DEFAULT 0")
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
 
@@ -486,6 +492,27 @@ class CoreStateStore:
                 raise
         return outcome
 
+    def record_guards_reset(self, contour_id: str, guards) -> int | None:
+        """Сброс предохранителей контура на брокере: поколение сброса +1; контура нет — ``None``."""
+        payload = {"guards": list(guards)}
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now()
+                row = conn.execute("SELECT guards_reset FROM contours WHERE contour_id=?", (contour_id,)).fetchone()
+                if row is None:
+                    self._log(conn, contour_id, "guards_reset", payload, None, CONFLICT, "контур ещё не запускался", now)
+                    conn.commit()
+                    return None
+                generation = int(row[0] or 0) + 1
+                conn.execute("UPDATE contours SET guards_reset=? WHERE contour_id=?", (generation, contour_id))
+                self._log(conn, contour_id, "guards_reset", payload, None, ACCEPTED, None, now)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return generation
+
     def record_membership(self, contour_id: str, *, add=(), remove=(), mode: str = NO_ENTRIES,
                           payload: dict | None = None, expected: int | None = None) -> MembershipOutcome:
         """Изменение состава одной транзакцией с одним поколением.
@@ -547,6 +574,60 @@ class CoreStateStore:
             self._put_member(conn, contour_id, member, generation, now)
         conn.execute("UPDATE contours SET generation=?, updated_at=? WHERE contour_id=?", (generation, now, contour_id))
         return MembershipOutcome(ACCEPTED, generation)
+
+    def record_bindings(self, contour_id: str, kind: str, *, add=(), remove=(), mode: str = NO_ENTRIES,
+                        payload: dict | None = None, expected: int | None = None) -> MembershipOutcome:
+        """Состав контура на брокере (add-sandbox-contour): работает и без запущенного процесса.
+
+        Контура ещё нет — заводится строка «остановлен» без режима: состав ждёт
+        первого запуска. Правила добавления и снятия — как у ``record_membership``.
+        """
+        if mode not in STOP_MODES:
+            raise ValueError(f"Неизвестный режим снятия: {mode!r}")
+        add, remove = list(add), list(remove)
+        payload = payload if payload is not None else {"add": [m.key for m in add], "remove": remove, "mode": mode}
+        action = "remove" if remove else "add"
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now()
+                self._expect(conn, contour_id, action, payload, expected, now)
+                row = conn.execute("SELECT * FROM contours WHERE contour_id=?", (contour_id,)).fetchone()
+                if row is None:
+                    conn.execute("""INSERT INTO contours(contour_id,kind,desired,stop_mode,generation,instruments_json,
+                        source,command,updated_at) VALUES(?,?,'stopped',NULL,0,'[]',NULL,NULL,?)""",
+                                 (contour_id, kind, now))
+                    row = conn.execute("SELECT * FROM contours WHERE contour_id=?", (contour_id,)).fetchone()
+                current = _desired(conn, row)
+                members = {member.key: member for member in current.members}
+                changes, outcome = [], None
+                for member in add:
+                    old = members.get(member.key)
+                    if old is None or not old.active:
+                        # Выбор и карточка контракта от ядра (add-tinvest-orders) — вместе с участником.
+                        changes.append(Member(member.key, member.instrument, member.chosen, member.contract))
+                for key in remove:
+                    old = members.get(key)
+                    if old is None:
+                        outcome = MembershipOutcome(CONFLICT, current.generation, f"{key} нет в составе")
+                        break
+                    if old.active or (old.remove_mode == NO_ENTRIES and mode == CLOSE_ALL):
+                        changes.append(Member(old.key, old.instrument, old.chosen, old.contract, False, mode))
+                if outcome is None and not changes:
+                    outcome = MembershipOutcome(IGNORED, current.generation)
+                if outcome is None:
+                    outcome = MembershipOutcome(ACCEPTED, current.generation + 1)
+                    for member in changes:
+                        self._put_member(conn, contour_id, member, outcome.generation, now)
+                    conn.execute("UPDATE contours SET generation=?, updated_at=? WHERE contour_id=?",
+                                 (outcome.generation, now, contour_id))
+                self._log(conn, contour_id, action, payload, outcome.generation or None, outcome.outcome,
+                          outcome.reason or None, now)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return outcome
 
     def attach_contracts(self, contour_id: str, contracts: dict) -> None:
         """Карточки контрактов участникам состава без нового поколения: ключ участника → ``contracts_payload``."""

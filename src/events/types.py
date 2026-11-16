@@ -1,6 +1,6 @@
 """Каталог типов событий шины.
 
-Список закрыт: 21 пользовательский и 2 служебных типа с фиксированным payload.
+Список закрыт: 22 пользовательских и 2 служебных типа с фиксированным payload.
 Значения ``StrEnum`` совпадают с именами типов в
 ``docs/notification/event-schemas.md`` и используются в конфигурации
 ``[notifier.<канал>] events``.
@@ -35,6 +35,10 @@ class EventType(StrEnum):
     RATE_LIMITED = "rate_limited"
     STARTUP_ANALYSIS = "startup_analysis"
     MARKET_DATA_STATUS = "market_data_status"
+    # Контур на брокере (add-sandbox-contour): старт, остановка, сверка счёта.
+    BROKER_ACCOUNT = "broker_account"
+    # Заявка контура на брокере (add-tinvest-orders): отправлена, неизвестна, найдена, перевыставлена.
+    BROKER_ORDER = "broker_order"
     TICK_STARTED = "tick_started"
     TICK_FINISHED = "tick_finished"
 

@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.notifier.templates.holds import data_reason
+from src.notifier.templates.orders import order_line
+from src.notifier.templates.console_view import number
 from src.events.visual import breaks_of, utc
 from src.trade_journal.reasons import REASON_LABELS
 
@@ -29,10 +31,13 @@ def price(value, step=None):
 
 
 def money(value, *, signed=False, units="RUB"):
+    """Деньги до копеек с разрядами, как в карточке плана и консоли: «+15 349,17 ₽», «−1 735,65 ₽»."""
     if value is None:
         return "неизвестно"
-    amount = price(value)
-    if signed and Decimal(str(value)) > 0:
+    amount = number(value)
+    if amount in {"−0", "0"}:
+        amount = "0"
+    elif signed and Decimal(str(value)) > 0:
         amount = "+" + amount
     return amount + (" ₽" if units == "RUB" else " в единицах цены")
 
@@ -66,6 +71,11 @@ def chart_notes(visual, offset=0):
         notes.append(f"расписание недоступно: {plural(unavailable, ('разрыв', 'разрыва', 'разрывов'))}")
     if market.get("history_limited") or market.get("stop_history_limited"):
         notes.append("неполная история исполнений")
+    for candle in market.get("candles", ()):
+        if candle.get("through"):
+            start = utc(candle["time"]) + timedelta(hours=offset)
+            through = utc(candle["through"]) + timedelta(hours=offset)
+            notes.append(f"свеча {start:%H:%M} не закрыта: по {through:%H:%M}")
     return notes
 
 
@@ -174,7 +184,108 @@ def _history(visual, step, unit, offset):
     return lines
 
 
+CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
+WHAT_LABELS = {"position": "позиция", "order": "заявки", "stop_order": "стоп-заявки"}
+# Предохранители контура на брокере (add-account-guards).
+GUARD_TITLES = {"daily_loss": "дневной убыток", "broker_rejects": "отказы брокера подряд"}
+
+
+def _money(value) -> str:
+    amount = Decimal(str(value))
+    text = f"{amount:,.0f}" if amount == amount.to_integral_value() else f"{amount:,.2f}"
+    return text.replace(",", " ") + " ₽"
+
+
+def render_broker_account(event) -> str:
+    """Сообщение контура на брокере (add-sandbox-contour): старт, сверка, остановка."""
+    title = CONTOUR_TITLES.get(event.get("contour"), escape(str(event.get("contour"))).upper())
+    kind = event.get("kind")
+    account = escape(str(event.get("account")))
+    if kind == "started":
+        lines = [f"<b>{title} · Контур запущен</b>", f"Счёт {account}"]
+        if event.get("rub") is not None:
+            money = "Рубли: " + _money(event.get("rub"))
+            if event.get("liquid_portfolio") is not None:
+                money += " · ликвидный портфель " + _money(event.get("liquid_portfolio"))
+            lines.append(money)
+        holdings = event.get("holdings") or ()
+        lines.append(f"Позиций: {len(holdings)} · заявок: {event.get('orders', 0)} · "
+                     f"стоп-заявок: {event.get('stop_orders', 0)}")
+        lines.extend(escape(f"  {item['name']}: {item['lots']} лот.") for item in holdings)
+        lines.append(f"Привязок в составе: {event.get('bindings', 0)} · ревизия {event.get('generation', '—')}")
+        if event.get("orders_enabled") is not None:
+            lines.append("Режим: заявки к брокеру" if event.get("orders_enabled") else "Режим: только чтение счёта")
+    elif kind == "reconcile_alarm":
+        lines = [f"<b>{title} · ТРЕВОГА · Сверка счёта</b>", f"Счёт {account}"]
+        if event.get("reason"):
+            lines.append(escape(event.get("reason")))
+        for item in event.get("mismatches") or ():
+            lines.append(escape(f"{item['instrument']}: {WHAT_LABELS.get(item['what'], item['what'])} — "
+                                f"на счёте {item['account']}, по журналу {item['journal']}"))
+        if event.get("frozen"):
+            lines.append("Заморожены: " + escape(", ".join(event.get("frozen"))))
+        lines.append("Снять заморозку: выровнять счёт и дождаться следующей сверки.")
+    elif kind == "execution_hold":
+        lines = [f"<b>{title} · ТРЕВОГА · Исполнение стоит</b>"]
+        lines.extend(escape(f"{item['name']}: минутки не исполняются {item['minutes']} мин") for item in event.get("holds") or ())
+        lines.append("Пока исполнение стоит, стоп по инструменту не проверяется. Подробности в bot_debug.log контура.")
+    elif kind == "execution_resumed":
+        lines = [f"<b>{title} · Исполнение возобновлено</b>"]
+        lines.extend(escape(f"{item['name']}: после {item['minutes']} мин удержания") for item in event.get("holds") or ())
+    elif kind == "guard_tripped":
+        guard, detail = event.get("guard"), event.get("guard_detail") or {}
+        lines = [f"<b>{title} · ТРЕВОГА · Предохранитель: {GUARD_TITLES.get(guard, escape(str(guard)))}</b>"]
+        if guard == "daily_loss":
+            lines.append(f"Убыток дня {_money(detail.get('loss', 0))} при лимите {_money(detail.get('limit', 0))} "
+                         f"(капитал на начало дня {_money(detail.get('start_capital', 0))})")
+            if detail.get("partial_day"):
+                lines.append("Контур поднялся посреди дня: капитал — на момент подъёма.")
+            if detail.get("missing_prices"):
+                lines.append("Нет последней цены: " + escape(", ".join(detail["missing_prices"])))
+            lines.append("Новые входы и доборы запрещены до 19:00 МСК. Позиции сопровождаются, стопы у брокера.")
+        else:
+            lines.append(f"Отказов брокера подряд: {detail.get('count', 0)}")
+            lines.extend(escape(f"  {reason}") for reason in detail.get("reasons") or ())
+            lines.append("Новые входы и доборы запрещены. Выходы и стопы работают.")
+            lines.append("Снять: разобраться с причиной и отправить POST /api/v1/sandbox/guards/reset.")
+    elif kind == "guard_cleared":
+        guard = event.get("guard")
+        why = "новый торговый день" if event.get("reason") == "new-day" else "командой сброса"
+        lines = [f"<b>{title} · Предохранитель снят: {GUARD_TITLES.get(guard, escape(str(guard)))}</b>",
+                 f"Причина: {why}. Новые входы разрешены."]
+    elif kind == "reconcile_cleared":
+        lines = [f"<b>{title} · Расхождение устранено</b>", f"Счёт {account} совпадает с журналом контура."]
+        if event.get("unfrozen"):
+            lines.append("Разморожены: " + escape(", ".join(event.get("unfrozen"))))
+    else:
+        lines = [f"<b>{title} · Контур остановлен</b>", f"Счёт {account}"]
+        if event.get("reason"):
+            lines.append("Причина: " + escape(event.get("reason")))
+        if event.get("open_positions"):
+            stops = event.get("broker_stops")
+            if stops is None:
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} — "
+                             "стоп без контура не проверяется")
+            elif stops >= event.get("open_positions"):
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} · "
+                             f"стоп-заявок у брокера: {stops} — позиции защищены без контура")
+            else:
+                lines.append(f"Открытых позиций на счёте: {event.get('open_positions')} · "
+                             f"стоп-заявок у брокера: {stops} — ⚠️ не у всех позиций стоп у брокера")
+    return "\n".join(lines)
+
+
+def render_broker_order(event) -> str:
+    title = CONTOUR_TITLES.get(event.get("contour"), escape(str(event.get("contour"))).upper())
+    instrument = escape(event.instrument or "контракт не указан")
+    return f"<b>{title} · {instrument}</b>\n{escape(order_line(event))}"
+
+
 def render(event, *, root=False, tz_offset_hours=0):
+    if event.type is EventType.BROKER_ACCOUNT:
+        return render_broker_account(event)
+    if event.type is EventType.BROKER_ORDER:
+        return render_broker_order(event)
     visual = event.get("visual")
     instrument = escape(event.instrument or "контракт не указан")
     if event.type in {EventType.STARTUP_ANALYSIS, EventType.MARKET_DATA_STATUS}:

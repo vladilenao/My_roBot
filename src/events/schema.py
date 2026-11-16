@@ -23,6 +23,8 @@ FINANCIAL_PAYLOAD_FIELDS = (
 _REQUIRED: dict[EventType, tuple[str, ...]] = {
     EventType.STARTUP_ANALYSIS: ("published_at", "results", "available_bars", "required_bars", "coverage_complete", "reason"),
     EventType.MARKET_DATA_STATUS: ("session", "data_state", "observed_at", "reason"),
+    EventType.BROKER_ACCOUNT: ("kind", "contour", "account", "event_id"),
+    EventType.BROKER_ORDER: ("kind", "contour", "trade_id", "event_id"),
     EventType.DECISION: ("outcome", "side"),
     EventType.SIGNAL: ("side", "quantity", "entry", "stop"),
     EventType.REJECTED: ("reason",),
@@ -34,6 +36,11 @@ _REQUIRED: dict[EventType, tuple[str, ...]] = {
 
 _OPTIONAL: dict[EventType, tuple[str, ...]] = {
     EventType.STARTUP_ANALYSIS: (),
+    EventType.BROKER_ACCOUNT: ("rub", "liquid_portfolio", "holdings", "orders", "stop_orders", "bindings",
+                               "generation", "mismatches", "frozen", "unfrozen", "reason", "orders_enabled",
+                               "open_positions", "broker_stops", "guard", "guard_detail", "since", "until"),
+    EventType.BROKER_ORDER: ("order", "order_type", "side", "lots", "price", "broker_order", "state", "attempt",
+                             "reason", "replaced", "exchange_order"),
     EventType.MARKET_DATA_STATUS: ("phase", "break_kind", "last_due", "next_event", "schedule",
                                   "received_bar", "analyzed_bar", "analysis_mode", "expected_bar",
                                  "publication_deadline", "next_open", "available_bars", "required_bars", "coverage_complete",
@@ -145,6 +152,19 @@ _JSON_TYPES: dict[str, str] = {
     "next_event": "object",
     "schedule": "object",
     "clusters": "object",
+    "orders": "number",
+    "stop_orders": "number",
+    "bindings": "number",
+    "generation": "number",
+    "frozen": "array",
+    "unfrozen": "array",
+    "lots": "number",
+    "orders_enabled": "boolean",
+    "open_positions": "number",
+    "broker_stops": "number",
+    "guard_detail": "object",
+    "attempt": "number",
+    "replaced": "boolean",
 }
 
 
@@ -161,6 +181,19 @@ def _property(name: str) -> dict[str, Any]:
             "type": "object", "required": ["assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason"],
             "properties": {field: {"type": "string"} for field in
                            ("assignment_id", "strategy", "filter_profile", "outcome", "indicators", "reason")},
+            "additionalProperties": False,
+        }}
+    if name == "holdings":
+        return {"type": "array", "items": {
+            "type": "object", "required": ["name", "lots"],
+            "properties": {"name": {"type": "string"}, "lots": {"type": "number"}},
+            "additionalProperties": False,
+        }}
+    if name == "mismatches":
+        return {"type": "array", "items": {
+            "type": "object", "required": ["instrument", "what", "account", "journal"],
+            "properties": {"instrument": {"type": "string"}, "what": {"type": "string"},
+                           "account": {"type": "number"}, "journal": {"type": "number"}},
             "additionalProperties": False,
         }}
     json_type = _JSON_TYPES.get(name, "string")

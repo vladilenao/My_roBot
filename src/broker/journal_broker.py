@@ -126,6 +126,15 @@ def _ttl_for(timeframe: str) -> Optional[int]:
     return None  # живёт до ближайшего клиринга
 
 
+def stop_triggered(side: str, stop, bar: tuple[float, float, float, float]) -> tuple[bool, bool]:
+    """Условие стопа на свече: (сработал, гэп через стоп на открытии). Общее у симулятора и контура на брокере."""
+    open_price, low, high, _ = bar
+    level = float(stop)
+    triggered = low <= level if side == "BUY" else high >= level
+    gap = open_price < level if side == "BUY" else open_price > level
+    return triggered, gap
+
+
 def _fee(pnl_rub: float) -> float:
     return round(abs(pnl_rub) * 0.001, 2)
 
@@ -971,12 +980,11 @@ class JournalBroker(BrokerPort):
         position = self.manager.positions.get(trade.plan.trade_id)
         if position is None or position.qty == 0 or trade.confirmed_stop is None:
             return False
-        open_price, low, high, _ = bar
+        open_price = bar[0]
         stop = float(trade.confirmed_stop)
-        triggered = low <= stop if trade.plan.side == "BUY" else high >= stop
+        triggered, gap = stop_triggered(trade.plan.side, trade.confirmed_stop, bar)
         if not triggered:
             return False
-        gap = open_price < stop if trade.plan.side == "BUY" else open_price > stop
         price = Decimal(str(open_price if gap else stop))
         quantity = position.qty
         position.reduce(quantity)

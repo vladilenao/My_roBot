@@ -219,9 +219,10 @@ def check_right_boundary(pair, *, start, boundary, load_candles, client_provider
 def instrument_assignments(instrument, share_strategies: dict, future_strategies: dict) -> list:
     """Привязки стратегий инструмента: фьючерс — по семейству, акция — по тикеру."""
     if instrument.instrument_type == "future":
-        family = getattr(instrument, "family", None)
-        if isinstance(family, str):
-            from src.instruments.futures import FAMILIES
+        from src.instruments.futures import FAMILIES, assignment_family
+        family = assignment_family(instrument.ticker, getattr(instrument, "short_name", None),
+                                   getattr(instrument, "family", None))
+        if family is not None:
             return list(future_strategies.get(family, future_strategies.get(FAMILIES[family][0], [])))
         return list(future_strategies.get(instrument.ticker[:2].upper(), []))
     return list(share_strategies.get(instrument.ticker, []))
