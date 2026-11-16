@@ -26,7 +26,7 @@ jobs:
         fail-fast: false
         matrix:
           include:
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
             suffix: ''
             architecture: arm64
