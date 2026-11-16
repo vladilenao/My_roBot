@@ -7,6 +7,9 @@ timeframe = "1h"
 sleep_seconds = 3600
 heartbeat_every_ticks = 60
 data_dir = "data"
+# Глубина расчёта стратегий и фильтров в свечах (50…1000): на 150 MACD, RSI и
+# тренд сходятся, и живой контур принимает те же решения, что прогон истории.
+analysis_depth = 150
 
 [tick]
 poll_secs = 1
@@ -54,6 +57,13 @@ telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Песочница».
 telegram_channel_env = "TELEGRAM_SANDBOX_CHANNEL_ID"  # Имя переменной .env с id канала «Песочница».
 reconcile_every_min = 1  # Как часто сверять счёт песочницы с журналом контура, минут (1–60). Состав — только командами API.
+orders = true  # Торговать привязками заявками; false — только читать и сверять счёт.
+exit_offset_steps = 5  # Запас лимита выхода (стоп, сигнал, закрытие) в шагах цены, 0–100.
+exit_requote_secs = 15  # Сколько ждать исполнения лимита выхода до перевыставления, секунд (5–300).
+exit_requote_attempts = 3  # Перевыставлений до аварийного выхода по рынку (1–10).
+stop_place_secs = 30  # За сколько секунд стоп-заявка у брокера должна стать активной, иначе выход и тревога (5–300).
+max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — предохранитель выключен.
+max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/sandbox/guards/reset (1–20).
 
 [instruments]
 fallback_type = "future"

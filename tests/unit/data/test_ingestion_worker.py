@@ -281,6 +281,22 @@ def test_history_error_keeps_pair_not_ready_and_is_visible(tmp_path):
     assert worker.startup_complete()  # попытка была; ожидание старта не бесконечно
 
 
+def test_depth_beyond_available_history_leaves_pair_ready(tmp_path):
+    """Глубина расчёта больше истории пары: окна прогрева исчерпаны, пара готова (add-analysis-depth)."""
+    exchange = Exchange(bars("2026-10-12 10:40", 80))
+    cache, store, worker, clock = setup(tmp_path, exchange, "2026-10-12 12:00:30", settings=LEGACY_QUEUE)
+    cache.prepare_live_history(ITEM, "1m", 150)
+    worker.run_until_idle()
+    status = cache.pair_status(ITEM, "1m")
+    assert status["history"] == "done" and status["state"] == "READY"
+    assert len(cache.frame_for(ITEM, "1m")) == 80
+    calls = len(exchange.calls)
+    # Повторный спрос той же глубины не возвращает пару в прогрев и не грузит заново.
+    cache.prepare_live_history(ITEM, "1m", 150)
+    worker.run_until_idle()
+    assert cache.pair_status(ITEM, "1m")["state"] == "READY" and len(exchange.calls) == calls
+
+
 def test_saved_obligations_register_management_timeframe_and_execution_lower(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from datetime import timezone
@@ -296,7 +312,8 @@ def test_saved_obligations_register_management_timeframe_and_execution_lower(tmp
     monkeypatch.setattr(core.LiveMarketDataPoller, "start", lambda self: started.append(self))
     core._start_live_ingestion(cache, contour.build_demand(SimpleNamespace(storage=storage), [ITEM], cache), None)
     needs = {key[2]: count for key, _, count in cache.live_needs()}
-    assert needs == {"1h": 21, "1m": 1}  # сопровождение не зависит от удалённой привязки
+    # Сопровождение не зависит от удалённой привязки; прогрев — до глубины расчёта.
+    assert needs == {"1h": contour.ANALYSIS_DEPTH, "1m": 1}
     assert cache._pending_execution_lower[UID] == pd.Timestamp("2026-10-12 11:00")
     assert started
 

@@ -1284,7 +1284,12 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 Событие контура на брокере (add-sandbox-contour): контур «Песочница», позже —
 «Счёт». `kind`: `started` — допуск пройден; `reconcile_alarm` — сверщик нашёл
 расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
-нет; `stopped` — штатный выход. `account` — только последние четыре символа
+нет; `stopped` — штатный выход (`broker_stops` — сколько стоп-заявок осталось у
+брокера, add-broker-protection); `guard_tripped` — сработал предохранитель
+(`guard`: `daily_loss` или `broker_rejects`, `guard_detail` — убыток, лимит и
+капитал на начало дня или число отказов и причины, `since`, `until`);
+`guard_cleared` — предохранитель снят (`reason`: `new-day` или `command`),
+add-account-guards. `account` — только последние четыре символа
 номера счёта. Деньги — десятичные строки. Инструменты — короткие имена.
 Доставляется в канал своего контура, каналам эмуляции не отправляется.
 
@@ -1293,36 +1298,206 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "payload broker_account",
   "type": "object",
-  "required": ["kind", "contour", "account", "event_id"],
+  "required": [
+    "kind",
+    "contour",
+    "account",
+    "event_id"
+  ],
   "properties": {
-    "kind": {"type": "string"},
-    "contour": {"type": "string"},
-    "account": {"type": "string"},
-    "event_id": {"type": "string"},
-    "rub": {"type": "string"},
-    "liquid_portfolio": {"type": "string"},
-    "holdings": {"type": "array", "items": {
-      "type": "object",
-      "required": ["name", "lots"],
-      "properties": {"name": {"type": "string"}, "lots": {"type": "number"}},
-      "additionalProperties": false
-    }},
-    "orders": {"type": "number"},
-    "stop_orders": {"type": "number"},
-    "bindings": {"type": "number"},
-    "generation": {"type": "number"},
-    "mismatches": {"type": "array", "items": {
-      "type": "object",
-      "required": ["instrument", "what", "account", "journal"],
-      "properties": {
-        "instrument": {"type": "string"}, "what": {"type": "string"},
-        "account": {"type": "number"}, "journal": {"type": "number"}
-      },
-      "additionalProperties": false
-    }},
-    "frozen": {"type": "array", "items": {"type": "string"}},
-    "unfrozen": {"type": "array", "items": {"type": "string"}},
-    "reason": {"type": "string"}
+    "kind": {
+      "type": "string"
+    },
+    "contour": {
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "rub": {
+      "type": "string"
+    },
+    "liquid_portfolio": {
+      "type": "string"
+    },
+    "holdings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "lots"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "lots": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "orders": {
+      "type": "number"
+    },
+    "stop_orders": {
+      "type": "number"
+    },
+    "bindings": {
+      "type": "number"
+    },
+    "generation": {
+      "type": "number"
+    },
+    "mismatches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "instrument",
+          "what",
+          "account",
+          "journal"
+        ],
+        "properties": {
+          "instrument": {
+            "type": "string"
+          },
+          "what": {
+            "type": "string"
+          },
+          "account": {
+            "type": "number"
+          },
+          "journal": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "frozen": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unfrozen": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reason": {
+      "type": "string"
+    },
+    "orders_enabled": {
+      "type": "boolean"
+    },
+    "open_positions": {
+      "type": "number"
+    },
+    "broker_stops": {
+      "type": "number"
+    },
+    "guard": {
+      "type": "string"
+    },
+    "guard_detail": {
+      "type": "object"
+    },
+    "since": {
+      "type": "string"
+    },
+    "until": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### `broker_order`
+
+Заявка контура на брокере (add-tinvest-orders): то, чего нет у эмуляции.
+`kind`: `sent` — заявка отправлена; `unknown` — ответ брокера потерян, заявка
+будет найдена по ключу; `found` — найдена по ключу; `resent` — по ключу пусто,
+отправлена снова тем же ключом; `cancelling` — отмена отправлена; `requoted` —
+лимит выхода перевыставлен (`attempt` — номер попытки); `exit_rejected` —
+брокер отклонил выход или заявку цели; `emergency_market` — лимит выхода не
+исполнился, выход по рынку. Стоп у брокера (add-broker-protection): `stop_placed` —
+стоп-заявка активна (`replaced` — пересоздана на новый объём или цену, `reason` —
+`entry`, `add`, `target`, `reduce`, `move`, `restart`); `stop_triggered` — стоп
+сработал у брокера (`exchange_order` — последние четыре символа порождённой
+заявки); `stop_failed` — стоп не принят, контур выходит; `stop_removed` — стоп
+снят перед выходом контура. `order` — вид заявки: `entry`, `add`, `target`,
+`stop`, `exit`, `emergency`, `broker_stop` (стоп-заявка у брокера и порождённая
+ею заявка). `broker_order` — только последние четыре символа номера заявки или
+стоп-заявки брокера; номер счёта и ключ не публикуются. Цена — десятичная
+строка в пунктах. Строка дописывается в карточку своей сделки в канале контура.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "payload broker_order",
+  "type": "object",
+  "required": [
+    "kind",
+    "contour",
+    "trade_id",
+    "event_id"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string"
+    },
+    "contour": {
+      "type": "string"
+    },
+    "trade_id": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "order": {
+      "type": "string"
+    },
+    "order_type": {
+      "type": "string"
+    },
+    "side": {
+      "type": "string"
+    },
+    "lots": {
+      "type": "number"
+    },
+    "price": {
+      "type": "string"
+    },
+    "broker_order": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "attempt": {
+      "type": "number"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "replaced": {
+      "type": "boolean"
+    },
+    "exchange_order": {
+      "type": "string"
+    }
   },
   "additionalProperties": false
 }

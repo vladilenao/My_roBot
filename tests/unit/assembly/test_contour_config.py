@@ -79,7 +79,52 @@ def test_sandbox_bindings_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("text", ["reconcile_every_min = 0", "reconcile_every_min = 61", "telegram_bot_env = \"bot-token\"",
-                                  "orders = true"])
+                                  "orders = \"yes\"", "exit_requote_attempts = 0", "exit_offset_steps = 101",
+                                  "exit_requote_secs = 4", "unknown_key = 1"])
 def test_sandbox_bad_values(tmp_path, text):
     with pytest.raises(ConfigError, match="contours.sandbox"):
         _load(tmp_path, f"[contours.sandbox]\n{text}\n")
+
+
+def test_sandbox_orders_and_exit_settings(tmp_path):
+    """add-tinvest-orders: режим заявок и перевыставление выходов; по умолчанию — заявки, 5 шагов, 15 с, 3 раза."""
+    from src import config
+
+    assert (config._DEFAULTS["contours_sandbox_orders"], config._DEFAULTS["contours_sandbox_exit_offset_steps"],
+            config._DEFAULTS["contours_sandbox_exit_requote_secs"],
+            config._DEFAULTS["contours_sandbox_exit_requote_attempts"]) == (True, 5, 15, 3)
+    loaded = _load(tmp_path, "[contours.sandbox]\norders = false\nexit_offset_steps = 0\nexit_requote_attempts = 10\n")
+    assert loaded["contours_sandbox_orders"] is False
+    assert (loaded["contours_sandbox_exit_offset_steps"], loaded["contours_sandbox_exit_requote_attempts"]) == (0, 10)
+
+
+def test_sandbox_stop_place_secs(tmp_path):
+    """add-broker-protection: срок постановки стоп-заявки у брокера — 30 с по умолчанию, 5–300."""
+    import pytest
+
+    from src import config
+    from src.config_loader import ConfigError
+
+    assert config._DEFAULTS["contours_sandbox_stop_place_secs"] == 30
+    assert _load(tmp_path, "[contours.sandbox]\nstop_place_secs = 300\n")["contours_sandbox_stop_place_secs"] == 300
+    for bad in ("stop_place_secs = 2", "stop_place_secs = 301", 'stop_place_secs = "30"'):
+        with pytest.raises(ConfigError, match="stop_place_secs"):
+            _load(tmp_path, f"[contours.sandbox]\n{bad}\n")
+
+
+def test_sandbox_guard_settings(tmp_path):
+    """add-account-guards: дневной убыток 3% капитала и три отказа подряд по умолчанию."""
+    import pytest
+
+    from src import config
+    from src.config_loader import ConfigError
+
+    assert (config._DEFAULTS["contours_sandbox_max_daily_loss_pct"],
+            config._DEFAULTS["contours_sandbox_max_rejects_in_row"]) == (3.0, 3)
+    loaded = _load(tmp_path, "[contours.sandbox]\nmax_daily_loss_pct = 0.5\nmax_rejects_in_row = 1\n")
+    assert (loaded["contours_sandbox_max_daily_loss_pct"], loaded["contours_sandbox_max_rejects_in_row"]) == (0.5, 1)
+    assert _load(tmp_path, "[contours.sandbox]\nmax_daily_loss_pct = 2\n")["contours_sandbox_max_daily_loss_pct"] == 2
+    for bad in ("max_daily_loss_pct = 60", "max_daily_loss_pct = -1", "max_rejects_in_row = 0",
+                "max_rejects_in_row = 21", 'max_rejects_in_row = "3"', 'max_daily_loss_pct = "3"'):
+        with pytest.raises(ConfigError, match="max_"):
+            _load(tmp_path, f"[contours.sandbox]\n{bad}\n")

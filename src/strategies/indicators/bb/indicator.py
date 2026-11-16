@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.chart import PANE_PRICE, ChartLine, IndicatorChart
 from src.strategies.indicators.bb.signalEnum import BbSignalEnum
 from src.logging_setup import get_logger
 
@@ -33,6 +34,17 @@ class BollingerBandsIndicator(Indicator):
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
         return self.length
+
+    @property
+    def chart(self) -> IndicatorChart:
+        """Полосы Боллинджера на свечах."""
+        suffix = f"{self.length}_{self.std}"
+        return IndicatorChart(
+            key="bbands", title=f"Боллинджер {self.length}/{self.std:g}",
+            params={"length": self.length, "std": self.std}, pane=PANE_PRICE,
+            lines=(ChartLine("upper", f"bbu_{suffix}"), ChartLine("middle", f"bbm_{suffix}"),
+                   ChartLine("lower", f"bbl_{suffix}")),
+        )
 
     def __post_init__(self) -> None:
         if self.length <= 0:

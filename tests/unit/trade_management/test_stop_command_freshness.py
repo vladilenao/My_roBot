@@ -234,3 +234,33 @@ def test_held_close_with_stale_revision_is_renewed(storage):
         "SELECT json_extract(payload_json,'$.reason') FROM events WHERE command_id=?", (old,)).fetchone() == (
         STOP_COMMAND_RENEWED,)
     assert [type(action) for action in live.broker.actions] == [OpenTrade, CloseTrade]
+
+
+def test_binding_close_all_is_current_while_binding_is_removed(storage):
+    """Снятие привязки с close_all (песочница С3): то же правило, область — привязка."""
+    live = Live(storage)
+    open_position(live)
+    live.now = STOP_AT
+    live.manager.stop_assignment("future-ed-macd", "close_all")
+    live.begin_step(STEP_START)
+    live.dispatch()
+
+    assert phase(storage) == "CLOSED"
+
+
+def test_binding_close_is_not_current_after_binding_returns(storage):
+    live = Live(storage)
+    open_position(live)
+    live.state = "WAITING"
+    live.now = STOP_AT
+    live.manager.stop_assignment("future-ed-macd", "close_all")
+    live.begin_step(STEP_START)
+    live.dispatch()
+
+    live.manager.stop_assignment("future-ed-macd", None)
+    live.begin_step(STOP_AT + timedelta(minutes=5))
+    live.state = "READY"
+    live.dispatch()
+
+    command, = (row[0] for row in closes(storage))
+    assert live.manager.dispatch_block_reasons == {command: "freshness-unconfirmed"}

@@ -107,6 +107,10 @@ def _samples() -> dict[EventType, Event]:
             holdings=[{"name": "NG-11.26", "lots": 1}], orders=0, stop_orders=0, bindings=1, generation=2,
             mismatches=[{"instrument": "NG-11.26", "what": "position", "account": 1, "journal": 0}],
             frozen=["NG-11.26"], unfrozen=[], liquid_portfolio=Decimal("1023916.4"), reason=""),
+        EventType.BROKER_ORDER: Event.broker_order(
+            "requoted", contour="sandbox", trade_id="t-1", event_id="e-2", instrument="NG-12.26", order="stop",
+            order_type="limit", side="SELL", lots=2, price=Decimal("2.807"), broker_order="…7f3a", state="accepted",
+            attempt=1, reason=""),
         EventType.DECISION: Event.decision("NG-10.26", outcome="signal_buy", side="BUY"),
         EventType.SIGNAL: Event.signal("NG-10.26", side="BUY", quantity=1, entry=1, stop=2),
         EventType.REJECTED: Event.rejected("NG-10.26", reason="мало"),

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Mapping
@@ -57,7 +57,9 @@ def visual_schema():
     group = _object({"role": text, "side": text, "start": text, "end": text, "quantity": integer,
                      "price": text, "count": integer}, ("role", "side", "start", "end", "quantity", "price", "count"))
     stop = _object({"key": text, "time": text, "old": text, "new": text, "reason": text}, ("key", "time", "new", "reason"))
-    candle = _object({k: text for k in ("time", "open", "high", "low", "close")}, ("time", "open", "high", "low", "close"))
+    # through — незакрытая свеча из минуток: момент закрытия последней минутки (fix-trade-close-accuracy).
+    candle = _object({k: text for k in ("time", "open", "high", "low", "close", "through")},
+                     ("time", "open", "high", "low", "close"))
     gap = _object({"after": text, "before": text, "kind": {"type": "string", "enum": list(BREAK_KINDS)},
                    "missing": {"type": "integer", "minimum": 1}}, ("after", "before", "kind", "missing"))
     plan = _object({"entry": text, "stop": text, "quantity": integer, "targets": targets,
@@ -201,6 +203,52 @@ def market_snapshot(frame, timeframe, as_of, breaks=None):
     result["breaks"] = tuple(_window_breaks(result["candles"], grid, known))
     result["gaps"] = any(item["kind"] in INCOMPLETE_BREAKS for item in result["breaks"])
     return result
+
+
+def with_forming_candle(market, timeframe, minutes, as_of):
+    """Незакрытая свеча ТФ справа от окна из закрытых к ``as_of`` минуток.
+
+    Только минутки после закрытия последней свечи окна; свеча помечена
+    ``through`` — закрытием последней минутки. Нет минуток — окно как есть.
+    """
+    candles = tuple(market.get("candles", ()))
+    if not candles or not minutes or not timeframe:
+        return market
+    grid = CandleScheduler(timeframe)
+    as_of = utc(as_of)
+    last_close = grid.bar_close(utc(candles[-1]["time"]))
+    bars: dict = {}
+    for row in sorted(minutes, key=lambda item: utc(item["datetime"])):
+        try:
+            minute = utc(row["datetime"])
+            prices = {key: Decimal(str(row[key])) for key in ("open", "high", "low", "close")}
+        except (KeyError, ValueError, InvalidOperation, TypeError):
+            continue
+        if minute < last_close or minute + timedelta(minutes=1) > as_of:
+            continue
+        if any(not p.is_finite() or p <= 0 for p in prices.values()) or prices["low"] > prices["high"]:
+            continue
+        # Сетка от закрытия последней свечи окна: у 4h и 1d брокера начало свечи не по UTC-сетке.
+        start = last_close
+        for _ in range(10_000):
+            following = grid.bar_close(start)
+            if following > minute or following <= start:
+                break
+            start = following
+        bar = bars.get(start)
+        if bar is None:
+            bars[start] = {"time": start.isoformat(), **prices, "through": minute + timedelta(minutes=1)}
+        else:
+            bar.update(high=max(bar["high"], prices["high"]), low=min(bar["low"], prices["low"]),
+                       close=prices["close"], through=minute + timedelta(minutes=1))
+    if not bars:
+        return market
+    forming = [{**bar, "through": bar["through"].isoformat()} for _, bar in sorted(bars.items())]
+    window = (candles + tuple(forming))[-CANDLE_LIMIT:]
+    known = {(utc(item["after"]), utc(item["before"])): item for item in market.get("breaks", ())}
+    breaks = tuple(_window_breaks(window, grid, known))
+    return dict(market, candles=window, breaks=breaks, limited=bool(market.get("limited")) or len(window) < len(candles) + len(forming),
+                gaps=any(item["kind"] in INCOMPLETE_BREAKS for item in breaks))
 
 
 def bounded_history(fills, stops, market):

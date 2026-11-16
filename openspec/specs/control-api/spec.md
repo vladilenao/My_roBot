@@ -171,7 +171,7 @@
 - **THEN** ответ — только контур эмуляции; прогоны показывает `GET /api/v1/history`
 
 ### Requirement: Доступ к управлению
-Нормативный уровень: MUST. Маршруты управления — `/api/v1/core`, `/api/v1/emulation…` и `/api/v1/history…` — ДОЛЖНЫ требовать ключ `ROBOT_CONTROL_TOKEN` в заголовке `Authorization: Bearer` и НЕ ДОЛЖНЫ принимать его в адресе запроса или cookie. Точка входа `GET /api/v1` ДОЛЖНА принимать любой из двух ключей. Ключ экспорта рыночных данных НЕ ДОЛЖЕН давать доступ к управлению, а ключ управления — к экспорту. Маршруты управления ДОЛЖНЫ отклонять запрос, если заголовок `Host` не равен `127.0.0.1`, `localhost` или `[::1]` с портом сервера. Сервер НЕ ДОЛЖЕН отдавать заголовки CORS. `ROBOT_CONTROL_TOKEN` ДОЛЖЕН быть в `secrets` журнала и НЕ ДОЛЖЕН печататься нигде.
+Нормативный уровень: MUST. Маршруты управления — `/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…` и `/api/v1/candles…` — ДОЛЖНЫ требовать ключ `ROBOT_CONTROL_TOKEN` в заголовке `Authorization: Bearer` и НЕ ДОЛЖНЫ принимать его в адресе запроса или cookie. Точка входа `GET /api/v1` ДОЛЖНА принимать любой из двух ключей. Ключ экспорта рыночных данных НЕ ДОЛЖЕН давать доступ к управлению, а ключ управления — к экспорту. Маршруты управления ДОЛЖНЫ отклонять запрос, если заголовок `Host` не равен `127.0.0.1`, `localhost` или `[::1]` с портом сервера. Сервер НЕ ДОЛЖЕН отдавать заголовки CORS. `ROBOT_CONTROL_TOKEN` ДОЛЖЕН быть в `secrets` журнала и НЕ ДОЛЖЕН печататься нигде.
 
 #### Scenario: Ключ экспорта для управления
 - **WHEN** команда запуска приходит с ключом `MARKET_DATA_EXPORT_TOKEN`
@@ -184,6 +184,10 @@
 #### Scenario: Ключ в адресе
 - **WHEN** ключ передан параметром адреса, а заголовка `Authorization` нет
 - **THEN** ответ `401`
+
+#### Scenario: Ключ экспорта для свечей
+- **WHEN** `GET /api/v1/candles/NG-12.26/15m` приходит с ключом `MARKET_DATA_EXPORT_TOKEN`
+- **THEN** ответ `401` с кодом `UNAUTHORIZED` в `application/problem+json`
 
 ### Requirement: Остановка контура командой
 Нормативный уровень: MUST. `PUT /api/v1/emulation/target` с телом `{"mode": "no_entries"}` или `{"mode": "close_all"}` ДОЛЖЕН записывать в `core.sqlite3` желаемое «остановлен» с режимом и новым поколением и отвечать `202` с эмуляцией и новой `target.revision`. Повтор команды с тем же режимом ДОЛЖЕН отвечать `200` с прежней ревизией и НЕ ДОЛЖЕН её менять. `close_all` поверх `no_entries` ДОЛЖЕН приниматься новой ревизией. `no_entries` поверх `close_all` ДОЛЖЕН отклоняться `409` с кодом `MODE_CONFLICT`.
@@ -762,13 +766,13 @@ API ДОЛЖЕН называть состояние словами операт
 - `history` — число идущих и ждущих прогонов и `max_history_runs`; `null` для ключа экспорта;
 - `sandbox` — `state`, число привязок, число замороженных инструментов и итог последней сверки; `null` для ключа экспорта;
 - `live` — `null`, пока контур «Счёт» не реализован;
-- `_links` — ссылки на разделы, разрешённые ключу: для ключа управления — `core`, `emulation`, `history`, `sandbox`, `docs`; для ключа экспорта — `market-data` (`/api/v1/market-data/source`), `clusters-report`, `docs`.
+- `_links` — ссылки на разделы, разрешённые ключу: для ключа управления — `core`, `emulation`, `history`, `sandbox`, `candles`, `docs`; для ключа экспорта — `market-data` (`/api/v1/market-data/source`), `clusters-report`, `docs`.
 
 Без ключа или с неверным ключом — `401`.
 
 #### Scenario: Ключ управления
 - **WHEN** приходит `GET /api/v1` с ключом управления
-- **THEN** ответ `200` со сводкой эмуляции, истории и песочницы и ссылками на ядро, эмуляцию, историю и песочницу, без ссылок на экспорт
+- **THEN** ответ `200` со сводкой эмуляции, истории и песочницы и ссылками на ядро, эмуляцию, историю, песочницу и ряды свечей (`/api/v1/candles`), без ссылок на экспорт
 
 #### Scenario: Ключ экспорта
 - **WHEN** приходит `GET /api/v1` с ключом экспорта
@@ -780,19 +784,20 @@ API ДОЛЖЕН называть состояние словами операт
 - **THEN** ответ `200` с `core.state = retrying`, сводка эмуляции, истории и песочницы показана
 
 ### Requirement: Ошибки API управления
-Нормативный уровень: MUST. Ответ с ошибкой на точке входа и на маршрутах управления (`/api/v1/core`, `/api/v1/emulation…`, `/api/v1/history…`) ДОЛЖЕН быть `application/problem+json` (RFC 9457) с полями:
+Нормативный уровень: MUST. Ответ с ошибкой на точке входа и на маршрутах управления (`/api/v1/core`, `/api/v1/emulation…`, `/api/v1/sandbox…`, `/api/v1/history…`, `/api/v1/candles…`) ДОЛЖЕН быть `application/problem+json` (RFC 9457) с полями:
 
 - `type` — `urn:my-robot:problem:<код>`, код в нижнем регистре через дефис;
 - `title` — короткое название ошибки;
 - `status` — код HTTP;
-- `code` — код ошибки: `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN_HOST`, `NOT_FOUND`, `REPORT_NOT_READY`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `MODE_CONFLICT`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`, `REVISION_CHANGED`, `INSTRUMENTS_REJECTED`;
+- `code` — код ошибки: `INVALID_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN_HOST`, `NOT_FOUND`, `REPORT_NOT_READY`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `MODE_CONFLICT`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`, `REVISION_CHANGED`, `INSTRUMENTS_REJECTED`, `MARKET_DATA_NOT_READY`, `JOURNAL_UNAVAILABLE`;
 - `detail` — понятная причина.
 
 Дополнительные поля:
 
 - `rejections` — у `INSTRUMENTS_REJECTED`: список `{instrument, reason}`, где `instrument` — имя из запроса как есть;
 - `core` — у `CORE_NOT_READY`: состояние, число попыток и время следующей;
-- `pid` — у `CONTOUR_DIR_BUSY`.
+- `pid` — у `CONTOUR_DIR_BUSY`;
+- `suggestions` — у `NOT_FOUND` на маршрутах `/api/v1/candles…`: подходящие короткие имена инструментов или имеющиеся таймфреймы, возможно пустой список.
 
 Ответ НЕ ДОЛЖЕН содержать секреты. Маршруты экспорта рыночных данных и отчёта кластеров ДОЛЖНЫ сохранить прежний формат `{code, message}` в `application/json`, включая ответ `401`: их читает Historical Broker API Emulator.
 
@@ -803,6 +808,15 @@ API ДОЛЖЕН называть состояние словами операт
 #### Scenario: Ошибка экспорта не меняется
 - **WHEN** эмулятор данных запрашивает `GET /api/v1/market-data/changes` с курсором старше хранимой ленты
 - **THEN** ответ `410` в `application/json` с `code = CURSOR_EXPIRED` и `message`, как в версии 1.8
+
+#### Scenario: Рыночная база ещё не открыта
+- **WHEN** `GET /api/v1/candles` приходит до того, как ядро открыло рыночную базу
+- **THEN** ответ `503` в `application/problem+json` с `code = MARKET_DATA_NOT_READY`
+
+#### Scenario: Журнал контура не читается
+- **GIVEN** `trades.sqlite3` эмуляции повреждён
+- **WHEN** приходит `GET /api/v1/emulation/trades`
+- **THEN** ответ `503` в `application/problem+json` с `code = JOURNAL_UNAVAILABLE`, в `detail` нет пути к файлу и текста исключения
 
 ### Requirement: Ссылки и доступные действия
 Нормативный уровень: MUST. Ответы точки входа, ядра, эмуляции, состава, участника состава, прогона и списка прогонов ДОЛЖНЫ содержать `_links` — объект «имя связи → `{href}`» с относительными адресами.
@@ -863,7 +877,7 @@ API ДОЛЖЕН называть состояние словами операт
 - **THEN** она применяется к текущему целевому состоянию, как прежде
 
 ### Requirement: Ресурс контура «Песочница»
-Нормативный уровень: MUST. Контур «Песочница» ДОЛЖЕН быть ресурсом `/api/v1/sandbox` под ключом управления, с проверкой `Host`, ответами `application/json`, ошибками `application/problem+json`, `_links` и `_actions`, `ETag` и `If-Match` по правилам эмуляции. `confirm` контуру песочницы НЕ НУЖЕН: денег на ней нет.
+Нормативный уровень: MUST. Контур «Песочница» ДОЛЖЕН быть ресурсом `/api/v1/sandbox` под ключом управления, с проверкой `Host`, ответами `application/json`, ошибками `application/problem+json`, `_links` и `_actions`, `ETag` и `If-Match` по правилам эмуляции. `confirm` контуру песочницы НЕ НУЖЕН: денег на ней нет. Маршруты и схемы ДОЛЖНЫ быть описаны в `docs/api/openapi.yaml` версии 2.2.0.
 
 | Маршрут | Что делает |
 |---|---|
@@ -882,23 +896,33 @@ API ДОЛЖЕН называть состояние словами операт
 - `400` — тело не объект, неизвестные поля, `mode` не из трёх значений, `bindings` не список строк или передан вместе с режимом остановки;
 - `409` — коды эмуляции: `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING` (остановка без процесса), `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`;
 - `412 REVISION_CHANGED`;
-- `422 BINDINGS_REJECTED` — список отказов: `id` и причина «Привязки нет в конфигурации»; запуск не начинается.
+- `422 BINDINGS_REJECTED` — список отказов: `id` и причина. Причины: «Привязки нет в конфигурации» или причина, по которой ядро не определило инструмент привязки (те же формулировки, что у отказа инструмента эмуляции). Запуск не начинается.
 
-**Состав.** Добавление и снятие ДОЛЖНЫ отвечать `202` с новой ревизией или `200` без изменений (уже в составе, уже снята). Неизвестный `id` ДОЛЖЕН давать `422 BINDINGS_REJECTED`, при этом состав не меняется. Команды состава ДОЛЖНЫ приниматься и тогда, когда процесс не запущен: они меняют целевой состав для следующего запуска.
+**Состав.** Добавление и снятие ДОЛЖНЫ отвечать `202` с новой ревизией или `200` без изменений (уже в составе, уже снята). Неизвестный `id` или привязка, инструмент которой не определён, ДОЛЖНЫ давать `422 BINDINGS_REJECTED`, при этом состав не меняется. Команды состава ДОЛЖНЫ приниматься и тогда, когда процесс не запущен: они меняют целевой состав для следующего запуска.
+
+На работающем контуре с `orders = true` режим снятия ДОЛЖЕН действовать на сделки привязки:
+
+- `no_entries` — привязка доводит свои сделки до выхода;
+- `close_all` — её сделки закрываются.
+
+Пока у снятой привязки есть сделки, она остаётся в `bindings` с `target = removed` и `current` `draining` или `closing`.
 
 **Состояние.** `state` — то же перечисление, что у эмуляции: `waiting_command`, `starting`, `running`, `stopping_no_entries`, `stopping_close_all`, `stopped`, `failed`. `current` ДОЛЖЕН содержать:
 
 - `applied_revision`;
+- `orders_enabled` — режим заявок;
 - `account` — последние четыре символа;
 - `capital` — `rub`, `liquid_portfolio`;
 - `positions` — инструмент коротким именем, лоты;
-- `orders` и `stop_orders` — число;
+- `orders` и `stop_orders` — число на счёте;
+- `trades` — число открытых сделок журнала;
+- `orders_in_flight` — число незавершённых заявок журнала заявок;
 - `frozen` — инструменты коротким именем;
 - `last_reconcile_at`;
-- `account_link`, `core_link`;
+- `account_link`, `core_link`, `stream_link`;
 - `reason`.
 
-`bindings` — участники: `id`, инструмент, стратегия, таймфрейм, `target` (`active` или `removed`) и `current` (`watching` в С2).
+`bindings` — участники: `id`, инструмент привязки (короткое имя контракта, если определён), стратегия, таймфрейм, `target` (`active` или `removed`) и `current`: `warming`, `trading`, `draining`, `closing`, `rejected` с причиной или `watching` (режим только чтения).
 
 **Привязки.** `GET /api/v1/sandbox/bindings` ДОЛЖЕН возвращать `members` — состав песочницы — и `available` — все привязки конфигурации. У каждой привязки — `id`, инструмент, стратегия, таймфрейм и `trades_in`:
 
@@ -908,18 +932,102 @@ API ДОЛЖЕН называть состояние словами операт
 #### Scenario: Запуск с составом
 - **GIVEN** ядро готово, в конфигурации есть привязки `share-sber-macd-4h-triple` и `future-ng-macd`
 - **WHEN** приходит `PUT /api/v1/sandbox/target` с `{"mode": "on", "bindings": ["share-sber-macd-4h-triple"]}`
-- **THEN** ответ `202` с `target.revision`, в составе одна привязка, ядро запускает процесс песочницы
+- **THEN** ответ `202` с `target.revision`, в составе одна привязка с инструментом SBER, ядро запускает процесс песочницы
 
 #### Scenario: Неизвестная привязка
 - **WHEN** приходит `POST /api/v1/sandbox/bindings` с `{"bindings": ["share-xxx"]}`
 - **THEN** ответ `422 BINDINGS_REJECTED` с причиной для `share-xxx`, ревизия не меняется
 
+#### Scenario: Нет действующего контракта
+- **GIVEN** у семейства привязки нет контракта с запасом до экспирации
+- **WHEN** приходит `POST /api/v1/sandbox/bindings` с этой привязкой
+- **THEN** ответ `422 BINDINGS_REJECTED` с причиной, как у отказа инструмента эмуляции, состав не меняется
+
+#### Scenario: Снятие привязки с открытой сделкой
+- **GIVEN** у привязки `future-ng-macd` открытая сделка
+- **WHEN** приходит `POST /api/v1/sandbox/bindings/remove` с `{"bindings": ["future-ng-macd"], "mode": "no_entries"}`
+- **THEN** ответ `202`, привязка в `bindings` с `target = removed` и `current = draining`, пока сделка не закрыта
+
 #### Scenario: Отчёт сверки
 - **GIVEN** последняя сверка нашла ручную позицию NG
 - **WHEN** приходит `GET /api/v1/sandbox/reconcile`
-- **THEN** ответ содержит время, `mismatch`, строку NG-11.26 `position` 1 против 0 и NG-11.26 в `frozen`
+- **THEN** ответ содержит время, `mismatch`, строку NG `position` и NG в `frozen`
 
 #### Scenario: Капитал в состоянии
-- **GIVEN** команда песочницы показала на счёте 1 000 000 ₽
+- **GIVEN** команда песочницы показала на счёте 1 000 000 ₽, у контура одна открытая сделка
 - **WHEN** приходит `GET /api/v1/sandbox` после очередного шага
-- **THEN** `current.capital.rub` равен 1 000 000, `current.account` — четыре последних символа номера
+- **THEN** `current.capital.rub` равен рублям на счёте, `current.trades = 1`, `current.orders_enabled = true`, `current.account` — четыре последних символа номера
+
+### Requirement: Профили привязки в ответах контуров
+Нормативный уровень: MUST. Каждая привязка в ответах API управления ДОЛЖНА нести профиль фильтра `filter` и профиль управления `management` — значения из текущей конфигурации `[strategies.*]`, без перевода (`raw` — без фильтра). Это касается:
+
+- участников песочницы — `bindings` в `GET /api/v1/sandbox` и `members` в `GET /api/v1/sandbox/bindings`; если привязки уже нет в конфигурации, значения ДОЛЖНЫ браться из карточки состава, а без них — `null`;
+- каталога — `available` в `GET /api/v1/sandbox/bindings`;
+- участников эмуляции — новое поле `bindings` у `Member`: `id`, `strategy`, `timeframe`, `filter`, `management` каждой привязки, по которой торгует инструмент. Подбор ДОЛЖЕН совпадать с торговлей: акция — по тикеру, фьючерс — по семейству, а если по семейству привязок нет — по его коду. Привязок нет — пустой список.
+
+Привязка участника эмуляции (`bindings` у `Member`) и привязка состава песочницы (`BindingMember`) ДОЛЖНЫ нести `_links.indicators` — адрес `GET /api/v1/candles/{instrument}/{timeframe}/indicators?binding=<id>` для короткого имени инструмента участника и таймфрейма привязки из текущей конфигурации, если привязка в ней есть, а инструмент участника — контракт или акция; иначе ссылки нет. У привязки песочницы на фьючерс, для которой ядро ещё не выбрало контракт, ссылки нет: в карточке только код семейства. У привязки каталога (`available`) ссылки НЕ ДОЛЖНО быть: там инструмент — код семейства, а не контракт.
+
+Новые поля НЕ ДОЛЖНЫ менять прежние поля ответов.
+
+#### Scenario: Фильтр и управление у привязки песочницы
+- **GIVEN** в составе песочницы привязка `future-ng-macd` с `filter = "triple_screen"` и `management = "levels_rr"`
+- **WHEN** приходит `GET /api/v1/sandbox`
+- **THEN** у привязки `future-ng-macd` в `bindings` есть `filter: "triple_screen"` и `management: "levels_rr"`
+
+#### Scenario: Привязка без фильтра в каталоге
+- **GIVEN** у привязки `share-sber-ma` в конфигурации `filter = "raw"`
+- **WHEN** приходит `GET /api/v1/sandbox/bindings`
+- **THEN** у `share-sber-ma` в `available` — `filter: "raw"`, а не пропуск поля
+
+#### Scenario: Привязки участника эмуляции
+- **GIVEN** эмуляция торгует NG-12.26, в конфигурации у семейства NG одна привязка `future-ng-macd`
+- **WHEN** приходит `GET /api/v1/emulation/instruments`
+- **THEN** у NG-12.26 `bindings` — один элемент с `id`, `strategy`, `timeframe`, `filter` и `management` привязки `future-ng-macd`
+
+#### Scenario: Инструмент без привязок
+- **GIVEN** в составе эмуляции акция, для которой в конфигурации нет привязок
+- **WHEN** приходит `GET /api/v1/emulation`
+- **THEN** у этого участника `bindings` — пустой список
+
+#### Scenario: Ссылка на индикаторы привязки
+- **GIVEN** эмуляция торгует NG-12.26 по привязке `future-ng-macd` на `15m`
+- **WHEN** приходит `GET /api/v1/emulation/instruments`
+- **THEN** у привязки `future-ng-macd` участника NG-12.26 `_links.indicators.href` равен `/api/v1/candles/NG-12.26/15m/indicators?binding=future-ng-macd`
+
+#### Scenario: Привязки уже нет в конфигурации
+- **GIVEN** в составе песочницы привязка, которой больше нет в `[strategies.*]`
+- **WHEN** приходит `GET /api/v1/sandbox`
+- **THEN** у этой привязки нет `_links.indicators`, прочие поля как раньше
+
+### Requirement: Предохранители контура «Песочница» в API
+Нормативный уровень: MUST. `GET /api/v1/sandbox` ДОЛЖЕН отдавать в `current.guards` список сработавших предохранителей; пустой список, если всё чисто. У предохранителя ДОЛЖНЫ быть:
+
+- `kind`: `daily_loss` или `broker_rejects`;
+- `since`;
+- `until`: начало следующего торгового дня у `daily_loss`, `null` у `broker_rejects`;
+- `detail`: у дневного убытка — `loss`, `limit`, `start_capital` десятичными строками и `partial_day`; у отказов — `count` и `reasons` (до трёх).
+
+`_actions` ДОЛЖЕН содержать `guards-reset`, когда сработал `broker_rejects`.
+
+`POST /api/v1/sandbox/guards/reset` с телом `{"guards": ["broker_rejects"]}` ДОЛЖЕН увеличивать поколение сброса в желаемом состоянии контура и записывать команду в журнал команд ядра. Ответы:
+
+- `202` — поколение записано, тело — состояние песочницы;
+- `400` — тело не объект, неизвестные поля, `guards` не непустой список известных видов;
+- `409 NOT_RUNNING` — процесса контура нет;
+- `409 GUARD_NOT_RESETTABLE` — в списке `daily_loss`: он снимается с новым торговым днём.
+
+Сброс без сработавшего предохранителя ДОЛЖЕН приниматься и ничего не менять. Маршрут и схемы ДОЛЖНЫ быть описаны в `docs/api/openapi.yaml` версии 2.9.0.
+
+#### Scenario: Сработавший предохранитель в состоянии
+- **GIVEN** у песочницы сработал `broker_rejects` после трёх отказов
+- **WHEN** приходит `GET /api/v1/sandbox`
+- **THEN** `current.guards` содержит `broker_rejects` с `count = 3` и причинами, `_actions` содержит `guards-reset`
+
+#### Scenario: Сброс отказов
+- **GIVEN** сработал `broker_rejects`
+- **WHEN** приходит `POST /api/v1/sandbox/guards/reset` с `{"guards": ["broker_rejects"]}`
+- **THEN** ответ `202`, поколение сброса увеличено, на ближайшей границе тика `current.guards` пуст
+
+#### Scenario: Дневной убыток командой не снимается
+- **WHEN** приходит `POST /api/v1/sandbox/guards/reset` с `{"guards": ["daily_loss"]}`
+- **THEN** ответ `409 GUARD_NOT_RESETTABLE`, поколение не меняется

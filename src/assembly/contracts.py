@@ -89,6 +89,52 @@ def _load_contracts_metadata(instruments, client_provider=None, request_budget=N
     return contracts
 
 
+class _BatchInstruments:
+    """Сервис инструментов на время одного пакета: одинаковый вызов — один запрос к брокеру.
+
+    Каталог фьючерсов и маржа контракта за секунды пакета не меняются, а квота
+    сервиса — около 20 запросов в минуту. Сбой не запоминается: повтор идёт к брокеру.
+    """
+
+    def __init__(self, instruments) -> None:
+        self._instruments = instruments
+        self._answers: dict = {}
+
+    def __getattr__(self, name):
+        method = getattr(self._instruments, name)
+        if not callable(method):
+            return method
+
+        def call(*args, **kwargs):
+            key = (name, args, tuple(sorted(kwargs.items())))
+            try:
+                hash(key)
+            except TypeError:
+                return method(*args, **kwargs)
+            if key not in self._answers:
+                self._answers[key] = method(*args, **kwargs)
+            return self._answers[key]
+
+        return call
+
+
+class BatchClient:
+    """Клиент брокера, у которого каталоги одного пакета запрашиваются один раз (fix-sandbox-restart-safety)."""
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self._instruments = None
+
+    @property
+    def instruments(self):
+        if self._instruments is None:
+            self._instruments = _BatchInstruments(self._client.instruments)
+        return self._instruments
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
 def _token_client_context():
     """Контекст клиента Тильды; без токена возвращается ``None``."""
     if not TINKOFF_TOKEN:

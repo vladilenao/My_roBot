@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.indicators.base import BaseSignalEnum, Indicator
+from src.strategies.indicators.chart import PANE_SEPARATE, ChartLine, IndicatorChart
 from src.strategies.indicators.stochastic.signalEnum import (
     SignalMode,
     StochasticSignalEnum,
@@ -38,6 +39,17 @@ class StochasticIndicator(Indicator):
     def warmup(self) -> int:
         """Количество баров для прогрева индикатора."""
         return self.k + self.smooth_k
+
+    @property
+    def chart(self) -> IndicatorChart:
+        """Стохастик в своей панели: %K и %D, уровни 20 и 80."""
+        suffix = f"{self.k}_{self.d}_{self.smooth_k}"
+        return IndicatorChart(
+            key="stochastic", title=f"Стохастик {suffix.replace('_', '/')}",
+            params={"k": self.k, "d": self.d, "smooth_k": self.smooth_k}, pane=PANE_SEPARATE,
+            lines=(ChartLine("k", f"stochk_{suffix}"), ChartLine("d", f"stochd_{suffix}")),
+            levels=(20.0, 80.0),
+        )
 
     def __post_init__(self) -> None:
         if self.k < self.d:

@@ -135,12 +135,15 @@ class MarketDataCache:
     #: ``None``, пока данных не объявлено конец.
     data_exhaustion: DataExhaustion | None = None
 
-    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, market_calendar=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None) -> None:
+    def __init__(self, loader, timeline, token=None, data_refresh_min_interval=0.0, data_backfill_window_seconds=None, freshness_tolerance_bars=0, clock=None, client_provider=None, market_store=None, market_source="tbank_exchange", market_reconciler=None, market_calendar=None, request_budget=None, recovery_retry_seconds=65, live_cutover=None, history_depth=0) -> None:
         self._loader = loader
         self._timeline = timeline  # MultiTimeframeScheduler: сетки и рыночное время
         self._token = token
         self._clock = clock
         self._history = bool(getattr(clock, "is_virtual", False))
+        # Прогон истории расширяет стартовый кадр назад до глубины расчёта, как
+        # прогрев живого ядра: окно старших ТФ одинаково (add-analysis-depth).
+        self._history_depth = history_depth
         self._client_provider = client_provider
         # В историческом режиме источник уже является эмулятором. Локальный
         # журнал живых данных включается только вызывающим кодом live-режима.
@@ -1087,7 +1090,10 @@ class MarketDataCache:
         instrument_id = self._uids.get(key)
         if not instrument_id:
             return frame.iloc[0:0].copy()
-        previous = _naive(last_bar)
+        # Граница может прийти не по сетке (время исполнения у брокера): проба
+        # минуты по такому времени не найдёт ни одного состояния и удержит
+        # исполнение навсегда (fix-sandbox-restart-safety).
+        previous = _naive(last_bar).floor("min")
         allowed: list[int] = []
         for index, row in frame.sort_values("datetime").iterrows():
             stamp = _naive(row["datetime"])
@@ -1115,7 +1121,7 @@ class MarketDataCache:
         uid = self._uids.get(self._key(instrument, "1m"))
         if not uid:
             return []
-        lower = _naive(last_bar) + pd.Timedelta(minutes=1)
+        lower = _naive(last_bar).floor("min") + pd.Timedelta(minutes=1)
         upper = _naive(frame["datetime"].max())
         if upper < lower:
             return []
@@ -1309,6 +1315,26 @@ class MarketDataCache:
         if floor is not None:
             self._pre_cutover_gaps[uid, timeframe] = unconfirmed
         return True
+
+    @_synchronized
+    def closed_minutes(self, instrument, since, until) -> list[dict]:
+        """Закрытые минутки 1m пары из памяти: открытие ``>= since``, закрытие ``<= until``.
+
+        Только для представления (незакрытая свеча графика исполнения,
+        fix-trade-close-accuracy): без сети, первичной загрузки и регистрации
+        пар — неизвестная пара даёт пустой список.
+        """
+        frame = self._frames.get(self._key(instrument, "1m"))
+        if frame is None or frame.empty:
+            return []
+        start, end = _naive(since), _naive(until) - pd.Timedelta(minutes=1)
+        stamps = _naive_series(frame["datetime"])
+        mask = (stamps >= start) & (stamps <= end)
+        if "is_complete" in frame.columns:
+            mask &= frame["is_complete"].astype(bool)
+        rows = frame[mask].sort_values("datetime")
+        return [{"datetime": row["datetime"], "open": row["open"], "high": row["high"], "low": row["low"],
+                 "close": row["close"]} for row in rows.to_dict("records")]
 
     def chart_breaks(self, instrument, timeframe, frame) -> dict:
         """Вид каждого разрыва окна для графика сделки.
@@ -1614,6 +1640,8 @@ class MarketDataCache:
     def _initial_load(self, instrument, timeframe: str, key: tuple) -> None:
         self._wait_throttle()
         df = self._load(instrument, timeframe, start_date=None)
+        if self._history and self._history_depth:
+            df = self._deepen_history(instrument, timeframe, df)
         self._frames[key] = df if df is not None else None
         self._instruments[key] = instrument
         grid = self._timeline.grid(timeframe)
@@ -1622,6 +1650,28 @@ class MarketDataCache:
             closed = self._closed_only(df, timeframe)
             if not closed.empty:
                 self._last_loaded[key] = _naive(closed["datetime"].max())
+
+    def _deepen_history(self, instrument, timeframe: str, df):
+        """Стартовый кадр истории до глубины расчёта: окна 60…960 дней, как у прогрева ядра.
+
+        Расширение останавливается, когда закрытых свечей хватает или окно не
+        дало ни одной более ранней свечи (история контракта кончилась).
+        """
+        from src.data.ingestion import WARMUP_DAYS
+
+        now = _naive(self._timeline.now())
+        for days in WARMUP_DAYS[1:]:
+            closed = self._closed_only(df, timeframe) if df is not None and not df.empty else pd.DataFrame()
+            if len(closed) >= self._history_depth:
+                break
+            wider = self._load(instrument, timeframe, start_date=now - pd.Timedelta(days=days))
+            if wider is None or wider.empty:
+                break
+            earlier = closed.empty or wider["datetime"].min() < closed["datetime"].min()
+            df = wider
+            if not earlier:
+                break
+        return df
 
     def _wait_throttle(self) -> None:
         """Досыпает остаток ``data_refresh_min_interval`` с последнего API-вызова.

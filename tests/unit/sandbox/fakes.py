@@ -42,12 +42,17 @@ class FakeBroker:
     reject_market: bool = False
     executes_stops: bool = True
     repeat_key: str = "same"  # same | new | error
+    repeat_stop_key: str = "error"  # same | new | error — повтор ключа стоп-заявки
+    stop_price_rub: bool = False  # GetStopOrders отдаёт стоп-цену в рублях за контракт (шаг 0.001 = 7.9 ₽)
+    cancel_executed_stop: str = "error"  # error | ok — снятие исполненной стоп-заявки
     margin_works: bool = True
     fail_operations: bool = False
+    fee_operation: str = "linked"  # linked | unlinked | none — «комиссия брокера» к операции сделки
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
+    stop_keys: dict = field(default_factory=dict)  # ключ -> stop_id
     operations: list = field(default_factory=list)
     calls: list = field(default_factory=list)
     stream: "queue.Queue" = field(default_factory=queue.Queue)
@@ -65,10 +70,12 @@ class FakeBroker:
         return Decimal(str(value))
 
     def push(self, order: s.OrderState) -> None:
+        trades = [s.OrderTrade(date_time=stage.execution_time, price=quote(money_to_decimal(stage.price)),
+                               quantity=stage.quantity, trade_id=stage.trade_id) for stage in (order.stages if isinstance(order.stages, list) else ())]
         self.stream.put(s.OrderStateStreamResponse(order_state=s.OrderStateStreamOrderState(
             order_id=order.order_id, order_request_id=order.order_request_id,
             execution_report_status=order.execution_report_status, lots_executed=order.lots_executed,
-            lots_requested=order.lots_requested, instrument_uid=order.instrument_uid)))
+            lots_requested=order.lots_requested, instrument_uid=order.instrument_uid, trades=trades)))
 
     def fill(self, uid: str, lots: int, direction, key: str) -> s.OrderState:
         sign = 1 if direction == s.OrderDirection.ORDER_DIRECTION_BUY else -1
@@ -80,15 +87,24 @@ class FakeBroker:
             order_id=self.next_id("ord"), order_request_id=key, instrument_uid=uid, direction=direction,
             execution_report_status=s.OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL,
             lots_requested=lots, lots_executed=lots, initial_security_price=money(price),
-            executed_order_price=money(price), executed_commission=money("1.5"), initial_commission=money("1.5"))
+            executed_order_price=money(price), executed_commission=money("1.5"), initial_commission=money("1.5"),
+            stages=[s.OrderStage(price=money(price), quantity=lots, trade_id=self.next_id("trade"),
+                                 execution_time=NOW)])
         self.orders[order.order_id] = order
         kind = s.OperationType.OPERATION_TYPE_BUY if sign > 0 else s.OperationType.OPERATION_TYPE_SELL
         executed = s.OperationState.OPERATION_STATE_EXECUTED
-        self.operations.append(s.OperationItem(type=kind, state=executed, instrument_uid=uid,
-                                               commission=money("-1.5"), payment=money(-price)))
-        self.operations.append(s.OperationItem(type=s.OperationType.OPERATION_TYPE_BROKER_FEE, state=executed,
-                                               instrument_uid=uid, commission=s.MoneyValue(currency="", units=0, nano=0),
-                                               payment=money("-1.5")))
+        operation_id = self.next_id("op")
+        trades = s.OperationItemTrades(trades=[s.OperationItemTrade(num=stage.trade_id, date=NOW, quantity=stage.quantity,
+                                                                    price=money(price)) for stage in order.stages])
+        self.operations.append(s.OperationItem(id=operation_id, type=kind, state=executed, instrument_uid=uid,
+                                               commission=money("-1.5"), payment=money(-price), trades_info=trades,
+                                               quantity=lots, date=NOW))
+        if self.fee_operation != "none":
+            self.operations.append(s.OperationItem(
+                id=self.next_id("op"), type=s.OperationType.OPERATION_TYPE_BROKER_FEE, state=executed,
+                parent_operation_id=operation_id if self.fee_operation == "linked" else "",
+                instrument_uid=uid, commission=s.MoneyValue(currency="", units=0, nano=0),
+                payment=money("-1.5"), date=NOW))
         self.push(order)
         return order
 
@@ -177,6 +193,8 @@ class _Api:
                 raise RequestError(StatusCode.ALREADY_EXISTS, "30057", SimpleNamespace(message="Дубль ключа"))
             if self.b.repeat_key == "same":
                 return self._response(existing)
+        if price is not None and quotation_to_decimal(price) > Decimal("3.300"):
+            raise RequestError(StatusCode.INVALID_ARGUMENT, "30010", SimpleNamespace(message="Цена вне коридора"))
         if order_type == s.OrderType.ORDER_TYPE_MARKET:
             if self.b.reject_market:
                 raise broker_reject()
@@ -202,7 +220,12 @@ class _Api:
 
     def orders__get_order_state(self, account_id="", order_id="", order_id_type=None):
         if order_id_type == s.OrderIdType.ORDER_ID_TYPE_REQUEST:
-            return next(o for o in self.b.orders.values() if o.order_request_id == order_id)
+            found = next((o for o in self.b.orders.values() if o.order_request_id == order_id), None)
+            if found is None:
+                raise RequestError(StatusCode.NOT_FOUND, "50005", SimpleNamespace(message="Order not found"))
+            return found
+        if order_id not in self.b.orders:
+            raise RequestError(StatusCode.NOT_FOUND, "50005", SimpleNamespace(message="Order not found"))
         return self.b.orders[order_id]
 
     def orders__cancel_order(self, account_id="", order_id=""):
@@ -214,12 +237,22 @@ class _Api:
     # stop orders
     def stop_orders__post_stop_order(self, *, instrument_id="", quantity=0, stop_price=None, direction=None,
                                      account_id="", expiration_type=None, stop_order_type=None, order_id=""):
+        if order_id and order_id in self.b.stop_keys:
+            if self.b.repeat_stop_key == "error":
+                raise RequestError(StatusCode.INVALID_ARGUMENT, "30057", SimpleNamespace(message="Дубль ключа"))
+            if self.b.repeat_stop_key == "same":
+                return s.PostStopOrderResponse(stop_order_id=self.b.stop_keys[order_id], order_request_id=order_id)
+        level = quotation_to_decimal(stop_price)
+        shown = level / Decimal("0.001") * Decimal("7.9") if self.b.stop_price_rub else level
         stop = s.StopOrder(stop_order_id=self.b.next_id("stop"), instrument_uid=instrument_id,
                            lots_requested=quantity, direction=direction, order_type=stop_order_type,
-                           stop_price=money(quotation_to_decimal(stop_price)),
-                           status=s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE)
+                           stop_price=money(shown), status=s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE,
+                           exchange_order_id="")
+        stop.level = level  # для срабатывания фейка: цена в пунктах
         self.b.stops[stop.stop_order_id] = stop
-        return s.PostStopOrderResponse(stop_order_id=stop.stop_order_id)
+        if order_id:
+            self.b.stop_keys[order_id] = stop.stop_order_id
+        return s.PostStopOrderResponse(stop_order_id=stop.stop_order_id, order_request_id=order_id)
 
     def stop_orders__get_stop_orders(self, account_id="", status=None, from_=None, to=None):
         items = list(self.b.stops.values())
@@ -228,7 +261,12 @@ class _Api:
         return s.GetStopOrdersResponse(stop_orders=items)
 
     def stop_orders__cancel_stop_order(self, account_id="", stop_order_id=""):
-        self.b.stops[stop_order_id].status = s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED
+        stop = self.b.stops[stop_order_id]
+        if stop.status == s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED:
+            if self.b.cancel_executed_stop == "error":
+                raise RequestError(StatusCode.NOT_FOUND, "50006", SimpleNamespace(message="Стоп-заявка не найдена"))
+            return s.CancelStopOrderResponse()
+        stop.status = s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED
         return s.CancelStopOrderResponse()
 
     # market data / instruments
@@ -240,9 +278,11 @@ class _Api:
         if self.b.executes_stops:
             for stop in self.b.stops.values():
                 if stop.status == s.StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE \
-                        and price <= money_to_decimal(stop.stop_price):
+                        and price <= getattr(stop, "level", money_to_decimal(stop.stop_price)):
                     stop.status = s.StopOrderStatusOption.STOP_ORDER_STATUS_EXECUTED
-                    self.b.fill(stop.instrument_uid, stop.lots_requested, s.OrderDirection.ORDER_DIRECTION_SELL, "")
+                    order = self.b.fill(stop.instrument_uid, stop.lots_requested,
+                                        s.OrderDirection.ORDER_DIRECTION_SELL, "")
+                    stop.exchange_order_id = order.order_id
         return s.GetLastPricesResponse(last_prices=[s.LastPrice(price=quote(price), instrument_uid=instrument_id[0])])
 
     def market_data__get_order_book(self, instrument_id="", depth=0):

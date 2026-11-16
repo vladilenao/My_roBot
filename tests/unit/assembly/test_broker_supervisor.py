@@ -107,3 +107,19 @@ def test_exit_is_recorded_and_not_restarted(tmp_path):
     snapshot = supervisor.snapshot()
     assert snapshot["exit_code"] == 1 and snapshot["exited_at"] and not snapshot["running"]
     assert len(FakeProcess.started) == 1
+
+
+def test_launch_file_carries_binding_instruments_and_contracts(tmp_path):
+    """add-tinvest-orders: инструменты и карточки контрактов привязок — в launch.json, без токенов."""
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    card = {"id": "future-ng-macd", "instrument": "NG", "label": "NG", "ticker": "NGZ6", "instrument_type": "future",
+            "short_name": "NG-12.26", "uid": None, "family": "NG"}
+    store.record_launch("sandbox", "sandbox", [], source="api", members=[
+        Member("future-ng-macd", card, None, {"NGZ6": {"ticker": "NGZ6"}}),
+        Member("future-ng-flat", {**card, "id": "future-ng-flat"}, None, {"NGZ6": {"ticker": "NGZ6"}}),
+        Member("share-old", {"id": "share-old", "instrument": "SBER"})])
+    supervisor = _supervisor(tmp_path, store)
+    supervisor.launch(store.desired("sandbox"))
+    launch = json.loads((tmp_path / "contours/sandbox/launch.json").read_text(encoding="utf-8"))
+    assert [item["ticker"] for item in launch["instruments"]] == ["NGZ6"]
+    assert launch["contracts"] == {"NGZ6": {"ticker": "NGZ6"}} and len(launch["bindings"]) == 3

@@ -434,3 +434,15 @@ def test_partial_entry_reallocates_zero_targets_without_fake_completion(tmp_path
         assert storage.load_trade("first").state.completed_target_ids == frozenset()
         fill(m, action, 1, identifier="second-part")
         assert storage.connection.execute("SELECT planned_quantity FROM targets ORDER BY target_index").fetchall() == [(1,), (1,)]
+
+
+def test_unknown_price_with_broker_capital_does_not_block_entries(tmp_path):
+    """05.11 (песочница): нет минутки ED — переоценка журнала справочная, капитал допуска со счёта
+    брокера; входы по SILV и BR не должны отклоняться как risk-state-unknown (fix-sandbox-restart-safety)."""
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        m = manager(storage, capital_provider=lambda: D(50000))
+        action = submit(m, plan(costs=CostSnapshot(D(0), D(0))), 2)
+        fill(m, action, 2)
+
+        assert not m.mark_to_market({})
+        assert m._budget_state(storage.connection).base == D(50000)

@@ -437,6 +437,9 @@ def _patch_contour(monkeypatch):
     monkeypatch.setattr("src.bot.live_analysis.TRADE_MANAGEMENT_PROFILES", PROFILES)
     monkeypatch.setattr(contour, "MarketContextCache", Levels)
     monkeypatch.setattr(contour, "print_contract_metadata", lambda *a: None)
+    # Сценарий прогревает ровно WARMUP минут: глубина расчёта не длиннее прогрева.
+    monkeypatch.setattr(contour, "ANALYSIS_DEPTH", 50)
+    monkeypatch.setattr("src.bot.trading_bot.ANALYSIS_DEPTH", 50)
     monkeypatch.setattr(feed, "CLUSTERS_ENABLED", False)
     monkeypatch.setattr(feed, "MARKET_DATA_SETTINGS",
                         dataclasses.replace(feed.MARKET_DATA_SETTINGS, startup_wait_timeout_secs=5))

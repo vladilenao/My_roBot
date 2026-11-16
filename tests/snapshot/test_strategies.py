@@ -1,5 +1,6 @@
 import pytest
 
+from src.config import ANALYSIS_DEPTH
 from src.strategies import get_strategy
 from src.strategies.macd_rsi_stoch_strategy import (
     DEFAULT_CONFIG as MACD_RSI_STOCH_CONFIG,
@@ -56,4 +57,23 @@ def test_strategy_snapshot(case, strategy_name, request):
             f"  фактическое: {a}\n"
             f"  эталонное:   {e}\n"
             f"{err}"
+        )
+
+
+@pytest.mark.parametrize("case,strategy_name", CASES)
+def test_analysis_depth_window_decides_like_full_series(case, strategy_name):
+    """Окно глубины расчёта решает так же, как весь ряд: живой контур = история (add-analysis-depth)."""
+    df = helper.load_candles_fixture(case)
+    if len(df) <= ANALYSIS_DEPTH + 50:
+        pytest.skip(f"фикстура {case} короче глубины расчёта с запасом")
+    config = STRATEGY_CONFIGS[strategy_name]
+    full, windowed = get_strategy(strategy_name, config=config), get_strategy(strategy_name, config=config)
+    ta = full.compute(df)
+    for end in range(ANALYSIS_DEPTH + 50, len(df) + 1):
+        window = df.iloc[end - ANALYSIS_DEPTH:end].reset_index(drop=True)
+        expected = full.decide(ta.iloc[:end]).signal_type
+        actual = windowed.decide(windowed.compute(window)).signal_type
+        assert actual == expected, (
+            f"Кейс '{case}', стратегия '{strategy_name}', бар {end - 1} ({df['datetime'].iloc[end - 1]}): "
+            f"окно {ANALYSIS_DEPTH} даёт {actual.value}, весь ряд — {expected.value}"
         )
