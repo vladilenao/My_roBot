@@ -36,7 +36,7 @@ def order_line(event) -> str:
     if event.type is EventType.ORDER_ACCEPTED:
         return f"принято брокером{number}"
     kind = event.get("kind")
-    if kind in ("stop_placed", "stop_triggered", "stop_failed", "stop_removed"):
+    if kind in ("stop_placed", "stop_triggered", "stop_failed", "stop_removed", "stop_duplicate_cancelled"):
         return _stop_line(event, kind)
     what = ORDER_KINDS.get(event.get("order"), event.get("order") or "заявка")
     lots = f" · {_lots(event.get('lots'))}" if event.get("lots") else ""
@@ -82,4 +82,6 @@ def _stop_line(event, kind: str) -> str:
     if kind == "stop_failed":
         reason = event.get("reason")
         return "⚠️ стоп не принят брокером" + (f": {reason}" if reason else "") + " — выход из сделки"
+    if kind == "stop_duplicate_cancelled":
+        return f"лишняя стоп-заявка снята{number}: ответ на её постановку был потерян"
     return f"стоп снят перед выходом{number}"
