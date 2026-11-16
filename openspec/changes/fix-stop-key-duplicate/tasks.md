@@ -1,19 +1,21 @@
 ## 1. Разбор потерянного ответа
 
-- [ ] 1.1 `src/broker_contour/stops.py`: состояние `LOST`; `_find_lost` — без повтора тем же ключом: не найдена и прошло меньше `STOP_LOST_SECS = 15` с с `sent_at` — ждать, иначе `lost` (design.md решение 1).
-- [ ] 1.2 Хранитель ставит новую стоп-заявку новым ключом на том же обслуживании: `lost` не в `IN_FLIGHT`, живая для опроса.
-- [ ] 1.3 Опрос: для строк `lost` — поиск по признакам строки среди непривязанных активных; одна — привязать, снять, `cancelled` с причиной `duplicate`, событие `stop_duplicate_cancelled`; отмена не подтверждена — `cancelling`. Через `STOP_LOST_WINDOW = 10` мин — `cancelled`, причина `undelivered` (решение 2).
-- [ ] 1.4 `stop_in_flight_uids` — инструменты строк `lost` (решение 3).
+- [x] 1.1 `src/broker_contour/stops.py`: состояние `LOST`; `_find_lost` — без повтора тем же ключом: не найдена и прошло меньше `STOP_LOST_SECS = 15` с с `sent_at` — ждать, иначе `lost` (design.md решение 1).
+- [x] 1.2 Хранитель ставит новую стоп-заявку новым ключом на том же обслуживании: `lost` не в `IN_FLIGHT`, живая для опроса.
+- [x] 1.3 Опрос: для строк `lost` — поиск по признакам строки среди непривязанных активных; одна — привязать, снять, `cancelled` с причиной `duplicate`, событие `stop_duplicate_cancelled`; отмена не подтверждена — `cancelling`. Через `STOP_LOST_WINDOW = 10` мин — `cancelled`, причина `undelivered` (решение 2).
+- [x] 1.4 `stop_in_flight_uids` — инструменты строк `lost` (решение 3).
 
 ## 2. Канал и документы
 
-- [ ] 2.1 `broker_order` `stop_duplicate_cancelled`: строка карточки «лишняя стоп-заявка …XXXX снята» и строка консоли; `docs/notification/event-schemas.md`.
+- [x] 2.1 `broker_order` `stop_duplicate_cancelled`: строка карточки «лишняя стоп-заявка …XXXX снята» и строка консоли; `docs/notification/event-schemas.md`.
 
 ## 3. Тесты
 
-- [ ] 3.1 Фейковая песочница: стоп-заявка, видимая в `GetStopOrders` с задержкой; повтор ключа даёт новую (`repeat_stop_key = "new"`).
-- [ ] 3.2 Юнит-тесты: потерянный ответ — первая показалась после новой → снята, у брокера одна; не дошла → новая через 15 с, через 10 мин `undelivered`; повтора тем же ключом нет в записях вызовов; сверка без тревоги, пока есть `lost`; рестарт со строкой `sending`.
-- [ ] 3.3 Полный `pytest` и `ruff check src tests run.py`.
+- [x] 3.1 Фейковая песочница: стоп-заявка, видимая в `GetStopOrders` с задержкой; повтор ключа даёт новую (`repeat_stop_key = "new"`).
+- [x] 3.2 Юнит-тесты: потерянный ответ — первая показалась после новой → снята, у брокера одна; не дошла → новая через 15 с, через 10 мин `undelivered`; повтора тем же ключом нет в записях вызовов; сверка без тревоги, пока есть `lost`; рестарт со строкой `sending`.
+- [x] 3.3 Полный `pytest` и `ruff check src tests run.py`.
+
+  Сделано 16.11: `src/broker_contour/stops.py` — `LOST`, `STOP_LOST = 15 с`, `STOP_LOST_WINDOW = 10 мин`, `_candidates`, `_sweep_lost`, повтор тем же ключом убран; `rows(state=…)`; «в пути» для сверки. Карточка — `src/notifier/templates/orders.py`. Фейк — `accepted-lost-hidden` и `hidden_stops` в `tests/unit/broker_contour/fake_api.py`; тесты — `test_broker_stops.py` (+5). Полный `pytest` 4164 passed, `ruff check` чистый.
 
 ## 4. Проверка владельцем
 

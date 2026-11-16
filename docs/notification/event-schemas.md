@@ -1447,7 +1447,8 @@ add-account-guards. `account` — только последние четыре �
 `entry`, `add`, `target`, `reduce`, `move`, `restart`); `stop_triggered` — стоп
 сработал у брокера (`exchange_order` — последние четыре символа порождённой
 заявки); `stop_failed` — стоп не принят, контур выходит; `stop_removed` — стоп
-снят перед выходом контура. `order` — вид заявки: `entry`, `add`, `target`,
+снят перед выходом контура; `stop_duplicate_cancelled` — снята лишняя стоп-заявка,
+чей ответ на постановку был потерян (fix-stop-key-duplicate). `order` — вид заявки: `entry`, `add`, `target`,
 `stop`, `exit`, `emergency`, `broker_stop` (стоп-заявка у брокера и порождённая
 ею заявка). `broker_order` — только последние четыре символа номера заявки или
 стоп-заявки брокера; номер счёта и ключ не публикуются. Цена — десятичная

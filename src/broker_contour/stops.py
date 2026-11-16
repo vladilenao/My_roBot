@@ -31,12 +31,18 @@ log = get_logger(__name__)
 
 SENDING, ACTIVE, CANCELLING, UNKNOWN = "sending", "active", "cancelling", "unknown"
 CANCELLED, EXECUTED, EXPIRED, REJECTED = "cancelled", "executed", "expired", "rejected"
+# Ответ на постановку потерян, у брокера не найдена за STOP_LOST: вместо неё поставлена новая новым ключом, а эта ещё
+# STOP_LOST_WINDOW ищется у брокера — найдётся, будет снята как лишняя (fix-stop-key-duplicate). Не «живая» для
+# хранителя и сводки, но опрашивается.
+LOST = "lost"
 LIVE = frozenset({SENDING, ACTIVE, CANCELLING, UNKNOWN})
 IN_FLIGHT = frozenset({SENDING, CANCELLING, UNKNOWN})
 POLL_MIN_SECS = 2            # не больше 30 опросов GetStopOrders в минуту
 POLL_EVERY_SECS = 60         # плановый опрос при живых стоп-заявках (как сверка)
 STRANGER_SECS = 60           # незнакомый отчёт стрима ждёт своей стоп-заявки, потом он чужой
 FOUND_SLACK = timedelta(seconds=5)
+STOP_LOST = timedelta(seconds=15)          # сколько ждать стоп-заявку с потерянным ответом, прежде чем ставить новую
+STOP_LOST_WINDOW = timedelta(minutes=10)   # сколько строка «потеряна» ищет свою стоп-заявку, чтобы снять лишнюю
 CLOSED_RETRY = timedelta(minutes=1)
 
 
@@ -122,11 +128,15 @@ class StopLedger:
             record = self._conn.execute("SELECT * FROM broker_stop_orders WHERE key=?", (key,)).fetchone()
         return None if record is None else self._row(record)
 
-    def rows(self, *, trade_id: str | None = None, live: bool | None = None) -> list[StopRow]:
+    def rows(self, *, trade_id: str | None = None, live: bool | None = None,
+             state: str | None = None) -> list[StopRow]:
         query, params = "SELECT * FROM broker_stop_orders WHERE 1=1", []
         if trade_id is not None:
             query += " AND trade_id=?"
             params.append(trade_id)
+        if state is not None:
+            query += " AND state=?"
+            params.append(state)
         if live is not None:
             query += f" AND state {'' if live else 'NOT '}IN ({','.join('?' * len(LIVE))})"
             params.extend(sorted(LIVE))
@@ -395,15 +405,16 @@ class StopKeeping:
 
     def _poll_stops(self, now: datetime, *, force: bool = False) -> None:
         live = self._stops.rows(live=True)
-        if not live:
+        lost = self._stops.rows(state=LOST)
+        if not live and not lost:
             self._strangers.clear()
             return
-        needed = force or bool(self._strangers) or any(row.state in IN_FLIGHT for row in live) \
+        needed = force or bool(self._strangers) or bool(lost) or any(row.state in IN_FLIGHT for row in live) \
             or self._last_stop_poll is None or (now - self._last_stop_poll).total_seconds() >= POLL_EVERY_SECS
         if not needed or (not force and self._last_stop_poll is not None
                           and (now - self._last_stop_poll).total_seconds() < POLL_MIN_SECS):
             return
-        since = min(datetime.fromisoformat(row.created_at) for row in live) - timedelta(minutes=1)
+        since = min(datetime.fromisoformat(row.created_at) for row in live + lost) - timedelta(minutes=1)
         try:
             reports = self._api.stop_orders(since, now + timedelta(minutes=1))
         except OrderFailure as failure:
@@ -422,38 +433,67 @@ class StopKeeping:
                 row = self._stops.update(row.key, stop_order_id=report.stop_order_id)
             if report is not None:
                 self._apply_stop_report(row, report, now)
+        for row in lost:
+            self._sweep_lost(row, reports, bound, now)
         for order_id, (_, seen) in list(self._strangers.items()):
             if (now - seen).total_seconds() >= STRANGER_SECS:
                 self._strangers.pop(order_id, None)
                 log.warning("Отчёт стрима по чужой заявке …%s: стоп-заявки с таким номером нет", order_id[-4:])
 
-    def _find_lost(self, row: StopRow, reports: list[StopReport], bound: set[str], now: datetime):
-        """Стоп-заявка с потерянным ответом: по инструменту, стороне, объёму, цене и времени (решение 6)."""
+    def _candidates(self, row: StopRow, reports: list[StopReport], bound: set[str]) -> list[StopReport]:
+        """Активные непривязанные стоп-заявки брокера, похожие на строку: инструмент, сторона, объём, цена, время."""
         sent = datetime.fromisoformat(row.sent_at) - FOUND_SLACK
         card = self._card_by_uid(row.instrument_uid)
-        found = [report for report in reports
-                 if report.status == "active" and report.stop_order_id not in bound
-                 and report.instrument_uid == row.instrument_uid and report.side == row.side
-                 and report.lots == row.lots and self._same_stop_price(card, report.stop_price, row.stop_price)
-                 and (report.created_at is None or report.created_at >= sent)]
+        return [report for report in reports
+                if report.status == "active" and report.stop_order_id not in bound
+                and report.instrument_uid == row.instrument_uid and report.side == row.side
+                and report.lots == row.lots and self._same_stop_price(card, report.stop_price, row.stop_price)
+                and (report.created_at is None or report.created_at >= sent)]
+
+    def _find_lost(self, row: StopRow, reports: list[StopReport], bound: set[str], now: datetime):
+        """Стоп-заявка с потерянным ответом: по инструменту, стороне, объёму, цене и времени (решение 6).
+
+        Не найдена — повтора тем же ключом нет (fix-stop-key-duplicate): песочница на него создаёт вторую
+        стоп-заявку. ``STOP_LOST`` строка ждёт, затем становится «потеряна», и хранитель ставит новую новым ключом.
+        """
+        found = self._candidates(row, reports, bound)
         if len(found) == 1:
             log.info("Стоп-заявка %s найдена у брокера по объёму и цене", row.trade_id)
             return found[0]
         if len(found) > 1:
             log.warning("Стоп-заявка %s: у брокера %d подходящих — оставлена «неизвестной»", row.trade_id, len(found))
             return None
-        wanted = self._wanted_stops().get(row.trade_id)
-        if row.state == UNKNOWN and wanted is not None and (wanted.lots, wanted.price) == (row.lots, row.stop_price):
-            try:
-                stop_id = self._api.post_stop(row.instrument_uid, row.side, row.lots, row.stop_price, row.key)
-            except OrderFailure as failure:
-                if failure.kind not in ("unknown", "duplicate"):
-                    self._stop_failed(row, failure, now)
-                return None
-            self._activated(self._stops.update(row.key, state=ACTIVE, stop_order_id=stop_id))
+        if row.state == UNKNOWN:
+            if now - datetime.fromisoformat(row.sent_at) < STOP_LOST:
+                return None                         # GetStopOrders мог ещё не показать принятую стоп-заявку
+            log.warning("Стоп-заявка %s: у брокера не найдена за %d с — ставим новую новым ключом, эту ищем %d мин",
+                        row.trade_id, STOP_LOST.seconds, STOP_LOST_WINDOW.seconds // 60)
+            self._stops.update(row.key, state=LOST)
             return None
         self._stops.update(row.key, state=CANCELLED, reason="undelivered")
         return None
+
+    def _sweep_lost(self, row: StopRow, reports: list[StopReport], bound: set[str], now: datetime) -> None:
+        """Строка «потеряна»: её стоп-заявка показалась у брокера — снять как лишнюю; окно вышло — «не дошла»."""
+        found = self._candidates(row, reports, bound)
+        if len(found) != 1:
+            if now - datetime.fromisoformat(row.sent_at) >= STOP_LOST_WINDOW:
+                self._stops.update(row.key, state=CANCELLED, reason="undelivered")
+            return
+        stop_id = found[0].stop_order_id
+        bound.add(stop_id)
+        try:
+            self._api.cancel_stop(stop_id)
+        except OrderFailure as failure:
+            log.warning("Лишняя стоп-заявка %s …%s: снятие %s — уточняем у брокера", row.trade_id, stop_id[-4:],
+                        failure.kind)
+            self._stops.update(row.key, state=CANCELLING, stop_order_id=stop_id, own_cancel=1, reason="duplicate")
+            self._last_stop_poll = None
+            return
+        self._stops.update(row.key, state=CANCELLED, stop_order_id=stop_id, own_cancel=1, reason="duplicate")
+        log.warning("Лишняя стоп-заявка %s …%s снята: ответ на её постановку был потерян", row.trade_id, stop_id[-4:])
+        self._notify_stop("stop_duplicate_cancelled", row.trade_id, row.instrument_uid, row.side, row.lots,
+                          row.stop_price, stop_id)
 
     @staticmethod
     def _same_stop_price(card, reported: Decimal | None, price: Decimal) -> bool:
@@ -510,6 +550,7 @@ class StopKeeping:
         if self._stops is None:
             return set()
         uids = {row.instrument_uid for row in self._stops.rows(live=True) if row.state in IN_FLIGHT}
+        uids |= {row.instrument_uid for row in self._stops.rows(state=LOST)}     # лишняя ещё может показаться
         return uids | {report.instrument_uid for report, seen in self._strangers.values()
                        if report.instrument_uid and (now - seen).total_seconds() < STRANGER_SECS}
 
