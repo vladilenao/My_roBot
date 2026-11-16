@@ -158,3 +158,36 @@ def test_execution_refused_by_journal_is_not_hidden_in_flight(tmp_path):
         assert [e.consumed for e in env.ledger.executions(extra)] == [REFUSED]
         assert env.ledger.pending_executions() == [] and env.broker.in_flight_instruments() == set()
         assert env.broker.drain_addressed_events() == []
+
+
+def test_partial_exit_of_the_bar_reaches_broker_after_its_stop_move(tmp_path):
+    """12.11, Si в песочнице: стоп и частичный выход одного бара с одной ревизией.
+
+    Брокер контура подтверждает перенос стопа сразу, ревизия сделки растёт, и выход за ним
+    висел в outbox PENDING с ``stale-state-revision`` — частичные выходы не исполнялись весь день.
+    """
+    from contextlib import nullcontext
+
+    from src.trade_management.actions import MoveStop, ReduceTrade
+    from src.trade_management.manager import DispatchDataEvidence
+
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        env = Env(tmp_path, storage)
+        env.manager.configure_dispatch_eligibility(lambda *args: DispatchDataEvidence(True, True, True), nullcontext)
+        key = env.enter(10)
+        env.stream_fill(key, 10, "2.846")
+        env.manager.consume_queued_broker_events()
+        revision = storage.connection.execute("SELECT state_revision FROM trades WHERE trade_id=?",
+                                              (TRADE,)).fetchone()[0]
+        stop = MoveStop(f"{TRADE}:ma-cloud-stop:1", TRADE, revision, "ma-cloud-protective-stop", D("2.820"))
+        reduce = ReduceTrade(f"{TRADE}:ma-partial-exit:1", TRADE, revision, "ma10-or-cloud-partial-exit", 1)
+        assert env.manager.submit_action(stop)
+        assert env.manager.submit_action(reduce)
+
+        env.manager.dispatch(env.clock())
+
+        statuses = dict(storage.connection.execute(
+            "SELECT command_id, status FROM outbox WHERE command_id IN (?, ?)", (stop.command_id, reduce.command_id)))
+        assert statuses == {stop.command_id: "SENT", reduce.command_id: "SENT"}
+        assert [call[4] for call in env.api.posts() if call[2] != key] == [1]   # заявка выхода на 1 лот
+        assert env.broker.trade_state(TRADE).confirmed_stop == D("2.820")

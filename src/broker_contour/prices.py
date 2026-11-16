@@ -109,5 +109,17 @@ def trade_lots(card: PriceCard, quantities: list[int], lots_executed: int) -> li
     return list(quantities)
 
 
+def executed_lots(card: PriceCard, lots_executed: int, lots_requested: int) -> int:
+    """Исполнено в лотах: песочница может вернуть ``lots_executed`` в штуках.
+
+    Песочница 11.11 (GAZP, лот 10): ``GetOrderState`` заявки на 10 лотов отдал ``lots_executed=100``.
+    Больше заявленного и кратно лоту — это штуки; иначе число брокера как есть.
+    """
+    if (card.lot > 1 and lots_requested > 0 and lots_executed > lots_requested
+            and lots_executed % card.lot == 0 and lots_executed // card.lot <= lots_requested):
+        return lots_executed // card.lot
+    return lots_executed
+
+
 def in_band(price: Decimal, band: tuple[Decimal, Decimal] | None) -> bool:
     return band is None or band[0] <= price <= band[1]

@@ -84,6 +84,7 @@ from src.data.loader import load_candles
 from src.instruments import Instrument, normalize_instrument
 from src.logging_setup import get_logger, setup_logging
 from src.runtime_lock import RuntimeLockError, acquire_runtime_lock
+from src.runtime_limits import describe as describe_open_files, raise_open_files_limit
 
 log = get_logger(__name__)
 
@@ -93,8 +94,20 @@ _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             TINKOFF_TRADE_TOKEN, TINKOFF_ACCOUNT_ID, account_bot_token())
 
 
+_OPEN_FILES = None  # итог подъёма предела открытых файлов при запуске процесса (fix-sqlite-connection-close)
+
+
+def _log_open_files() -> None:
+    """Строка журнала о пределе открытых файлов — после настройки журнала процесса."""
+    line = None if _OPEN_FILES is None else describe_open_files(_OPEN_FILES)
+    if line is not None:
+        getattr(log, line[0])("%s", line[1])
+
+
 def main(argv=None):
     """Точка входа: служебный вход процесса контура или робот без параметров (add-history-contour)."""
+    global _OPEN_FILES
+    _OPEN_FILES = raise_open_files_limit()  # до открытия баз, сокетов и запуска процессов контуров
     argv = list(argv or [])
     if argv[:1] == ["--contour"]:
         # Служебный вход процесса контура: его запускает робот (add-contour-process).
@@ -144,6 +157,7 @@ def _run_contour(kind: str, args=()) -> int:
         **_log_settings(False, None),
     )
     log.info("Контур %s v%s запущен", kind, __version__)
+    _log_open_files()
     try:
         launch = read_launch(directory, kind)
     except LaunchFileError as exc:
@@ -215,6 +229,7 @@ def _run_broker_contour(kind: str) -> int:
     setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE), secrets=_SECRETS,
                   **_log_settings(False, None))
     log.info("Контур %s v%s запущен", kind, __version__)
+    _log_open_files()
     try:
         launch = read_launch(directory, kind)
     except LaunchFileError as exc:
@@ -375,6 +390,7 @@ def _run_history_contour(name: str) -> int:
                   **_log_settings(True, None))
     run_id = RUN_PREFIX + name
     log.info("Прогон %s v%s запущен", run_id, __version__)
+    _log_open_files()
     try:
         launch = read_launch(directory, run_id)
     except LaunchFileError as exc:
@@ -420,6 +436,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(state_dir / LOGGING_FILE), secrets=_SECRETS,
                   **_log_settings(False, None))
     log.info("Робот v%s запущен", __version__)
+    _log_open_files()
     if not ROBOT_CONTROL_TOKEN:
         _say("Робот не запущен: в .env не задан ROBOT_CONTROL_TOKEN — без ключа управления роботом нельзя "
              "управлять (эмуляция и история запускаются командами API).")

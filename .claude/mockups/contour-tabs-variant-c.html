@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Макет: контур с вкладками</title>
+<style>
+:root{--bg:#f5f5f5;--card:#fff;--line:#f0f0f0;--line2:#d9d9d9;--text:rgba(0,0,0,.88);--sec:rgba(0,0,0,.45);--primary:#1677ff;--ok:#52c41a;--okText:#389e0d;--err:#ff4d4f;--errText:#cf1322;--warn:#faad14;--sider:#001529}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5715 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:var(--text);background:var(--bg);display:flex;min-height:100vh}
+aside{width:200px;flex:none;background:var(--sider);color:rgba(255,255,255,.65);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{padding:16px 20px;color:#fff;font-weight:600;font-size:18px;line-height:1.1}.brand small{display:block;font-weight:400;font-size:11px;color:rgba(255,255,255,.45);margin-top:2px}
+.menu a{display:flex;gap:10px;padding:9px 20px;margin:2px 8px;border-radius:8px;color:inherit;text-decoration:none;cursor:pointer}
+.menu a:hover{color:#fff}.menu a.on{background:var(--primary);color:#fff}
+.sider-foot{margin-top:auto;padding:12px 16px;font-size:12px}
+.estop{display:block;margin-top:10px;border:1px solid var(--err);color:var(--err);border-radius:6px;padding:4px 8px;text-align:center}
+main{flex:1;min-width:0;padding:16px 24px 40px}
+.mock{background:#fffbe6;border:1px solid #ffe58f;border-radius:8px;padding:8px 12px;margin-bottom:16px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:13px}
+.mock label{display:flex;gap:6px;align-items:center;cursor:pointer}
+.head{display:flex;align-items:center;gap:12px}
+.head h1{font-size:20px;font-weight:600;margin:0;flex:1}
+.btn{border:1px solid var(--line2);background:#fff;border-radius:6px;padding:4px 12px;font:inherit;cursor:pointer}
+.btn.danger{border-color:var(--err);color:var(--err)}
+.btn.link{border:0;background:none;color:var(--primary);padding:0 4px}
+.strip{display:flex;flex-wrap:wrap;gap:8px 32px;margin-top:10px}
+.strip .s{display:flex;flex-direction:column}.s .l{font-size:12px;color:var(--sec)}.s .v{font-size:14px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:2px}
+.dot.bad{background:var(--err)}
+.money{display:flex;flex-wrap:wrap;gap:12px;margin-top:14px}
+.kpi{background:var(--card);border-radius:8px;padding:10px 16px;min-width:170px}
+.kpi .l{font-size:12px;color:var(--sec)}.kpi .v{font-size:20px;font-weight:600;white-space:nowrap}.kpi .n{font-size:12px;color:var(--sec)}
+.pos{color:var(--okText)}.neg{color:var(--errText)}
+.alert{margin-top:16px;background:#fff2f0;border:1px solid #ffccc7;border-radius:8px;padding:10px 16px}
+.alert b{display:block;margin-bottom:4px}.alert ul{margin:0;padding-left:18px}
+.alert.warn{background:#fffbe6;border-color:#ffe58f}
+.ptabs{display:flex;gap:28px;border-bottom:1px solid var(--line2);margin:20px 0 16px}
+.ptabs a{padding:8px 0;cursor:pointer;font-size:15px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.ptabs a.on{color:var(--primary);border-color:var(--primary);font-weight:500}
+.ptabs a .c{color:var(--sec);font-weight:400}
+.card{background:var(--card);border-radius:8px;margin-bottom:16px}
+.card>.ch{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);font-weight:600;min-height:44px}
+.card>.ch .x{margin-left:auto;font-weight:400}
+.card>.cb{padding:12px 16px}
+.seg{display:inline-flex;background:#f5f5f5;border-radius:6px;padding:2px}
+.seg span{padding:1px 10px;border-radius:4px;cursor:pointer;font-size:13px}.seg span.on{background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.sumrow{display:grid;grid-template-columns:minmax(0,10fr) minmax(0,14fr);gap:24px;align-items:center}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:12px 16px}
+.stats .l{font-size:12px;color:var(--sec);white-space:nowrap}.stats .v{font-size:16px;font-weight:600;white-space:nowrap}
+.itabs{display:flex;gap:24px;border-bottom:1px solid var(--line);margin-top:12px}
+.itabs a{padding:6px 0;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;font-size:13px}.itabs a.on{color:var(--primary);border-color:var(--primary)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:600;background:#fafafa;padding:8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+tr.click{cursor:pointer}tr.click:hover td{background:#fafafa}tr.sel td{background:#e6f4ff}
+.r{text-align:right;white-space:nowrap}
+.tag{display:inline-block;font-size:12px;line-height:20px;padding:0 7px;border-radius:4px;border:1px solid var(--line2);background:#fafafa;white-space:nowrap}
+.tag.green{color:var(--okText);background:#f6ffed;border-color:#b7eb8f}.tag.red{color:var(--errText);background:#fff1f0;border-color:#ffa39e}.tag.blue{color:#0958d9;background:#e6f4ff;border-color:#91caff}
+.tag.fill-red{color:var(--errText);background:#fff1f0;border-color:transparent}.tag.fill-green{color:var(--okText);background:#f6ffed;border-color:transparent}
+.sub{display:block;font-size:12px;color:var(--sec)}
+.new{outline:2px dashed #b37feb;outline-offset:2px;border-radius:6px}
+.newnote{font-size:11px;color:#722ed1;font-weight:400}
+.tf span{padding:1px 8px;font-size:12px;border:1px solid var(--line2);margin-left:-1px;cursor:pointer;background:#fff}.tf span.on{color:var(--primary);border-color:var(--primary);position:relative}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--sec)}dd{margin:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;align-items:start}
+.grid2 .card{margin:0}
+pre{margin:0;font:12px/1.6 Menlo,monospace;white-space:pre-wrap;color:#595959}
+.muted{color:var(--sec)}
+@media (max-width:900px){aside{display:none}.sumrow{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand">TradeRobot<small>Algo Trading System</small></div>
+  <nav class="menu">
+    <a>Обзор</a>
+    <a data-contour="emulation">Эмуляция</a>
+    <a data-contour="sandbox">Песочница</a>
+    <a>История</a>
+    <a>Настройки</a>
+  </nav>
+  <div class="sider-foot"><span class="dot"></span>Ядро: Готово<span class="estop">Аварийная остановка</span></div>
+</aside>
+<main>
+  <div class="mock">
+    <span><b>Макет варианта C</b>, это не настоящий UI. Данные сняты с тестового робота 05.11 около 17:51. Фиолетовая рамка — новые места.</span>
+    <label><input type="checkbox" id="attn"> Показать пример «Требует внимания»</label>
+  </div>
+
+  <div class="head"><h1 id="title"></h1><button class="btn">Остановить</button><button class="btn danger">Закрыть всё</button></div>
+  <div class="strip">
+    <div class="s"><span class="l">Состояние</span><span class="v"><span class="dot"></span>Торгует</span></div>
+    <div class="s"><span class="l">Режим</span><span class="v">Торговать</span></div>
+    <div class="s"><span class="l">Команды</span><span class="v pos">Все применены</span></div>
+  </div>
+  <div class="money new" id="money"></div>
+  <div id="attention"></div>
+
+  <nav class="ptabs" id="ptabs"></nav>
+  <section id="page"></section>
+</main>
+
+<script>
+const D = {
+  emulation: {
+    title: 'Эмуляция', composition: 23, log: 'Журнал эмуляции',
+    money: [
+      {l: 'Капитал с открытыми', v: '88 680,44 ₽', n: 'баланс 88 198,59 из 100 000,00 ₽'},
+      {l: 'Результат с начала', v: '−11 801,41 ₽', cls: 'neg', n: 'комиссии −636,00 ₽ · оценка'},
+      {l: 'Связь', v: '<span class="dot"></span>ядро', n: 'тик 17:51:40 · 6 с назад'},
+    ],
+    attention: {type: 'warn', items: [
+      'Отказы последней команды: <b style="display:inline">NG-12.26</b> — нет 1m свечей за субботнюю сессию',
+      'Ревизия 16 ждёт применения 2 мин',
+    ]},
+    summary: {Результат: ['−862,87 ₽', 'neg'], Нереализовано: ['+481,85 ₽', 'pos'], Комиссия: ['−15,00 ₽ <small class="muted">оценка</small>', ''], 'Сделок · в плюс': ['2 · 50%', ''], Средняя: ['−431,43 ₽', 'neg'], 'Макс. просадка': ['−931,87 ₽', 'neg']},
+    curve: [0, 30, 69, 40, -200, -500, -862.87, -700, -381],
+    positions: [
+      ['ED-12.26', 'macd_rsi_stoch · 1h', 'future-ed-macd', 'Шорт 3', '1,1216 → 1,1207', '1,1263 / 1,1168', '2 ч 46 мин', '+220,51 ₽', 1.12],
+      ['SILV-12.26', 'macd_rsi_stoch · 15m', 'future-silv-macd', 'Шорт 1', '53,25 → 52,93', '53,96 / 51,82', '8 ч 50 мин', '+261,34 ₽', 53.1],
+    ],
+    trades: [
+      ['05.11 15:18', 'Si-12.26', 'ma_cloud_rsi_macd · 5m', 'future-si-ma-raw', 'Шорт 2', '82 821 → 82 783,5', '3 ч 12 мин', 'стоп', '+69,00 ₽', 82800],
+      ['05.11 12:34', 'NG-12.26', 'ma_cloud_rsi_macd · 1h', 'future-ng-ma', 'Лонг 3', '3,467 → 3,42933', '15 ч 32 мин', 'стоп', '−931,87 ₽', 3.45],
+    ],
+    account: [['Баланс', '88 198,59 ₽ <span class="muted">из 100 000,00 ₽</span>'], ['С открытыми позициями', '88 680,44 ₽'], ['Результат', '<span class="neg">−11 801,41 ₽</span>'], ['Комиссии', '−636,00 ₽ <span class="muted">оценка</span>'], ['Открытых позиций', '2'], ['Ждут входа', '0'], ['Последний тик', '17:51:40 · 6 с назад'], ['Связь с ядром', '<span class="tag green">есть</span>']],
+    launch: [['Когда', '04.11 10:29'], ['Как', 'командой API, поднят после рестарта робота'], ['Состав', 'NG-12.26'], ['Ревизия', '15'], ['Процесс', '29437']],
+  },
+  sandbox: {
+    title: 'Песочница', composition: 22, log: 'Журнал песочницы',
+    money: [
+      {l: 'Портфель', v: '72 269,87 ₽', n: 'рубли 895 772,34 ₽ · счёт …09c3'},
+      {l: 'Заявки', v: '<span class="tag green" style="font-size:13px">торгует привязками</span>', n: 'сверка 17:51:39 · сходится'},
+      {l: 'Связь', v: '<span class="dot"></span>ядро <span class="dot" style="margin-left:8px"></span>счёт <span class="dot" style="margin-left:8px"></span>исполнения', n: ''},
+    ],
+    attention: {type: 'err', items: [
+      'Заморожено сверкой: <b style="display:inline">ED-12.26</b> — на счёте −10 лотов, в журнале −9. Подробности — на вкладке «Сверка».',
+      'Связь со счётом: нет 2 мин',
+    ]},
+    summary: {Результат: ['+143,00 ₽', 'pos'], Нереализовано: ['+563,90 ₽', 'pos'], Комиссия: ['−30,00 ₽ <small class="muted">оценка</small>', ''], 'Сделок · в плюс': ['1 · 100%', ''], Средняя: ['+143,00 ₽', 'pos'], 'Макс. просадка': ['0,00 ₽', '']},
+    curve: [0, 0, 60, 143, 143, 400, 706.9],
+    positions: [
+      ['ED-12.26', 'macd_rsi_stoch · 1h', 'future-ed-macd', 'Шорт 10', '1,1217 → 1,121', '1,1264 / 1,1169', '2 ч 52 мин', '+563,90 ₽', 1.12],
+    ],
+    trades: [
+      ['05.11 14:51', 'Si-12.26', 'ma_cloud_rsi_macd · 5m', 'future-si-ma-raw', 'Шорт 10', '82 794 → 82 776,7', '2 ч 45 мин', 'стоп', '+143,00 ₽', 82800],
+    ],
+    reconcile: true,
+    account: [['Счёт', '…09c3'], ['Рубли', '895 772,34 ₽'], ['Портфель', '72 269,87 ₽'], ['Заявки', '<span class="tag green">торгует привязками</span>'], ['Связь', '<span class="tag green">ядро: есть</span> <span class="tag green">счёт: есть</span> <span class="tag green">исполнения: есть</span>'], ['Сверка', '17:51:39 · 52 с назад']],
+    launch: [['Когда', '05.11 15:00'], ['Как', 'командой API'], ['Состав', 'NG-11.26 · 15m, BR-12.26 · 1h, BR-12.26 · 15m, ED-12.26 · 1h, GOLD-12.26 · 15m, RTS-12.26 · 15m, … (22 привязки)'], ['Ревизия', '19'], ['Процесс', '16677']],
+  },
+};
+
+const FILTER = {t: ['Старшие ТФ', 'blue'], l: ['По тренду', 'blue'], r: ['без фильтра', '']};
+const EXIT = {macd_rsi_stoch: 'Уровни · R:R', flat_triangle: 'Уровни · R:R', ma_cloud_rsi_macd: 'Облако MA', harmonic_abcd: 'Цели AB=CD'};
+const share = (n) => [[`macd_rsi_stoch · 4h`, 't', `share-${n}-macd-4h-triple`], [`macd_rsi_stoch · 4h`, 'l', `share-${n}-macd-4h-levels`], [`flat_triangle · 1h`, 'l', `share-${n}-flat`], [`ma_cloud_rsi_macd · 1h`, 'r', `share-${n}-ma`]];
+const fut = (n, a, b, c) => [[`flat_triangle · 15m`, 'r', `future-${n}-flat`], [`macd_rsi_stoch · ${a}`, b, `future-${n}-macd`], [`ma_cloud_rsi_macd · 1h`, c, `future-${n}-ma`]];
+const MEMBERS = {
+  emulation: [
+    ['ALRS', '', share('alrs')],
+    ['BR-12.26', 'через 29 дн.', [['macd_rsi_stoch · 5m', 'r', 'future-br-macd'], ['flat_triangle · 1h', 'l', 'future-br-flat'], ['harmonic_abcd · 1h', 'r', 'future-br-harmonic'], ['ma_cloud_rsi_macd · 15m', 'l', 'future-br-ma']]],
+    ['ED-12.26', 'через 45 дн.', [['flat_triangle · 15m', 'r', 'future-ed-flat'], ['macd_rsi_stoch · 1h', 'l', 'future-ed-macd'], ['harmonic_abcd · 1h', 'l', 'future-ed-harmonic'], ['ma_cloud_rsi_macd · 1h', 'l', 'future-ed-ma']]],
+    ['GAZP', '', share('gazp')],
+    ['GOLD-12.26', 'через 48 дн.', fut('gold', '15m', 'l', 't')],
+    ['NG-12.26', 'через 57 дн.', fut('ng', '15m', 't', 'l')],
+    ['SILV-12.26', 'через 48 дн.', fut('silv', '15m', 'l', 't')],
+    ['Si-12.26', 'через 45 дн.', [['ma_cloud_rsi_macd · 5m', 'r', 'future-si-ma-raw'], ['ma_cloud_rsi_macd · 5m', 't', 'future-si-ma-triple']]],
+  ],
+  sandbox: [
+    ['BR-12.26', 'через 29 дн.', [['flat_triangle · 1h', 'l', 'future-br-flat'], ['harmonic_abcd · 1h', 'r', 'future-br-harmonic'], ['ma_cloud_rsi_macd · 15m', 'l', 'future-br-ma'], ['macd_rsi_stoch · 5m', 'r', 'future-br-macd']]],
+    ['ED-12.26', 'через 45 дн.', [['flat_triangle · 15m', 'r', 'future-ed-flat'], ['harmonic_abcd · 1h', 'l', 'future-ed-harmonic'], ['ma_cloud_rsi_macd · 1h', 'l', 'future-ed-ma'], ['macd_rsi_stoch · 1h', 'l', 'future-ed-macd']]],
+    ['GOLD-12.26', 'через 48 дн.', fut('gold', '15m', 'l', 't')],
+    ['NG-11.26', 'через 23 дн.', fut('ng', '15m', 't', 'l')],
+  ],
+};
+const shownMore = {emulation: 15, sandbox: 9};
+
+const state = {contour: 'emulation', tab: 'trading', inner: 'positions', period: 'День', sel: null, tf: '1h'};
+
+function readHash() {
+  const [c, t] = location.hash.slice(1).split('/');
+  if (D[c]) state.contour = c;
+  if (['trading', 'members', 'account', 'log'].includes(t)) state.tab = t;
+}
+function writeHash() { history.replaceState(null, '', `#${state.contour}/${state.tab}`); }
+
+function defaultSel() {
+  const d = D[state.contour];
+  const p = d.positions[0], t = d.trades[0];
+  if (p) return {name: p[0], tf: p[1].split(' · ')[1], price: p[8]};
+  return t ? {name: t[1], tf: t[2].split(' · ')[1], price: t[9]} : null;
+}
+
+function render() {
+  const d = D[state.contour];
+  if (!state.sel) state.sel = defaultSel();
+  document.querySelectorAll('.menu a').forEach((a) => a.classList.toggle('on', a.dataset.contour === state.contour));
+  document.getElementById('title').textContent = d.title;
+  document.getElementById('money').innerHTML = d.money.map((m) => `<div class="kpi"><div class="l">${m.l}</div><div class="v ${m.cls || ''}">${m.v}</div><div class="n">${m.n}</div></div>`).join('')
+    + '<span class="newnote" style="align-self:center">деньги и связь — из карточки «Счёт»</span>';
+  const a = d.attention;
+  document.getElementById('attention').innerHTML = document.getElementById('attn').checked
+    ? `<div class="alert ${a.type === 'warn' ? 'warn' : ''} new"><b>Требует внимания</b><ul>${a.items.map((i) => `<li>${i}</li>`).join('')}</ul></div>`
+    : '';
+  const tabs = [['trading', 'Торговля', ''], ['members', 'Состав', ` · ${d.composition}`], ['account', 'Счёт и запуск', ''], ['log', 'Журнал', '']];
+  document.getElementById('ptabs').innerHTML = tabs.map(([k, l, c]) => `<a data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${l}<span class="c">${c}</span></a>`).join('');
+  document.getElementById('page').innerHTML = {trading, members, account, log}[state.tab](d);
+  writeHash();
+}
+
+function curveSvg(pts) {
+  const w = 560, h = 120, min = Math.min(...pts, 0), max = Math.max(...pts, 0), sx = w / (pts.length - 1), sy = (v) => h - 8 - ((v - min) / (max - min || 1)) * (h - 16);
+  const line = pts.map((v, i) => `${i * sx},${sy(v)}`).join(' ');
+  const last = pts[pts.length - 1];
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none"><line x1="0" x2="${w}" y1="${sy(0)}" y2="${sy(0)}" stroke="#d9d9d9" stroke-dasharray="3 3"/><polyline points="${line}" fill="none" stroke="${last >= 0 ? '#52c41a' : '#ff4d4f'}" stroke-width="2"/></svg>`;
+}
+
+function candlesSvg(seedName, price) {
+  let s = [...seedName].reduce((a, c) => a * 31 + c.charCodeAt(0), 7) % 233280;
+  const rnd = () => (s = (s * 9301 + 49297) % 233280) / 233280;
+  const n = 90, w = 1000, h = 300, bars = [];
+  let p = price * 0.985;
+  for (let i = 0; i < n; i++) {
+    const o = p, c = o * (1 + (rnd() - 0.48) * 0.006), hi = Math.max(o, c) * (1 + rnd() * 0.002), lo = Math.min(o, c) * (1 - rnd() * 0.002);
+    bars.push([o, c, hi, lo]); p = c;
+  }
+  const min = Math.min(...bars.map((b) => b[3])), max = Math.max(...bars.map((b) => b[2])), y = (v) => 10 + (max - v) / (max - min) * (h - 20), bw = w / n;
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="320" preserveAspectRatio="none">${bars.map(([o, c, hi, lo], i) => {
+    const col = c >= o ? '#26a69a' : '#ef5350', x = i * bw + bw / 2;
+    return `<line x1="${x}" x2="${x}" y1="${y(hi)}" y2="${y(lo)}" stroke="${col}"/><rect x="${x - bw * 0.35}" width="${bw * 0.7}" y="${y(Math.max(o, c))}" height="${Math.max(1, Math.abs(y(o) - y(c)))}" fill="${col}"/>`;
+  }).join('')}</svg>`;
+}
+
+const strategyCell = (s, id) => `${s}<span class="sub">${id}</span>`;
+const sideTag = (s) => `<span class="tag ${s.startsWith('Шорт') ? 'fill-red' : 'fill-green'}">${s}</span>`;
+const pnl = (v) => `<span class="${v.startsWith('−') ? 'neg' : v === '0,00 ₽' ? '' : 'pos'}">${v}</span>`;
+
+function trading(d) {
+  const periods = ['День', 'Неделя', 'Месяц', 'Всё'];
+  const inner = [['positions', `Позиции · ${d.positions.length}`], ['trades', `Сделки · ${d.trades.length}`]];
+  if (d.reconcile) inner.push(['reconcile', 'Сверка <span class="tag green">Сходится</span>']);
+  let table = '';
+  if (state.inner === 'positions') {
+    table = `<table><tr><th>Инструмент</th><th>Стратегия</th><th>Сторона</th><th class="r">Вход → сейчас</th><th class="r">Стоп / тейк</th><th>Открыта</th><th class="r">Результат</th></tr>${d.positions.map((p) => `<tr class="click ${state.sel?.name === p[0] ? 'sel' : ''}" data-name="${p[0]}" data-tf="${p[1].split(' · ')[1]}" data-price="${p[8]}"><td><b>${p[0]}</b></td><td>${strategyCell(p[1], p[2])}</td><td>${sideTag(p[3])}</td><td class="r">${p[4]}</td><td class="r">${p[5]}</td><td>${p[6]}</td><td class="r">${pnl(p[7])}</td></tr>`).join('')}</table>`;
+  } else if (state.inner === 'trades') {
+    table = `<table><tr><th>Закрыта</th><th>Инструмент</th><th>Стратегия</th><th>Сторона</th><th class="r">Вход → выход</th><th>Длит.</th><th>Причина</th><th class="r">Результат</th></tr>${d.trades.map((t) => `<tr class="click ${state.sel?.name === t[1] ? 'sel' : ''}" data-name="${t[1]}" data-tf="${t[2].split(' · ')[1]}" data-price="${t[9]}"><td>${t[0]}</td><td><b>${t[1]}</b></td><td>${strategyCell(t[2], t[3])}</td><td>${sideTag(t[4])}</td><td class="r">${t[5]}</td><td>${t[6]}</td><td><span class="tag">${t[7]}</span></td><td class="r">${pnl(t[8])}</td></tr>`).join('')}</table>`;
+  } else {
+    table = `<div class="sumrow" style="align-items:start;padding-top:8px"><div><div class="stats" style="margin-bottom:12px"><div><div class="l">Открытых сделок</div><div class="v">1</div></div><div><div class="l">Заявок в работе</div><div class="v">2</div></div><div><div class="l">Заявок на счёте</div><div class="v">2</div></div><div><div class="l">Стоп-заявок</div><div class="v">0</div></div></div><table><tr><th>На счёте</th><th class="r">Лотов</th></tr><tr><td><b>ED-12.26</b></td><td class="r">−10</td></tr></table></div><div><p class="muted" style="margin-top:0">05.11 17:51 · счёт …09c3</p><p>Счёт и журнал контура сходятся.</p></div></div>`;
+  }
+  const sel = state.sel;
+  return `
+  <div class="card"><div class="ch">Позиции и сделки<span class="x seg">${periods.map((p) => `<span data-period="${p}" class="${state.period === p ? 'on' : ''}">${p}</span>`).join('')}</span></div>
+    <div class="cb"><div class="sumrow"><div class="stats">${Object.entries(d.summary).map(([l, [v, c]]) => `<div><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join('')}</div><div>${curveSvg(d.curve)}</div></div>
+    <div class="itabs">${inner.map(([k, l]) => `<a data-inner="${k}" class="${state.inner === k ? 'on' : ''}">${l}</a>`).join('')}</div>${table}</div></div>
+  <div class="card new"><div class="ch">График · ${sel ? sel.name : '—'} <span class="newnote">сразу под таблицей; по умолчанию — первая открытая позиция, без позиций — последняя сделка</span><span class="x tf">${['1m', '5m', '15m', '1h', '4h', '1d'].map((t) => `<span data-tf="${t}" class="${(sel?.tf || state.tf) === t ? 'on' : ''}">${t}</span>`).join('')}</span></div>
+    <div class="cb">${sel ? candlesSvg(sel.name + sel.tf, sel.price) : '<p class="muted">Нет позиций и сделок</p>'}</div></div>`;
+}
+
+function members(d) {
+  const posBy = Object.fromEntries(d.positions.map((p) => [p[2], `${sideTag(p[3])} ${pnl(p[7])}`]));
+  const rows = MEMBERS[state.contour].map(([name, exp, list]) => list.map(([s, f, id], i) => {
+    const strat = s.split(' · ')[0];
+    return `<tr>${i === 0 ? `<td rowspan="${list.length}"><b>${name}</b>${exp ? `<span class="sub">${exp}</span>` : ''}</td>` : ''}<td>${s}</td><td><span class="tag ${FILTER[f][1]}">${FILTER[f][0]}</span></td><td><span class="tag">${EXIT[strat]}</span></td><td class="muted">${id}</td><td><span class="tag green">Торгует</span></td><td>${posBy[id] || '<span class="muted">—</span>'}</td><td class="r"><button class="btn link" title="Убрать">Убрать</button></td></tr>`;
+  }).join('')).join('');
+  return `<div class="card"><div class="ch">${state.contour === 'sandbox' ? 'Привязки' : 'Инструменты'} · ${d.composition}<span class="newnote">на всю ширину, без графика: стратегия, фильтр и выход — отдельными колонками</span><span class="x"><button class="btn link">+ Добавить</button></span></div>
+    <div class="cb"><table><tr><th>Инструмент</th><th>Стратегия</th><th>Фильтр</th><th>Выход</th><th>Привязка</th><th>Состояние</th><th class="new">Позиция <span class="newnote">новое</span></th><th></th></tr>${rows}
+    <tr><td colspan="8" class="muted">… ещё ${shownMore[state.contour]} — в макете не показаны</td></tr></table></div></div>`;
+}
+
+function account(d) {
+  const dl = (rows) => `<dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
+  return `<div class="grid2"><div class="card"><div class="ch">${state.contour === 'sandbox' ? 'Счёт' : 'Счёт (виртуальный)'}</div><div class="cb">${dl(d.account)}</div></div>
+    <div class="card"><div class="ch">Запуск <span class="newnote">+ ревизия и процесс из шапки</span></div><div class="cb">${dl(d.launch)}</div></div></div>`;
+}
+
+function log(d) {
+  const lines = ['17:51:40 [INFO] tick: позиции 2, ждут входа 0', '17:51:39 [INFO] свечи 15m обновлены: SILV-12.26, GOLD-12.26', '17:50:40 [INFO] tick: позиции 2, ждут входа 0', '17:49:12 [DEBUG] ED-12.26 стоп 1,1263 без изменений', '17:48:40 [INFO] tick: позиции 2, ждут входа 0'];
+  return `<div class="card"><div class="ch">${d.log}<span class="x seg"><span>100</span><span class="on">200</span><span>500</span><span>1000</span></span></div><div class="cb"><pre>${lines.join('\n')}\n…</pre></div></div>`;
+}
+
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('[data-tab],[data-inner],[data-period],[data-contour],tr.click,.tf [data-tf]');
+  if (!t) return;
+  if (t.dataset.contour) { state.contour = t.dataset.contour; state.sel = null; state.inner = 'positions'; }
+  else if (t.dataset.tab) state.tab = t.dataset.tab;
+  else if (t.dataset.inner) state.inner = t.dataset.inner;
+  else if (t.dataset.period) state.period = t.dataset.period;
+  else if (t.matches('tr.click')) state.sel = {name: t.dataset.name, tf: t.dataset.tf, price: +t.dataset.price};
+  else if (state.sel) state.sel = {...state.sel, tf: t.dataset.tf};
+  render();
+});
+document.getElementById('attn').addEventListener('change', render);
+readHash();
+render();
+</script>
+</body>
+</html>

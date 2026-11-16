@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from statistics import median
-from typing import Callable
+from typing import Callable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -126,10 +127,16 @@ class ClusterReport:
         }
 
     # ── источники ──
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Журнал сделок только на чтение; соединение закрывается сразу (fix-sqlite-connection-close)."""
         conn = sqlite3.connect(f"file:{self._trades_db}?mode=ro", uri=True, timeout=10)
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _verdicts(self, start: date, end: date) -> list[dict]:
         """Последняя трасса ``filter.cluster`` на сигнал, МСК-дата бара в [start, end]."""

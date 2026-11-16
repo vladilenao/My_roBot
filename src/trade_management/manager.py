@@ -303,6 +303,8 @@ class TradeManager:
         # Кластерный фильтр входа (src.clusters.gate.ClusterGate); None — выключен.
         self._cluster_gate = cluster_gate
         self._clock = as_clock(clock)
+        # Стратегии привязок, прошедших допуск: подпись занявшей инструмент привязки в отказе instrument-busy.
+        self._assignment_strategies: dict[str, str] = {}
         self._reducer = ExecutionReducer(storage)
         self._initial_balance = initial_balance
         self._post_fill_check = post_fill_check
@@ -1008,7 +1010,8 @@ class TradeManager:
         if status != "PENDING":
             return deny("order-state-unconfirmed")
         protected = self._confirmed_guard_close(connection, action, phase, revision, quantity)
-        if action.state_revision != revision and not protected:
+        if (action.state_revision != revision and not protected
+                and not self._revised_only_by_own_stop_moves(connection, action, revision)):
             return deny("stale-state-revision")
         if isinstance(action, OpenTrade):
             phase_valid = phase == TradePhase.ENTRY_PENDING and quantity == 0
@@ -1070,6 +1073,27 @@ class TradeManager:
         if isinstance(action, CloseTrade):
             return mode == CONTOUR_CLOSE_ALL
         return isinstance(action, CancelEntry) and mode is not None
+
+    @staticmethod
+    def _revised_only_by_own_stop_moves(connection, action, revision) -> bool:
+        """Ревизию выхода сменили только подтверждённые переносы стопа с той же ревизией (fix-exit-after-stop-confirm).
+
+        Профиль на одном баре ставит перенос стопа и выход с одной ревизией. Брокер контура подтверждает
+        стоп сразу при доставке, ``_confirm_stop`` повышает ревизию, и выход за ним иначе навсегда устаревает.
+        Перенос стопа не меняет остаток и фазу, на которых основан выход. Любое другое изменение — исполнение,
+        смена фазы, перенос стопа другого решения — даёт лишнее повышение, и выход остаётся устаревшим.
+        """
+        if not isinstance(action, (CloseTrade, ReduceTrade)) or revision <= action.state_revision:
+            return False
+        rows = connection.execute(
+            "SELECT e.payload_json, b.payload_json FROM events e JOIN orders o ON o.command_id=e.command_id "
+            "JOIN outbox b ON b.command_id=e.command_id "
+            "WHERE e.trade_id=? AND o.action_type='MOVESTOP' AND e.event_type='ACK'", (action.trade_id,),
+        ).fetchall()
+        confirmed = sum(1 for event, command in rows
+                        if "confirmed_stop" in json.loads(event)
+                        and json.loads(command).get("state_revision") == action.state_revision)
+        return confirmed == revision - action.state_revision
 
     def _confirmed_guard_close(self, connection, action, phase, revision, quantity):
         """Proof существующего guard, не whitelist по строке reason."""
@@ -1249,6 +1273,9 @@ class TradeManager:
             return SignalAdmission()
         timeframe = timeframe or assignment.timeframe
         self._session_instruments[instrument_key(instrument)] = instrument
+        strategy = getattr(assignment, "strategy", None)
+        if strategy:
+            self._assignment_strategies[assignment.id] = str(strategy)
         if self.contract_lifecycle is not None and not self.contract_lifecycle.can_increase(instrument_key(instrument), self._clock.now()):
             return SignalAdmission(rejections=(rejection_reason("contract-expiring", message="Вход запрещён: контрактный переход не завершён"),))
         contract = getattr(self._broker, "contract_for", None)
@@ -1282,9 +1309,9 @@ class TradeManager:
             session_rejection = self._intraday_entry_rejection(instrument, assignment, decision, timeframe)
             if session_rejection is not None:
                 return SignalAdmission(rejections=(session_rejection,))
-            opposite_rejection = self._opposite_exposure_rejection(assignment, decision, instrument)
-            if opposite_rejection is not None:
-                return SignalAdmission(rejections=(opposite_rejection,))
+            busy_rejection = self._instrument_busy_rejection(assignment, decision, instrument)
+            if busy_rejection is not None:
+                return SignalAdmission(rejections=(busy_rejection,))
             return self._plan_entry(assignment, decision, instrument, frame, context, meta, timeframe)
         except sqlite3.IntegrityError as exc:
             log.warning("actions_for_signal %s: %s", instrument.ticker, exc, exc_info=True)
@@ -1782,14 +1809,15 @@ class TradeManager:
         ))
         return False
 
-    def _opposite_exposure_rejection(self, assignment, decision, instrument):
-        """Недопуск входа против незавершённой сделки другой привязки (trade-management: «Отказ во встречном входе»).
+    def _instrument_busy_rejection(self, assignment, decision, instrument):
+        """Недопуск входа по инструменту, занятому другой привязкой (trade-management: «Владелец и жизненный цикл сделки»).
 
-        Счёт один, позиция по контракту у брокера общая, поэтому встречной
-        считается любая незавершённая сделка другого направления — с ожидающим
-        входом или с ненулевым объёмом — по тому же контракту или по другому
-        контракту того же семейства фьючерсов (переход BR-6.25 → BR-7.25).
-        Существующая сделка не закрывается.
+        Счёт один, позиция по инструменту у брокера общая (неттинг), поэтому на
+        инструмент — одна привязка-владелица. Инструмент — контракт или всё
+        семейство фьючерса (переход BR-6.25 → BR-7.25). Блокирует незавершённая
+        сделка — с ожидающим входом или с ненулевым объёмом:
+        встречная любой привязки — ``opposite-exposure``; в ту же сторону другой
+        привязки — ``instrument-busy``. Существующая сделка не меняется.
         """
         side = decision.signal_type.value
         names = self._storage.instrument_names()
@@ -1797,32 +1825,52 @@ class TradeManager:
         key = _exposure_key(own_id, getattr(instrument, "ticker", None),
                             getattr(instrument, "short_name", None), getattr(instrument, "family", None))
         rows = self._storage.connection.execute(
-            "SELECT t.trade_id, t.instrument_id, t.side FROM trades t LEFT JOIN positions p USING(trade_id) "
-            f"WHERE t.side<>? AND (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) ORDER BY t.created_at",
-            (side,),
+            "SELECT t.trade_id, t.assignment_id, t.instrument_id, t.side, t.plan_json FROM trades t "
+            f"LEFT JOIN positions p USING(trade_id) WHERE (t.{self._OPEN_PHASES_SQL} OR COALESCE(p.quantity, 0)>0) "
+            "ORDER BY t.created_at",
         ).fetchall()
-        blocking = [(trade_id, instrument_id, other_side) for trade_id, instrument_id, other_side in rows
-                    if instrument_id == own_id
-                    or _exposure_key(instrument_id, instrument_id, names.get(instrument_id)) == key]
-        if not blocking:
-            return None
-        _, instrument_id, other_side = blocking[0]
-        contract = names.get(instrument_id)
-        message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
-                   f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+        exposure = [row for row in rows
+                    if row[2] == own_id or _exposure_key(row[2], row[2], names.get(row[2])) == key]
+        opposite = [row for row in exposure if row[3] != side]
+        if opposite:
+            blocking, reason = opposite, "opposite-exposure"
+            _, _, instrument_id, other_side, _ = blocking[0]
+            contract = names.get(instrument_id)
+            message = (f"{'по ' + contract + ' ' if contract else ''}уже есть встречная "
+                       f"{'покупка' if other_side == 'BUY' else 'продажа'}")
+            formula = "new entry side != side of an unfinished trade on the same contract or futures family -> reject"
+        else:
+            blocking = [row for row in exposure if row[1] != assignment.id]
+            if not blocking:
+                return None
+            reason = "instrument-busy"
+            _, owner_id, instrument_id, _, plan_json = blocking[0]
+            contract = names.get(instrument_id)
+            message = (f"{'по ' + contract + ' ' if contract else ''}уже ведёт сделку "
+                       f"{self._binding_label(owner_id, plan_json)}")
+            formula = "unfinished trade of another assignment on the same contract or futures family -> reject"
         log.info("actions_for_signal %s: вход отклонён — %s", instrument.ticker, message)
         self._traces.record(calculation_trace(
-            "portfolio.opposite-exposure",
+            f"portfolio.{reason}",
             inputs={"signal": MeasuredValue(side, "side"),
                     "exposure_key": MeasuredValue(key, "exposure-key"),
                     "blocking_trades": MeasuredValue([row[0] for row in blocking], "trade-ids")},
             result=MeasuredValue(False, "allowed"),
-            reason="opposite-exposure",
-            formula="new entry side != side of an unfinished trade on the same contract or futures family -> reject",
+            reason=reason,
+            formula=formula,
             links=TraceLinks(assignment_id=assignment.id, signal_id=decision.event_id),
             outcome=TraceOutcome.REJECTED,
         ))
-        return rejection_reason("opposite-exposure", message=message)
+        return rejection_reason(reason, message=message)
+
+    def _binding_label(self, assignment_id: str, plan_json: str) -> str:
+        """«стратегия · ТФ» занявшей привязки; стратегия неизвестна (после рестарта) — id привязки."""
+        try:
+            timeframe = json.loads(plan_json).get("timeframe") or ""
+        except (TypeError, ValueError, AttributeError):
+            timeframe = ""
+        name = self._assignment_strategies.get(assignment_id) or f"привязка {assignment_id}"
+        return f"{name} · {timeframe}" if timeframe else name
 
     def _open_order(self, trade_id: str, action_type: str, *, reason: str | None = None) -> bool:
         """Есть ли незавершённая заявка типа ``action_type`` (при ``reason`` — с этой причиной)."""

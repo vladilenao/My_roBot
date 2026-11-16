@@ -11,11 +11,11 @@ import json
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import pandas as pd
 
@@ -136,12 +136,21 @@ class MarketDataStore:
         self._lock = threading.RLock()
         self._create_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Короткое соединение на операцию: фиксация или откат, затем ``close()`` (fix-sqlite-connection-close).
+
+        Без явного закрытия файлы базы держит сборщик мусора, и за минуты их копятся сотни.
+        """
         conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 10000")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _create_schema(self) -> None:
         with self._lock, self._connect() as conn:
