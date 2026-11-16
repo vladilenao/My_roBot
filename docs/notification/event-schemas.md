@@ -1284,7 +1284,8 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 Событие контура на брокере (add-sandbox-contour): контур «Песочница» и «Счёт»
 (`contour = account`, add-account-contour). `kind`: `started` — допуск пройден
 (у «Счёта» ещё `access_level` — `read_only` или `full_access` — и `warnings` —
-предупреждения допуска, не мешающие старту на чтение); `reconcile_alarm` — сверщик нашёл
+предупреждения допуска, не мешающие старту на чтение); `refused` — контур не
+стартует, `reason` — причина отказа допуска (add-account-contour); `reconcile_alarm` — сверщик нашёл
 расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
 нет; `stopped` — штатный выход (`broker_stops` — сколько стоп-заявок осталось у
 брокера, add-broker-protection); `guard_tripped` — сработал предохранитель

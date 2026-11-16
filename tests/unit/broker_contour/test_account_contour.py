@@ -271,3 +271,27 @@ def test_broker_contours_recover_in_order_and_failure_does_not_block():
 
     run._recover_broker_contours(Supervisor("account", fail=True), Supervisor("sandbox"))
     assert order == ["account", "sandbox"]
+
+
+# --- карточка отказа -----------------------------------------------------------------
+
+def test_refused_card_is_not_a_reconcile_alarm():
+    from src.events.event import Event
+    from src.notifier.telegram_templates import render_broker_account
+
+    reason = "Токен видит счёт …7029, а TINKOFF_ACCOUNT_ID задаёт другой"
+    text = render_broker_account(Event.broker_account("refused", contour="account", account="…", event_id="e1",
+                                                      reason=reason))
+    assert text.startswith("<b>СЧЁТ · ТРЕВОГА · Контур не стартует</b>")
+    assert reason in text and "Сверка" not in text and "заморозк" not in text and "Счёт …\n" not in text
+
+
+def test_wrong_account_id_sends_refused_card(tmp_path):
+    collector, bus, stop = Collector(), EventBus(), Stop()
+    bus.subscribe_all([collector])
+    broker = FakeBroker(accounts=[_account("2000555-other-0002")])
+    contour = BrokerContour(_settings(tmp_path), gateway_factory=_gateway(broker), bus=bus, stop=stop, pid=4242,
+                            find_account=_find, read_facts=partial(read_facts, orders=False))
+    assert contour.run() == 2
+    assert collector.kinds() == ["refused"]
+    assert collector.events[0].get("reason") == "Токен видит счёт …0002, а TINKOFF_ACCOUNT_ID задаёт другой"

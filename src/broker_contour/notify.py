@@ -63,6 +63,10 @@ class BrokerNotifier:
     def alarm(self, items, frozen, *, reason: str | None = None) -> None:
         self._publish("reconcile_alarm", mismatches=list(items), frozen=list(frozen), reason=reason)
 
+    def refused(self, reason: str) -> None:
+        """Контур не стартует (add-account-contour): тревога отказа допуска, без сверки и заморозок."""
+        self._publish("refused", reason=reason)
+
     def cleared(self, unfrozen) -> None:
         self._publish("reconcile_cleared", unfrozen=list(unfrozen))
 

@@ -220,6 +220,13 @@ def render_broker_account(event) -> str:
         if event.get("access_level"):
             lines.append("Токен: " + ACCESS_LABELS.get(event.get("access_level"), escape(str(event.get("access_level")))))
         lines.extend("⚠ " + escape(str(item)) for item in event.get("warnings") or ())
+    elif kind == "refused":
+        # Отказ допуска (add-account-contour): не сверка — ни расхождений, ни совета про заморозку.
+        lines = [f"<b>{title} · ТРЕВОГА · Контур не стартует</b>"]
+        if account and account != "…":
+            lines.append(f"Счёт {account}")
+        lines.append(escape(str(event.get("reason") or "причина не указана")))
+        lines.append("Исправьте причину и запустите контур снова: PUT …/target {\"mode\": \"on\"}.")
     elif kind == "reconcile_alarm":
         lines = [f"<b>{title} · ТРЕВОГА · Сверка счёта</b>", f"Счёт {account}"]
         if event.get("reason"):

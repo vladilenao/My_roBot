@@ -268,7 +268,7 @@ def test_process_refuses_foreign_fingerprint_with_alarm(tmp_path):
     contour, collector, _ = _contour(tmp_path, broker)
     assert contour.run() == 2
     assert "…09c3" in _status(tmp_path)["reason"]
-    assert collector.kinds() == ["reconcile_alarm"] and "Контур не стартует" in collector.events[0].get("reason")
+    assert collector.kinds() == ["refused"] and "…09c3" in collector.events[0].get("reason")
 
 
 # --- торговля привязками (add-tinvest-orders) -----------------------------------

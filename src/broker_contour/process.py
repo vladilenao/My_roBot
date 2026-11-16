@@ -164,7 +164,7 @@ class BrokerContour:
         print(f"Контур {self.settings.contour_id} не стартует: {exc.reason}")
         if exc.alarm:
             self.notifier.account_tail = exc.account_tail
-            self.notifier.alarm([], (), reason=f"Контур не стартует: {exc.reason}")
+            self.notifier.refused(exc.reason)
         self._write(state=FAILED, reason=exc.reason, exited_at=_now(), exit_reason=exc.reason)
         return 2
 
