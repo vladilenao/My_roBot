@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Iterator, Mapping
 
 SCHEMA_VERSION = 1
 FILE_NAME = "cluster-events.sqlite3"
@@ -121,16 +121,21 @@ class ClusterEventStore:
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Короткое соединение: фиксация или откат, затем ``close()`` (fix-sqlite-connection-close)."""
         if self.read_only:
             if not self.path.exists():
                 raise _Missing()
             conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=30)
+        else:
+            conn = sqlite3.connect(self.path, timeout=30)
+        try:
             conn.row_factory = sqlite3.Row
-            return conn
-        conn = sqlite3.connect(self.path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     # ── запись ──
     def write(self, entries: Iterable[tuple[str, Mapping[str, str]]], *, received_at: datetime | None = None) -> int:
