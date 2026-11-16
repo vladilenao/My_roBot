@@ -112,6 +112,18 @@ def test_read_only_token_refused_with_orders():
         _facts(FakeBroker(accounts=[_account()]), orders=True)
 
 
+def test_limits_of_contour_methods_only():
+    from src.account.admission import _limits
+
+    prefix = "tinkoff.public.invest.api.contract.v1."
+    response = s.GetUserTariffResponse(unary_limits=[
+        s.UnaryLimit(limit_per_minute=5, methods=[prefix + "OperationsService/GetBrokerReport"]),
+        s.UnaryLimit(limit_per_minute=200, methods=[prefix + "OperationsService/GetOperationsByCursor",
+                                                    prefix + "OperationsService/GetPositions"]),
+        s.UnaryLimit(limit_per_minute=50, methods=[prefix + "StopOrdersService/PostStopOrder"])])
+    assert _limits(response) == {"operations": 200, "stop_orders": 50}
+
+
 def test_tariff_failure_is_warning():
     facts = _facts(FakeBroker(accounts=[_account()], tariff_fails=True), orders=False)
     assert facts["limits"] is None and facts["warnings"][0].startswith("лимиты API не прочитаны")
@@ -162,6 +174,7 @@ def test_read_only_contour_on_empty_account(tmp_path):
     started = next(event for event in collector.events if event.get("kind") == "started")
     assert started.get("contour") == "account" and started.get("access_level") == "read_only"
     assert list(started.get("warnings")) == [] and started.get("account") == "…7f21"
+    assert started.get("orders_enabled") is False
     assert status["admission"]["access_level"] == "read_only" and status["orders_enabled"] is False
     assert status["capital"]["rub"] == "150000.00" and status["account"] == "…7f21"
     assert not {method for method, _ in broker.calls} & WRITE_METHODS

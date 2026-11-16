@@ -11,17 +11,20 @@ from src.broker_contour.admission import AdmissionError
 from src.sandbox.gateway import BrokerCallError
 
 DERIVATIVES = "derivative"       # строка допуска к срочным контрактам; сверить по списку на первом старте
-LIMIT_SERVICES = {"OrdersService": "orders", "StopOrdersService": "stop_orders", "OperationsService": "operations"}
+# Лимиты методов, которые вызывает контур: у сервиса операций тяжёлые методы (отчёт брокера) ограничены
+# 5 в минуту, и минимум по сервису вводил бы в заблуждение.
+LIMIT_METHODS = {"OrdersService/PostOrder": "orders", "StopOrdersService/PostStopOrder": "stop_orders",
+                 "OperationsService/GetOperationsByCursor": "operations"}
 NO_DERIVATIVES = "нет допуска к срочным контрактам — на Р2 фьючерсы не торгуются"
 
 
 def _limits(response) -> dict[str, int]:
-    """Лимит в минуту по сервисам заявок, стоп-заявок и операций; у сервиса берётся меньший."""
+    """Лимит в минуту методов контура: заявка, стоп-заявка, операции по курсору."""
     found: dict[str, int] = {}
     for limit in response.unary_limits:
         for method in limit.methods:
-            service = method.rsplit("/", 1)[0].rsplit(".", 1)[-1]
-            key = LIMIT_SERVICES.get(service)
+            service, _, name = method.rpartition("/")
+            key = LIMIT_METHODS.get(f"{service.rsplit('.', 1)[-1]}/{name}")
             if key is not None:
                 found[key] = min(found.get(key, limit.limit_per_minute), limit.limit_per_minute)
     return dict(sorted(found.items()))

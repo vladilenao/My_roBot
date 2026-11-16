@@ -184,7 +184,7 @@ class BrokerContour:
         if admitted.facts is not None:
             self._write(admission=admitted.facts)
         self.notifier.started(admitted.snapshot, bindings=len(self._status["members"]), generation=self._generation,
-                              **_admission_card(admitted.facts))
+                              orders_enabled=False, **_admission_card(admitted.facts))
         log.info("Контур %s запущен: счёт %s, поколение %s", settings.contour_id, account.masked, self._generation)
         self._reconcile(reconciler, gateway, account, admitted.snapshot)
         self._write(state=RUNNING, account=account.masked, account_link="ok")
