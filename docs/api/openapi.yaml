@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.11.0
+  version: 2.12.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -95,7 +95,7 @@ tags:
   - name: Песочница
     description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
   - name: Счёт
-    description: Контур на брокерском счёте робота (2.11.0, add-account-contour) — до Р2 только чтение счёта и сверка.
+    description: Контур на брокерском счёте робота (2.11.0, add-account-contour); с 2.12.0 (enable-live-trading) — заявки по привязкам из состава песочницы, если [contours.account] orders = true.
   - name: Свечи
     description: Свечи рядов рыночной базы ядра для графиков UI — только чтение.
   - name: Индикаторы
@@ -1263,44 +1263,145 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenHost'}
     post:
       tags: [Счёт]
-      summary: Добавить привязки (с Р2)
+      summary: Добавить привязки из состава песочницы
+      description: |
+        Принимаются только привязки, которые сейчас в составе песочницы
+        (путь эмуляция → песочница → счёт); иначе `422 BINDINGS_REJECTED`.
+        Подтверждение не нужно. При `[contours.account] orders = false` —
+        `409 ACCOUNT_READ_ONLY`.
       operationId: addAccountBindings
       security:
         - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
           application/json:
-            schema: {$ref: '#/components/schemas/BindingsAddRequest'}
+            schema: {$ref: '#/components/schemas/AccountBindingsAddRequest'}
       responses:
+        '202':
+          description: Состав записан новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
         '409':
-          description: '`ACCOUNT_READ_ONLY` — состав «Счёта» меняется командами с Р2.'
+          description: '`ACCOUNT_READ_ONLY` — заявки на счёте выключены.'
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
 
   /api/v1/account/bindings/remove:
     post:
       tags: [Счёт]
-      summary: Убрать привязки (с Р2)
+      summary: Убрать привязки со счёта
+      description: |
+        `mode = no_entries` — сделки доживают со стопом у брокера, без подтверждения.
+        `mode = close_all` — сделки закрываются, только с `"confirm": true`, иначе
+        `409 CONFIRM_REQUIRED`.
       operationId: removeAccountBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountBindingsRemoveRequest'}
+      responses:
+        '202':
+          description: Состав записан новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '409':
+          description: '`CONFIRM_REQUIRED`, `ACCOUNT_READ_ONLY`, `MODE_CONFLICT`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/account/guards/reset:
+    post:
+      tags: [Счёт]
+      summary: Снять предохранитель «отказы брокера подряд»
+      description: Как у песочницы; «дневной убыток» командой не снимается — `409 GUARD_NOT_RESETTABLE`.
+      operationId: resetAccountGuards
       security:
         - ControlToken: []
       requestBody:
         required: true
         content:
           application/json:
-            schema: {$ref: '#/components/schemas/BindingsRemoveRequest'}
+            schema: {$ref: '#/components/schemas/GuardsResetRequest'}
       responses:
+        '202':
+          description: Поколение сброса записано.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
         '409':
-          description: '`ACCOUNT_READ_ONLY` — состав «Счёта» меняется командами с Р2.'
+          description: '`GUARD_NOT_RESETTABLE`, `NOT_RUNNING`.'
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
+
+  /api/v1/account/comparison:
+    get:
+      tags: [Счёт]
+      summary: «Счёт» против песочницы и эмуляции
+      description: |
+        Сигналы привязок «Счёта»: три стороны — `account`, `sandbox`, `emulation`,
+        расхождения от счёта (`account_vs_sandbox`, `account_vs_emulation`).
+        Параметры и ошибки — как у `/api/v1/sandbox/comparison`. Есть, только
+        если `[contours.account] orders = true`.
+      operationId: getAccountComparison
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+        - {name: binding, in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/TradeInstrument'
+        - $ref: '#/components/parameters/TradesLimit'
+      responses:
+        '200':
+          description: Сравнение трёх контуров.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountComparison'}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '404': {$ref: '#/components/responses/NotFound'}
 
   /api/v1/account/reconcile:
     get:
@@ -3662,6 +3763,95 @@ components:
       required: [mode]
       properties:
         mode: {type: string, enum: ['on']}
+        bindings:
+          type: array
+          items: {type: string, minLength: 1}
+          description: '`id` привязок из состава песочницы; без поля — текущий состав (2.12.0).'
+        confirm: {type: boolean, description: Не нужен; допустим.}
+    GuardsResetRequest:
+      type: object
+      additionalProperties: false
+      required: [guards]
+      properties:
+        guards:
+          type: array
+          minItems: 1
+          items: {type: string, enum: [daily_loss, broker_rejects]}
+    AccountBindingsAddRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        confirm: {type: boolean, description: Не нужен; допустим.}
+    AccountBindingsRemoveRequest:
+      type: object
+      additionalProperties: false
+      required: [bindings]
+      properties:
+        bindings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        mode: {type: string, enum: [no_entries, close_all]}
+        confirm: {type: boolean, description: 'Обязателен и равен `true` для `mode = close_all`.'}
+    AccountComparisonSideDiffs:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [diffs, steps_unknown]
+      properties:
+        diffs:
+          type: array
+          items: {$ref: '#/components/schemas/ComparisonDiff'}
+        steps_unknown: {type: boolean}
+    AccountComparisonItem:
+      type: object
+      additionalProperties: false
+      required: [signal, account, sandbox, emulation, missing, account_vs_sandbox, account_vs_emulation]
+      properties:
+        signal: {type: object}
+        account:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ComparisonSide'}]
+          nullable: true
+        sandbox:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ComparisonSide'}]
+          nullable: true
+        emulation:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ComparisonSide'}]
+          nullable: true
+        missing:
+          type: object
+          description: Сторона без сделки → причина `{code, label}`.
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [code, label]
+            properties:
+              code: {type: string}
+              label: {type: string}
+        account_vs_sandbox: {$ref: '#/components/schemas/AccountComparisonSideDiffs'}
+        account_vs_emulation: {$ref: '#/components/schemas/AccountComparisonSideDiffs'}
+    AccountComparison:
+      type: object
+      additionalProperties: false
+      required: [currency, as_of, period, summary, items, earlier, _links]
+      properties:
+        currency: {type: string, enum: [RUB]}
+        as_of: {type: string, format: date-time}
+        period: {type: object}
+        summary: {type: object, description: 'trades, account_vs_sandbox, account_vs_emulation, closed_result, missing_reasons.'}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/AccountComparisonItem'}
+        earlier: {type: boolean}
+        _links: {$ref: '#/components/schemas/Links'}
     AccountStopRequest:
       type: object
       additionalProperties: false

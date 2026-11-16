@@ -76,6 +76,8 @@ class MarketDataExportServer:
         # Отчёт «Песочница против эмуляции» (src.bot.comparison_view.ContourComparison,
         # add-account-vs-emulation-report) или None — ресурс отвечает 404.
         self.comparison = None
+        # Сравнение «Счёт — песочница — эмуляция» (enable-live-trading) или None — ресурс отвечает 404.
+        self.account_comparison = None
         # Индикаторы стратегий привязок на свечах базы (src.bot.indicators_view.IndicatorsView, add-indicators-api)
         # или None — ресурс отвечает 404.
         self.indicators = None
@@ -253,6 +255,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_get(path, query)
             return
+        if path == views.ACCOUNT_COMPARISON and server.account_comparison is not None:
+            self._comparison_get(query, server.account_comparison)
+            return
         if path == views.ACCOUNT or path.startswith(views.ACCOUNT + "/"):
             self._account_get(path, query)
             return
@@ -355,12 +360,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._problem(exc.status, exc.code, exc.detail)
         return True
 
-    def _comparison_get(self, query: dict[str, list[str]]) -> None:
-        """Песочница против эмуляции по журналам контуров (add-account-vs-emulation-report)."""
+    def _comparison_get(self, query: dict[str, list[str]], comparison=None) -> None:
+        """Сравнение контуров по журналам (add-account-vs-emulation-report, enable-live-trading)."""
         from src.bot.trades_view import TradesError
 
         try:
-            self._json(HTTPStatus.OK, self.export_server.comparison.report(query))
+            self._json(HTTPStatus.OK, (comparison or self.export_server.comparison).report(query))
         except TradesError as exc:
             self._problem(exc.status, exc.code, exc.detail)
 
@@ -437,32 +442,37 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _account_command(self, path: str) -> None:
         """Команды «Счёта»: запуск и остановка; состав до Р2 — ``409 ACCOUNT_READ_ONLY``."""
-        from src.bot.account_control import parse_account_target
+        from src.bot.account_control import parse_account_bindings, parse_account_target
         from src.bot.launch_control import BadCommand
-        from src.bot.sandbox_control import parse_bindings
+        from src.bot.sandbox_control import parse_guards_reset
 
         account = self.export_server.account
         if account is None:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Счёт» недоступен в этом процессе.")
             return
-        routes = {("PUT", views.ACCOUNT_TARGET), ("POST", views.ACCOUNT_BINDINGS), ("POST", views.ACCOUNT_REMOVE)}
+        routes = {("PUT", views.ACCOUNT_TARGET), ("POST", views.ACCOUNT_BINDINGS), ("POST", views.ACCOUNT_REMOVE),
+                  ("POST", views.ACCOUNT_GUARDS_RESET)}
         if (self.command, path) not in routes:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
         expected = _if_match(self.headers.get("If-Match"))
         try:
             body = self._read_json()
-            if path == views.ACCOUNT_TARGET:
-                mode, confirm = parse_account_target(body)
-                status, payload = account.put_account_target(mode, confirm, expected)
+            if path == views.ACCOUNT_GUARDS_RESET:
+                status, payload = account.reset_guards(parse_guards_reset(body))
+                headers = None
+            elif path == views.ACCOUNT_TARGET:
+                mode, bindings, confirm = parse_account_target(body)
+                status, payload = account.put_account_target(mode, bindings, confirm, expected)
                 headers = views.etag((payload.get("target") or {}).get("revision")) if status < 400 else None
                 if status == HTTPStatus.ACCEPTED:
                     headers = {**(headers or {}), "Location": views.ACCOUNT}
             else:
                 remove = path == views.ACCOUNT_REMOVE
-                ids, mode = parse_bindings(body, remove=remove)
-                status, payload = account.change_bindings(ids, remove=remove, mode=mode, expected=expected)
-                headers = None
+                ids, mode, confirm = parse_account_bindings(body, remove=remove)
+                status, payload = account.change_account_bindings(ids, remove=remove, mode=mode, confirm=confirm,
+                                                                  expected=expected)
+                headers = views.etag(payload.get("revision")) if status < 400 else None
         except BadCommand as exc:
             self._problem(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
             return

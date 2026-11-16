@@ -1,30 +1,32 @@
 ## 1. Настройки
 
-- [ ] 1.1 `[contours.account]`: `orders = true` принимается; ключи `exit_offset_steps`, `exit_requote_secs`, `exit_requote_attempts`, `stop_place_secs`, `max_daily_loss_pct`, `max_rejects_in_row` с диапазонами и значениями песочницы в `config_loader.py`, `config.py`, `default.toml` (`orders = false` по умолчанию остаётся).
+- [x] 1.1 `[contours.account]`: `orders = true` принимается; ключи `exit_offset_steps`, `exit_requote_secs`, `exit_requote_attempts`, `stop_place_secs`, `max_daily_loss_pct`, `max_rejects_in_row` с диапазонами и значениями песочницы в `config_loader.py`, `config.py`, `default.toml` (`orders = false` по умолчанию остаётся).
 
 ## 2. Процесс «Счёта» с заявками
 
-- [ ] 2.1 `run.py` `_run_account_contour`: при `orders = true` — `ExitPolicy`, пороги предохранителей, фабрика торговой части `_broker_trading_factory("account", …)`, каналы с торговыми событиями (design.md решение 1).
-- [ ] 2.2 Ядро: спрос свечей и карточки контрактов привязок «Счёта» в `launch.json` — как у песочницы (`resolve_binding` в `_account_control`).
-- [ ] 2.3 Юнит-тесты: процесс «Счёта» с `orders = true` поднимает торговую часть на шлюзе счёта; с `orders = false` — без неё, как на Р1.
+- [x] 2.1 `run.py` `_run_account_contour`: при `orders = true` — `ExitPolicy`, пороги предохранителей, фабрика торговой части `_broker_trading_factory("account", …)`, каналы с торговыми событиями (design.md решение 1).
+- [x] 2.2 Ядро: спрос свечей и карточки контрактов привязок «Счёта» в `launch.json` — как у песочницы (`resolve_binding` в `_account_control`).
+- [x] 2.3 Юнит-тесты: процесс «Счёта» с `orders = true` поднимает торговую часть на шлюзе счёта; с `orders = false` — без неё, как на Р1.
 
 ## 3. API «Счёта»
 
-- [ ] 3.1 `AccountControl`: режим заявок из настроек; при `orders = true` — запуск с `bindings`, добавление и снятие привязок; проверка «привязка в составе песочницы» → `422 BINDINGS_REJECTED` (решение 3); при `orders = false` — `409 ACCOUNT_READ_ONLY`.
-- [ ] 3.2 Подтверждение только у `close_all`: `PUT …/target` и `POST …/bindings/remove` с `mode = close_all` без `confirm: true` — `409 CONFIRM_REQUIRED`; `confirm` не логического типа — `400` (решение 4).
-- [ ] 3.3 `POST /api/v1/account/guards/reset` и `_actions` «Счёта»: добавить привязки, снять предохранитель, остановки (решение 5).
-- [ ] 3.4 Юнит-тесты API: состав из песочницы и не из неё, режим чтения, `CONFIRM_REQUIRED` у обоих `close_all`, `no_entries` без подтверждения, сброс предохранителя, ответ по схеме OpenAPI.
+- [x] 3.1 `AccountControl`: режим заявок из настроек; при `orders = true` — запуск с `bindings`, добавление и снятие привязок; проверка «привязка в составе песочницы» → `422 BINDINGS_REJECTED` (решение 3); при `orders = false` — `409 ACCOUNT_READ_ONLY`.
+- [x] 3.2 Подтверждение только у `close_all`: `PUT …/target` и `POST …/bindings/remove` с `mode = close_all` без `confirm: true` — `409 CONFIRM_REQUIRED`; `confirm` не логического типа — `400` (решение 4).
+- [x] 3.3 `POST /api/v1/account/guards/reset` и `_actions` «Счёта»: добавить привязки, снять предохранитель, остановки (решение 5).
+- [x] 3.4 Юнит-тесты API: состав из песочницы и не из неё, режим чтения, `CONFIRM_REQUIRED` у обоих `close_all`, `no_entries` без подтверждения, сброс предохранителя, ответ по схеме OpenAPI.
 
 ## 4. Сравнение трёх контуров
 
-- [ ] 4.1 `src/bot/comparison_view.py`: обобщить на список сторон с опорной первой; отчёт песочницы — две стороны, ответ не меняется (решение 7).
-- [ ] 4.2 `GET /api/v1/account/comparison`: стороны `account`, `sandbox`, `emulation`, расхождения `account_vs_sandbox` и `account_vs_emulation`, `summary` по сторонам; маршрут в `export_api.py`.
-- [ ] 4.3 Юнит-тесты: сделка во всех трёх, отказ бюджета на счёте, нет журнала счёта, отчёт песочницы без изменений.
+- [x] 4.1 `src/bot/comparison_view.py`: обобщить на список сторон с опорной первой; отчёт песочницы — две стороны, ответ не меняется (решение 7).
+- [x] 4.2 `GET /api/v1/account/comparison`: стороны `account`, `sandbox`, `emulation`, расхождения `account_vs_sandbox` и `account_vs_emulation`, `summary` по сторонам; маршрут в `export_api.py`.
+- [x] 4.3 Юнит-тесты: сделка во всех трёх, отказ бюджета на счёте, нет журнала счёта, отчёт песочницы без изменений.
 
 ## 5. Документы и прогон
 
-- [ ] 5.1 `docs/api/openapi.yaml` 2.12.0: маршруты `comparison` и `guards/reset` «Счёта», состав и `confirm` у `bindings/remove`, схемы `AccountComparison` и `AccountBindingsRemoveRequest`.
-- [ ] 5.2 Полный `pytest` и `ruff check src tests run.py`.
+- [x] 5.1 `docs/api/openapi.yaml` 2.12.0: маршруты `comparison` и `guards/reset` «Счёта», состав и `confirm` у `bindings/remove`, схемы `AccountComparison` и `AccountBindingsRemoveRequest`.
+- [x] 5.2 Полный `pytest` и `ruff check src tests run.py`.
+
+  Сделано 16.11: настройки — `config_loader.py`, `config.py`, `default.toml` (диапазоны общие с песочницей); `run.py` — `_run_account_contour` с `ExitPolicy`, порогами и торговой частью, разведка комиссий только при `orders = false`; `_account_control` с режимом, составом песочницы и `resolve_binding`, `_account_comparison`; `BrokerContour._serve_trading` пишет факты допуска и причину первой тревоги; `src/bot/account_control.py` (`parse_account_target`, `parse_account_bindings`, `put_account_target`, `change_account_bindings`); `src/bot/comparison_view.py` — `_diffs_between`, `AccountComparison` (отчёт песочницы не изменён); `export_api.py` — `guards/reset`, `comparison`; `docs/api/openapi.yaml` 2.12.0. Тесты: `test_account_api.py` (+5, обновлены 3 теста Р1), `test_contour_comparison.py` (+3), `test_account_contour.py` (+1), `test_contour_config.py` (+3). Полный `pytest` 4175 passed, `ruff check` чистый.
 
 ## 6. Ручная проверка владельцем
 

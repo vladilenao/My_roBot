@@ -122,6 +122,12 @@ _DEFAULTS = {
     "contours_account_telegram_channel_env": "TELEGRAM_ACCOUNT_CHANNEL_ID",
     "contours_account_reconcile_every_min": 1,
     "contours_account_orders": False,
+    "contours_account_exit_offset_steps": 5,
+    "contours_account_exit_requote_secs": 15,
+    "contours_account_exit_requote_attempts": 3,
+    "contours_account_stop_place_secs": 30,
+    "contours_account_max_daily_loss_pct": 3.0,
+    "contours_account_max_rejects_in_row": 3,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -221,6 +227,12 @@ CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV = _CONFIG["contours_account_telegram_bot_env"]
 CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_account_telegram_channel_env"]
 CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN = _CONFIG["contours_account_reconcile_every_min"]
 CONTOUR_ACCOUNT_ORDERS = _CONFIG["contours_account_orders"]
+CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS = _CONFIG["contours_account_exit_offset_steps"]
+CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS = _CONFIG["contours_account_exit_requote_secs"]
+CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_account_exit_requote_attempts"]
+CONTOUR_ACCOUNT_STOP_PLACE_SECS = _CONFIG["contours_account_stop_place_secs"]
+CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT = _CONFIG["contours_account_max_daily_loss_pct"]
+CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW = _CONFIG["contours_account_max_rejects_in_row"]
 
 
 def telegram_channel_id() -> str | None:

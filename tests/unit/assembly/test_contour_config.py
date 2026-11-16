@@ -149,7 +149,8 @@ def test_account_section_values(tmp_path):
 
 
 @pytest.mark.parametrize("text, match", [
-    ("orders = true", "Р2"),
+    ("max_rejects_in_row = 0", "от 1 до 20"),
+    ("max_daily_loss_pct = 60", "от 0 до 50"),
     ('account_id = "2000123456"', "незнакомые ключи"),
     ('bindings = ["future-ng-macd"]', "командами API с Р2"),
     ("reconcile_every_min = 0", "от 1 до 60"),
@@ -158,3 +159,10 @@ def test_account_section_values(tmp_path):
 def test_account_section_rejected(tmp_path, text, match):
     with pytest.raises(ConfigError, match=match):
         _load(tmp_path, f"[contours.account]\n{text}\n")
+
+
+def test_account_orders_enabled_with_trading_keys(tmp_path):
+    """enable-live-trading: заявки на счёте включаются строкой в robot.toml, пороги — свои."""
+    config = _load(tmp_path, "[contours.account]\norders = true\nmax_daily_loss_pct = 2\nstop_place_secs = 20\n")
+    assert config["contours_account_orders"] is True
+    assert config["contours_account_max_daily_loss_pct"] == 2 and config["contours_account_stop_place_secs"] == 20

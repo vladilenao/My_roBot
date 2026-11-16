@@ -295,3 +295,43 @@ def test_wrong_account_id_sends_refused_card(tmp_path):
     assert contour.run() == 2
     assert collector.kinds() == ["refused"]
     assert collector.events[0].get("reason") == "Токен видит счёт …0002, а TINKOFF_ACCOUNT_ID задаёт другой"
+
+
+# --- заявки на счёте (enable-live-trading) ------------------------------------------------
+
+def test_account_with_orders_builds_trading_part(tmp_path):
+    from src.assembly.core_state import CoreStateStore, Member
+    from src.events.types import EventType
+    from tests.unit.broker_contour.test_broker_contour import FakeTradingPart, _run_in_thread, _wait
+
+    broker = FakeBroker(accounts=[_account(level=FULL)], rub=Decimal("150000"))
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    store.record_launch("account", "account", [], source="api",
+                        members=[Member("future-ng-macd", {"id": "future-ng-macd", "instrument": "NG",
+                                                          "strategy": "macd_rsi_stoch", "timeframe": "15m"})])
+    collector, stop, bus = Collector(), Stop(), EventBus()
+    collector.supported_types = frozenset({EventType.BROKER_ACCOUNT, EventType.BROKER_ORDER})
+    bus.subscribe(collector)
+    parts = []
+
+    def factory(trading, control, strategies):
+        parts.append(FakeTradingPart(trading, control, strategies, stop))
+        return parts[-1]
+
+    from dataclasses import replace
+    settings = replace(_settings(tmp_path), orders=True)
+    contour = BrokerContour(settings, gateway_factory=_gateway(broker), bus=bus, stop=stop, pid=4242,
+                            find_account=_find, read_facts=partial(read_facts, orders=True), trading_factory=factory)
+    thread, result = _run_in_thread(contour)
+    status_path = tmp_path / "contours" / "account" / "status.json"
+    assert _wait(lambda: status_path.exists() and json.loads(status_path.read_text()).get("stream_link") == "ok")
+    status = json.loads(status_path.read_text())
+    assert status["orders_enabled"] is True and parts and status["admission"]["access_level"] == "full_access"
+    started = next(event for event in collector.events if event.get("kind") == "started")
+    assert started.get("orders_enabled") is True and started.get("contour") == "account"
+    assert started.get("access_level") == "full_access"
+    store.record_stop("account", "no_entries")
+    thread.join(timeout=5)
+    assert result["code"] == 0
+    assert "orders_stream.order_state_stream" in {name for name, _ in broker.calls}
+    assert not {name for name, _ in broker.calls if name.startswith("sandbox.")}

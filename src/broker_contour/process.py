@@ -283,6 +283,7 @@ class BrokerContour:
                         cleared=lambda state, why: self._guard_event(guards, state, why))
         reconciler = Reconciler(store=store, notifier=self.notifier, account_tail=account.masked,
                                 every_secs=settings.reconcile_every_secs)
+        reconciler.note = _first_start_note(admitted)
         self._capital = admitted.snapshot.rub
         self._account(admitted.snapshot)
         holder: dict = {}
@@ -324,6 +325,8 @@ class BrokerContour:
             holder["guards"] = guards
             guards.attach(manager)              # сработавшие предохранители — до первого тика (add-account-guards)
             self._write(guards=guards.states())
+            if admitted.facts is not None:      # факты допуска «Счёта» (add-account-contour)
+                self._write(admission=admitted.facts)
             # До первого тика: «отправлена» без ответа и «неизвестно» — поиск по ключу; непроведённые
             # исполнения — в журнал; затем сверка (design.md решение 8).
             now = self._clock()
@@ -342,7 +345,8 @@ class BrokerContour:
             desired = read_desired(settings.core_db, settings.contour_id)
             self.notifier.started(admitted.snapshot, bindings=0 if desired is None else
                                   sum(1 for member in desired.members if member.active),
-                                  generation=None if desired is None else desired.generation, orders_enabled=True)
+                                  generation=None if desired is None else desired.generation, orders_enabled=True,
+                                  **_admission_card(admitted.facts))
             log.info("Контур %s запущен с заявками: счёт %s", settings.contour_id, account.masked)
             self._write(state=RUNNING, account=account.masked, account_link="ok")
             contour.run(contour.waiter())

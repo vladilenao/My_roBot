@@ -153,6 +153,12 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_account_telegram_channel_env": str,
     "contours_account_reconcile_every_min": int,
     "contours_account_orders": bool,
+    "contours_account_exit_offset_steps": int,
+    "contours_account_exit_requote_secs": int,
+    "contours_account_exit_requote_attempts": int,
+    "contours_account_stop_place_secs": int,
+    "contours_account_max_daily_loss_pct": (int, float),
+    "contours_account_max_rejects_in_row": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -627,16 +633,13 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
             kind = key.removeprefix("contours_").split("_", 1)[0]
             raise ConfigError(f"{path}: [contours.{kind}] reconcile_every_min должен быть целым числом от 1 до 60, "
                               f"получено {value!r}")
-        # Контур «Счёт» (add-account-contour): до Р2 только чтение.
-        if key == "contours_account_orders" and value is True:
-            raise ConfigError(f"{path}: [contours.account] orders = true не принимается: заявки на счёте включаются "
-                              f"на Р2 (enable-live-trading)")
         # Выходы лимитом (add-tinvest-orders): запас в шагах, пауза и число перевыставлений.
         if key in _SANDBOX_EXIT_RANGES:
             low, high = _SANDBOX_EXIT_RANGES[key]
             if isinstance(value, bool) or not low <= value <= high:
-                kind = "числом" if key == "contours_sandbox_max_daily_loss_pct" else "целым числом"
-                raise ConfigError(f"{path}: [contours.sandbox] {key.removeprefix('contours_sandbox_')} должен быть "
+                contour, option = key.removeprefix("contours_").split("_", 1)
+                kind = "числом" if option == "max_daily_loss_pct" else "целым числом"
+                raise ConfigError(f"{path}: [contours.{contour}] {option} должен быть "
                                   f"{kind} от {low} до {high}, получено {value!r}")
         if key == "contours_demand_release_secs" and (isinstance(value, bool) or value < 0):
             raise ConfigError(f"{path}: [contours] demand_release_secs должен быть целым числом >= 0, получено {value!r}")
@@ -1072,7 +1075,9 @@ _CONTOUR_KEYS = {
                 "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
                 "max_daily_loss_pct", "max_rejects_in_row"},
     # Контур «Счёт» (add-account-contour): токен и номер счёта — только из окружения, состав — командами API.
-    "account": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders"},
+    "account": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
+                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
+                "max_daily_loss_pct", "max_rejects_in_row"},
 }
 _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_exit_offset_steps": (0, 100),
@@ -1082,6 +1087,9 @@ _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_max_daily_loss_pct": (0, 50),
     "contours_sandbox_max_rejects_in_row": (1, 20),
 }
+# Контур «Счёт» (enable-live-trading): те же диапазоны торговли, что у песочницы.
+_SANDBOX_EXIT_RANGES.update({key.replace("contours_sandbox_", "contours_account_"): value
+                             for key, value in list(_SANDBOX_EXIT_RANGES.items())})
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
