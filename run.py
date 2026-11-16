@@ -242,7 +242,7 @@ def _run_broker_contour(kind: str) -> int:
     from src.broker_contour import ACCOUNT
 
     if kind == ACCOUNT:
-        return _run_account_contour(directory, data_dir, stop)
+        return _run_account_contour(directory, data_dir, stop, launch, kind)
     settings = BrokerContourSettings(
         orders=CONTOUR_SANDBOX_ORDERS,
         max_daily_loss_pct=CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, max_rejects_in_row=CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
@@ -273,8 +273,8 @@ def _run_broker_contour(kind: str) -> int:
         close_channels(channels)
 
 
-def _run_account_contour(directory: Path, data_dir: Path, stop) -> int:
-    """Процесс контура «Счёт» (add-account-contour): до Р2 только чтение брокерского счёта робота."""
+def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, kind: str) -> int:
+    """Процесс контура «Счёт»: только чтение счёта (add-account-contour) или торговля привязками (enable-live-trading)."""
     from functools import partial
 
     from src.account.account import account_by_id
@@ -282,9 +282,13 @@ def _run_account_contour(directory: Path, data_dir: Path, stop) -> int:
     from src.account.fee_probes import FeeProbes
     from src.assembly.pulse import CorePulse
     from src.broker_contour import ACCOUNT
+    from src.broker_contour.broker import ExitPolicy
     from src.broker_contour.notify import build_channels
     from src.broker_contour.process import BrokerContour, BrokerContourSettings
-    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_ACCOUNT_ORDERS,
+    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS,
+                            CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
+                            CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT, CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
+                            CONTOUR_ACCOUNT_ORDERS, CONTOUR_ACCOUNT_STOP_PLACE_SECS,
                             CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN, CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
                             CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                             NOTIFIER_TELEGRAM_REQUEST_TIMEOUT, account_channel_id)
@@ -292,9 +296,13 @@ def _run_account_contour(directory: Path, data_dir: Path, stop) -> int:
     from src.notifier.factory import close_channels
     from src.sandbox.gateway import AccountGateway
 
-    orders = bool(CONTOUR_ACCOUNT_ORDERS)       # до Р2 загрузка настроек не пропускает true
+    orders = bool(CONTOUR_ACCOUNT_ORDERS)       # true — настоящие заявки (enable-live-trading); включает владелец
     settings = BrokerContourSettings(
-        orders=orders, contour_id=ACCOUNT, broker=ACCOUNT, directory=directory,
+        orders=orders, max_daily_loss_pct=CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT,
+        max_rejects_in_row=CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
+        exit_policy=ExitPolicy(CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
+                               CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_ACCOUNT_STOP_PLACE_SECS),
+        contour_id=ACCOUNT, broker=ACCOUNT, directory=directory,
         core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=TINKOFF_TRADE_TOKEN,
         token_env="TINKOFF_TRADE_TOKEN", account_id=TINKOFF_ACCOUNT_ID, account_id_env="TINKOFF_ACCOUNT_ID",
         bot_token=account_bot_token(), bot_env=CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
@@ -306,11 +314,14 @@ def _run_account_contour(directory: Path, data_dir: Path, stop) -> int:
                                   cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
                                   request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
                                   max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
-                                  contour=ACCOUNT, orders=False)
+                                  contour=ACCOUNT, orders=orders)
         bus.subscribe_all(channels)
     contour = BrokerContour(settings, gateway_factory=AccountGateway, bus=bus, stop=stop, pid=os.getpid(),
                             find_account=lambda gateway: account_by_id(gateway, TINKOFF_ACCOUNT_ID or ""),
-                            read_facts=partial(read_facts, orders=orders), fee_probes_factory=FeeProbes)
+                            read_facts=partial(read_facts, orders=orders),
+                            # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
+                            fee_probes_factory=None if orders else FeeProbes,
+                            trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
     pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
                       timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
     pulse.start()
@@ -470,9 +481,10 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         pulse.stop()
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
-    server.account = _account_control(account, core_state)
+    server.account = _account_control(account, core_state, resolve_binding=_binding_resolver(core))
     server.trading = _contour_trading(state_dir, sandbox, account)
     server.comparison = _contour_comparison(server.trading, core_state)
+    server.account_comparison = _account_comparison(server.trading, core_state)
     server.indicators = _indicators_view()
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
@@ -526,8 +538,16 @@ def _account_supervisor(state_dir, core_state):
                                    heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
 
 
-def _account_control(supervisor, core_state):
+def _active_members(core_state, kind: str) -> set[str]:
+    desired = core_state.desired(kind)
+    return set() if desired is None else {member.key for member in desired.members if member.active}
+
+
+def _account_control(supervisor, core_state, resolve_binding=None):
+    """Ресурс «Счёта»: состав — только из состава песочницы, заявки — по [contours.account] (enable-live-trading)."""
     from src.bot.account_control import AccountControl
+    from src.broker_contour import SANDBOX
+    from src.config import CONTOUR_ACCOUNT_ORDERS
 
     def emulation_members():
         desired = core_state.desired(MODE_EMULATION)
@@ -535,7 +555,24 @@ def _account_control(supervisor, core_state):
 
     return AccountControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
                           share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
-                          emulation_members=emulation_members, log_file=LOGGING_FILE)
+                          emulation_members=emulation_members, log_file=LOGGING_FILE,
+                          resolve_binding=resolve_binding, orders_enabled=bool(CONTOUR_ACCOUNT_ORDERS),
+                          sandbox_members=lambda: _active_members(core_state, SANDBOX))
+
+
+def _account_comparison(trading: dict, core_state):
+    """«Счёт» против песочницы и эмуляции (enable-live-trading); без заявок на счёте ресурса нет."""
+    from src.bot import control_views as views
+    from src.bot.comparison_view import AccountComparison
+    from src.broker_contour import ACCOUNT
+    from src.broker_contour.bindings import binding_catalog
+    from src.config import CONTOUR_ACCOUNT_ORDERS
+
+    if not CONTOUR_ACCOUNT_ORDERS or views.ACCOUNT not in trading:
+        return None
+    return AccountComparison(account=trading[views.ACCOUNT], sandbox=trading[views.SANDBOX],
+                             emulation=trading[views.EMULATION], members=lambda: _active_members(core_state, ACCOUNT),
+                             catalog=binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES))
 
 
 def _indicators_view():

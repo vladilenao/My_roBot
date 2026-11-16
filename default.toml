@@ -69,7 +69,13 @@ max_rejects_in_row = 3  # Отказов брокера подряд до зап
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Счёт».
 telegram_channel_env = "TELEGRAM_ACCOUNT_CHANNEL_ID"  # Имя переменной .env с id канала «Счёт».
 reconcile_every_min = 1  # Как часто сверять брокерский счёт робота с журналом контура, минут (1–60).
-orders = false  # До Р2 только чтение счёта; токен и номер счёта — TINKOFF_TRADE_TOKEN и TINKOFF_ACCOUNT_ID в .env.
+orders = false  # true — торговать привязками заявками на НАСТОЯЩЕМ счёте (Р2); false — только читать. Токен и номер — TINKOFF_TRADE_TOKEN и TINKOFF_ACCOUNT_ID в .env.
+exit_offset_steps = 5  # Запас лимита выхода в шагах цены, 0–100.
+exit_requote_secs = 15  # Сколько ждать исполнения лимита выхода до перевыставления, секунд (5–300).
+exit_requote_attempts = 3  # Перевыставлений до аварийного выхода по рынку (1–10).
+stop_place_secs = 30  # За сколько секунд стоп-заявка должна стать активной, иначе выход и тревога (5–300).
+max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — выключен.
+max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/account/guards/reset (1–20).
 
 [instruments]
 fallback_type = "future"
