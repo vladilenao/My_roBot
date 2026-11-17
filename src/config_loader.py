@@ -149,6 +149,9 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_sandbox_stop_place_secs": int,
     "contours_sandbox_max_daily_loss_pct": (int, float),
     "contours_sandbox_max_rejects_in_row": int,
+    "contours_emulation_portfolio_pct": (int, float),
+    "contours_sandbox_portfolio_pct": (int, float),
+    "contours_account_portfolio_pct": (int, float),
     "contours_account_telegram_bot_env": str,
     "contours_account_telegram_channel_env": str,
     "contours_account_reconcile_every_min": int,
@@ -1025,6 +1028,12 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
 
 def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
     """Validate constraints that span TOML sections and configuration files."""
+    floor = (config.get("risk_limits") or {}).get("min_trade_risk_pct", 0) or 0
+    for kind in ("emulation", "sandbox", "account"):
+        pct = config.get(f"contours_{kind}_portfolio_pct")
+        if pct is not None and floor > pct:
+            raise ConfigError(f"{path}: [trading.risk_limits] min_trade_risk_pct ({floor}) не может превышать "
+                              f"[contours.{kind}] portfolio_pct ({pct})")
     try:
         validate_combination({key.removeprefix("market_data_"): value for key, value in config.items() if key in _INGESTION_KEYS})
     except SettingError as exc:
@@ -1069,15 +1078,15 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
 
 
 _CONTOUR_KEYS = {
-    "emulation": {"telegram_channel_env"},
+    "emulation": {"telegram_channel_env", "portfolio_pct"},
     # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
     "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
                 "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row"},
+                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct"},
     # Контур «Счёт» (add-account-contour): токен и номер счёта — только из окружения, состав — командами API.
     "account": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
                 "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row"},
+                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct"},
 }
 _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_exit_offset_steps": (0, 100),
@@ -1105,6 +1114,11 @@ def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
     if kind == "account" and "bindings" in value:
         raise ConfigError(f"{path}: [contours.account] bindings не задаётся в конфиге — состав «Счёта» задаётся "
                           f"командами API с Р2")
+    if "portfolio_pct" in value:
+        # Свой риск портфеля контура (add-contour-risk-limit): 0–100, как общий [trading.risk_limits].
+        _finite_number(value["portfolio_pct"], f"[contours.{kind}] portfolio_pct", path, non_negative=True)
+        if value["portfolio_pct"] > 100:
+            raise ConfigError(f"{path}: [contours.{kind}] portfolio_pct должен быть в [0, 100]")
     allowed = _CONTOUR_KEYS[kind]
     unknown = set(value) - allowed
     if unknown:

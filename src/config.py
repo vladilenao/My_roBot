@@ -233,6 +233,10 @@ CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_account_exit_requote_a
 CONTOUR_ACCOUNT_STOP_PLACE_SECS = _CONFIG["contours_account_stop_place_secs"]
 CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT = _CONFIG["contours_account_max_daily_loss_pct"]
 CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW = _CONFIG["contours_account_max_rejects_in_row"]
+# Свой риск портфеля контура (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct.
+CONTOUR_EMULATION_PORTFOLIO_PCT = _CONFIG.get("contours_emulation_portfolio_pct")
+CONTOUR_SANDBOX_PORTFOLIO_PCT = _CONFIG.get("contours_sandbox_portfolio_pct")
+CONTOUR_ACCOUNT_PORTFOLIO_PCT = _CONFIG.get("contours_account_portfolio_pct")
 
 
 def telegram_channel_id() -> str | None:

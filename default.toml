@@ -52,6 +52,7 @@ max_history_runs = 2  # Сколько прогонов истории идёт 
 
 [contours.emulation]
 telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env с id канала Telegram контура (сам id — только в .env).
+# portfolio_pct = 2.0  # Свой риск портфеля эмуляции, % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
 [contours.sandbox]
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Песочница».
@@ -64,6 +65,7 @@ exit_requote_attempts = 3  # Перевыставлений до аварийн�
 stop_place_secs = 30  # За сколько секунд стоп-заявка у брокера должна стать активной, иначе выход и тревога (5–300).
 max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — предохранитель выключен.
 max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/sandbox/guards/reset (1–20).
+# portfolio_pct = 2.0  # Свой риск портфеля песочницы, % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
 [contours.account]
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Счёт».
@@ -76,6 +78,7 @@ exit_requote_attempts = 3  # Перевыставлений до аварийн�
 stop_place_secs = 30  # За сколько секунд стоп-заявка должна стать активной, иначе выход и тревога (5–300).
 max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — выключен.
 max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/account/guards/reset (1–20).
+# portfolio_pct = 2.0  # Свой риск портфеля «Счёта», % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
 [instruments]
 fallback_type = "future"

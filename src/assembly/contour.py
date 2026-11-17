@@ -442,7 +442,7 @@ class BrokerTrading:
 
 def _build_runtime(
     instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None,
-    contracts=None, broker_trading: BrokerTrading | None = None,
+    contracts=None, broker_trading: BrokerTrading | None = None, portfolio_pct: float | None = None,
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -492,7 +492,9 @@ def _build_runtime(
         log.warning("Не удалось поднять SQLite-симуляцию (%s) — NotifyOnly.", exc)
         return _Runtime()
 
-    risk_limits = _risk_limits()
+    # Свой риск портфеля контура (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct.
+    pct = RISK_LIMITS.get("portfolio_pct", 2) if portfolio_pct is None else portfolio_pct
+    risk_limits = _risk_limits() if portfolio_pct is None else _risk_limits(portfolio_pct)
     names = _instrument_names(instruments)
     costs = {"commission": 1.5, "slippage": 1.0} if historical else {}
 
@@ -540,7 +542,7 @@ def _build_runtime(
         slippage=RISK_LIMITS.get("slippage", costs.get("slippage")),
         slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
         min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
-        portfolio_pct=RISK_LIMITS.get("portfolio_pct", 2),
+        portfolio_pct=pct,
         min_risk_cost_ratio=RISK_LIMITS.get("min_risk_cost_ratio", 2),
         min_net_payoff=RISK_LIMITS.get("min_net_payoff", 1.5),
         max_slippage_r=RISK_LIMITS.get("max_slippage_r", 0.25),
@@ -884,16 +886,12 @@ def _broker_event(event) -> Event:
     )
 
 
-def _risk_limits():
-    """Build typed portfolio limits from the validated configuration values."""
+def _risk_limits(pct=None):
+    """Build typed portfolio limits from the validated configuration values; ``pct`` — процент контура."""
     from src.portfolio import RiskLimits
 
-    return RiskLimits(
-        per_trade=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
-        per_instrument=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
-        per_group={},
-        portfolio=Decimal(str(RISK_LIMITS.get("portfolio_pct", 2))),
-    )
+    value = Decimal(str(RISK_LIMITS.get("portfolio_pct", 2) if pct is None else pct))
+    return RiskLimits(per_trade=value, per_instrument=value, per_group={}, portfolio=value)
 
 
 
@@ -1008,6 +1006,8 @@ class ContourSettings:
     broker_trading: BrokerTrading | None = None
     # Готовая шина со своими каналами (контур на брокере); None — каналы эмуляции по настройкам.
     bus: object = None
+    # Свой риск портфеля, % (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct.
+    portfolio_pct: float | None = None
 
 
 class TradingContour:
@@ -1043,6 +1043,7 @@ class TradingContour:
             settings.instruments, services.data_cache, self.bus, settings.state_dir, clock=settings.clock,
             session=settings.session, client_provider=settings.client_provider, cluster_gate=cluster_gate,
             contracts=settings.contracts, broker_trading=settings.broker_trading,
+            portfolio_pct=settings.portfolio_pct,
         )
         return self
 

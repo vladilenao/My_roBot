@@ -166,3 +166,47 @@ def test_account_orders_enabled_with_trading_keys(tmp_path):
     config = _load(tmp_path, "[contours.account]\norders = true\nmax_daily_loss_pct = 2\nstop_place_secs = 20\n")
     assert config["contours_account_orders"] is True
     assert config["contours_account_max_daily_loss_pct"] == 2 and config["contours_account_stop_place_secs"] == 20
+
+
+# --- свой риск портфеля контура (add-contour-risk-limit) --------------------------------
+
+@pytest.mark.parametrize("kind", ["emulation", "sandbox", "account"])
+def test_contour_portfolio_pct_loaded(tmp_path, kind):
+    config = _load(tmp_path, f"[contours.{kind}]\nportfolio_pct = 6\n")
+    assert config[f"contours_{kind}_portfolio_pct"] == 6
+
+
+@pytest.mark.parametrize("value, match", [("150", r"\[contours.account\] portfolio_pct должен быть в \[0, 100\]"),
+                                          ("-1", "должен быть >= 0"), ("true", "конечным числом"),
+                                          ('"5"', "")])
+def test_contour_portfolio_pct_rejected(tmp_path, value, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"[contours.account]\nportfolio_pct = {value}\n")
+
+
+def test_contour_portfolio_pct_below_min_trade_risk_rejected(tmp_path):
+    with pytest.raises(ConfigError, match=r"min_trade_risk_pct \(1.0\) не может превышать \[contours.sandbox\]"):
+        _load(tmp_path, "[trading.risk_limits]\nmin_trade_risk_pct = 1.0\n[contours.sandbox]\nportfolio_pct = 0.5\n")
+
+
+def test_contour_risk_limits_use_own_percent():
+    from decimal import Decimal
+
+    from src.assembly.contour import RISK_LIMITS, _risk_limits
+    from src.trade_management.models import PortfolioBudgetPolicy
+
+    assert _risk_limits(6).portfolio == Decimal("6")
+    assert _risk_limits().portfolio == Decimal(str(RISK_LIMITS.get("portfolio_pct", 2)))
+    budget = PortfolioBudgetPolicy(Decimal("6")).budget(Decimal("9900"), Decimal("9900"))
+    assert budget == Decimal("594")             # хватает на лот Si с риском 528 ₽, при 2% было 198 ₽
+
+
+def test_contour_portfolio_pct_by_kind(monkeypatch):
+    import run
+    from src import config
+
+    monkeypatch.setattr(config, "CONTOUR_ACCOUNT_PORTFOLIO_PCT", 6)
+    monkeypatch.setattr(config, "CONTOUR_SANDBOX_PORTFOLIO_PCT", None)
+    assert run._contour_portfolio_pct("account") == 6
+    assert run._contour_portfolio_pct("sandbox") is None
+    assert run._contour_portfolio_pct("history") is None
