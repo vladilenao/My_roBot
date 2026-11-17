@@ -28,6 +28,8 @@
 
   Сделано 16.11: настройки — `config_loader.py`, `config.py`, `default.toml` (диапазоны общие с песочницей); `run.py` — `_run_account_contour` с `ExitPolicy`, порогами и торговой частью, разведка комиссий только при `orders = false`; `_account_control` с режимом, составом песочницы и `resolve_binding`, `_account_comparison`; `BrokerContour._serve_trading` пишет факты допуска и причину первой тревоги; `src/bot/account_control.py` (`parse_account_target`, `parse_account_bindings`, `put_account_target`, `change_account_bindings`); `src/bot/comparison_view.py` — `_diffs_between`, `AccountComparison` (отчёт песочницы не изменён); `export_api.py` — `guards/reset`, `comparison`; `docs/api/openapi.yaml` 2.12.0. Тесты: `test_account_api.py` (+5, обновлены 3 теста Р1), `test_contour_comparison.py` (+3), `test_account_contour.py` (+1), `test_contour_config.py` (+3). Полный `pytest` 4175 passed, `ruff check` чистый.
 
+- [x] 5.3 Комиссия брокера на счёте: окно `GetOperationsByCursor` назад — сутки, а не минута; операция счёта датирована постановкой заявки (найдено на проверке 6.3, 17.11: вход ждал 85 с, комиссия 20,76 ₽ не подтянулась). Тест `test_operation_dated_at_order_placement_hours_before_fill`.
+
 ## 6. Ручная проверка владельцем
 
 - [ ] 6.1 `[contours.account] orders = true`, перезапуск «Счёта»: в карточке старта «Режим: заявки к брокеру», токен с полным доступом, предупреждений нет.
