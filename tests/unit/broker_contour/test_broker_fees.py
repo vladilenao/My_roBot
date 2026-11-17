@@ -238,3 +238,16 @@ def test_api_operations_failure_is_classified():
         assert exc.kind == "unknown"
     else:
         raise AssertionError("ожидался OrderFailure")
+
+
+def test_operation_dated_at_order_placement_hours_before_fill(tmp_path):
+    """Счёт …7029, 17.11: операция датирована постановкой лимитной заявки, а не исполнением (enable-live-trading)."""
+    journal = _Journal(tmp_path / "trades.sqlite3")
+    _open(journal, fills=(("tinvest:exch-1", 1),))
+    api = FakeApi()
+    placed = NOW - timedelta(hours=6)                    # дневной лимит цели: утром выставлен, исполнен днём
+    api.operation_items = [_trade_op("op-1", [("exch-1", 1)], at=placed), _fee_op("op-2", "op-1", "20.76", at=NOW)]
+    events = _sync(journal, api).run(NOW + timedelta(minutes=1))
+    assert [(e.execution_id, e.new_fee) for e in events] == [("tinvest:exch-1", D("20.76"))]
+    since = api.calls[-1][1]
+    assert since <= placed

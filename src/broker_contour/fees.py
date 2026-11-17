@@ -35,7 +35,9 @@ ORDER_PREFIX = "tinvest-order:"
 ORDER_RETRY = timedelta(minutes=15)
 HORIZON = timedelta(days=7)
 FALLBACK_AFTER = timedelta(minutes=15)
-LOOKBACK = timedelta(minutes=1)
+# Операция счёта датирована постановкой заявки, а не исполнением: лимит входа ждёт минуты, дневной лимит цели —
+# часы (счёт …7029, 17.11, enable-live-trading). Окно назад от самого раннего ждущего исполнения — сутки.
+LOOKBACK = timedelta(days=1)
 MAX_PAGES = 10
 _CENT = Decimal("0.01")
 
