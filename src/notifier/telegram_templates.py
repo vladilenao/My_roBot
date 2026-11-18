@@ -259,7 +259,8 @@ def render_broker_account(event) -> str:
             lines.append(f"Отказов брокера подряд: {detail.get('count', 0)}")
             lines.extend(escape(f"  {reason}") for reason in detail.get("reasons") or ())
             lines.append("Новые входы и доборы запрещены. Выходы и стопы работают.")
-            lines.append("Снять: разобраться с причиной и отправить POST /api/v1/sandbox/guards/reset.")
+            resource = "account" if event.get("contour") == "account" else "sandbox"
+            lines.append(f"Снять: разобраться с причиной и отправить POST /api/v1/{resource}/guards/reset.")
     elif kind == "guard_cleared":
         guard = event.get("guard")
         why = "новый торговый день" if event.get("reason") == "new-day" else "командой сброса"

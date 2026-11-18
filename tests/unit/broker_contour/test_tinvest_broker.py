@@ -598,3 +598,46 @@ def test_order_state_over_order_lots_is_ignored_without_resync(tmp_path):
         h.broker.service(h.clock.advance(1))
     assert h.drain() == [] and [e.lots for e in h.ledger.executions(key)] == [10]
     assert not [call for call in h.api.calls if call[0] == "state"]      # досверки по лишним лотам нет
+
+
+def test_entry_lots_limit_asks_broker_only_on_account(tmp_path):
+    """«Счёт» спрашивает ``GetMaxLots`` по цене заявки; песочница — нет (fix 30042, 18.11)."""
+    sandbox = Harness(tmp_path)
+    assert sandbox.broker.entry_lots_limit(NG, "SELL", D("2.8451")) is None
+    assert not [call for call in sandbox.api.calls if call[0] == "max-lots"]
+
+    api, clock = FakeApi(), Clock()
+    broker = TInvestBroker(api, OrderLedger(tmp_path / "account.sqlite3"), contour="account", clock=clock,
+                           ask_max_lots=True)
+    broker.set_contracts({NG: NG_META})
+    api.max_lots_answer = 2
+    assert broker.entry_lots_limit(NG, "SELL", D("2.8451")) == 2
+    assert api.calls[-1] == ("max-lots", NG, "SELL", D("2.846"))   # цена заявки: продажа вверх на сетку
+    api.max_lots_answer = OrderFailure("unknown", "DEADLINE_EXCEEDED")
+    assert broker.entry_lots_limit(NG, "BUY", D("2.845")) is None   # сбой не запрещает вход
+
+
+def test_api_max_lots_takes_larger_of_cash_and_margin_for_side():
+    """Ответ счёта …7029 18.11 по BR: без плеча 0, с плечом 2 — лимит 2; запрос с ценой заявки."""
+    from t_tech.invest import schemas as s
+
+    from src.broker_contour.api import TInvestApi
+
+    class Gateway:
+        def __init__(self):
+            self.requests = []
+
+        def call(self, method, **kwargs):
+            self.requests.append((method, kwargs["request"]))
+            return s.GetMaxLotsResponse(buy_limits=s.BuyLimitsView(buy_max_lots=0),
+                                        buy_margin_limits=s.BuyLimitsView(buy_max_lots=3),
+                                        sell_limits=s.SellLimitsView(sell_max_lots=0),
+                                        sell_margin_limits=s.SellLimitsView(sell_max_lots=2))
+
+    gateway = Gateway()
+    api = TInvestApi(gateway, "acc-0000")
+    assert api.max_lots("uid-br", "SELL", D("92.85")) == 2
+    assert api.max_lots("uid-br", "BUY", D("92.85")) == 3
+    method, request = gateway.requests[0]
+    assert method == "orders.get_max_lots" and request.instrument_id == "uid-br" and request.account_id == "acc-0000"
+    assert request.price.units == 92 and request.price.nano == 850000000

@@ -120,8 +120,10 @@ class TInvestBroker(StopKeeping, BrokerPort):
                  entry_ttl: Callable[[str], int] = lambda timeframe: 3600,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  stops: StopLedger | None = None,
-                 order_outcome: Callable[[bool, str], None] = lambda accepted, reason: None):
+                 order_outcome: Callable[[bool, str], None] = lambda accepted, reason: None,
+                 ask_max_lots: bool = False):
         self._api = api
+        self._ask_max_lots = ask_max_lots   # «Счёт»: объём входа не больше GetMaxLots (fix 30042)
         self._ledger = ledger
         ledger.clock = clock
         self._contour = contour
@@ -171,6 +173,23 @@ class TInvestBroker(StopKeeping, BrokerPort):
         if meta is None or not margin:
             return meta
         return replace(meta, go_buy=float(margin["go_buy"]), go_sell=float(margin["go_sell"]))
+
+    def entry_lots_limit(self, key: str, side: str, price: Decimal) -> int | None:
+        """Лоты входа, которые брокер даёт по обеспечению счёта; ``None`` — не спрашиваем или нет ответа.
+
+        Цена — та же, что уйдёт в заявку (на сетке шага в безопасную сторону).
+        Сбой запроса не запрещает вход: остаётся проверка ГО бюджета.
+        """
+        if not self._ask_max_lots:
+            return None
+        card = self._card_for(key)
+        if card is None:
+            return None
+        try:
+            return int(self._api.max_lots(card.uid, side, entry_limit(card, Decimal(str(price)), side)))
+        except OrderFailure as failure:
+            log.warning("Лимит лотов %s у брокера не прочитан: %s", self._display(key), failure.kind)
+            return None
 
     def refresh_margins(self, now: datetime) -> list[str]:
         """ГО фьючерсов из ``GetFuturesMargin``: при допуске инструмента и раз в сутки."""

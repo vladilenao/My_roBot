@@ -279,6 +279,21 @@ class TInvestApi:
                               account_id=self._account, order_type=s.OrderType.ORDER_TYPE_MARKET, order_id=key)
         return report_from_state(response)
 
+    def max_lots(self, uid: str, side: str, price: Decimal) -> int:
+        """Сколько лотов брокер даёт по цене ``price`` (``GetMaxLots``): большее из «без плеча» и «с плечом».
+
+        Требование брокера к марже не равно биржевому ГО: на счёте …7029 18.11 при
+        49 825 ₽ брокер давал BR 2, GOLD 1, Si 6 против 3, 2 и 3 по ГО
+        ``GetFuturesMargin`` (отказ 30042 «Not enough assets for a margin trade»).
+        """
+        from t_tech.invest.utils import decimal_to_quotation
+
+        response = self._call("orders.get_max_lots", request=s.GetMaxLotsRequest(
+            account_id=self._account, instrument_id=uid, price=decimal_to_quotation(price)))
+        if side == "BUY":
+            return max(response.buy_limits.buy_max_lots, response.buy_margin_limits.buy_max_lots)
+        return max(response.sell_limits.sell_max_lots, response.sell_margin_limits.sell_max_lots)
+
     def cancel(self, broker_order_id: str) -> None:
         self._call("orders.cancel_order", account_id=self._account, order_id=broker_order_id)
 

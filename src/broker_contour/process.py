@@ -299,7 +299,8 @@ class BrokerContour:
             broker = TInvestBroker(api, ledger, contour=settings.contour_id,
                                    policy=settings.exit_policy or ExitPolicy(), publish=self._bus.publish,
                                    journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
-                                   stops=stops, order_outcome=guards.order_outcome)
+                                   stops=stops, order_outcome=guards.order_outcome,
+                                   ask_max_lots=settings.contour_id == "account")
             holder["broker"] = broker
             holder["fees"] = FeeSync(api, lambda: storage.connection)   # add-account-vs-emulation-report
             return broker

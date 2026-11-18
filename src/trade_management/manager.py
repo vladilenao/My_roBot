@@ -100,7 +100,7 @@ STOP_BOUNDARY_REASON = "stop_loss_beyond_market_boundary"
 GAP_ENTRY_REASON = "gap-entry"
 DEFAULT_SLIPPAGE_TOLERANCE = Decimal("0.005")
 BUDGET_REJECTION_CODES = frozenset(
-    {"risk-budget", "margin-committed-by-pending-orders", "margin-budget"}
+    {"risk-budget", "margin-committed-by-pending-orders", "margin-budget", "broker-margin"}
 )
 
 
@@ -2463,20 +2463,28 @@ class TradeManager:
         def margin_allowed(quantity: int) -> bool:
             return go <= 0 or go * quantity <= free_margin
 
+        broker_limit = self._broker_lots_limit(plan.instrument_id, plan.side, plan.reference_entry)
+
+        def broker_allowed(quantity: int) -> bool:
+            return broker_limit is None or quantity <= broker_limit
+
         def allowed(quantity: int) -> bool:
-            return risk_allowed(quantity) and margin_allowed(quantity)
+            return risk_allowed(quantity) and margin_allowed(quantity) and broker_allowed(quantity)
 
         maximum = min(self._max_qty, plan.requested_quantity) if plan.requested_quantity is not None else self._max_qty
         quantity = self._largest_allowed(allowed, maximum)
         if quantity > 0:
             constraint = ("risk" if not risk_allowed(quantity+1) else
                           "margin" if not margin_allowed(quantity+1) else
+                          "broker-margin" if not broker_allowed(quantity+1) else
                           "requested-quantity" if plan.requested_quantity is not None and plan.requested_quantity <= self._max_qty else
                           "max-quantity")
             return _Sizing(quantity, per_unit_risk * quantity, None, quantity, per_unit_risk,
                            go, used_risk, used_margin, risk_budget, budget, constraint)
         risk_quantity = self._largest_allowed(risk_allowed, maximum)
-        if risk_quantity > 0:
+        if risk_quantity > 0 and margin_allowed(1) and not broker_allowed(1):
+            code = "broker-margin"
+        elif risk_quantity > 0:
             code = "margin-committed-by-pending-orders" if state.pending_margin > 0 else "margin-budget"
         elif per_unit_risk > free_risk:
             code = "risk-budget"
@@ -2485,6 +2493,19 @@ class TradeManager:
         candidate_quantity = risk_quantity or 1
         return _Sizing(0, Decimal("0"), code, candidate_quantity, per_unit_risk, go,
                        used_risk, used_margin, risk_budget, budget)
+
+    def _broker_lots_limit(self, instrument_id: str, side: str, price) -> int | None:
+        """Сколько лотов брокер даёт по обеспечению счёта; ``None`` — брокер не спрашивается.
+
+        Только у контура «Счёт» (``TInvestBroker.entry_lots_limit``): требование
+        брокера к марже не равно биржевому ГО (fix 30042, 18.11), поэтому объём
+        входа и добора не больше, чем брокер разрешает сейчас.
+        """
+        limit = getattr(self._broker, "entry_lots_limit", None)
+        if not callable(limit) or price is None:
+            return None
+        value = limit(instrument_id, side, Decimal(str(price)))
+        return value if isinstance(value, int) and value >= 0 else None
 
     def _largest_allowed(self, allowed: Callable[[int], bool], maximum: int | None = None) -> int:
         low, high = 0, self._max_qty if maximum is None else maximum
@@ -2683,14 +2704,22 @@ class TradeManager:
             raise ValueError("zero-quantity")
         def risk_allowed(q):
             return self._budget_policy.portfolio_pct > 0 and budget.used_risk <= budget.limit and budget.used_risk+delta(q) <= budget.limit
+        def margin_allowed(q):
+            return self._margin_in_use(budget)+go*q <= budget.base
+        broker_limit = self._broker_lots_limit(current.instrument_id, current.side, action.limit_price)
+        def broker_allowed(q):
+            return broker_limit is None or q <= broker_limit
         def allowed(q):
-            return risk_allowed(q) and self._margin_in_use(budget)+go*q <= budget.base
+            return risk_allowed(q) and margin_allowed(q) and broker_allowed(q)
         quantity = self._largest_allowed(allowed, maximum)
         if quantity <= 0:
-            code = "risk-budget" if self._largest_allowed(risk_allowed, maximum) == 0 else "margin-committed-by-pending-orders" if budget.pending_margin > 0 else "margin-budget"
+            code = ("risk-budget" if self._largest_allowed(risk_allowed, maximum) == 0 else
+                    "broker-margin" if margin_allowed(1) and not broker_allowed(1) else
+                    "margin-committed-by-pending-orders" if budget.pending_margin > 0 else "margin-budget")
             raise ReservationRejected(code, used_risk=budget.used_risk, candidate_risk=delta(1), risk_budget=budget.limit,
                                       used_margin=budget.used_margin, candidate_margin=go, margin_budget=budget.base)
-        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if self._margin_in_use(budget)+go*(quantity+1) > budget.base else
+        constraint = ("risk" if not risk_allowed(quantity+1) else "margin" if not margin_allowed(quantity+1) else
+                      "broker-margin" if not broker_allowed(quantity+1) else
                       "max-quantity" if current.quantity+quantity >= self._max_qty else action.limiting_constraint or "profile")
         selected = replace(action, quantity=quantity, requested_quantity=requested, limiting_constraint=constraint)
         self._traces.record_in_transaction(connection, calculation_trace(
