@@ -323,6 +323,9 @@ strategies = [
 strategies = [
     { id = "future-si-ma-raw", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", tf = "5m", priority = 10 },
     { id = "future-si-ma-triple", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "triple_screen", tf = "5m", priority = 10 },
+    { id = "future-si-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10, clusters = "shadow" },
+    { id = "future-si-harmonic", name = "harmonic_abcd", management = "pattern_targets", priority = 10 },
+    { id = "future-si-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", tf = "15m", priority = 5 }
 ]
 
 [strategies.future.ED]
