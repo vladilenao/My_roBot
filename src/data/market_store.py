@@ -122,6 +122,11 @@ class StoredScheduleDay:
     rules_version: str | None = None
 
 
+# Удержания UID прежней версии (fix-executed-minute-revision).
+_LEGACY_HOLDS = """SELECT key,value FROM metadata WHERE key LIKE 'live:uid:%'
+    AND (value LIKE '%"integrity_hold"%' OR value LIKE '%"pending_input_conflicts"%')"""
+
+
 class MarketDataStore:
     """SQLite-хранилище независимое от памяти ``MarketDataCache``.
 
@@ -351,7 +356,11 @@ class MarketDataStore:
                 )
             self._migrate_contour_marks(conn)
             self._release_integrity_holds(conn)
-            conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+            # Записи только при отличии (fix-market-store-startup-lock): ядро и контуры
+            # открывают базу одновременно, и открытие актуальной базы не ждёт пишущего.
+            if self._metadata_value(conn, "schema_version") != str(SCHEMA_VERSION):
+                conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
             self._set_default(conn, "schedule_max_change_id", "0")
@@ -410,12 +419,16 @@ class MarketDataStore:
         минуты (``integrity_hold``) или начатого пакета (``pending_input_conflicts``).
         Контур продолжает от своих курсоров; исполненное не переигрывается.
         """
+        # Удержания пишет только прежняя версия, новые не появляются: без них
+        # блокировка записи не берётся, и старт не ждёт пишущий процесс
+        # (fix-market-store-startup-lock).
+        if not conn.execute(_LEGACY_HOLDS + " LIMIT 1").fetchone():
+            return
         released = _utc_text()
         conn.execute("BEGIN IMMEDIATE")
         try:
             # Ядро и контур открывают базу одновременно: чтение под той же блокировкой.
-            rows = conn.execute("""SELECT key,value FROM metadata WHERE key LIKE 'live:uid:%'
-                AND (value LIKE '%"integrity_hold"%' OR value LIKE '%"pending_input_conflicts"%')""").fetchall()
+            rows = conn.execute(_LEGACY_HOLDS).fetchall()
             for key, value in rows:
                 held = json.loads(value)
                 held.pop("integrity_hold", None)
@@ -448,7 +461,14 @@ class MarketDataStore:
 
     @staticmethod
     def _set_default(conn: sqlite3.Connection, key: str, value: str) -> None:
-        conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)", (key, value))
+        # INSERT OR IGNORE берёт блокировку записи и тогда, когда ключ уже есть.
+        if MarketDataStore._metadata_value(conn, key) is None:
+            conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)", (key, value))
+
+    @staticmethod
+    def _metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
+        row = conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return None if row is None else row[0]
 
     def source_info(self) -> SourceInfo:
         with self._lock, self._connect() as conn:
