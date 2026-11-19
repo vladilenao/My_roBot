@@ -8,7 +8,7 @@ manager.
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Mapping
 
 import pandas as pd
@@ -51,6 +51,7 @@ def build_management_market(
     commission: Decimal | float | str | None = None,
     slippage: Decimal | float | str | None = None,
     admission_snapshot: Mapping[str, object] | None = None,
+    commission_pct: Decimal | float | str | None = None,
 ) -> dict[str, object]:
     """Assemble the local market view consumed by trade-management profiles.
 
@@ -118,13 +119,29 @@ def build_management_market(
         market["support"] = below[-1] if below else None
         market["resistance"] = above[0] if above else None
 
-    market["entry_cost"] = _price(commission) if commission is not None else Decimal("0")
-    market["exit_cost"] = _price(commission) if commission is not None else Decimal("0")
+    per_contract = _commission_per_contract(commission_pct, decision_price or market.get("close"), price_step, step_cost)
+    if per_contract is None:
+        per_contract = _price(commission) if commission is not None else Decimal("0")
+    market["entry_cost"] = per_contract
+    market["exit_cost"] = per_contract
     market["slippage_cost"] = _price(slippage) if slippage is not None else Decimal("0")
 
     if signal and decision_price is not None:
         market["add_signal_price"] = decision_price
     return market
+
+
+def _commission_per_contract(pct, price, price_step, step_cost) -> Decimal | None:
+    """Комиссия за контракт за сторону из процента стоимости контракта (add-commission-pct).
+
+    Стоимость контракта — цена × стоимость шага ÷ шаг; округление до копейки вверх. Нет процента, цены
+    или карточки контракта — ``None``: действует комиссия в рублях.
+    """
+    pct = _price(pct)
+    if pct is None or price is None or not price_step or not step_cost:
+        return None
+    value = Decimal(str(price)) * Decimal(str(step_cost)) / Decimal(str(price_step)) * pct / Decimal(100)
+    return value.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
 
 
 def _price(value: object) -> Decimal | None:

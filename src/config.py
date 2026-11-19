@@ -237,6 +237,10 @@ CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW = _CONFIG["contours_account_max_rejects_in_ro
 CONTOUR_EMULATION_PORTFOLIO_PCT = _CONFIG.get("contours_emulation_portfolio_pct")
 CONTOUR_SANDBOX_PORTFOLIO_PCT = _CONFIG.get("contours_sandbox_portfolio_pct")
 CONTOUR_ACCOUNT_PORTFOLIO_PCT = _CONFIG.get("contours_account_portfolio_pct")
+# Своя комиссия контура, % стоимости контракта за сторону (add-commission-pct); None — общий [trading.risk_limits].
+CONTOUR_EMULATION_COMMISSION_PCT = _CONFIG.get("contours_emulation_commission_pct")
+CONTOUR_SANDBOX_COMMISSION_PCT = _CONFIG.get("contours_sandbox_commission_pct")
+CONTOUR_ACCOUNT_COMMISSION_PCT = _CONFIG.get("contours_account_commission_pct")
 
 
 def telegram_channel_id() -> str | None:
