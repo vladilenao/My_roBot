@@ -185,6 +185,7 @@ def _run_contour(kind: str, args=()) -> int:
         kind=kind, state_dir=directory, channel_names=None, clock=None,
         session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
         contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
+        portfolio_pct=_contour_portfolio_pct(kind),
     ), services)
     try:
         contour.build()
@@ -373,10 +374,20 @@ def _broker_trading_factory(kind: str, directory: Path, data_dir: Path, launch: 
             kind=kind, state_dir=directory, channel_names=None, clock=None,
             session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
             contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
-            strategies=strategies, broker_trading=trading, bus=bus), services)
+            strategies=strategies, broker_trading=trading, bus=bus,
+            portfolio_pct=_contour_portfolio_pct(kind)), services)
         return _BrokerTradingPart(contour, services)
 
     return factory
+
+
+def _contour_portfolio_pct(kind: str):
+    """Свой риск портфеля контура (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct."""
+    from src.config import (CONTOUR_ACCOUNT_PORTFOLIO_PCT, CONTOUR_EMULATION_PORTFOLIO_PCT,
+                            CONTOUR_SANDBOX_PORTFOLIO_PCT)
+
+    return {MODE_EMULATION: CONTOUR_EMULATION_PORTFOLIO_PCT, "sandbox": CONTOUR_SANDBOX_PORTFOLIO_PCT,
+            "account": CONTOUR_ACCOUNT_PORTFOLIO_PCT}.get(kind)
 
 
 def _run_history_contour(name: str) -> int:
