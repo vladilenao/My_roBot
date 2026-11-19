@@ -154,16 +154,19 @@ class MarketDataReconciler:
         if expectation.last_due is not None:
             ranges.append((grid.bar_close(stamps[-1]), expectation.last_due.close))
 
+        # Все новые промежутки пары — одним пакетом: после перезапуска это
+        # тысячи уже записанных промежутков ряда (fix-coverage-reconcile-restart).
+        # Промежуток считается проверенным только после записи пакета.
+        rows, markers = [], []
         for start, end in ranges:
             if end <= start:
                 continue
             marker = (instrument_uid, interval, start, end, bool(calendar), self._calendar_evidence)
             if marker in self._scanned:
                 continue
-            self._scanned.add(marker)
-            rows = []
+            markers.append(marker)
             if calendar is None:
-                rows = [(opened, "unresolved", "schedule_unavailable") for opened in self._grid_opens(grid, start, end)]
+                rows.extend((opened, "unresolved", "schedule_unavailable") for opened in self._grid_opens(grid, start, end))
             else:
                 due = {bar.open: bar for bar in expected_bars(calendar, rule, start, end, timeout)}
                 for opened in self._grid_opens(grid, start, end):
@@ -178,8 +181,10 @@ class MarketDataReconciler:
                             rows.append((opened, "unresolved", "calendar_evidence_disabled"))
                     else:
                         rows.append((opened, "unresolved", "schedule_unavailable"))
+        if rows:
             self._store.set_interval_states(source=self._source, instrument_uid=instrument_uid, interval=interval,
                                             rows=rows, observed_at=now)
+        self._scanned.update(markers)
 
     @staticmethod
     def _grid_opens(grid, start, end):
