@@ -185,7 +185,7 @@ def _run_contour(kind: str, args=()) -> int:
         kind=kind, state_dir=directory, channel_names=None, clock=None,
         session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
         contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
-        portfolio_pct=_contour_portfolio_pct(kind),
+        portfolio_pct=_contour_portfolio_pct(kind), commission_pct=_contour_commission_pct(kind),
     ), services)
     try:
         contour.build()
@@ -375,10 +375,19 @@ def _broker_trading_factory(kind: str, directory: Path, data_dir: Path, launch: 
             session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
             contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
             strategies=strategies, broker_trading=trading, bus=bus,
-            portfolio_pct=_contour_portfolio_pct(kind)), services)
+            portfolio_pct=_contour_portfolio_pct(kind), commission_pct=_contour_commission_pct(kind)), services)
         return _BrokerTradingPart(contour, services)
 
     return factory
+
+
+def _contour_commission_pct(kind: str):
+    """Своя комиссия контура, % стоимости контракта за сторону (add-commission-pct); None — общий процент."""
+    from src.config import (CONTOUR_ACCOUNT_COMMISSION_PCT, CONTOUR_EMULATION_COMMISSION_PCT,
+                            CONTOUR_SANDBOX_COMMISSION_PCT)
+
+    return {MODE_EMULATION: CONTOUR_EMULATION_COMMISSION_PCT, "sandbox": CONTOUR_SANDBOX_COMMISSION_PCT,
+            "account": CONTOUR_ACCOUNT_COMMISSION_PCT}.get(kind)
 
 
 def _contour_portfolio_pct(kind: str):

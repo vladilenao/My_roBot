@@ -443,6 +443,7 @@ class BrokerTrading:
 def _build_runtime(
     instruments, data_cache, bus, state_dir, clock=None, session=None, client_provider=None, cluster_gate=None,
     contracts=None, broker_trading: BrokerTrading | None = None, portfolio_pct: float | None = None,
+    commission_pct: float | None = None,
 ) -> _Runtime:
     """Compose notification-only or SQLite-backed simulated runtime services.
 
@@ -539,6 +540,8 @@ def _build_runtime(
         risk_limits=risk_limits,
         max_qty=RISK_LIMITS.get("max_qty"),
         commission=RISK_LIMITS.get("commission", costs.get("commission")),
+        # Своя комиссия контура, % стоимости контракта (add-commission-pct); None — общий [trading.risk_limits].
+        commission_pct=RISK_LIMITS.get("commission_pct") if commission_pct is None else commission_pct,
         slippage=RISK_LIMITS.get("slippage", costs.get("slippage")),
         slippage_tolerance=RISK_LIMITS.get("slippage_tolerance"),
         min_trade_risk_pct=RISK_LIMITS.get("min_trade_risk_pct"),
@@ -1008,6 +1011,8 @@ class ContourSettings:
     bus: object = None
     # Свой риск портфеля, % (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct.
     portfolio_pct: float | None = None
+    # Своя комиссия, % стоимости контракта за сторону (add-commission-pct); None — общий [trading.risk_limits].
+    commission_pct: float | None = None
 
 
 class TradingContour:
@@ -1044,6 +1049,7 @@ class TradingContour:
             session=settings.session, client_provider=settings.client_provider, cluster_gate=cluster_gate,
             contracts=settings.contracts, broker_trading=settings.broker_trading,
             portfolio_pct=settings.portfolio_pct,
+            commission_pct=settings.commission_pct,
         )
         return self
 

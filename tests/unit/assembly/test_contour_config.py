@@ -210,3 +210,26 @@ def test_contour_portfolio_pct_by_kind(monkeypatch):
     assert run._contour_portfolio_pct("account") == 6
     assert run._contour_portfolio_pct("sandbox") is None
     assert run._contour_portfolio_pct("history") is None
+
+
+# --- комиссия в процентах (add-commission-pct) -------------------------------------------------
+
+def test_commission_pct_defaults():
+    from src import config
+
+    assert config.RISK_LIMITS.get("commission_pct") == 0.025
+    assert config.CONTOUR_SANDBOX_COMMISSION_PCT == 0.05 and config.CONTOUR_ACCOUNT_COMMISSION_PCT is None
+
+
+def test_commission_pct_per_contour(tmp_path):
+    config = _load(tmp_path, "[trading.risk_limits]\ncommission_pct = 0.03\n\n[contours.account]\ncommission_pct = 0.025\n")
+    assert config["contours_account_commission_pct"] == 0.025
+    risk = config.get("risk_limits") or config.get("trading_risk_limits") or {}
+    assert not risk or risk.get("commission_pct") == 0.03
+
+
+@pytest.mark.parametrize("text", ["[contours.account]\ncommission_pct = 2.5\n", "[contours.sandbox]\ncommission_pct = true\n",
+                                  "[trading.risk_limits]\ncommission_pct = -0.1\n", "[contours.emulation]\ncommission_pct = 1.5\n"])
+def test_commission_pct_rejected(tmp_path, text):
+    with pytest.raises(ConfigError, match="commission_pct"):
+        _load(tmp_path, text)

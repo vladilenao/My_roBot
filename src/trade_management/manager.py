@@ -278,6 +278,7 @@ class TradeManager:
         risk_limits: RiskLimits | None = None,
         max_qty: int | None = None,
         commission: Decimal | float | str | None = None,
+        commission_pct: Decimal | float | str | None = None,
         slippage: Decimal | float | str | None = None,
         slippage_tolerance: Decimal | float | str | None = None,
         signal_filter: object | None = None,
@@ -318,6 +319,8 @@ class TradeManager:
         self._risk_limits = risk_limits or _DEFAULT_RISK_LIMITS
         self._max_qty = max_qty if isinstance(max_qty, int) and max_qty > 0 else 10
         self._commission = Decimal(str(commission)) if commission is not None else Decimal("0")
+        # Комиссия за сторону, % стоимости контракта (add-commission-pct); None — ``commission`` ₽ за контракт.
+        self._commission_pct = Decimal(str(commission_pct)) if commission_pct is not None else None
         self._slippage = Decimal(str(slippage)) if slippage is not None else Decimal("0")
         self._slippage_tolerance = (
             Decimal(str(slippage_tolerance)) if slippage_tolerance is not None else DEFAULT_SLIPPAGE_TOLERANCE
@@ -1398,6 +1401,7 @@ class TradeManager:
                 profile_parameters=dict(plan.profile.parameters),
                 signal=False,
                 commission=self._commission,
+                commission_pct=self._commission_pct,
                 slippage=self._slippage,
             )
             self._enrich_owned_market(recovered, market)
@@ -2045,6 +2049,7 @@ class TradeManager:
             price=decision.price,
             signal=True,
             commission=self._commission,
+            commission_pct=self._commission_pct,
             slippage=self._slippage,
         )
         self._enrich_owned_market(owned, market)
@@ -2187,6 +2192,7 @@ class TradeManager:
             price=decision.price,
             signal=False,
             commission=self._commission,
+            commission_pct=self._commission_pct,
             slippage=self._slippage,
             admission_snapshot={
                 "portfolio_pct": self._budget_policy.portfolio_pct,

@@ -77,3 +77,28 @@ def test_atr_needs_a_warmed_up_history():
     )
 
     assert market["atr"] is None
+
+
+# --- комиссия в процентах от стоимости контракта (add-commission-pct) ------------------------------
+
+BR = SimpleNamespace(price_step=Decimal("0.01"), step_cost=Decimal("8.25143"))
+SI = SimpleNamespace(price_step=Decimal("1"), step_cost=Decimal("1"))
+
+
+def test_commission_from_percent_of_contract_value():
+    market = build_management_market(contract=BR, frame=None, price=Decimal("92.45"), commission=Decimal("1.5"),
+                                     commission_pct=Decimal("0.025"))
+    assert market["entry_cost"] == market["exit_cost"] == Decimal("19.08")   # на счёте брокер взял 19,01
+
+
+def test_commission_percent_uses_bar_close_without_signal_price():
+    frame = _frame([83054.0] * 20)
+    market = build_management_market(contract=SI, frame=frame, commission_pct="0.025")
+    assert market["entry_cost"] == Decimal("20.77")
+
+
+def test_commission_falls_back_to_rubles():
+    without_pct = build_management_market(contract=BR, frame=None, price=Decimal("92.45"), commission=Decimal("1.5"))
+    no_card = build_management_market(contract=None, frame=None, price=Decimal("92.45"), commission=Decimal("1.5"),
+                                      commission_pct=Decimal("0.025"))
+    assert without_pct["entry_cost"] == no_card["entry_cost"] == Decimal("1.5")

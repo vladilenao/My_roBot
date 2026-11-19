@@ -152,6 +152,9 @@ _EXPECTED_TYPES: dict[str, type] = {
     "contours_emulation_portfolio_pct": (int, float),
     "contours_sandbox_portfolio_pct": (int, float),
     "contours_account_portfolio_pct": (int, float),
+    "contours_emulation_commission_pct": (int, float),
+    "contours_sandbox_commission_pct": (int, float),
+    "contours_account_commission_pct": (int, float),
     "contours_account_telegram_bot_env": str,
     "contours_account_telegram_channel_env": str,
     "contours_account_reconcile_every_min": int,
@@ -239,7 +242,7 @@ _RISK_DEFAULTS = {
     "max_slippage_r": 0.25,
     "max_entry_deviation_r": 0.25,
 }
-_RISK_LIMIT_KEYS = set(_RISK_DEFAULTS) | {"max_qty", "slippage_tolerance"}
+_RISK_LIMIT_KEYS = set(_RISK_DEFAULTS) | {"max_qty", "slippage_tolerance", "commission_pct"}
 _ALLOWED_DIRECTIONS = frozenset({"long", "short"})
 _PATTERN_STRATEGIES = {"harmonic_abcd"}
 
@@ -456,6 +459,13 @@ def _validate_trade_management_profiles(value: dict, path: Path) -> dict[str, di
     return value
 
 
+def _commission_pct(value: Any, where: str, path: Path) -> None:
+    """Комиссия за сторону, % стоимости контракта (add-commission-pct): 0–1; больше 1% — почти наверняка опечатка."""
+    _finite_number(value, where, path, non_negative=True)
+    if value > 1:
+        raise ConfigError(f"{path}: {where} должен быть в [0, 1] — процент стоимости контракта, получено {value!r}")
+
+
 def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
     _reject_legacy_risk_keys(value, path)
     unknown = set(value) - _RISK_LIMIT_KEYS
@@ -474,6 +484,8 @@ def _validate_risk_limits(value: dict, path: Path) -> dict[str, Any]:
                 f"{path}: [trading.risk_limits] min_trade_risk_pct "
                 f"({value['min_trade_risk_pct']}) не может превышать portfolio_pct ({value['portfolio_pct']})"
             )
+    if "commission_pct" in value:
+        _commission_pct(value["commission_pct"], "[trading.risk_limits] commission_pct", path)
     if "max_qty" in value and (isinstance(value["max_qty"], bool) or not isinstance(value["max_qty"], int) or value["max_qty"] <= 0):
         raise ConfigError(f"{path}: [trading.risk_limits] max_qty должен быть целым числом > 0")
     return value
@@ -1078,15 +1090,15 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
 
 
 _CONTOUR_KEYS = {
-    "emulation": {"telegram_channel_env", "portfolio_pct"},
+    "emulation": {"telegram_channel_env", "portfolio_pct", "commission_pct"},
     # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
     "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
                 "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct"},
+                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct", "commission_pct"},
     # Контур «Счёт» (add-account-contour): токен и номер счёта — только из окружения, состав — командами API.
     "account": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
                 "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct"},
+                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct", "commission_pct"},
 }
 _SANDBOX_EXIT_RANGES = {
     "contours_sandbox_exit_offset_steps": (0, 100),
@@ -1119,6 +1131,8 @@ def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
         _finite_number(value["portfolio_pct"], f"[contours.{kind}] portfolio_pct", path, non_negative=True)
         if value["portfolio_pct"] > 100:
             raise ConfigError(f"{path}: [contours.{kind}] portfolio_pct должен быть в [0, 100]")
+    if "commission_pct" in value:
+        _commission_pct(value["commission_pct"], f"[contours.{kind}] commission_pct", path)
     allowed = _CONTOUR_KEYS[kind]
     unknown = set(value) - allowed
     if unknown:
