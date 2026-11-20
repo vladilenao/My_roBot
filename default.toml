@@ -266,7 +266,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10, clusters = "shadow" },
     { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "basic_levels", priority = 10 },
 ]
@@ -274,7 +274,7 @@ strategies = [
 [strategies.future.BR]
 strategies = [
     { id = "future-br-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "5m", priority = 10, clusters = "shadow" },
-    { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5, clusters = "shadow" },
     { id = "future-br-harmonic", name = "harmonic_abcd", management = "pattern_targets", filter = "raw", priority = 10 },
     { id = "future-br-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "15m", priority = 10 },
 ]
@@ -284,7 +284,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-rts-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-rts-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
@@ -302,7 +302,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-gold-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-gold-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
