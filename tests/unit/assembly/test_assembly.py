@@ -111,6 +111,18 @@ def test_live_core_closes_in_previous_order():
     assert order == ["trigger", "patterns", "poller", "clusters", "api"]
 
 
+def test_live_core_closes_shared_broker_connection_last():
+    """Общее подключение к брокеру закрывается после поллера и API (fix-broker-channel-reuse)."""
+    order = []
+    live = core.LiveCore.__new__(core.LiveCore)
+    live.pattern_sink = live._pattern_trigger = live._cluster_consumer = live.early = None
+    live._poller = SimpleNamespace(close=lambda: order.append("poller"))
+    live.export_server = SimpleNamespace(close=lambda: order.append("api"))
+    live.client_provider = SimpleNamespace(close=lambda: order.append("provider"))
+    live.close()
+    assert order == ["poller", "api", "provider"]
+
+
 def test_live_core_without_serve_closes_early_lanes():
     order = []
     live = core.LiveCore.__new__(core.LiveCore)
