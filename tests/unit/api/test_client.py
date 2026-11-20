@@ -19,6 +19,15 @@ def configured_token():
         yield "env-token"
 
 
+@pytest.fixture(autouse=True)
+def fresh_provider():
+    """Общее подключение провайдера не переживает тест (fix-broker-channel-reuse)."""
+    from src.api.client import TinkoffClientProvider
+
+    with patch("src.api.client._DEFAULT_PROVIDER", TinkoffClientProvider()):
+        yield
+
+
 class TestGetClient:
     def test_uses_config_token(self, mock_client_cls, configured_token):
         client = get_client()
@@ -29,10 +38,11 @@ class TestGetClient:
 
 class TestClientContext:
     def test_default_falls_back_to_config_token(self, mock_client_cls, configured_token):
-        ctx = client_context()
+        with client_context() as services:
+            pass
 
         mock_client_cls.assert_called_once_with("env-token", interceptors=[ANY])
-        assert ctx is mock_client_cls.return_value
+        assert services is mock_client_cls.return_value.__enter__.return_value
 
     def test_explicit_token_wins_over_config(self, mock_client_cls, configured_token):
         client_context(token="custom-token")
