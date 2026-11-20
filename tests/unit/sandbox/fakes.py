@@ -52,6 +52,8 @@ class FakeBroker:
     tariff_fails: bool = False
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
+    # GetPortfolio отдаёт это вместо ``positions`` (сбой брокера 20.11: портфель пуст при живой позиции)
+    portfolio_glitch: dict | None = None  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
     stop_keys: dict = field(default_factory=dict)  # ключ -> stop_id
@@ -169,14 +171,16 @@ class _Api:
     def operations__get_positions(self, account_id=""):
         return s.PositionsResponse(
             money=[money(self.b.rub)], securities=[],
-            futures=[s.PositionsFutures(instrument_uid=uid, balance=lots) for uid, lots in self.b.positions.items()])
+            futures=[s.PositionsFutures(instrument_uid=uid, balance=lots, blocked=0)
+                     for uid, lots in self.b.positions.items()])
 
     def operations__get_portfolio(self, account_id=""):
         items = [s.PortfolioPosition(instrument_type="currency", quantity_lots=quote(self.b.rub),
                                      instrument_uid="rub", average_position_price=money(1))]
         items += [s.PortfolioPosition(instrument_type="futures", quantity_lots=quote(lots), instrument_uid=uid,
                                       average_position_price=money("3.000"))
-                  for uid, lots in self.b.positions.items()]
+                  for uid, lots in (self.b.positions if self.b.portfolio_glitch is None
+                                    else self.b.portfolio_glitch).items()]
         return s.PortfolioResponse(positions=items)
 
     def operations__get_operations_by_cursor(self, request):
