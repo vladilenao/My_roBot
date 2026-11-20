@@ -27,6 +27,9 @@ load_dotenv()  # загружает переменные из .env
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 # Токен песочницы Т-Инвест: только команда песочницы и контур «Песочница» (add-sandbox-probe).
 TINKOFF_SANDBOX_TOKEN = os.getenv("TINKOFF_SANDBOX_TOKEN")
+# Контур «Счёт» (add-account-contour): токен только на брокерский счёт робота и его номер.
+TINKOFF_TRADE_TOKEN = os.getenv("TINKOFF_TRADE_TOKEN")
+TINKOFF_ACCOUNT_ID = os.getenv("TINKOFF_ACCOUNT_ID")
 MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 # Ключ управления запуском через локальный API (схема ControlToken); отдельно от экспортного.
 ROBOT_CONTROL_TOKEN = os.getenv("ROBOT_CONTROL_TOKEN")
@@ -114,6 +117,17 @@ _DEFAULTS = {
     "contours_sandbox_stop_place_secs": 30,
     "contours_sandbox_max_daily_loss_pct": 3.0,
     "contours_sandbox_max_rejects_in_row": 3,
+    # Контур «Счёт» (add-account-contour): до Р2 только чтение.
+    "contours_account_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
+    "contours_account_telegram_channel_env": "TELEGRAM_ACCOUNT_CHANNEL_ID",
+    "contours_account_reconcile_every_min": 1,
+    "contours_account_orders": False,
+    "contours_account_exit_offset_steps": 5,
+    "contours_account_exit_requote_secs": 15,
+    "contours_account_exit_requote_attempts": 3,
+    "contours_account_stop_place_secs": 30,
+    "contours_account_max_daily_loss_pct": 3.0,
+    "contours_account_max_rejects_in_row": 3,
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},
@@ -209,6 +223,24 @@ CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_sandbox_exit_requote_a
 CONTOUR_SANDBOX_STOP_PLACE_SECS = _CONFIG["contours_sandbox_stop_place_secs"]
 CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT = _CONFIG["contours_sandbox_max_daily_loss_pct"]
 CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW = _CONFIG["contours_sandbox_max_rejects_in_row"]
+CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV = _CONFIG["contours_account_telegram_bot_env"]
+CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV = _CONFIG["contours_account_telegram_channel_env"]
+CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN = _CONFIG["contours_account_reconcile_every_min"]
+CONTOUR_ACCOUNT_ORDERS = _CONFIG["contours_account_orders"]
+CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS = _CONFIG["contours_account_exit_offset_steps"]
+CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS = _CONFIG["contours_account_exit_requote_secs"]
+CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS = _CONFIG["contours_account_exit_requote_attempts"]
+CONTOUR_ACCOUNT_STOP_PLACE_SECS = _CONFIG["contours_account_stop_place_secs"]
+CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT = _CONFIG["contours_account_max_daily_loss_pct"]
+CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW = _CONFIG["contours_account_max_rejects_in_row"]
+# Свой риск портфеля контура (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct.
+CONTOUR_EMULATION_PORTFOLIO_PCT = _CONFIG.get("contours_emulation_portfolio_pct")
+CONTOUR_SANDBOX_PORTFOLIO_PCT = _CONFIG.get("contours_sandbox_portfolio_pct")
+CONTOUR_ACCOUNT_PORTFOLIO_PCT = _CONFIG.get("contours_account_portfolio_pct")
+# Своя комиссия контура, % стоимости контракта за сторону (add-commission-pct); None — общий [trading.risk_limits].
+CONTOUR_EMULATION_COMMISSION_PCT = _CONFIG.get("contours_emulation_commission_pct")
+CONTOUR_SANDBOX_COMMISSION_PCT = _CONFIG.get("contours_sandbox_commission_pct")
+CONTOUR_ACCOUNT_COMMISSION_PCT = _CONFIG.get("contours_account_commission_pct")
 
 
 def telegram_channel_id() -> str | None:
@@ -224,6 +256,16 @@ def sandbox_bot_token() -> str | None:
 def sandbox_channel_id() -> str | None:
     """Id канала контура «Песочница» из переменной, названной в ``[contours.sandbox]``."""
     return os.getenv(CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV) or None
+
+
+def account_bot_token() -> str | None:
+    """Токен бота контура «Счёт» из переменной, названной в ``[contours.account]`` (секрет лога)."""
+    return os.getenv(CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV) or None
+
+
+def account_channel_id() -> str | None:
+    """Id канала «Счёт» из переменной, названной в ``[contours.account]``."""
+    return os.getenv(CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV) or None
 MARKET_DATA_EXPORT_HOST = _CONFIG["market_data_export_host"]
 MARKET_DATA_EXPORT_PORT = _CONFIG["market_data_export_port"]
 MARKET_STRUCTURE_PATTERNS_ENABLED = _CONFIG["market_structure_patterns_enabled"]

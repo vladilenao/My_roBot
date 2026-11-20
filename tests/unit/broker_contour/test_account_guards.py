@@ -220,6 +220,10 @@ def test_guard_messages_render():
     assert "до 19:00 МСК" in tripped
     rejects = text("guard_tripped", guard="broker_rejects", guard_detail={"count": 3, "reasons": ["broker:30042"]})
     assert "Отказов брокера подряд: 3" in rejects and "POST /api/v1/sandbox/guards/reset" in rejects
+    account = render_broker_account(Event.broker_account(
+        "guard_tripped", contour="account", account="…7029", event_id="e", guard="broker_rejects",
+        guard_detail={"count": 3, "reasons": ["broker:30042"]}))
+    assert "POST /api/v1/account/guards/reset" in account and "/sandbox/" not in account
     assert "командой сброса" in text("guard_cleared", guard="broker_rejects", reason="command")
     assert "новый торговый день" in text("guard_cleared", guard="daily_loss", reason="new-day")
 

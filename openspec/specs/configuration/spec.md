@@ -754,3 +754,81 @@
 - **GIVEN** `analysis_depth = 50`, у привязки минимум допуска 60
 - **WHEN** робот считает глубину привязки
 - **THEN** глубина привязки равна 60
+
+### Requirement: Настройки контура «Счёт»
+Нормативный уровень: MUST. Секция `[contours.account]` ДОЛЖНА принимать ключи:
+
+| Ключ | Тип | По умолчанию | Смысл |
+|---|---|---|---|
+| `telegram_bot_env` | имя переменной окружения | `TELEGRAM_ACCOUNT_BOT_TOKEN` | токен бота контура |
+| `telegram_channel_env` | имя переменной окружения | `TELEGRAM_ACCOUNT_CHANNEL_ID` | id канала «Счёт» |
+| `reconcile_every_min` | целое от 1 до 60 | `1` | как часто сверять счёт |
+| `orders` | логический | `false` | торговать привязками заявками на настоящем счёте; `false` — только читать счёт |
+| `exit_offset_steps` | целое от 0 до 100 | `5` | запас лимита выхода в шагах цены |
+| `exit_requote_secs` | целое от 5 до 300 | `15` | сколько ждать исполнения лимита выхода до перевыставления |
+| `exit_requote_attempts` | целое от 1 до 10 | `3` | сколько перевыставлений до аварийного выхода по рынку |
+| `stop_place_secs` | целое от 5 до 300 | `30` | за сколько секунд стоп-заявка должна стать активной, иначе выход и тревога |
+| `max_daily_loss_pct` | число от 0 до 50 | `3` | предел убытка торгового дня в процентах капитала на начало дня; `0` — выключен |
+| `max_rejects_in_row` | целое от 1 до 20 | `3` | сколько отказов брокера подряд запрещают входы до команды сброса |
+
+Значение по умолчанию `orders = false` НЕ ДОЛЖНО меняться: заявки на счёте включает человек строкой в `robot.toml`. Незнакомый ключ, неверный тип или значение вне диапазона ДОЛЖНЫ завершать загрузку `ConfigError` с указанием файла и ключа; `bindings` в секции отклоняется, как у песочницы. Токен брокера и номер счёта ДОЛЖНЫ читаться только из `TINKOFF_TRADE_TOKEN` и `TINKOFF_ACCOUNT_ID` и НЕ ДОЛЖНЫ задаваться в `robot.toml`. Вшитый `default.toml` ДОЛЖЕН содержать секцию со значениями по умолчанию и комментариями.
+
+#### Scenario: Значения по умолчанию
+- **WHEN** секции `[contours.account]` в `robot.toml` нет
+- **THEN** контур «Счёт» берёт бота из `TELEGRAM_ACCOUNT_BOT_TOKEN`, канал из `TELEGRAM_ACCOUNT_CHANNEL_ID`, сверяет счёт раз в минуту и работает только на чтение
+
+#### Scenario: Заявки до Р2
+- **GIVEN** `[contours.account]` без ключа `orders`
+- **WHEN** загружаются настройки
+- **THEN** `orders = false`: контур «Счёт» только читает счёт, пока владелец сама не включит заявки
+
+#### Scenario: Заявки включены
+- **WHEN** `robot.toml` содержит `[contours.account] orders = true` и `max_daily_loss_pct = 2`
+- **THEN** загрузка проходит, контур «Счёт» торгует привязками с пределом дневного убытка 2%
+
+#### Scenario: Порог вне диапазона
+- **WHEN** `robot.toml` содержит `[contours.account] max_rejects_in_row = 0`
+- **THEN** загрузка завершается `ConfigError` с указанием ключа
+
+#### Scenario: Номер счёта в конфиге
+- **WHEN** `robot.toml` содержит `[contours.account] account_id = "…"`
+- **THEN** загрузка завершается `ConfigError`: незнакомый ключ, номер задаётся только в `TINKOFF_ACCOUNT_ID`
+
+### Requirement: Комиссия в процентах от стоимости контракта
+Нормативный уровень: MUST. `[trading.risk_limits]` и секции `[contours.emulation]`, `[contours.sandbox]`, `[contours.account]` ДОЛЖНЫ принимать ключ `commission_pct` — комиссию за одну сторону в процентах от стоимости контракта, число от 0 до 1. Значение вне диапазона, нечисло или `bool` ДОЛЖНЫ завершать загрузку `ConfigError` с указанием секции и ключа.
+
+Контур ДОЛЖЕН брать процент своей секции, без неё — `[trading.risk_limits] commission_pct`. Прогоны истории ДОЛЖНЫ брать общий процент. Если процент не задан нигде, ДОЛЖНА действовать `[trading.risk_limits] commission` в рублях за контракт.
+
+Вшитый `default.toml` ДОЛЖЕН задавать `[trading.risk_limits] commission_pct = 0.025` и `[contours.sandbox] commission_pct = 0.05`.
+
+#### Scenario: Свой процент песочницы
+- **GIVEN** `[trading.risk_limits] commission_pct = 0.025`, `[contours.sandbox] commission_pct = 0.05`
+- **WHEN** загружаются настройки
+- **THEN** песочница считает комиссию по 0,05%, эмуляция, «Счёт» и история — по 0,025%
+
+#### Scenario: Опечатка
+- **WHEN** `robot.toml` содержит `[contours.account] commission_pct = 2.5`
+- **THEN** загрузка завершается `ConfigError` с указанием `[contours.account] commission_pct`
+
+#### Scenario: Процента нет
+- **GIVEN** `commission_pct` не задан ни в одной секции, `commission = 1.5`
+- **WHEN** строится план сделки
+- **THEN** комиссия плана — 1,5 ₽ за контракт, как до изменения
+
+### Requirement: Риск портфеля контура
+Нормативный уровень: MUST. Секции `[contours.emulation]`, `[contours.sandbox]` и `[contours.account]` ДОЛЖНЫ принимать ключ `portfolio_pct` — число от 0 до 100, процент капитала контура, который могут потерять все его открытые остатки и ожидающие входы вместе. Торговая часть контура ДОЛЖНА считать бюджет риска портфеля от этого процента. Если ключа нет, ДОЛЖЕН действовать `[trading.risk_limits] portfolio_pct`. Прогоны истории ДОЛЖНЫ использовать общий `portfolio_pct`.
+
+Значение вне диапазона, не число или `bool` ДОЛЖНЫ завершать загрузку `ConfigError` с указанием секции и ключа. `[trading.risk_limits] min_trade_risk_pct` больше `portfolio_pct` контура ДОЛЖЕН завершать загрузку `ConfigError`.
+
+#### Scenario: Свой риск у «Счёта»
+- **GIVEN** `[trading.risk_limits] portfolio_pct = 2`, `[contours.account] portfolio_pct = 6`, капитал счёта 9 900 ₽
+- **WHEN** сигнал «Счёта» с риском одного лота 528 ₽
+- **THEN** бюджет риска «Счёта» 594 ₽, вход на 1 лот; у песочницы и эмуляции бюджет считается от 2%
+
+#### Scenario: Ключа нет
+- **WHEN** в `[contours.sandbox]` нет `portfolio_pct`
+- **THEN** песочница считает бюджет риска от `[trading.risk_limits] portfolio_pct`
+
+#### Scenario: Вне диапазона
+- **WHEN** `robot.toml` содержит `[contours.emulation] portfolio_pct = 150`
+- **THEN** загрузка завершается `ConfigError` с указанием `[contours.emulation] portfolio_pct`

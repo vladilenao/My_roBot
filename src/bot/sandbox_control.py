@@ -70,6 +70,10 @@ def parse_guards_reset(body) -> tuple[str, ...]:
 
 
 class SandboxControl:
+    TITLE = "Песочница"
+    BASE = views.SANDBOX
+    TRADES_IN = "sandbox"
+
     def __init__(self, *, kind: str, core_state, supervisor, share_strategies: dict, future_strategies: dict,
                  emulation_members=lambda: (), log_file: str = "bot_debug.log", resolve_binding=None) -> None:
         self.kind = kind
@@ -187,11 +191,17 @@ class SandboxControl:
                 "dir": f"contours/{self.kind}"},
             "bindings": [self._member_view(member, status, process["running"])
                          for member in (desired.members if desired is not None else ())],
-            "_links": views.links(self=views.SANDBOX, target=views.SANDBOX_TARGET, bindings=views.SANDBOX_BINDINGS,
-                                  reconcile=views.SANDBOX_RECONCILE, log=views.SANDBOX_LOG,
-                                  comparison=views.SANDBOX_COMPARISON, **views.trading_links(views.SANDBOX)),
-            "_actions": views.sandbox_action_list(actions),
+            "_links": self._links(),
+            "_actions": self._action_list(actions),
         }
+
+    def _links(self) -> dict:
+        return views.links(self=views.SANDBOX, target=views.SANDBOX_TARGET, bindings=views.SANDBOX_BINDINGS,
+                           reconcile=views.SANDBOX_RECONCILE, log=views.SANDBOX_LOG,
+                           comparison=views.SANDBOX_COMPARISON, **views.trading_links(views.SANDBOX))
+
+    def _action_list(self, names) -> list[dict]:
+        return views.sandbox_action_list(names)
 
     def target(self) -> dict | None:
         return self._target(self._desired())
@@ -208,7 +218,7 @@ class SandboxControl:
         available = []
         for card in self._catalog.values():
             trades = (["emulation"] if emulation_traded(card, emulation) else []) + \
-                     (["sandbox"] if card["id"] in ours else [])
+                     ([self.TRADES_IN] if card["id"] in ours else [])
             available.append({**binding_brief(card), "instrument": card["instrument"], "trades_in": trades})
         return {"revision": None if desired is None else desired.generation,
                 "members": [self._member_view(member, status, process["running"]) for member in members],
@@ -333,9 +343,9 @@ class SandboxControl:
         if process["running"]:
             desired = self._desired()
             if desired is not None and not desired.running:
-                return self._problem(HTTPStatus.CONFLICT, "STOPPING", "Песочница останавливается.")
+                return self._problem(HTTPStatus.CONFLICT, "STOPPING", f"{self.TITLE} останавливается.")
             return self._problem(HTTPStatus.CONFLICT, "ALREADY_RUNNING",
-                                 "Песочница уже работает: состав меняется через /api/v1/sandbox/bindings.")
+                                 f"{self.TITLE} уже работает: состав меняется через {self.BASE}/bindings.")
         busy = self._supervisor.busy_pid()
         if busy is not None:
             return self._problem(HTTPStatus.CONFLICT, "CONTOUR_DIR_BUSY",
@@ -345,7 +355,8 @@ class SandboxControl:
 
     def _stop(self, mode, expected) -> tuple[int, dict]:
         if not self._supervisor.snapshot()["running"]:
-            return self._problem(HTTPStatus.CONFLICT, "NOT_RUNNING", "Процесса песочницы нет — останавливать нечего.")
+            return self._problem(HTTPStatus.CONFLICT, "NOT_RUNNING", f"Процесса контура «{self.TITLE}» нет — "
+                                 "останавливать нечего.")
         outcome = self._core_state.record_stop(self.kind, mode, expected)
         if outcome.outcome == CONFLICT:
             return self._problem(HTTPStatus.CONFLICT, "MODE_CONFLICT", outcome.reason)

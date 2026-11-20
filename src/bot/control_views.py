@@ -32,6 +32,15 @@ SANDBOX_COMPARISON = SANDBOX + "/comparison"
 # Предохранители контура на брокере (add-account-guards): сброс «отказов подряд».
 SANDBOX_GUARDS_RESET = SANDBOX + "/guards/reset"
 GUARD_KINDS = ("daily_loss", "broker_rejects")
+# Контур «Счёт» (add-account-contour): брокерский счёт робота, до Р2 только чтение.
+ACCOUNT = "/api/v1/account"
+ACCOUNT_TARGET = ACCOUNT + "/target"
+ACCOUNT_BINDINGS = ACCOUNT + "/bindings"
+ACCOUNT_REMOVE = ACCOUNT_BINDINGS + "/remove"
+ACCOUNT_RECONCILE = ACCOUNT + "/reconcile"
+ACCOUNT_LOG = ACCOUNT + "/log"
+ACCOUNT_GUARDS_RESET = ACCOUNT + "/guards/reset"
+ACCOUNT_COMPARISON = ACCOUNT + "/comparison"
 # Позиции, сделки и итоги контура по журналу сделок (add-contour-trades-api); счёт — только у эмуляции.
 TRADING_PARTS = ("positions", "trades", "performance")
 EMULATION_ACCOUNT = EMULATION + "/account"
@@ -65,6 +74,8 @@ PROBLEM_TITLES = {
     "INTERNAL": "Внутренняя ошибка",
     "MARKET_DATA_NOT_READY": "Рыночная база не готова",
     "JOURNAL_UNAVAILABLE": "Журнал контура недоступен",
+    "CONFIRM_REQUIRED": "Нужно подтверждение",
+    "ACCOUNT_READ_ONLY": "Счёт только на чтение",
 }
 _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 
@@ -174,6 +185,27 @@ def sandbox_action_list(names) -> list[dict]:
                          {"guards": ["broker_rejects"]}),
     }
     return [_action(name, *table[name]) for name in names]
+
+
+def account_action_list(names) -> list[dict]:
+    """Команды «Счёта» (add-account-contour, enable-live-trading); ``close_all`` — с подтверждением."""
+    table = {
+        "start": ("Запустить «Счёт»", "PUT", ACCOUNT_TARGET, {"mode": MODE_ON}),
+        "stop": ("Остановить", "PUT", ACCOUNT_TARGET, {"mode": NO_ENTRIES}),
+        "stop-close-all": ("Остановить, закрыть свои сделки", "PUT", ACCOUNT_TARGET,
+                           {"mode": CLOSE_ALL, "confirm": True}),
+        "add-bindings": ("Добавить привязки из песочницы", "POST", ACCOUNT_BINDINGS, {"bindings": []}),
+        "guards-reset": ("Снять предохранитель «отказы брокера подряд»", "POST", ACCOUNT_GUARDS_RESET,
+                         {"guards": ["broker_rejects"]}),
+    }
+    return [_action(name, *table[name]) for name in names]
+
+
+def account_binding_actions(binding: str, active: bool) -> list[dict]:
+    if active:
+        return [_action("remove", "Убрать со счёта", "POST", ACCOUNT_REMOVE,
+                        {"bindings": [binding], "mode": NO_ENTRIES})]
+    return [_action("restore", "Вернуть на счёт", "POST", ACCOUNT_BINDINGS, {"bindings": [binding]})]
 
 
 def binding_action_list(binding: str, active: bool) -> list[dict]:

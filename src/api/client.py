@@ -1,5 +1,8 @@
+import threading
 from dataclasses import dataclass
 from types import MappingProxyType
+
+import grpc
 
 from t_tech.invest import Client, CandleInterval, SubscriptionInterval
 from t_tech.invest.schemas import CandleSource
@@ -101,17 +104,86 @@ class ClientProvider:
         raise NotImplementedError
 
 
+def _new_client(token):
+    return Client(token, interceptors=[RpcDeadline()])
+
+
+def _status(exc: BaseException):
+    """Код gRPC ошибки SDK (``RequestError.code``) либо сырого ``RpcError.code()``."""
+    code = getattr(exc, "code", None)
+    if callable(code):
+        try:
+            code = code()
+        except Exception:
+            return None
+    return code
+
+
+class _SharedClientContext:
+    """``with`` над общим подключением: вход отдаёт сервисы, выход канал не закрывает."""
+
+    def __init__(self, provider, token, entry):
+        self._provider = provider
+        self._token = token
+        self._entry = entry
+
+    def __enter__(self):
+        return self._entry[1]
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None and _status(exc) == grpc.StatusCode.UNAVAILABLE:
+            self._provider._drop(self._token, self._entry)
+        return False
+
+
 class TinkoffClientProvider(ClientProvider):
-    """Боевой режим: аутентифицированный клиент T-Банка Invest API."""
+    """Боевой режим: аутентифицированный клиент T-Банка Invest API.
+
+    Unary-вызовы идут через одно долгоживущее подключение на токен: новое
+    подключение к брокеру примерно через раз устанавливается ~2 с, открытое
+    отвечает за десятки миллисекунд (fix-broker-channel-reuse). ``UNAVAILABLE``
+    сбрасывает подключение — следующий вызов откроет новое. Поток свечей
+    открывает своё отдельное подключение.
+    """
+
+    def __init__(self, client_factory=None) -> None:
+        self._client_factory = client_factory or _new_client
+        self._lock = threading.Lock()
+        self._shared = {}
 
     def client_context(self, token=None):
-        return Client(token or TINKOFF_TOKEN, interceptors=[RpcDeadline()])
+        token = token or TINKOFF_TOKEN
+        with self._lock:
+            entry = self._shared.get(token)
+            if entry is None:
+                client = self._client_factory(token)
+                entry = (client, client.__enter__())
+                self._shared[token] = entry
+        return _SharedClientContext(self, token, entry)
+
+    def _drop(self, token, entry) -> None:
+        # Не закрывается: канал ещё может использовать параллельный вызов,
+        # gRPC закроет его, когда ссылок не останется.
+        with self._lock:
+            if self._shared.get(token) is entry:
+                del self._shared[token]
+                log.warning("Подключение к брокеру недоступно — следующий вызов откроет новое")
+
+    def close(self) -> None:
+        """Закрывает общие подключения; следующий вызов откроет новое."""
+        with self._lock:
+            entries, self._shared = list(self._shared.values()), {}
+        for client, _ in entries:
+            try:
+                client.__exit__(None, None, None)
+            except Exception as exc:
+                log.warning("Подключение к брокеру не закрылось: %s", type(exc).__name__)
 
     def stream_session(self, token=None, *, control_queue_max_messages=128):
         """Необязательный live-порт; исторический provider остаётся unary."""
         from src.api.market_data_stream import MarketDataStreamSession
         return MarketDataStreamSession(
-            self.client_context(token), control_queue_max_messages=control_queue_max_messages,
+            self._client_factory(token or TINKOFF_TOKEN), control_queue_max_messages=control_queue_max_messages,
         )
 
     def calendar_source(self, store, *, token=None, request_budget=None, horizon_days=7, refresh_seconds=3600):

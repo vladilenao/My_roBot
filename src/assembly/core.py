@@ -867,3 +867,7 @@ class LiveCore:
             self._cluster_consumer.stop()
         if self.export_server is not None:
             self.export_server.close()
+        # Общее подключение к брокеру (fix-broker-channel-reuse): после поллера вызовов нет.
+        close_provider = getattr(getattr(self, "client_provider", None), "close", None)
+        if close_provider is not None:
+            close_provider()

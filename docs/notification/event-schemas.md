@@ -1281,8 +1281,11 @@ configured либо unknown. `gross_pnl`, `net_pnl` и `fees_total` — нако
 
 ### `broker_account`
 
-Событие контура на брокере (add-sandbox-contour): контур «Песочница», позже —
-«Счёт». `kind`: `started` — допуск пройден; `reconcile_alarm` — сверщик нашёл
+Событие контура на брокере (add-sandbox-contour): контур «Песочница» и «Счёт»
+(`contour = account`, add-account-contour). `kind`: `started` — допуск пройден
+(у «Счёта» ещё `access_level` — `read_only` или `full_access` — и `warnings` —
+предупреждения допуска, не мешающие старту на чтение); `refused` — контур не
+стартует, `reason` — причина отказа допуска (add-account-contour); `reconcile_alarm` — сверщик нашёл
 расхождение или его состав изменился; `reconcile_cleared` — расхождений больше
 нет; `stopped` — штатный выход (`broker_stops` — сколько стоп-заявок осталось у
 брокера, add-broker-protection); `guard_tripped` — сработал предохранитель
@@ -1416,6 +1419,15 @@ add-account-guards. `account` — только последние четыре �
     },
     "until": {
       "type": "string"
+    },
+    "access_level": {
+      "type": "string"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   },
   "additionalProperties": false
@@ -1435,7 +1447,8 @@ add-account-guards. `account` — только последние четыре �
 `entry`, `add`, `target`, `reduce`, `move`, `restart`); `stop_triggered` — стоп
 сработал у брокера (`exchange_order` — последние четыре символа порождённой
 заявки); `stop_failed` — стоп не принят, контур выходит; `stop_removed` — стоп
-снят перед выходом контура. `order` — вид заявки: `entry`, `add`, `target`,
+снят перед выходом контура; `stop_duplicate_cancelled` — снята лишняя стоп-заявка,
+чей ответ на постановку был потерян (fix-stop-key-duplicate). `order` — вид заявки: `entry`, `add`, `target`,
 `stop`, `exit`, `emergency`, `broker_stop` (стоп-заявка у брокера и порождённая
 ею заявка). `broker_order` — только последние четыре символа номера заявки или
 стоп-заявки брокера; номер счёта и ключ не публикуются. Цена — десятичная

@@ -70,13 +70,21 @@ def new_key() -> str:
 
 
 def rub_balance(gateway: SandboxGateway, account: RobotAccount) -> Decimal:
-    positions = gateway.call("operations.get_positions", account_id=account.account_id)
+    return rub_of(gateway.call("operations.get_positions", account_id=account.account_id))
+
+
+def rub_of(positions) -> Decimal:
+    """Рубли из ответа ``GetPositions``."""
     return sum((money_to_decimal(item) for item in positions.money if item.currency.lower() == "rub"), Decimal(0))
 
 
 def open_positions(gateway: SandboxGateway, account: RobotAccount) -> list:
     """Позиции портфеля без валюты: ``(instrument_uid, лоты, средняя цена)``."""
-    portfolio = gateway.call("operations.get_portfolio", account_id=account.account_id)
+    return portfolio_positions(gateway.call("operations.get_portfolio", account_id=account.account_id))
+
+
+def portfolio_positions(portfolio) -> list:
+    """Позиции из ответа ``GetPortfolio`` без валюты: ``(instrument_uid, лоты, средняя цена)``."""
     result = []
     for item in portfolio.positions:
         if item.instrument_type == "currency":

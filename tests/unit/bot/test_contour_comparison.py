@@ -379,3 +379,67 @@ class TestHttp:
     def test_export_key_rejected(self, server):
         status, payload, headers = _call(server, "GET", "/api/v1/sandbox/comparison", EXPORT_KEY)
         _problem(401, payload, headers, "UNAUTHORIZED")
+
+
+# --- «Счёт» против песочницы и эмуляции (enable-live-trading) -------------------------------
+
+class Triple(Pair):
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        (tmp_path / "account").mkdir()
+        self.paths["account"] = tmp_path / "account" / "trades.sqlite3"
+        self.journals["account"] = _Journal(self.paths["account"])
+
+    def account_report(self, query=None, members=None):
+        from src.bot.comparison_view import AccountComparison
+
+        for journal in self.journals.values():
+            journal.storage.connection.commit()
+        comparison = AccountComparison(account=_trades(views.ACCOUNT, self.paths["account"]),
+                                       sandbox=_trades(views.SANDBOX, self.paths["sandbox"]),
+                                       emulation=_trades(views.EMULATION, self.paths["emulation"]),
+                                       members=lambda: set(self.members if members is None else members),
+                                       catalog=CATALOG, clock=lambda: NOW)
+        return comparison.report(query or {})
+
+
+def _account_schema(payload):
+    _check(payload, {"$ref": "#/components/schemas/AccountComparison"})
+
+
+def test_account_trade_in_all_three(tmp_path):
+    triple = Triple(tmp_path)
+    signal = _signal(SI, "SIZ6", 7)
+    triple["emulation"].open(signal, SI, "SIZ6", "BUY", 1, "92410", _at(7, 15))
+    triple["sandbox"].open(signal, SI, "SIZ6", "BUY", 1, "92411", _at(7, 15, 10))
+    triple["account"].open(signal, SI, "SIZ6", "BUY", 1, "92413", _at(7, 15, 20))
+    report = triple.account_report(members={SI})
+    _account_schema(report)
+    [item] = report["items"]
+    assert item["account"] and item["sandbox"] and item["emulation"] and item["missing"] == {}
+    vs_sandbox = {d["code"]: d["value"] for d in item["account_vs_sandbox"]["diffs"]}
+    vs_emulation = {d["code"]: d["value"] for d in item["account_vs_emulation"]["diffs"]}
+    assert vs_sandbox == {"entry_price": "2"} and vs_emulation == {"entry_price": "3"}
+    summary = report["summary"]
+    assert summary["trades"] == {"account": 1, "sandbox": 1, "emulation": 1}
+    assert summary["account_vs_sandbox"]["pairs"] == 1 and summary["account_vs_emulation"]["pairs"] == 1
+
+
+def test_account_side_missing_with_budget_reason(tmp_path):
+    triple = Triple(tmp_path)
+    signal = _signal(SI, "SIZ6", 8)
+    triple["sandbox"].open(signal, SI, "SIZ6", "BUY", 1, "92411", _at(8, 15))
+    triple.reject_signal("account", signal, "risk-budget")
+    report = triple.account_report(members={SI})
+    _account_schema(report)
+    [item] = report["items"]
+    assert item["account"] is None and item["account_vs_sandbox"] is None
+    assert item["missing"]["account"]["code"] == "risk-budget"
+    assert item["missing"]["emulation"]["code"] == "not-seen"
+
+
+def test_account_report_without_journal(tmp_path):
+    triple = Triple(tmp_path)
+    triple.paths["account"].unlink()
+    report = triple.account_report({"period": ["week"]}, members=set())
+    assert report["items"] == [] and report["summary"]["trades"] == {"account": 0, "sandbox": 0, "emulation": 0}

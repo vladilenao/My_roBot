@@ -101,7 +101,7 @@ def test_second_contour_process_does_not_take_lock(data_dir):
 
 
 def test_unknown_contour_kind(data_dir, capsys):
-    assert run.main(["--contour", "account"]) == 2
+    assert run.main(["--contour", "live"]) == 2
     assert "Неизвестный вид контура" in capsys.readouterr().out
 
 

@@ -316,7 +316,7 @@ class Event:
 
     @classmethod
     def broker_account(cls, kind: str, *, contour: str, account: str, event_id: str, **fields: Any) -> "Event":
-        """Событие контура на брокере (add-sandbox-contour): ``started``, ``reconcile_alarm``,
+        """Событие контура на брокере (add-sandbox-contour): ``started``, ``refused``, ``reconcile_alarm``,
         ``reconcile_cleared``, ``execution_hold``, ``execution_resumed``, ``stopped``.
         ``account`` — только последние символа номера."""
         return cls._make(EventType.BROKER_ACCOUNT,

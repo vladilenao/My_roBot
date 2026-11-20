@@ -41,8 +41,10 @@ class FakeApi:
         self.stop_failures: list[OrderFailure | str] = []  # «accepted-lost» — принята, ответ потерян
         self.cancel_stop_failures: list[OrderFailure] = []
         self.stop_price_rub = False                        # GetStopOrders отдаёт стоп-цену в рублях за контракт
+        self.hidden_stops: set[str] = set()                # приняты, но GetStopOrders их пока не показывает
         self.operation_items: list = []                    # OperationReport счёта (add-account-vs-emulation-report)
         self.operations_failure: OrderFailure | None = None
+        self.max_lots_answer: int | OrderFailure = 10       # GetMaxLots: лоты по обеспечению счёта
         self._seq = 0
         self._trade = 0
         self._stop = 0
@@ -91,7 +93,9 @@ class FakeApi:
         shown = stop_price / D("0.001") * D("8.08664") if self.stop_price_rub else stop_price
         self.stops[stop_id] = StopReport(stop_id, uid, side, lots, shown, "active", "", self.now_for_stops)
         self.stop_keys[key] = stop_id
-        if failure == "accepted-lost":
+        if failure == "accepted-lost-hidden":               # принята, ответ потерян, в GetStopOrders не видна
+            self.hidden_stops.add(stop_id)
+        if failure in ("accepted-lost", "accepted-lost-hidden"):
             raise OrderFailure("unknown", "DEADLINE_EXCEEDED")
         return stop_id
 
@@ -108,7 +112,7 @@ class FakeApi:
 
     def stop_orders(self, since, until):
         self.calls.append(("stop_orders",))
-        return list(self.stops.values())
+        return [report for stop_id, report in self.stops.items() if stop_id not in self.hidden_stops]
 
     def active_stops(self) -> list[StopReport]:
         return [report for report in self.stops.values() if report.status == "active"]
@@ -140,6 +144,12 @@ class FakeApi:
     def instrument_uid(self, ticker, future):
         self.calls.append(("uid", ticker))
         return ticker
+
+    def max_lots(self, uid, side, price):
+        self.calls.append(("max-lots", uid, side, price))
+        if isinstance(self.max_lots_answer, OrderFailure):
+            raise self.max_lots_answer
+        return self.max_lots_answer
 
     def futures_margin(self, uid):
         self.calls.append(("margin", uid))

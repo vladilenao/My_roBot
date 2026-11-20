@@ -446,3 +446,62 @@ def test_unknown_price_with_broker_capital_does_not_block_entries(tmp_path):
 
         assert not m.mark_to_market({})
         assert m._budget_state(storage.connection).base == D(50000)
+
+
+class AccountBroker(Broker):
+    """Брокер «Счёта»: объём входа ограничен ответом ``GetMaxLots`` (fix 30042, 18.11)."""
+
+    def __init__(self, go=0, lots=None):
+        super().__init__(go)
+        self.lots, self.asked = lots, []
+
+    def entry_lots_limit(self, instrument, side, price):
+        self.asked.append((instrument, side, price))
+        return self.lots
+
+
+def test_broker_max_lots_caps_entry_below_exchange_margin(tmp_path):
+    """BR 18.11: риск и ГО биржи дают 3, брокер — 2; вход на 2, ограничение ``broker-margin``."""
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = AccountBroker(go=16000, lots=2)
+        m = TradeManager(storage, broker, initial_balance=D(50000), max_qty=10, clock=lambda: NOW)
+        p = plan(stop=99, requested=3, costs=CostSnapshot(D(0), D(0)))
+        sizing = m._size_open_quantity(p, broker.meta)
+        assert sizing.quantity == 2 and sizing.limiting_constraint == "broker-margin"
+        assert broker.asked == [("SBER", "BUY", D(100))]
+
+
+def test_broker_without_margin_refuses_as_budget_not_broker_reject(tmp_path):
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = AccountBroker(go=16000, lots=0)
+        m = TradeManager(storage, broker, initial_balance=D(50000), max_qty=10, clock=lambda: NOW)
+        sizing = m._size_open_quantity(plan(stop=99, costs=CostSnapshot(D(0), D(0))), broker.meta)
+        assert sizing.quantity == 0 and sizing.code == "broker-margin"
+
+
+def test_broker_unknown_limit_keeps_budget_sizing(tmp_path):
+    """Брокер не ответил (``None``) — объём по риску и ГО, как раньше."""
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = AccountBroker(go=8000, lots=None)
+        m = TradeManager(storage, broker, initial_balance=D(20000), max_qty=10, clock=lambda: NOW)
+        sizing = m._size_open_quantity(plan(stop=99, requested=5, costs=CostSnapshot(D(0), D(0))), broker.meta)
+        assert sizing.quantity == 2 and sizing.limiting_constraint == "margin"
+
+
+def test_broker_max_lots_caps_addition(tmp_path):
+    with Storage(tmp_path / "trades.sqlite3") as storage:
+        broker = AccountBroker(lots=None)
+        m = TradeManager(storage, broker, initial_balance=D(250000), max_qty=10, clock=lambda: NOW)
+        action = submit(m, plan(side="SELL", stop=101, costs=CostSnapshot(D(0), D(0))), 2)
+        fill(m, action, 2)
+        broker.lots = 1
+        state = storage.load_trade("first").state
+        assert m.submit_action(AddToTrade("add", "first", state.state_revision, "signal", 3, "limit", D(98)))
+        payload = json.loads(storage.connection.execute("SELECT payload_json FROM outbox WHERE command_id='add'").fetchone()[0])
+        assert payload["quantity"] == 1 and payload["limiting_constraint"] == "broker-margin"
+        assert broker.asked[-1] == ("SBER", "SELL", D(98))
+        broker.lots = 0
+        state = storage.load_trade("first").state
+        with pytest.raises(ReservationRejected) as refused:
+            m.submit_action(AddToTrade("add-2", "first", state.state_revision, "signal", 1, "limit", D(97)))
+        assert refused.value.code == "broker-margin"

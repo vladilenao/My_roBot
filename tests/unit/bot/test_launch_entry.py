@@ -44,8 +44,8 @@ class TestMain:
         run_history_contour.assert_called_once_with("20261024-101500")
 
     def test_unknown_contour_kind(self, capsys):
-        assert run.main(["--contour", "account"]) == 2
-        assert "emulation, history и sandbox" in capsys.readouterr().out
+        assert run.main(["--contour", "live"]) == 2
+        assert "emulation, history, sandbox и account" in capsys.readouterr().out
 
     @patch("run._run_broker_contour", return_value=0)
     def test_sandbox_contour_entry(self, run_broker_contour):

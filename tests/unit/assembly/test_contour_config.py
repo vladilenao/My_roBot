@@ -128,3 +128,108 @@ def test_sandbox_guard_settings(tmp_path):
                 "max_rejects_in_row = 21", 'max_rejects_in_row = "3"', 'max_daily_loss_pct = "3"'):
         with pytest.raises(ConfigError, match="max_"):
             _load(tmp_path, f"[contours.sandbox]\n{bad}\n")
+
+
+# --- контур «Счёт» (add-account-contour) ---------------------------------------------
+
+def test_account_section_defaults():
+    from src import config
+
+    assert config._DEFAULTS["contours_account_telegram_bot_env"] == "TELEGRAM_ACCOUNT_BOT_TOKEN"
+    assert config._DEFAULTS["contours_account_telegram_channel_env"] == "TELEGRAM_ACCOUNT_CHANNEL_ID"
+    assert config._DEFAULTS["contours_account_reconcile_every_min"] == 1
+    assert config._DEFAULTS["contours_account_orders"] is False
+
+
+def test_account_section_values(tmp_path):
+    config = _load(tmp_path, '[contours.account]\ntelegram_channel_env = "ACCOUNT_CHANNEL"\nreconcile_every_min = 3\n'
+                             'orders = false\n')
+    assert config["contours_account_telegram_channel_env"] == "ACCOUNT_CHANNEL"
+    assert config["contours_account_reconcile_every_min"] == 3 and config["contours_account_orders"] is False
+
+
+@pytest.mark.parametrize("text, match", [
+    ("max_rejects_in_row = 0", "от 1 до 20"),
+    ("max_daily_loss_pct = 60", "от 0 до 50"),
+    ('account_id = "2000123456"', "незнакомые ключи"),
+    ('bindings = ["future-ng-macd"]', "командами API с Р2"),
+    ("reconcile_every_min = 0", "от 1 до 60"),
+    ('telegram_bot_env = "bad name"', "имя переменной окружения"),
+])
+def test_account_section_rejected(tmp_path, text, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"[contours.account]\n{text}\n")
+
+
+def test_account_orders_enabled_with_trading_keys(tmp_path):
+    """enable-live-trading: заявки на счёте включаются строкой в robot.toml, пороги — свои."""
+    config = _load(tmp_path, "[contours.account]\norders = true\nmax_daily_loss_pct = 2\nstop_place_secs = 20\n")
+    assert config["contours_account_orders"] is True
+    assert config["contours_account_max_daily_loss_pct"] == 2 and config["contours_account_stop_place_secs"] == 20
+
+
+# --- свой риск портфеля контура (add-contour-risk-limit) --------------------------------
+
+@pytest.mark.parametrize("kind", ["emulation", "sandbox", "account"])
+def test_contour_portfolio_pct_loaded(tmp_path, kind):
+    config = _load(tmp_path, f"[contours.{kind}]\nportfolio_pct = 6\n")
+    assert config[f"contours_{kind}_portfolio_pct"] == 6
+
+
+@pytest.mark.parametrize("value, match", [("150", r"\[contours.account\] portfolio_pct должен быть в \[0, 100\]"),
+                                          ("-1", "должен быть >= 0"), ("true", "конечным числом"),
+                                          ('"5"', "")])
+def test_contour_portfolio_pct_rejected(tmp_path, value, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"[contours.account]\nportfolio_pct = {value}\n")
+
+
+def test_contour_portfolio_pct_below_min_trade_risk_rejected(tmp_path):
+    with pytest.raises(ConfigError, match=r"min_trade_risk_pct \(1.0\) не может превышать \[contours.sandbox\]"):
+        _load(tmp_path, "[trading.risk_limits]\nmin_trade_risk_pct = 1.0\n[contours.sandbox]\nportfolio_pct = 0.5\n")
+
+
+def test_contour_risk_limits_use_own_percent():
+    from decimal import Decimal
+
+    from src.assembly.contour import RISK_LIMITS, _risk_limits
+    from src.trade_management.models import PortfolioBudgetPolicy
+
+    assert _risk_limits(6).portfolio == Decimal("6")
+    assert _risk_limits().portfolio == Decimal(str(RISK_LIMITS.get("portfolio_pct", 2)))
+    budget = PortfolioBudgetPolicy(Decimal("6")).budget(Decimal("9900"), Decimal("9900"))
+    assert budget == Decimal("594")             # хватает на лот Si с риском 528 ₽, при 2% было 198 ₽
+
+
+def test_contour_portfolio_pct_by_kind(monkeypatch):
+    import run
+    from src import config
+
+    monkeypatch.setattr(config, "CONTOUR_ACCOUNT_PORTFOLIO_PCT", 6)
+    monkeypatch.setattr(config, "CONTOUR_SANDBOX_PORTFOLIO_PCT", None)
+    assert run._contour_portfolio_pct("account") == 6
+    assert run._contour_portfolio_pct("sandbox") is None
+    assert run._contour_portfolio_pct("history") is None
+
+
+# --- комиссия в процентах (add-commission-pct) -------------------------------------------------
+
+def test_commission_pct_defaults():
+    from src import config
+
+    assert config.RISK_LIMITS.get("commission_pct") == 0.025
+    assert config.CONTOUR_SANDBOX_COMMISSION_PCT == 0.05 and config.CONTOUR_ACCOUNT_COMMISSION_PCT is None
+
+
+def test_commission_pct_per_contour(tmp_path):
+    config = _load(tmp_path, "[trading.risk_limits]\ncommission_pct = 0.03\n\n[contours.account]\ncommission_pct = 0.025\n")
+    assert config["contours_account_commission_pct"] == 0.025
+    risk = config.get("risk_limits") or config.get("trading_risk_limits") or {}
+    assert not risk or risk.get("commission_pct") == 0.03
+
+
+@pytest.mark.parametrize("text", ["[contours.account]\ncommission_pct = 2.5\n", "[contours.sandbox]\ncommission_pct = true\n",
+                                  "[trading.risk_limits]\ncommission_pct = -0.1\n", "[contours.emulation]\ncommission_pct = 1.5\n"])
+def test_commission_pct_rejected(tmp_path, text):
+    with pytest.raises(ConfigError, match="commission_pct"):
+        _load(tmp_path, text)

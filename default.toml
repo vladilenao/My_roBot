@@ -52,11 +52,13 @@ max_history_runs = 2  # Сколько прогонов истории идёт 
 
 [contours.emulation]
 telegram_channel_env = "TELEGRAM_CHANNEL_ID"  # Имя переменной .env с id канала Telegram контура (сам id — только в .env).
+# portfolio_pct = 2.0  # Свой риск портфеля эмуляции, % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
 [contours.sandbox]
 telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Песочница».
 telegram_channel_env = "TELEGRAM_SANDBOX_CHANNEL_ID"  # Имя переменной .env с id канала «Песочница».
 reconcile_every_min = 1  # Как часто сверять счёт песочницы с журналом контура, минут (1–60). Состав — только командами API.
+commission_pct = 0.05  # Комиссия песочницы за сторону, % стоимости контракта (её тариф).
 orders = true  # Торговать привязками заявками; false — только читать и сверять счёт.
 exit_offset_steps = 5  # Запас лимита выхода (стоп, сигнал, закрытие) в шагах цены, 0–100.
 exit_requote_secs = 15  # Сколько ждать исполнения лимита выхода до перевыставления, секунд (5–300).
@@ -64,6 +66,20 @@ exit_requote_attempts = 3  # Перевыставлений до аварийн�
 stop_place_secs = 30  # За сколько секунд стоп-заявка у брокера должна стать активной, иначе выход и тревога (5–300).
 max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — предохранитель выключен.
 max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/sandbox/guards/reset (1–20).
+# portfolio_pct = 2.0  # Свой риск портфеля песочницы, % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
+
+[contours.account]
+telegram_bot_env = "TELEGRAM_ACCOUNT_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Счёт».
+telegram_channel_env = "TELEGRAM_ACCOUNT_CHANNEL_ID"  # Имя переменной .env с id канала «Счёт».
+reconcile_every_min = 1  # Как часто сверять брокерский счёт робота с журналом контура, минут (1–60).
+orders = false  # true — торговать привязками заявками на НАСТОЯЩЕМ счёте (Р2); false — только читать. Токен и номер — TINKOFF_TRADE_TOKEN и TINKOFF_ACCOUNT_ID в .env.
+exit_offset_steps = 5  # Запас лимита выхода в шагах цены, 0–100.
+exit_requote_secs = 15  # Сколько ждать исполнения лимита выхода до перевыставления, секунд (5–300).
+exit_requote_attempts = 3  # Перевыставлений до аварийного выхода по рынку (1–10).
+stop_place_secs = 30  # За сколько секунд стоп-заявка должна стать активной, иначе выход и тревога (5–300).
+max_daily_loss_pct = 3.0  # Предел убытка торгового дня, % капитала на начало дня (0–50); 0 — выключен.
+max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/account/guards/reset (1–20).
+# portfolio_pct = 2.0  # Свой риск портфеля «Счёта», % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
 [instruments]
 fallback_type = "future"
@@ -250,7 +266,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-ng-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-ng-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "triple_screen", priority = 10, clusters = "shadow" },
     { id = "future-ng-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "basic_levels", priority = 10 },
 ]
@@ -258,7 +274,7 @@ strategies = [
 [strategies.future.BR]
 strategies = [
     { id = "future-br-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "raw", tf = "5m", priority = 10, clusters = "shadow" },
-    { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5 },
+    { id = "future-br-flat", name = "flat_triangle", management = "levels_rr", priority = 5, clusters = "shadow" },
     { id = "future-br-harmonic", name = "harmonic_abcd", management = "pattern_targets", filter = "raw", priority = 10 },
     { id = "future-br-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "15m", priority = 10 },
 ]
@@ -268,7 +284,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-rts-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-rts-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-rts-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
@@ -286,7 +302,7 @@ strategies = [
 timeframe = "15m"        # база тикера: всё без явного tf работает на 15m
 strategies = [
 
-    { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5 },
+    { id = "future-gold-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", priority = 5, clusters = "shadow" },
     { id = "future-gold-macd", name = "macd_rsi_stoch", management = "levels_rr", tf = "15m", filter = "basic_levels", priority = 10, clusters = "shadow" },
     { id = "future-gold-ma", name = "ma_cloud_rsi_macd", management = "ma_cloud", tf = "1h", filter = "triple_screen", priority = 10 },
 ]
@@ -311,6 +327,9 @@ strategies = [
 strategies = [
     { id = "future-si-ma-raw", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "raw", tf = "5m", priority = 10 },
     { id = "future-si-ma-triple", name = "ma_cloud_rsi_macd", management = "ma_cloud", filter = "triple_screen", tf = "5m", priority = 10 },
+    { id = "future-si-macd", name = "macd_rsi_stoch", management = "levels_rr", filter = "basic_levels", priority = 10, clusters = "shadow" },
+    { id = "future-si-harmonic", name = "harmonic_abcd", management = "pattern_targets", priority = 10 },
+    { id = "future-si-flat", name = "flat_triangle", management = "levels_rr", filter = "raw", tf = "15m", priority = 5 }
 ]
 
 [strategies.future.ED]
@@ -408,6 +427,8 @@ portfolio_pct = 2.0     # единый риск всех открытых ост
 # отдельные процентные квоты заменены единым portfolio_pct, молчаливой миграции нет.
 max_qty = 10            # верхняя граница размера входа: не более такого числа контрактов на сделку
 commission = 1.5        # ₽ на контракт за одну сторону; оценка круга = 2 × commission
+commission_pct = 0.025   # комиссия за сторону, % стоимости контракта (0–1): тариф счёта; задан — заменяет commission.
+                         # Свой у контура — [contours.*] commission_pct; история берёт этот.
 slippage = 1.0          # ₽ на контракт за полный круг; запас пополам на вход и выход
 slippage_tolerance = 0.005  # допуск гэпа на входе, доля от цены сигнала: вход исполняется по цене,
                            # ушедшей от сигнальной дальше этой доли — позиция признаётся аварийной

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from src.broker_contour.account import AccountSnapshot, read_account
@@ -13,6 +14,10 @@ from src.broker_contour.fingerprint import FingerprintMismatch, check_fingerprin
 from src.broker_contour.store import BrokerStore
 from src.sandbox.account import AccountConflict, RobotAccount, robot_account
 from src.sandbox.gateway import BrokerCallError
+
+
+class AccountRuleError(Exception):
+    """Счёт робота не определён правилом вида (у «Счёта» — ``src.account.account``)."""
 
 
 class AdmissionError(Exception):
@@ -30,27 +35,40 @@ class Admitted:
     account: RobotAccount
     snapshot: AccountSnapshot
     fingerprint_created: bool
+    facts: dict | None = None        # факты допуска «Счёта» (add-account-contour); у песочницы нет
 
 
 def check_settings(*, token: str | None, token_env: str, bot_token: str | None, bot_env: str,
-                   channel_id: str | None, channel_env: str) -> None:
-    """Проверки без сети: токен брокера, бот и канал. Имя переменной в причине называется, значение — нет."""
+                   channel_id: str | None, channel_env: str, account_id: str | None = None,
+                   account_id_env: str | None = None) -> None:
+    """Проверки без сети: токен брокера, номер счёта (у «Счёта»), бот и канал.
+
+    Имя переменной в причине называется, значение — нет.
+    """
     if not token:
         raise AdmissionError(f"Не задан {token_env}")
+    if account_id_env is not None and not account_id:
+        raise AdmissionError(f"Не задан {account_id_env}")
     if not bot_token:
         raise AdmissionError(f"Не задан {bot_env} — бот контура обязателен: сделки без уведомлений недопустимы")
     if not channel_id:
         raise AdmissionError(f"Не задан {channel_env} — канал контура обязателен: сделки без уведомлений недопустимы")
 
 
-def admit_account(gateway, store: BrokerStore, *, broker: str) -> Admitted:
-    """Сетевые проверки: счёт робота, отпечаток, снимок счёта."""
+def admit_account(gateway, store: BrokerStore, *, broker: str, find_account: Callable = robot_account,
+                  read_facts: Callable | None = None) -> Admitted:
+    """Сетевые проверки: счёт робота, факты допуска (у «Счёта»), отпечаток, снимок счёта.
+
+    ``find_account(gateway)`` — правило счёта вида; ``read_facts(gateway, account)`` — права токена и
+    допуски брокера, отказ — ``AdmissionError``.
+    """
     try:
-        account = robot_account(gateway)
-    except AccountConflict as exc:
+        account = find_account(gateway)
+    except (AccountConflict, AccountRuleError) as exc:
         raise AdmissionError(str(exc), alarm=True) from None
     except BrokerCallError as exc:
-        raise AdmissionError(f"Счёт брокера не прочитан: {exc}", alarm=True) from None
+        raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True) from None
+    facts = read_facts(gateway, account) if read_facts is not None else None
     try:
         _, created = check_fingerprint(store, broker, account.account_id)
     except FingerprintMismatch as exc:
@@ -58,5 +76,5 @@ def admit_account(gateway, store: BrokerStore, *, broker: str) -> Admitted:
     try:
         snapshot = read_account(gateway, account)
     except BrokerCallError as exc:
-        raise AdmissionError(f"Счёт брокера не прочитан: {exc}", alarm=True, account_tail=account.masked) from None
-    return Admitted(account, snapshot, created)
+        raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True, account_tail=account.masked) from None
+    return Admitted(account, snapshot, created, facts)

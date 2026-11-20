@@ -343,6 +343,7 @@ class TestRuntimeComposition:
             risk_limits=limits.return_value,
             max_qty=contour.RISK_LIMITS.get("max_qty"),
             commission=contour.RISK_LIMITS.get("commission"),
+            commission_pct=contour.RISK_LIMITS.get("commission_pct"),
             slippage=contour.RISK_LIMITS.get("slippage"),
             slippage_tolerance=contour.RISK_LIMITS.get("slippage_tolerance"),
             min_trade_risk_pct=contour.RISK_LIMITS.get("min_trade_risk_pct"),

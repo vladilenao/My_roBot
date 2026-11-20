@@ -86,7 +86,7 @@ def test_missing_files_fall_back_to_defaults(tmp_path):
 
 def test_bundled_default_si_two_ma_cloud_bindings_on_5m():
     """Бандл default.toml: сценарий сравнения на SI — две привязки
-    ma_cloud_rsi_macd на 5m с профилями raw и triple_screen."""
+    ma_cloud_rsi_macd на 5m с профилями raw и triple_screen, затем macd, harmonic и flat (17.11)."""
     bundled = app_dir() / "default.toml"
     cfg = load_config(
         _defaults(),
@@ -95,10 +95,11 @@ def test_bundled_default_si_two_ma_cloud_bindings_on_5m():
     )
 
     si = cfg["future_strategies"]["SI"]["strategies"]
-    assert si == [
+    assert si[:2] == [
         {"id": "future-si-ma-raw", "name": "ma_cloud_rsi_macd", "management": "ma_cloud", "filter": "raw", "tf": "5m", "priority": 10},
         {"id": "future-si-ma-triple", "name": "ma_cloud_rsi_macd", "management": "ma_cloud", "filter": "triple_screen", "tf": "5m", "priority": 10},
     ]
+    assert [item["id"] for item in si[2:]] == ["future-si-macd", "future-si-harmonic", "future-si-flat"]
 
 
 class TestTradeManagementConfiguration:

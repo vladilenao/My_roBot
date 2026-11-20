@@ -48,8 +48,12 @@ class FakeBroker:
     margin_works: bool = True
     fail_operations: bool = False
     fee_operation: str = "linked"  # linked | unlinked | none — «комиссия брокера» к операции сделки
+    qualified: list = field(default_factory=lambda: ["derivative", "bond"])  # GetInfo «Счёта» (add-account-contour)
+    tariff_fails: bool = False
     exhaust_market: int = 0  # столько рыночных заявок подряд получат RESOURCE_EXHAUSTED
     positions: dict = field(default_factory=dict)  # uid -> lots
+    # GetPortfolio отдаёт это вместо ``positions`` (сбой брокера 20.11: портфель пуст при живой позиции)
+    portfolio_glitch: dict | None = None  # uid -> lots
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
     stop_keys: dict = field(default_factory=dict)  # ключ -> stop_id
@@ -146,7 +150,12 @@ class _Api:
         self.b.rub += money_to_decimal(amount)
         return s.SandboxPayInResponse(balance=money(self.b.rub))
 
+    def users__get_info(self):
+        return s.GetInfoResponse(qualified_for_work_with=list(self.b.qualified), tariff="trader")
+
     def users__get_user_tariff(self):
+        if self.b.tariff_fails:
+            raise RequestError(StatusCode.UNAVAILABLE, "", SimpleNamespace(message=""))
         return s.GetUserTariffResponse(
             unary_limits=[s.UnaryLimit(limit_per_minute=100, methods=[
                 "tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"])],
@@ -162,14 +171,16 @@ class _Api:
     def operations__get_positions(self, account_id=""):
         return s.PositionsResponse(
             money=[money(self.b.rub)], securities=[],
-            futures=[s.PositionsFutures(instrument_uid=uid, balance=lots) for uid, lots in self.b.positions.items()])
+            futures=[s.PositionsFutures(instrument_uid=uid, balance=lots, blocked=0)
+                     for uid, lots in self.b.positions.items()])
 
     def operations__get_portfolio(self, account_id=""):
         items = [s.PortfolioPosition(instrument_type="currency", quantity_lots=quote(self.b.rub),
                                      instrument_uid="rub", average_position_price=money(1))]
         items += [s.PortfolioPosition(instrument_type="futures", quantity_lots=quote(lots), instrument_uid=uid,
                                       average_position_price=money("3.000"))
-                  for uid, lots in self.b.positions.items()]
+                  for uid, lots in (self.b.positions if self.b.portfolio_glitch is None
+                                    else self.b.portfolio_glitch).items()]
         return s.PortfolioResponse(positions=items)
 
     def operations__get_operations_by_cursor(self, request):

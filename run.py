@@ -23,6 +23,9 @@ from src.config import (
     SHARE_STRATEGIES,
     TINKOFF_TOKEN,
     TINKOFF_SANDBOX_TOKEN,
+    TINKOFF_TRADE_TOKEN,
+    TINKOFF_ACCOUNT_ID,
+    account_bot_token,
     sandbox_bot_token,
     sandbox_channel_id,
     CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
@@ -87,7 +90,8 @@ log = get_logger(__name__)
 
 _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD,
-            TINKOFF_SANDBOX_TOKEN, sandbox_bot_token())
+            TINKOFF_SANDBOX_TOKEN, sandbox_bot_token(),
+            TINKOFF_TRADE_TOKEN, TINKOFF_ACCOUNT_ID, account_bot_token())
 
 
 _OPEN_FILES = None  # итог подъёма предела открытых файлов при запуске процесса (fix-sqlite-connection-close)
@@ -129,14 +133,15 @@ def _run_contour(kind: str, args=()) -> int:
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
-    from src.broker_contour import SANDBOX
+    from src.broker_contour import ACCOUNT, SANDBOX
 
     if kind == MODE_HISTORY:
         return _run_history_contour(args[0] if args else "")
-    if kind == SANDBOX:
+    if kind in (SANDBOX, ACCOUNT):
         return _run_broker_contour(kind)
     if kind != MODE_EMULATION:
-        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION}, {MODE_HISTORY} и {SANDBOX}.")
+        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION}, {MODE_HISTORY}, {SANDBOX} "
+              f"и {ACCOUNT}.")
         return 2
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -180,6 +185,7 @@ def _run_contour(kind: str, args=()) -> int:
         kind=kind, state_dir=directory, channel_names=None, clock=None,
         session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
         contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
+        portfolio_pct=_contour_portfolio_pct(kind), commission_pct=_contour_commission_pct(kind),
     ), services)
     try:
         contour.build()
@@ -234,6 +240,10 @@ def _run_broker_contour(kind: str) -> int:
     stop = StdinStop()
     stop.start()
     signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
+    from src.broker_contour import ACCOUNT
+
+    if kind == ACCOUNT:
+        return _run_account_contour(directory, data_dir, stop, launch, kind)
     settings = BrokerContourSettings(
         orders=CONTOUR_SANDBOX_ORDERS,
         max_daily_loss_pct=CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, max_rejects_in_row=CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
@@ -253,6 +263,65 @@ def _run_broker_contour(kind: str) -> int:
                                   contour=kind, orders=settings.orders)
         bus.subscribe_all(channels)
     contour = BrokerContour(settings, gateway_factory=SandboxGateway, bus=bus, stop=stop, pid=os.getpid(),
+                            trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
+    pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
+                      timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
+    pulse.start()
+    try:
+        return contour.run()
+    finally:
+        pulse.close()
+        close_channels(channels)
+
+
+def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, kind: str) -> int:
+    """Процесс контура «Счёт»: только чтение счёта (add-account-contour) или торговля привязками (enable-live-trading)."""
+    from functools import partial
+
+    from src.account.account import account_by_id
+    from src.account.admission import read_facts
+    from src.account.fee_probes import FeeProbes
+    from src.assembly.pulse import CorePulse
+    from src.broker_contour import ACCOUNT
+    from src.broker_contour.broker import ExitPolicy
+    from src.broker_contour.notify import build_channels
+    from src.broker_contour.process import BrokerContour, BrokerContourSettings
+    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS,
+                            CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
+                            CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT, CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
+                            CONTOUR_ACCOUNT_ORDERS, CONTOUR_ACCOUNT_STOP_PLACE_SECS,
+                            CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN, CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
+                            CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT, account_channel_id)
+    from src.events.bus import EventBus
+    from src.notifier.factory import close_channels
+    from src.sandbox.gateway import AccountGateway
+
+    orders = bool(CONTOUR_ACCOUNT_ORDERS)       # true — настоящие заявки (enable-live-trading); включает владелец
+    settings = BrokerContourSettings(
+        orders=orders, max_daily_loss_pct=CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT,
+        max_rejects_in_row=CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
+        exit_policy=ExitPolicy(CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
+                               CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_ACCOUNT_STOP_PLACE_SECS),
+        contour_id=ACCOUNT, broker=ACCOUNT, directory=directory,
+        core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=TINKOFF_TRADE_TOKEN,
+        token_env="TINKOFF_TRADE_TOKEN", account_id=TINKOFF_ACCOUNT_ID, account_id_env="TINKOFF_ACCOUNT_ID",
+        bot_token=account_bot_token(), bot_env=CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
+        channel_id=account_channel_id(), channel_env=CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV,
+        reconcile_every_secs=CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN * 60)
+    bus, channels = EventBus(), []
+    if settings.bot_token and settings.channel_id:
+        channels = build_channels(bot_token=settings.bot_token, channel_id=settings.channel_id, directory=directory,
+                                  cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
+                                  request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
+                                  max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                                  contour=ACCOUNT, orders=orders)
+        bus.subscribe_all(channels)
+    contour = BrokerContour(settings, gateway_factory=AccountGateway, bus=bus, stop=stop, pid=os.getpid(),
+                            find_account=lambda gateway: account_by_id(gateway, TINKOFF_ACCOUNT_ID or ""),
+                            read_facts=partial(read_facts, orders=orders),
+                            # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
+                            fee_probes_factory=None if orders else FeeProbes,
                             trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
     pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
                       timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
@@ -305,10 +374,29 @@ def _broker_trading_factory(kind: str, directory: Path, data_dir: Path, launch: 
             kind=kind, state_dir=directory, channel_names=None, clock=None,
             session=StoppableRunSession(stop.requested), client_provider=None, instruments=instruments,
             contracts=contracts_from_payload(launch.get("contracts") or {}), control=control,
-            strategies=strategies, broker_trading=trading, bus=bus), services)
+            strategies=strategies, broker_trading=trading, bus=bus,
+            portfolio_pct=_contour_portfolio_pct(kind), commission_pct=_contour_commission_pct(kind)), services)
         return _BrokerTradingPart(contour, services)
 
     return factory
+
+
+def _contour_commission_pct(kind: str):
+    """Своя комиссия контура, % стоимости контракта за сторону (add-commission-pct); None — общий процент."""
+    from src.config import (CONTOUR_ACCOUNT_COMMISSION_PCT, CONTOUR_EMULATION_COMMISSION_PCT,
+                            CONTOUR_SANDBOX_COMMISSION_PCT)
+
+    return {MODE_EMULATION: CONTOUR_EMULATION_COMMISSION_PCT, "sandbox": CONTOUR_SANDBOX_COMMISSION_PCT,
+            "account": CONTOUR_ACCOUNT_COMMISSION_PCT}.get(kind)
+
+
+def _contour_portfolio_pct(kind: str):
+    """Свой риск портфеля контура (add-contour-risk-limit); None — общий [trading.risk_limits] portfolio_pct."""
+    from src.config import (CONTOUR_ACCOUNT_PORTFOLIO_PCT, CONTOUR_EMULATION_PORTFOLIO_PCT,
+                            CONTOUR_SANDBOX_PORTFOLIO_PCT)
+
+    return {MODE_EMULATION: CONTOUR_EMULATION_PORTFOLIO_PCT, "sandbox": CONTOUR_SANDBOX_PORTFOLIO_PCT,
+            "account": CONTOUR_ACCOUNT_PORTFOLIO_PCT}.get(kind)
 
 
 def _run_history_contour(name: str) -> int:
@@ -404,6 +492,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     control.core_status = core.core_snapshot
     control.contour_busy = lambda: _contour_busy(state_dir)
     sandbox = _sandbox_supervisor(state_dir, core_state)
+    account = _account_supervisor(state_dir, core_state)
     try:
         server = core.start_control_api(control)
     except OSError as exc:
@@ -412,8 +501,10 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         pulse.stop()
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
-    server.trading = _contour_trading(state_dir, sandbox)
+    server.account = _account_control(account, core_state, resolve_binding=_binding_resolver(core))
+    server.trading = _contour_trading(state_dir, sandbox, account)
     server.comparison = _contour_comparison(server.trading, core_state)
+    server.account_comparison = _account_comparison(server.trading, core_state)
     server.indicators = _indicators_view()
     host, port = server.address
     _say(f"Робот запущен, API: http://{host}:{port}")
@@ -421,8 +512,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     code = 0
     try:
         if core.starter.run():
-            # Контур на брокере — раньше эмуляции (add-sandbox-contour): после рестарта он поднимается первым.
-            sandbox.recover()
+            # Контуры на брокере — раньше эмуляции: первым «Счёт» (add-account-contour), затем песочница.
+            _recover_broker_contours(account, sandbox)
             code = _serve_emulation(state_dir, core, core_state, control, client_provider)
         else:
             _wait_for_ctrl_c()
@@ -433,8 +524,18 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         pulse.stop()
         history.close()
         sandbox.stop()
+        account.stop()
         core.close()
     return code
+
+
+def _recover_broker_contours(*supervisors) -> None:
+    """Судьбы контуров на брокере по порядку; сбой подъёма одного не держит следующие (add-account-contour)."""
+    for supervisor in supervisors:
+        try:
+            supervisor.recover()
+        except Exception as exc:  # noqa: BLE001 — сбой подъёма одного контура не держит остальные
+            log.error("Подъём контура %s не удался (%s)", supervisor.kind, type(exc).__name__)
 
 
 def _sandbox_supervisor(state_dir, core_state):
@@ -445,6 +546,53 @@ def _sandbox_supervisor(state_dir, core_state):
     return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
                                    autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
                                    heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _account_supervisor(state_dir, core_state):
+    """Надзиратель контура «Счёт» (add-account-contour): свой поток ядра, как у песочницы."""
+    from src.assembly.broker_supervisor import BrokerContourSupervisor
+    from src.broker_contour import ACCOUNT
+
+    return BrokerContourSupervisor(kind=ACCOUNT, state_dir=state_dir, core_state=core_state, version=__version__,
+                                   autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
+                                   heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+
+
+def _active_members(core_state, kind: str) -> set[str]:
+    desired = core_state.desired(kind)
+    return set() if desired is None else {member.key for member in desired.members if member.active}
+
+
+def _account_control(supervisor, core_state, resolve_binding=None):
+    """Ресурс «Счёта»: состав — только из состава песочницы, заявки — по [contours.account] (enable-live-trading)."""
+    from src.bot.account_control import AccountControl
+    from src.broker_contour import SANDBOX
+    from src.config import CONTOUR_ACCOUNT_ORDERS
+
+    def emulation_members():
+        desired = core_state.desired(MODE_EMULATION)
+        return () if desired is None else desired.members
+
+    return AccountControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
+                          share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
+                          emulation_members=emulation_members, log_file=LOGGING_FILE,
+                          resolve_binding=resolve_binding, orders_enabled=bool(CONTOUR_ACCOUNT_ORDERS),
+                          sandbox_members=lambda: _active_members(core_state, SANDBOX))
+
+
+def _account_comparison(trading: dict, core_state):
+    """«Счёт» против песочницы и эмуляции (enable-live-trading); без заявок на счёте ресурса нет."""
+    from src.bot import control_views as views
+    from src.bot.comparison_view import AccountComparison
+    from src.broker_contour import ACCOUNT
+    from src.broker_contour.bindings import binding_catalog
+    from src.config import CONTOUR_ACCOUNT_ORDERS
+
+    if not CONTOUR_ACCOUNT_ORDERS or views.ACCOUNT not in trading:
+        return None
+    return AccountComparison(account=trading[views.ACCOUNT], sandbox=trading[views.SANDBOX],
+                             emulation=trading[views.EMULATION], members=lambda: _active_members(core_state, ACCOUNT),
+                             catalog=binding_catalog(SHARE_STRATEGIES, FUTURE_STRATEGIES))
 
 
 def _indicators_view():
@@ -458,8 +606,8 @@ def _indicators_view():
                           triple_screen=TRIPLE_SCREEN_PARAMS, ladder=tuple(TIMEFRAMES), depth=ANALYSIS_DEPTH)
 
 
-def _contour_trading(state_dir, sandbox):
-    """Позиции, сделки и итоги эмуляции и песочницы по журналам контуров (add-contour-trades-api)."""
+def _contour_trading(state_dir, sandbox, account=None):
+    """Позиции, сделки и итоги эмуляции, песочницы и «Счёта» по журналам контуров (add-contour-trades-api)."""
     from src.bot import control_views as views
     from src.bot.trades_view import ContourTrades
     from src.broker_contour.bindings import binding_catalog
@@ -473,6 +621,9 @@ def _contour_trading(state_dir, sandbox):
                                        initial_deposit=INITIAL_DEPOSIT),
         views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
                                      catalog=catalog, broker_db=lambda: sandbox.directory / BROKER_DATABASE_FILE),
+        **({} if account is None else {
+            views.ACCOUNT: ContourTrades(base=views.ACCOUNT, journal=lambda: account.directory / DATABASE_FILE,
+                                         catalog=catalog, broker_db=lambda: account.directory / BROKER_DATABASE_FILE)}),
     }
 
 

@@ -52,14 +52,20 @@ class BrokerNotifier:
                                                event_id=str(uuid.uuid4()), **fields))
 
     def started(self, snapshot: AccountSnapshot, *, bindings: int, generation: int | None,
-                orders_enabled: bool | None = None) -> None:
+                orders_enabled: bool | None = None, access_level: str | None = None,
+                warnings: list | None = None) -> None:
+        extra = {} if access_level is None else {"access_level": access_level, "warnings": list(warnings or ())}
         self._publish("started", rub=snapshot.rub, liquid_portfolio=snapshot.liquid_portfolio,
                       holdings=[{"name": name, "lots": lots} for name, lots in snapshot.holdings],
                       orders=len(snapshot.orders), stop_orders=len(snapshot.stop_orders), bindings=bindings,
-                      generation=generation, orders_enabled=orders_enabled)
+                      generation=generation, orders_enabled=orders_enabled, **extra)
 
     def alarm(self, items, frozen, *, reason: str | None = None) -> None:
         self._publish("reconcile_alarm", mismatches=list(items), frozen=list(frozen), reason=reason)
+
+    def refused(self, reason: str) -> None:
+        """Контур не стартует (add-account-contour): тревога отказа допуска, без сверки и заморозок."""
+        self._publish("refused", reason=reason)
 
     def cleared(self, unfrozen) -> None:
         self._publish("reconcile_cleared", unfrozen=list(unfrozen))

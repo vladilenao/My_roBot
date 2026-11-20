@@ -11,7 +11,7 @@ from src.broker.port import ExecutionStatus
 from src.broker_contour.api import OrderFailure
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import OrderLedger, order_key
-from src.broker_contour.stops import ACTIVE, EXECUTED, UNKNOWN, StopLedger
+from src.broker_contour.stops import ACTIVE, EXECUTED, LOST, UNKNOWN, StopLedger
 from src.events.types import EventType
 from src.trade_management.actions import AddToTrade, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
 from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi
@@ -437,3 +437,85 @@ def test_reconcile_compares_own_stops_with_account():
     foreign = AccountSnapshot(D(1_000_000), None, (("NG-12.26", 2),), (), ("NG-12.26", "NG-12.26"))
     [item] = compare(foreign, journal)
     assert (item["instrument"], item["what"], item["account"], item["journal"]) == ("NG-12.26", "stop_order", 2, 1)
+
+
+# --- потерянный ответ без повтора ключа (fix-stop-key-duplicate) ---------------------------
+
+def _lost_harness(tmp_path):
+    h = Harness(tmp_path)
+    h.ledger.clock = h.clock                     # время строк журнала — часы теста, как у брокера
+    h.filled(targets=False)
+    h.api.stop_failures.append("accepted-lost-hidden")
+    h.service()
+    return h, h.stops.rows(trade_id="trade-ng-1")[-1]
+
+
+def _posted_keys(h):
+    return [call[1] for call in h.api.calls if call[0] == "post_stop"]
+
+
+def test_lost_stop_waits_then_new_key_and_duplicate_cancelled(tmp_path):
+    h, lost = _lost_harness(tmp_path)
+    assert lost.state == UNKNOWN
+    h.service(3)
+    assert h.stops.get(lost.key).state == UNKNOWN and len(_posted_keys(h)) == 1    # 15 с ещё не прошли
+    h.service(13)
+    assert h.stops.get(lost.key).state == LOST
+    keys = _posted_keys(h)
+    assert len(keys) == 2 and len(set(keys)) == 2                                   # новый ключ, не повтор
+    assert h.stops.rows(trade_id="trade-ng-1")[-1].state == ACTIVE
+    assert NG in h.broker.in_flight_instruments()                                   # сверка не сравнивает
+    h.api.hidden_stops.clear()                                                      # первая показалась у брокера
+    h.service(3)
+    row = h.stops.get(lost.key)
+    assert row.state == "cancelled" and row.reason == "duplicate" and row.own_cancel
+    assert h.active() == [("SELL", 2, STOP)]                                        # у брокера одна
+    assert h.stop_events()[-1][0] == "stop_duplicate_cancelled"
+    assert NG not in h.broker.in_flight_instruments()
+
+
+def test_lost_stop_never_arrives_becomes_undelivered(tmp_path):
+    h, lost = _lost_harness(tmp_path)
+    h.api.stops.pop(next(iter(h.api.hidden_stops)))                                 # до брокера не дошла
+    h.api.hidden_stops.clear()
+    h.service(16)
+    assert h.stops.get(lost.key).state == LOST and h.active() == [("SELL", 2, STOP)]
+    h.service(60 * 10)
+    row = h.stops.get(lost.key)
+    assert row.state == "cancelled" and row.reason == "undelivered"
+    assert len(_posted_keys(h)) == 2 and len(set(_posted_keys(h))) == 2
+
+
+def test_duplicate_cancel_unconfirmed_resolved_by_poll(tmp_path):
+    h, lost = _lost_harness(tmp_path)
+    h.service(16)
+    h.api.hidden_stops.clear()
+    h.api.cancel_stop_failures.append(OrderFailure("unknown", "DEADLINE_EXCEEDED"))
+    h.service(3)
+    assert h.stops.get(lost.key).state == "cancelling"
+    h.service(3)
+    assert h.stops.get(lost.key).state == "cancelled" and h.active() == [("SELL", 2, STOP)]
+
+
+def test_restart_with_sending_row_follows_new_rule(tmp_path):
+    h, lost = _lost_harness(tmp_path)
+    h.stops.update(lost.key, state="sending")
+    h.clock.advance(20)
+    h.broker.recover_stops(h.clock())
+    assert h.stops.get(lost.key).state == LOST                                      # не найдена за 15 с
+    h.service()
+    assert len(set(_posted_keys(h))) == 2                                            # новая — новым ключом
+    h.api.hidden_stops.clear()                                                      # прежняя показалась
+    h.service(3)
+    assert h.active() == [("SELL", 2, STOP)] and h.stops.get(lost.key).reason == "duplicate"
+
+
+def test_duplicate_cancelled_card_line(tmp_path):
+    from src.notifier.templates.orders import order_line
+
+    h, _ = _lost_harness(tmp_path)
+    h.service(16)
+    h.api.hidden_stops.clear()
+    h.service(3)
+    event = next(e for e in h.published if e.get("kind") == "stop_duplicate_cancelled")
+    assert order_line(event).startswith("лишняя стоп-заявка снята, стоп-заявка …")

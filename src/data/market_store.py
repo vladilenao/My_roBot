@@ -52,6 +52,10 @@ def _utc_text(value: object | None = None) -> str:
     return stamp.isoformat().replace("+00:00", "Z")
 
 
+# Минут в одном запросе чтения состояний пакета: ниже предела переменных SQLite.
+_STATE_READ_CHUNK = 500
+
+
 def _downgrades_final(current: str, state: str) -> bool:
     """Ожидание поверх итога по данным источника — понижение, его не пишем."""
     return current in FINAL_EVIDENCE_STATES and state in WAITING_INTERVAL_STATES
@@ -120,6 +124,11 @@ class StoredScheduleDay:
     # восстановлен историческим источником и живёт только в снимке прогона.
     provenance: str = "broker"
     rules_version: str | None = None
+
+
+# Удержания UID прежней версии (fix-executed-minute-revision).
+_LEGACY_HOLDS = """SELECT key,value FROM metadata WHERE key LIKE 'live:uid:%'
+    AND (value LIKE '%"integrity_hold"%' OR value LIKE '%"pending_input_conflicts"%')"""
 
 
 class MarketDataStore:
@@ -351,7 +360,11 @@ class MarketDataStore:
                 )
             self._migrate_contour_marks(conn)
             self._release_integrity_holds(conn)
-            conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+            # Записи только при отличии (fix-market-store-startup-lock): ядро и контуры
+            # открывают базу одновременно, и открытие актуальной базы не ждёт пишущего.
+            if self._metadata_value(conn, "schema_version") != str(SCHEMA_VERSION):
+                conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
             self._set_default(conn, "producer_id", str(uuid.uuid4()))
             self._set_default(conn, "min_after_id", "0")
             self._set_default(conn, "schedule_max_change_id", "0")
@@ -410,12 +423,16 @@ class MarketDataStore:
         минуты (``integrity_hold``) или начатого пакета (``pending_input_conflicts``).
         Контур продолжает от своих курсоров; исполненное не переигрывается.
         """
+        # Удержания пишет только прежняя версия, новые не появляются: без них
+        # блокировка записи не берётся, и старт не ждёт пишущий процесс
+        # (fix-market-store-startup-lock).
+        if not conn.execute(_LEGACY_HOLDS + " LIMIT 1").fetchone():
+            return
         released = _utc_text()
         conn.execute("BEGIN IMMEDIATE")
         try:
             # Ядро и контур открывают базу одновременно: чтение под той же блокировкой.
-            rows = conn.execute("""SELECT key,value FROM metadata WHERE key LIKE 'live:uid:%'
-                AND (value LIKE '%"integrity_hold"%' OR value LIKE '%"pending_input_conflicts"%')""").fetchall()
+            rows = conn.execute(_LEGACY_HOLDS).fetchall()
             for key, value in rows:
                 held = json.loads(value)
                 held.pop("integrity_hold", None)
@@ -448,7 +465,14 @@ class MarketDataStore:
 
     @staticmethod
     def _set_default(conn: sqlite3.Connection, key: str, value: str) -> None:
-        conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)", (key, value))
+        # INSERT OR IGNORE берёт блокировку записи и тогда, когда ключ уже есть.
+        if MarketDataStore._metadata_value(conn, key) is None:
+            conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)", (key, value))
+
+    @staticmethod
+    def _metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
+        row = conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return None if row is None else row[0]
 
     def source_info(self) -> SourceInfo:
         with self._lock, self._connect() as conn:
@@ -827,6 +851,11 @@ class MarketDataStore:
         источника (``confirmed_no_trade``, ``source_absent``) не возвращается в
         ``pending``/``unresolved``. Возвращает число изменённых строк. Нужен сверке длинных диапазонов: ночь и выходные —
         это тысячи минут, по транзакции на каждую слишком дорого.
+
+        Текущие состояния минут пакета читаются пачками и сначала без
+        блокировки записи: пакет, который ничего не меняет и не продвигает
+        префикс (сверка после перезапуска), не ждёт пишущий процесс и не пишет
+        (fix-coverage-reconcile-restart).
         """
         prepared = []
         for open_time, state, evidence in rows:
@@ -836,35 +865,66 @@ class MarketDataStore:
         if not prepared:
             return 0
         when = _utc_text(observed_at)
-        changed = 0
+        latest = max(stamp for stamp, _, _ in prepared)
         with self._lock, self._connect() as conn:
+            if not self._plan_interval_states(conn, source, instrument_uid, interval, prepared):
+                known, resolved = self._interval_prefix(conn, source, instrument_uid, interval, latest)
+                if resolved is None or (known is not None and resolved <= known):
+                    return 0
             conn.execute("BEGIN IMMEDIATE")
             try:
-                for stamp, state, evidence in prepared:
-                    current = conn.execute(
-                        "SELECT state FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?",
-                        (source, instrument_uid, interval, stamp)).fetchone()
-                    if current is not None and current["state"] == "received":
-                        continue
-                    if current is not None and _downgrades_final(current["state"], state):
-                        continue
-                    if self._upsert_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True):
-                        changed += 1
-                pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
-                cursor = conn.execute(
-                    "SELECT received_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
-                    (source, instrument_uid, interval),
-                ).fetchone()
-                latest = max(stamp for stamp, _, _ in prepared)
-                horizon = None if cursor is None or cursor[0] is None else max(latest, cursor[0])
-                if pair.get("coverage_lower") and horizon is not None and horizon >= _utc_text(pair["coverage_lower"]):
-                    self._resolve_contiguous_prefix(conn, source, instrument_uid, interval,
-                                                    pair["coverage_lower"], horizon)
+                plan = self._plan_interval_states(conn, source, instrument_uid, interval, prepared)
+                for stamp, state, evidence in plan:
+                    self._write_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, when, emit=True)
+                known, resolved = self._interval_prefix(conn, source, instrument_uid, interval, latest)
+                if resolved is not None and (known is None or resolved > known):
+                    self._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
                 conn.commit()
-                return changed
+                return len(plan)
             except Exception:
                 conn.rollback()
                 raise
+
+    @staticmethod
+    def _plan_interval_states(conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
+                              prepared: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+        """Строки пакета, которые меняют записанное состояние.
+
+        Текущие состояния читаются пачками только по минутам пакета: диапазон
+        ряда целиком — это ещё и все полученные минуты, вдвое больше чтения.
+        """
+        stamps = sorted({stamp for stamp, _, _ in prepared})
+        reader = conn.cursor()
+        reader.row_factory = None
+        known = {}
+        for offset in range(0, len(stamps), _STATE_READ_CHUNK):
+            chunk = stamps[offset:offset + _STATE_READ_CHUNK]
+            known.update((stamp, (state, evidence)) for stamp, state, evidence in reader.execute(
+                f"""SELECT open_time_utc,state,evidence FROM interval_coverage
+                WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc IN ({",".join("?" * len(chunk))})""",
+                (source, instrument_uid, interval, *chunk)))
+        plan = []
+        for stamp, state, evidence in prepared:
+            current = known.get(stamp)
+            if current is not None and (current[0] == "received" or _downgrades_final(current[0], state)
+                                        or current == (state, evidence)):
+                continue
+            known[stamp] = (state, evidence)
+            plan.append((stamp, state, evidence))
+        return plan
+
+    def _interval_prefix(self, conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
+                         latest: str) -> tuple[str | None, str | None]:
+        """Записанный и доказанный префикс покрытия пары после пакета; ``(None, None)`` — пересчитывать нечего."""
+        pair = self._read_live(conn, self._live_key("pair", source, instrument_uid, interval))
+        cursor = conn.execute(
+            "SELECT received_through FROM market_cursors WHERE source=? AND instrument_uid=? AND interval=?",
+            (source, instrument_uid, interval),
+        ).fetchone()
+        horizon = None if cursor is None or cursor[0] is None else max(latest, cursor[0])
+        if not pair.get("coverage_lower") or horizon is None or horizon < _utc_text(pair["coverage_lower"]):
+            return None, None
+        return self._contiguous_prefix(conn, source, instrument_uid, interval, pair["coverage_lower"], horizon)
 
     @staticmethod
     def _keeps_final_state(conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str,
@@ -880,6 +940,10 @@ class MarketDataStore:
         old = conn.execute("SELECT state,evidence FROM interval_coverage WHERE source=? AND instrument_uid=? AND interval=? AND open_time_utc=?", (source, instrument_uid, interval, stamp)).fetchone()
         if old is not None and old["state"] == state and old["evidence"] == evidence:
             return None
+        return self._write_coverage(conn, source, instrument_uid, interval, stamp, state, evidence, observed_at, emit=emit)
+
+    def _write_coverage(self, conn: sqlite3.Connection, source: str, instrument_uid: str, interval: str, stamp: str,
+                        state: str, evidence: str, observed_at: str, *, emit: bool) -> int | None:
         conn.execute(
             """INSERT INTO interval_coverage(source,instrument_uid,interval,open_time_utc,state,evidence,observed_at)
             VALUES (?,?,?,?,?,?,?) ON CONFLICT(source,instrument_uid,interval,open_time_utc) DO UPDATE SET
@@ -1164,6 +1228,15 @@ class MarketDataStore:
 
     @staticmethod
     def _resolve_contiguous_prefix(conn, source, instrument_uid, interval, meaningful_lower, horizon):
+        known, resolved = MarketDataStore._contiguous_prefix(conn, source, instrument_uid, interval,
+                                                             meaningful_lower, horizon)
+        if resolved is not None and (known is None or resolved > known):
+            MarketDataStore._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
+        return resolved
+
+    @staticmethod
+    def _contiguous_prefix(conn, source, instrument_uid, interval, meaningful_lower, horizon):
+        """Чтение: ``(записанный resolved_through, доказанный префикс)``; курсор не двигает."""
         lower, upper = _utc_text(meaningful_lower), _utc_text(horizon)
         if upper < lower:
             raise ValueError("Горизонт coverage не может быть раньше meaningful lower")
@@ -1190,9 +1263,7 @@ class MarketDataStore:
                 break
             resolved = _utc_text(current)
             current += step
-        if resolved is not None and (known is None or known[0] is None or resolved > known[0]):
-            MarketDataStore._advance_cursor(conn, source, instrument_uid, interval, resolved=resolved)
-        return resolved
+        return (None if known is None else known[0]), resolved
 
     def publish_pair_readiness(self, *, source: str, instrument_uid: str, interval: str, status: dict) -> None:
         """Текущая готовность живой пары от ядра; не событие и не строка ``/changes``."""

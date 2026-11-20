@@ -37,7 +37,8 @@ _CONTROL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 _CONTOURS = "/api/v1/contours"
 # /api/v1/history/{run_id}[/stop|/report|/log]; run_id — имя папки прогона.
 _RUN = re.compile(r"^/api/v1/history/([0-9]{8}-[0-9]{6}(?:-[0-9]+)?)(?:/(stop|report|log))?$")
-_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX, views.CANDLES)
+_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX, views.ACCOUNT,
+                     views.CANDLES)
 _OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.yaml"
 # Маршруты экспорта рыночных данных и отчёта кластеров: им нужна рыночная база ядра.
 _EXPORT_GET = ("/api/v1/market-data/source", "/api/v1/market-data/changes",
@@ -67,12 +68,16 @@ class MarketDataExportServer:
         self.core_state = None
         # Контур «Песочница» (src.bot.sandbox_control.SandboxControl, add-sandbox-contour) или None.
         self.sandbox = None
+        # Контур «Счёт» (src.bot.account_control.AccountControl, add-account-contour) или None.
+        self.account = None
         # Позиции, сделки и итоги контуров по журналу (src.bot.trades_view.ContourTrades, add-contour-trades-api):
         # адрес контура → ресурсы; контура нет в словаре — 404.
         self.trading: dict = {}
         # Отчёт «Песочница против эмуляции» (src.bot.comparison_view.ContourComparison,
         # add-account-vs-emulation-report) или None — ресурс отвечает 404.
         self.comparison = None
+        # Сравнение «Счёт — песочница — эмуляция» (enable-live-trading) или None — ресурс отвечает 404.
+        self.account_comparison = None
         # Индикаторы стратегий привязок на свечах базы (src.bot.indicators_view.IndicatorsView, add-indicators-api)
         # или None — ресурс отвечает 404.
         self.indicators = None
@@ -214,6 +219,8 @@ class _Handler(BaseHTTPRequestHandler):
             found.update(core=views.CORE, emulation=views.EMULATION, history=views.HISTORY)
             if server.sandbox is not None:
                 found["sandbox"] = views.SANDBOX
+            if server.account is not None:
+                found["account"] = views.ACCOUNT
             found["candles"] = views.CANDLES
         if export:
             found.update({"market-data": "/api/v1/market-data/source", "clusters-report": "/api/v1/clusters/report"})
@@ -225,6 +232,7 @@ class _Handler(BaseHTTPRequestHandler):
             "history": None if not control else (history.limits() if history is not None else
                                                  {"max": 0, "running": 0, "queued": 0}),
             "sandbox": server.sandbox.summary() if control and server.sandbox is not None else None,
+            "account": server.account.summary() if control and server.account is not None else None,
             "live": None,
             "_links": {name: {"href": href} for name, href in found.items()},
         })
@@ -246,6 +254,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_get(path, query)
+            return
+        if path == views.ACCOUNT_COMPARISON and server.account_comparison is not None:
+            self._comparison_get(query, server.account_comparison)
+            return
+        if path == views.ACCOUNT or path.startswith(views.ACCOUNT + "/"):
+            self._account_get(path, query)
             return
         if path == views.CANDLES or path.startswith(views.CANDLES + "/"):
             self._candles_get(path, query)
@@ -346,12 +360,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._problem(exc.status, exc.code, exc.detail)
         return True
 
-    def _comparison_get(self, query: dict[str, list[str]]) -> None:
-        """Песочница против эмуляции по журналам контуров (add-account-vs-emulation-report)."""
+    def _comparison_get(self, query: dict[str, list[str]], comparison=None) -> None:
+        """Сравнение контуров по журналам (add-account-vs-emulation-report, enable-live-trading)."""
         from src.bot.trades_view import TradesError
 
         try:
-            self._json(HTTPStatus.OK, self.export_server.comparison.report(query))
+            self._json(HTTPStatus.OK, (comparison or self.export_server.comparison).report(query))
         except TradesError as exc:
             self._problem(exc.status, exc.code, exc.detail)
 
@@ -401,6 +415,71 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_text(HTTPStatus.OK, sandbox.log_tail(tail), "text/plain; charset=utf-8")
         else:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+
+    def _account_get(self, path: str, query: dict[str, list[str]]) -> None:
+        """Контур «Счёт» (add-account-contour): те же чтения, что у песочницы, без отчёта сравнения."""
+        account = self.export_server.account
+        if account is None:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Счёт» недоступен в этом процессе.")
+            return
+        if path == views.ACCOUNT:
+            view = account.view()
+            self._json(HTTPStatus.OK, view, headers=views.etag((view["target"] or {}).get("revision")))
+        elif path == views.ACCOUNT_TARGET:
+            target = account.target()
+            self._json(HTTPStatus.OK, target, headers=views.etag((target or {}).get("revision")))
+        elif path == views.ACCOUNT_BINDINGS:
+            payload = account.bindings()
+            self._json(HTTPStatus.OK, payload, headers=views.etag(payload["revision"]))
+        elif path == views.ACCOUNT_RECONCILE:
+            self._json(HTTPStatus.OK, account.reconcile())
+        elif path == views.ACCOUNT_LOG:
+            tail = self._tail(query)
+            if tail is not None:
+                self._send_text(HTTPStatus.OK, account.log_tail(tail), "text/plain; charset=utf-8")
+        else:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+
+    def _account_command(self, path: str) -> None:
+        """Команды «Счёта»: запуск и остановка; состав до Р2 — ``409 ACCOUNT_READ_ONLY``."""
+        from src.bot.account_control import parse_account_bindings, parse_account_target
+        from src.bot.launch_control import BadCommand
+        from src.bot.sandbox_control import parse_guards_reset
+
+        account = self.export_server.account
+        if account is None:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Счёт» недоступен в этом процессе.")
+            return
+        routes = {("PUT", views.ACCOUNT_TARGET), ("POST", views.ACCOUNT_BINDINGS), ("POST", views.ACCOUNT_REMOVE),
+                  ("POST", views.ACCOUNT_GUARDS_RESET)}
+        if (self.command, path) not in routes:
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
+            return
+        expected = _if_match(self.headers.get("If-Match"))
+        try:
+            body = self._read_json()
+            if path == views.ACCOUNT_GUARDS_RESET:
+                status, payload = account.reset_guards(parse_guards_reset(body))
+                headers = None
+            elif path == views.ACCOUNT_TARGET:
+                mode, bindings, confirm = parse_account_target(body)
+                status, payload = account.put_account_target(mode, bindings, confirm, expected)
+                headers = views.etag((payload.get("target") or {}).get("revision")) if status < 400 else None
+                if status == HTTPStatus.ACCEPTED:
+                    headers = {**(headers or {}), "Location": views.ACCOUNT}
+            else:
+                remove = path == views.ACCOUNT_REMOVE
+                ids, mode, confirm = parse_account_bindings(body, remove=remove)
+                status, payload = account.change_account_bindings(ids, remove=remove, mode=mode, confirm=confirm,
+                                                                  expected=expected)
+                headers = views.etag(payload.get("revision")) if status < 400 else None
+        except BadCommand as exc:
+            self._problem(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
+            return
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            self._problem(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Тело команды — JSON-объект.")
+            return
+        self._reply(status, payload, headers)
 
     def _sandbox_command(self, path: str) -> None:
         from src.bot.launch_control import BadCommand
@@ -457,6 +536,9 @@ class _Handler(BaseHTTPRequestHandler):
         control = self.export_server.control
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_command(path)
+            return
+        if path == views.ACCOUNT or path.startswith(views.ACCOUNT + "/"):
+            self._account_command(path)
             return
         run = _RUN.match(path)
         if run is not None and run.group(2) == "stop" and self.command == "POST":

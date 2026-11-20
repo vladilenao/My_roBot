@@ -58,6 +58,8 @@ class Reconciler:
         self.frozen: tuple[str, ...] = ()
         self.last_at: datetime | None = None
         self.skipped_in_row = 0
+        # Причина первой тревоги (add-account-contour): «счёт не пуст на первом старте»; после неё — None.
+        self.note: str | None = None
         self._signature: tuple | None = ()  # () — «совпадает»; при старте процесса всё начинается заново
 
     def due(self, now: datetime) -> bool:
@@ -92,11 +94,15 @@ class Reconciler:
         if signature != self._signature:
             if items:
                 log.warning("Сверка счёта: расхождение по %s", ", ".join(frozen))
-                self._notifier.alarm(items, frozen)
+                if self.note:
+                    self._notifier.alarm(items, frozen, reason=self.note)
+                else:
+                    self._notifier.alarm(items, frozen)
             elif not kept:
                 log.info("Сверка счёта: расхождение устранено, разморожены %s", ", ".join(self.frozen) or "—")
                 self._notifier.cleared(sorted(set(self.frozen) - set(frozen)))
         self._signature, self.frozen = signature, frozen
+        self.note = None
         report = {"at": stamp, "account": self._account, "result": MISMATCH if items else OK, "items": items,
                   "in_flight": in_flight, "frozen": list(frozen), "skipped_in_row": 0}
         self._store.add_report(report)

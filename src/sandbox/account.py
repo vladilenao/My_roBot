@@ -29,6 +29,7 @@ class AccountConflict(Exception):
 class RobotAccount:
     account_id: str
     opened: bool
+    access_level: str | None = None   # права токена на счёт брокера (add-account-contour); у песочницы нет
 
     @property
     def masked(self) -> str:
