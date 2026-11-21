@@ -19,9 +19,12 @@ from src.bot.run_session import HistoricalRunSession
 from src.config_loader import ConfigError, load_config
 from src.history.report import MarketDataSync
 from src.scheduler.clock import HistoricalClock
+from src.strategies.contracts import Assignment
 
-SHARES = {"SBER": ["a"]}
-FUTURES = {"NG": ["a"], "BR": []}
+SBER_MACD = Assignment("share-sber-macd", "macd", "levels_rr", timeframe="4h")
+NG_MACD = Assignment("future-ng-macd", "macd", "levels_rr", "triple_screen", timeframe="1h")
+SHARES = {"SBER": [SBER_MACD]}
+FUTURES = {"NG": [NG_MACD], "BR": []}
 
 
 def _key(run_id: str) -> str:
@@ -176,6 +179,7 @@ class TestQueue:
         assert runs.queue.report(run_id) == (200, {
             "covered": True, "stop_reason": "диапазон обработан полностью", "trades": 7, "net_pnl": rub("12.5"),
             "fees": rub("1"), "balance": rub("100012.5"), "open_positions": [],
+            "bindings": None,  # отчёт прежней версии — без связок (add-history-preflight-api)
             "_links": {"run": {"href": f"/api/v1/history/{run_id}"}}})
         assert runs.queue.run(run_id)["_links"]["report"] == {"href": f"/api/v1/history/{run_id}/report"}
 
@@ -397,3 +401,161 @@ class TestSettings:
 
 def test_module_is_history_runs():
     assert history_runs.RUN_PREFIX == "history-"
+
+
+def _outcome(**kw):
+    from src.assembly.history_runs import PreflightOutcome
+
+    return PreflightOutcome(datetime(2026, 9, 1, 10), datetime(2026, 9, 8, 10), **kw)
+
+
+class TestPreflight:
+    """Проверка прогона без очереди (add-history-preflight-api)."""
+
+    def _queue(self, runs, checker):
+        runs.queue._checker = checker
+        return runs.queue
+
+    def test_ok_check_queues_nothing_and_writes_nothing(self, runs):
+        from src.history.preflight import CheckedPair, PreflightReport
+
+        report = PreflightReport(start=datetime(2026, 9, 1, 10), checked_pairs=1, notes=("покрытие: свечей 10",),
+                                 pairs=(CheckedPair("SBER", "share", "1m", True, datetime(2026, 8, 31, 23),
+                                                    datetime(2026, 9, 8, 9, 59)),))
+        seen = []
+
+        def checker(request, provider):
+            seen.append((request.instruments, provider))
+            return _outcome(report=report, bindings=[{"id": "share-sber-macd"}])
+
+        status, payload = self._queue(runs, checker).preflight(_request("SBER"))
+        assert status == 200 and payload["ok"] is True and payload["reason"] is None
+        assert payload["problems"] == [] and payload["notes"] == ["покрытие: свечей 10"]
+        assert payload["pairs"] == [{"instrument": "SBER", "instrument_type": "share", "timeframe": "1m",
+                                     "segment": None, "found": {"from": "2026-08-31T23:00:00Z",
+                                                                "to": "2026-09-08T09:59:00Z"}, "ok": True}]
+        assert payload["start"] == "2026-09-01T10:00:00Z" and payload["bindings"] == [{"id": "share-sber-macd"}]
+        assert payload["market_data_sync"] == {"status": "synchronized", "snapshot_generation": 42}
+        [action] = payload["_actions"]
+        assert (action["name"], action["method"], action["href"]) == ("start", "POST", "/api/v1/history")
+        assert action["body"] == payload["request"]
+        assert seen == [(("SBER",), runs.syncs[0])] and len(runs.syncs) == 1
+        assert runs.store.history_runs() == [] and not (runs.tmp_path / "contours").exists()
+
+    def test_failed_data_gives_reason_of_failed_run(self, runs):
+        from src.history.preflight import PreflightReport
+
+        report = PreflightReport(problems=("NG-12.26 1m: конец участка не покрыт",), start=datetime(2026, 9, 1, 10))
+        status, payload = self._queue(runs, lambda request, provider: _outcome(
+            report=report, refusal=report.message())).preflight(_request("NG"))
+        assert status == 200 and payload["ok"] is False and payload["_actions"] == []
+        assert payload["problems"] == ["NG-12.26 1m: конец участка не покрыт"]
+        assert payload["reason"] == "Прогон невозможен — данные не прошли предварительную проверку:"
+
+    def test_emulator_rejection_is_reported_like_failed_run(self, runs):
+        from src.bot.launch import Rejection
+
+        progress = HistoryProgress(runs.tmp_path, run_id="history-x", core_db=runs.tmp_path / "core.sqlite3",
+                                   version="7.1.0", interval=1)
+        rejection = Rejection("NG-03.20", "Контракт не найден среди контрактов эмулятора на начало прогона.")
+        progress.reject([rejection])
+        status, payload = self._queue(runs, lambda request, provider: _outcome(
+            rejections=(rejection,))).preflight(_request("NG-03.20"))
+        assert status == 200 and payload["ok"] is False
+        assert payload["rejections"] == [{"instrument": "NG-03.20", "reason": rejection.reason}]
+        assert payload["reason"] == read_status(runs.tmp_path / STATUS_FILE)["reason"]
+
+    def test_repeated_shift_is_service_code_three(self, runs):
+        from src.history.preflight import PreflightReport
+
+        report = PreflightReport(start=datetime(2026, 9, 2, 10))
+        status, payload = self._queue(runs, lambda request, provider: _outcome(
+            report=report, exit_code=3)).preflight(_request("NG"))
+        assert payload["ok"] is False and payload["reason"] == "процесс прогона завершился с кодом 3"
+        assert "сдвинулось повторно" in payload["problems"][0]
+
+    def test_tokens_are_refused_like_submit_without_emulator(self, runs):
+        called = []
+        status, payload = self._queue(runs, lambda *args: called.append(args)).preflight(_request("NG", "AFLT"))
+        assert status == 422 and payload["code"] == "INSTRUMENTS_REJECTED"
+        assert [item["token"] for item in payload["rejections"]] == ["AFLT"]
+        assert called == [] and runs.syncs == []
+
+    @pytest.mark.parametrize("code, text", [("SOURCE_UNAVAILABLE", "Эмулятор недоступен: Connection refused"),
+                                            ("SNAPSHOT_MISMATCH", "снимок сменился")])
+    def test_emulator_error_is_503(self, runs, code, text):
+        from src.api.emulator_client import EmulatorError
+
+        def checker(request, provider):
+            raise EmulatorError(code, text)
+
+        status, payload = self._queue(runs, checker).preflight(_request("NG"))
+        assert status == 503 and payload["code"] == "SOURCE_UNAVAILABLE" and text in payload["message"]
+        assert runs.store.history_runs() == []
+
+    def test_unexpected_failure_is_500_with_type_only(self, runs):
+        def checker(request, provider):
+            raise KeyError("секрет")
+
+        status, payload = self._queue(runs, checker).preflight(_request("NG"))
+        assert status == 500 and payload["code"] == "INTERNAL" and "секрет" not in payload["message"]
+
+    def test_without_checker_is_unavailable(self, runs):
+        assert runs.queue.preflight(_request("NG"))[0] == 409
+
+    def test_check_and_queue_syncs_do_not_overlap(self, runs):
+        """Сверка проверки ждёт сверку очереди: две сверки одновременно не отправляются."""
+        inside, release, order = threading.Event(), threading.Event(), []
+
+        def slow_prepare(provider):
+            order.append("start")
+            inside.set()
+            release.wait(5)
+            order.append("end")
+            return MarketDataSync(), None, "импорт не подтверждён"
+
+        runs.queue._prepare = slow_prepare
+        runs.queue._checker = lambda request, provider: _outcome()
+        runs.queue.submit(_request())
+        queue_thread = threading.Thread(target=runs.queue._fill)
+        queue_thread.start()
+        assert inside.wait(5)
+        check = threading.Thread(target=runs.queue.preflight, args=(_request(),))
+        check.start()
+        check.join(0.3)
+        assert order == ["start"]
+        release.set()
+        queue_thread.join(5)
+        check.join(5)
+        assert order == ["start", "end", "start", "end"]
+
+
+class TestRunBindings:
+    """Состав прогона — связки при постановке (add-history-preflight-api)."""
+
+    def test_bindings_are_fixed_at_submit(self, runs):
+        run_id = runs.queue.submit(_request("NG", "SBER"))[1]["id"]
+        FUTURES["NG"].append(Assignment("future-ng-new", "macd", "levels_rr", timeframe="5m"))
+        try:
+            bindings = runs.queue.run(run_id)["bindings"]
+        finally:
+            FUTURES["NG"].pop()
+        assert [(item["id"], item["instrument"]) for item in bindings] == [
+            ("future-ng-macd", "NG"), ("share-sber-macd", "SBER")]
+        assert bindings[0] == {"id": "future-ng-macd", "instrument": "NG", "strategy": "macd", "timeframe": "1h",
+                               "filter": "triple_screen", "management": "levels_rr"}
+
+    def test_run_of_previous_version_has_null_bindings(self, runs):
+        runs.store.add_history_run("history-20261024-091000", "20261024-091000",
+                                   {"from": "2026-09-01 10:00", "to": "2026-09-08 10:00", "pause": 1.0, "instruments": ["NG"]})
+        assert runs.queue.run("20261024-091000")["bindings"] is None
+
+    def test_report_carries_bindings_of_run(self, runs):
+        run_id = runs.queue.submit(_request())[1]["id"]
+        runs.queue._fill()
+        rows = [{"id": "future-ng-macd", "instrument": "NG", "strategy": "macd", "timeframe": "1h",
+                 "filter": "triple_screen", "management": "levels_rr"}]
+        (run_dir(runs.tmp_path, run_id) / "report.json").write_text(json.dumps({
+            "covered": True, "stop_reason": "ok", "result": {"trades": 0}, "bindings": rows}), encoding="utf-8")
+        FakeProcess.started[0].exit(0)
+        assert runs.queue.report(run_id)[1]["bindings"] == rows

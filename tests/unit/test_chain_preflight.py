@@ -157,3 +157,22 @@ def test_br_6_25_monday_expiration_after_weekend_passes():
         start=start, end=end, load_candles=weekdays)
     assert result.ok, result.problems
     assert any("BR-6.25" in line for line in result.detail)
+
+
+def test_chain_pairs_carry_segment_and_found_bars():
+    result = check()
+    assert [pair.instrument for pair in result.pairs] == [segment.card.short_name
+                                                         for segment in selection().chains[0]]
+    first = result.pairs[0]
+    segment = selection().chains[0][0]
+    assert first.ok and first.timeframe == "1m" and first.segment == (segment.start, segment.end)
+    assert first.first is not None and first.last is not None and first.first < segment.start < first.last
+
+
+def test_chain_pair_without_candles_is_failed():
+    def empty(**kw):
+        return pd.DataFrame({"datetime": pd.Series([], dtype="datetime64[ns]")}), kw["instrument_id"]
+
+    result = check(empty)
+    assert not result.ok and result.pairs and not any(pair.ok for pair in result.pairs)
+    assert all(pair.first is None for pair in result.pairs)

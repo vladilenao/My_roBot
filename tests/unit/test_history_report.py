@@ -234,6 +234,16 @@ class TestWriteReport:
         assert "calendar_schedule" not in payload
         assert "Расписание торгов:" not in txt.read_text(encoding="utf-8")
 
+    def test_bindings_of_run_are_written(self, tmp_path):
+        """Связки прогона в report.json (add-history-preflight-api); без них поля нет."""
+        storage = _storage_with_round_trip(tmp_path)
+        rows = ({"id": "future-ng-macd", "instrument": "NG", "strategy": "macd", "timeframe": "1h",
+                 "filter": "triple_screen", "management": "levels_rr"},)
+        _, js = write_report(tmp_path, _metrics(bindings=rows), collect_result(storage))
+        assert __import__("json").loads(js.read_text(encoding="utf-8"))["bindings"] == list(rows)
+        _, js = write_report(tmp_path, _metrics(), collect_result(storage))
+        assert "bindings" not in __import__("json").loads(js.read_text(encoding="utf-8"))
+
     def test_complete_log_is_reported(self, tmp_path):
         storage = _storage_with_round_trip(tmp_path)
         rotation = LogRotation(rollovers=0, backup_count=0, retained_from=None)

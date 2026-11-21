@@ -171,6 +171,8 @@ class RunMetrics:
     log_rotation: LogRotation | None = None
     #: Сигналы, сделки и недопуски по привязкам стратегий.
     strategy_admissions: tuple[StrategyAdmission, ...] = ()
+    #: Связки, по которым торговал прогон (add-history-preflight-api); ``None`` — не собраны.
+    bindings: tuple[dict, ...] | None = None
 
 
 @dataclass
@@ -440,6 +442,8 @@ def write_report(
         payload["calendar_schedule"] = metrics.calendar_schedule.to_json()
     if metrics.strategy_admissions:
         payload["strategy_admissions"] = [row.to_json() for row in metrics.strategy_admissions]
+    if metrics.bindings is not None:
+        payload["bindings"] = [dict(row) for row in metrics.bindings]
     txt_path.write_text(
         "\n".join(_lines(metrics, result, origin)) + "\n", encoding="utf-8"
     )

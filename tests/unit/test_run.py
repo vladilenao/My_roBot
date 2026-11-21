@@ -832,3 +832,84 @@ def test_binding_resolver_asks_catalog_once_and_margin_once_per_contract(monkeyp
     assert calls.count(("futures", 1)) == 1
     assert sorted(call for call in calls if call[0] == "margin") == [("margin", "uid-BRZ6"), ("margin", "uid-EDZ6"),
                                                                        ("margin", "uid-NGZ6")]
+
+
+class TestHistoryPreflight:
+    """Проверка без очереди идёт теми же шагами, что процесс прогона (add-history-preflight-api)."""
+
+    START = datetime(2024, 1, 1, 0, 0)
+    END = datetime(2024, 1, 5, 0, 0)
+    REQUEST = LaunchRequest("history", "api", ("SBER",), start=START, end=END, pause=0.0)
+
+    def _resolution(self):
+        return Resolution([SELECTOR_SBER], [Chosen("SBER", "SBER", "share")], [])
+
+    def _patches(self, report):
+        return (
+            patch.object(run, "setup_logging"),
+            patch.object(run, "_resolve_request", return_value=self._resolution()),
+            patch.object(run, "active_pairs", return_value=[("SBER", "1m")]),
+            patch.object(run, "_warmup_bars", return_value=41),
+            patch.object(run, "run_preflight", **({"side_effect": report} if isinstance(report, list)
+                                                  else {"return_value": report})),
+            patch.object(contour, "build_channels"),
+        )
+
+    def _check(self, report):
+        p = self._patches(report)
+        with p[0], p[1], p[2], p[3], p[4] as preflight, p[5]:
+            outcome = run._history_preflight(self.REQUEST, MagicMock())
+        return outcome, preflight
+
+    def test_reason_is_the_reason_of_refused_run(self, tmp_path):
+        report = _preflight_report(start=self.START, ok=False)
+        progress = MagicMock()
+        p = self._patches(report)
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
+            code, _, _ = run._launch(state_dir=tmp_path / "state", client_provider=MagicMock(),
+                                     clock=MagicMock(), session=MagicMock(start=self.START, end=self.END),
+                                     channel_names=[], launch=self.REQUEST, progress=progress)
+        outcome, _ = self._check(report)
+        assert code == 2 and not outcome.ok
+        progress.fail.assert_called_once_with(outcome.reason)
+        assert outcome.problems() == list(report.problems)
+
+    def test_ok_check_has_bindings_and_writes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        outcome, preflight = self._check(_preflight_report(start=self.START))
+        assert outcome.ok and outcome.reason is None and outcome.start == self.START
+        assert [row["instrument"] for row in outcome.bindings] == ["SBER"] * len(run.SHARE_STRATEGIES.get("SBER", []))
+        assert preflight.call_count == 1 and list(tmp_path.iterdir()) == []
+
+    def test_shifted_start_is_checked_again_like_run(self):
+        shifted = _preflight_report(start=self.START, shift_to=SHIFTED_START)
+        outcome, preflight = self._check([shifted, _preflight_report(start=SHIFTED_START)])
+        assert outcome.ok and outcome.start == SHIFTED_START
+        assert [call.kwargs["start"] for call in preflight.call_args_list] == [self.START, SHIFTED_START]
+        assert outcome.all_notes()[0] == "начало диапазона сдвинуто"
+
+    def test_second_shift_is_service_code(self):
+        shifted = _preflight_report(start=self.START, shift_to=SHIFTED_START)
+        again = _preflight_report(start=SHIFTED_START, shift_to=SHIFTED_START + timedelta(hours=1))
+        outcome, preflight = self._check([shifted, again])
+        assert outcome.exit_code == 3 and outcome.reason == "процесс прогона завершился с кодом 3"
+        assert preflight.call_count == 2
+
+    def test_rejections_of_emulator(self):
+        from src.bot.launch import Rejection
+
+        rejected = Resolution([], [], [Rejection("NG-03.20", "Контракт не найден.")])
+        with patch.object(run, "_resolve_request", return_value=rejected), \
+                patch.object(run, "run_preflight") as preflight:
+            outcome = run._history_preflight(self.REQUEST, MagicMock())
+        assert outcome.reason == "NG-03.20: Контракт не найден." and not preflight.called
+
+    def test_unavailable_emulator_raises_before_resolution(self):
+        from src.api.emulator_client import EmulatorError
+
+        provider = MagicMock()
+        provider.client_context.return_value.__enter__.return_value.ping.side_effect = EmulatorError(
+            "SOURCE_UNAVAILABLE", "Эмулятор недоступен: Connection refused")
+        with patch.object(run, "_resolve_request") as resolve, pytest.raises(EmulatorError):
+            run._history_preflight(self.REQUEST, provider)
+        resolve.assert_not_called()

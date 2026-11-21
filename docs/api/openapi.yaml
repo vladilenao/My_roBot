@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.12.0
+  version: 2.13.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -38,6 +38,9 @@ info:
       `POST /api/v1/sandbox/guards/reset`.
     * `/api/v1/sandbox/comparison` (2.10.0) — песочница против эмуляции:
       пары сделок по ключу сигнала, расхождения, причины сделок без пары.
+    * `POST /api/v1/history/preflight` (2.13.0) — проверка прогона истории
+      без постановки в очередь; `bindings` — связки прогона у `HistoryRun`
+      и `HistoryReport`.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -1541,8 +1544,10 @@ paths:
         цепочку контрактов на весь диапазон; контракт (`NG-12.26`) —
         фиксированный; семейство вместе со своим контрактом — конфликт. Контракты у эмулятора и покрытие свечей
         проверяет процесс прогона; отказ виден как `failed` с причиной.
+        Узнать вердикт заранее — `POST /api/v1/history/preflight` (2.13.0).
         Инструмент, названный и в истории, и в эмуляции, торгуется по одним
-        привязкам `robot.toml`.
+        привязкам `robot.toml`. `bindings` прогона — связки на момент
+        постановки (2.13.0).
       operationId: createHistoryRun
       security:
         - ControlToken: []
@@ -1582,6 +1587,88 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '422': {$ref: '#/components/responses/InstrumentsRejected'}
+
+  /api/v1/history/preflight:
+    post:
+      tags: [История]
+      summary: Проверить прогон, не ставя его в очередь
+      description: |
+        2.13.0. Тело — как у `POST /api/v1/history`; `pause` принимается и на
+        итог не влияет. Робот делает то же, что процесс прогона до первого
+        тика, — проверку привязок (`422`), сверку импорта эмулятора данных,
+        выбор контрактов у эмулятора, контрактную цепочку, расписание и
+        предпроверку данных (пары связок и `1m`, прогрев, начало и правая
+        граница, один повтор после сдвига начала), — но ничего не ставит в
+        очередь и не пишет файлов. Вердикт совпадает с тем, что получит
+        прогон на тех же данных: `reason` — его будущая причина `failed`.
+        Ответ приходит, когда проверка закончена: на длинном диапазоне — до
+        десятков секунд.
+      operationId: preflightHistoryRun
+      security:
+        - ControlToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/HistoryRunRequest'}
+            example: {from: '2026-06-01 00:00', to: '2026-06-20 00:00', instruments: [BR, NG]}
+      responses:
+        '200':
+          description: Проверка выполнена; `ok` — пройдёт ли прогон предпроверку.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HistoryPreflight'}
+              example:
+                ok: false
+                request: {from: '2026-06-01 00:00', to: '2026-06-20 00:00', pause: 1.0, instruments: [BR, NG]}
+                start: '2026-06-01T07:00:00Z'
+                end: '2026-06-20T00:00:00Z'
+                market_data_sync: {status: synchronized, snapshot_generation: 41}
+                pairs:
+                  - instrument: BR-7.26
+                    instrument_type: future
+                    timeframe: 1m
+                    segment: {from: '2026-06-01T07:00:00Z', to: '2026-06-20T00:00:00Z'}
+                    found: {from: '2026-05-29T20:40:00Z', to: '2026-06-19T20:49:00Z'}
+                    ok: true
+                  - instrument: NG-7.26
+                    instrument_type: future
+                    timeframe: 1m
+                    segment: {from: '2026-06-01T07:00:00Z', to: '2026-06-20T00:00:00Z'}
+                    found: {from: '2026-05-29T20:40:00Z', to: '2026-06-17T12:31:00Z'}
+                    ok: false
+                problems:
+                  - 'NG-7.26 1m: конец участка не покрыт: NG-7.26 1m: граница 2026-06-20 00:00:00, ожидался бар 2026-06-19 23:59:00; поиск [2026-06-13 00:00:00, 2026-06-20 00:00:00) / [2026-06-20 00:00:00, 2026-06-27 00:00:00): конец диапазона не покрыт — нет допустимого бара-продолжения'
+                notes:
+                  - 'начало диапазона сдвинуто с 2026-06-01 00:00:00 на 2026-06-01 07:00:00: первая доступная рабочая свеча'
+                rejections: []
+                reason: 'Прогон невозможен — данные не прошли предварительную проверку:'
+                bindings:
+                  - {id: future-br-macd, instrument: BR, strategy: macd, timeframe: 1h, filter: triple_screen, management: levels_rr}
+                  - {id: future-ng-macd, instrument: NG, strategy: macd, timeframe: 1h, filter: triple_screen, management: levels_rr}
+                _links:
+                  history: {href: /api/v1/history}
+                _actions: []
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '422': {$ref: '#/components/responses/InstrumentsRejected'}
+        '500':
+          description: '`INTERNAL` — проверка не выполнена из-за сбоя робота; тип сбоя — в `detail`, подробности — в журнале робота.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '503':
+          description: '`SOURCE_UNAVAILABLE` — эмулятор данных недоступен, не ответил или ответил ошибкой; проверка не выполнена.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+              example:
+                type: 'urn:my-robot:problem:source-unavailable'
+                title: Эмулятор данных недоступен
+                status: 503
+                code: SOURCE_UNAVAILABLE
+                detail: 'Проверка не выполнена — Эмулятор недоступен: [Errno 61] Connection refused'
 
   /api/v1/history/{run_id}:
     parameters:
@@ -2914,7 +3001,7 @@ components:
           enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN_HOST, NOT_FOUND, REPORT_NOT_READY,
                  ALREADY_RUNNING, STOPPING, NOT_RUNNING, MODE_CONFLICT, CORE_NOT_READY,
                  CONTOUR_DIR_BUSY, REVISION_CHANGED, INSTRUMENTS_REJECTED, BINDINGS_REJECTED,
-                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE,
+                 HISTORY_UNAVAILABLE, INTERNAL, MARKET_DATA_NOT_READY, JOURNAL_UNAVAILABLE, SOURCE_UNAVAILABLE,
                  GUARD_NOT_RESETTABLE, CONFIRM_REQUIRED, ACCOUNT_READ_ONLY]
         rejections:
           type: array
@@ -3986,7 +4073,7 @@ components:
       type: object
       additionalProperties: false
       required: [id, state, request, accepted_at, started_at, finished_at, queue_position, reason,
-                 market_data_sync, progress, process, _links, _actions]
+                 market_data_sync, progress, process, bindings, _links, _actions]
       properties:
         id: {type: string, example: '20261024-101500'}
         state: {$ref: '#/components/schemas/HistoryRunState'}
@@ -4017,6 +4104,11 @@ components:
           type: object
           allOf: [{$ref: '#/components/schemas/ContourProcess'}]
           nullable: true
+        bindings:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/HistoryBinding'}
+          description: 'Связки прогона на момент постановки (2.13.0): смена конфигурации потом их не меняет; `null` — прогон принят прежней версией.'
         _links: {$ref: '#/components/schemas/Links'}
         _actions: {$ref: '#/components/schemas/Actions'}
     HistoryRunList:
@@ -4038,7 +4130,7 @@ components:
     HistoryReport:
       type: object
       additionalProperties: false
-      required: [covered, stop_reason, trades, net_pnl, fees, balance, open_positions, _links]
+      required: [covered, stop_reason, trades, net_pnl, fees, balance, open_positions, bindings, _links]
       properties:
         covered: {type: boolean}
         stop_reason: {type: string}
@@ -4049,7 +4141,99 @@ components:
         open_positions:
           type: array
           items: {type: string}
+        bindings:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/HistoryBinding'}
+          description: 'Связки, по которым торговал процесс прогона (2.13.0); `null` — отчёт записан прежней версией.'
         _links: {$ref: '#/components/schemas/Links'}
+    HistoryBinding:
+      type: object
+      additionalProperties: false
+      required: [id, instrument, strategy, timeframe, filter, management]
+      description: |
+        Связка прогона (2.13.0) — привязка `[strategies.*]`, по которой торгует
+        инструмент прогона. Подбор — как у торговли: акция по тикеру, фьючерс
+        по семейству.
+      properties:
+        id: {type: string, description: '`id` привязки из `[strategies.*]`.'}
+        instrument: {type: string, description: 'Тикер акции, короткое имя фиксированного контракта или код семейства автоматической цепочки.'}
+        strategy: {type: string}
+        timeframe: {type: string}
+        filter: {$ref: '#/components/schemas/BindingFilter'}
+        management: {$ref: '#/components/schemas/BindingManagement'}
+    HistoryPreflightPair:
+      type: object
+      additionalProperties: false
+      required: [instrument, instrument_type, timeframe, segment, found, ok]
+      properties:
+        instrument: {type: string, description: 'Тикер акции или короткое имя контракта (у цепочки — контракт участка).'}
+        instrument_type: {type: string, enum: [share, future]}
+        timeframe: {type: string}
+        segment:
+          type: object
+          nullable: true
+          additionalProperties: false
+          description: 'Участок автоматической цепочки; `null` — фиксированный инструмент на весь диапазон.'
+          required: [from, to]
+          properties:
+            from: {type: string, format: date-time}
+            to: {type: string, format: date-time}
+        found:
+          type: object
+          nullable: true
+          additionalProperties: false
+          description: 'Первый (с прогревом) и последний найденные бары пары; `null` — свечей не нашлось.'
+          required: [from, to]
+          properties:
+            from: {type: string, format: date-time}
+            to: {type: string, format: date-time, nullable: true}
+        ok: {type: boolean, description: 'Пара прошла проверку начала, прогрева и правой границы.'}
+    HistoryPreflight:
+      type: object
+      additionalProperties: false
+      required: [ok, request, start, end, market_data_sync, pairs, problems, notes, rejections, reason, bindings,
+                 _links, _actions]
+      description: |
+        Итог проверки прогона без постановки в очередь (2.13.0). Шаги и текст
+        проблем — те же, что у процесса прогона перед первым тиком.
+      properties:
+        ok: {type: boolean, description: 'Прогон с этим телом на тех же данных пройдёт предпроверку.'}
+        request: {$ref: '#/components/schemas/HistoryRunRequest'}
+        start: {type: string, format: date-time, description: 'Начало торговли с учётом сдвига на первую доступную свечу.'}
+        end: {type: string, format: date-time}
+        market_data_sync:
+          type: object
+          additionalProperties: false
+          required: [status, snapshot_generation]
+          properties:
+            status: {type: string, nullable: true, description: '`synchronized` — импорт подтверждён; `null` — нет.'}
+            snapshot_generation: {type: integer, nullable: true}
+        pairs:
+          type: array
+          items: {$ref: '#/components/schemas/HistoryPreflightPair'}
+        problems:
+          type: array
+          description: Проблемы предпроверки — тем же текстом, что процесс прогона пишет в `console.log`.
+          items: {type: string}
+        notes:
+          type: array
+          description: Сдвиг начала, наблюдаемое покрытие, расписание — не мешают прогону.
+          items: {type: string}
+        rejections:
+          type: array
+          description: Инструменты, которые не разрешились у эмулятора данных; прогон с ними завершится в `failed`.
+          items: {$ref: '#/components/schemas/Rejection'}
+        reason:
+          type: string
+          nullable: true
+          description: 'Причина, с которой прогон с этим телом завершится в `failed` (`HistoryRun.reason`); `null` при `ok`.'
+        bindings:
+          type: array
+          description: Связки, которые будут торговать.
+          items: {$ref: '#/components/schemas/HistoryBinding'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
 
     # ------------------------------------- рыночные данные и кластеры (как в 1.8)
     SourceInfo:

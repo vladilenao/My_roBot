@@ -548,3 +548,28 @@ class TestCoverageProbe:
 
         assert report.ok is True
         assert [tf for _, tf, _, _ in calls] == ["1m"]
+
+
+class TestCheckedPairs:
+    """Проверенные пары для API (add-history-preflight-api)."""
+
+    def test_covered_pair_has_found_range(self):
+        [pair] = _run().pairs
+        assert (pair.instrument, pair.instrument_type, pair.timeframe, pair.ok) == ("SBER", "share", "1m", True)
+        assert pair.first == datetime(2023, 12, 31, 23, 58) and pair.last == datetime(2024, 1, 1, 23, 59)
+        assert pair.segment is None
+
+    def test_uncovered_end_marks_pair_failed(self):
+        report = _run(load_candles=_candles({HEAD_WINDOW: _head(), TAIL_WINDOW: _empty(),
+                                             (pd.Timestamp("2023-12-31"), pd.Timestamp(END)): _empty(),
+                                             (pd.Timestamp("2023-12-25 23:59"), pd.Timestamp("2024-01-01 23:59")): _empty()}))
+        assert not report.ok
+        [pair] = report.pairs
+        assert not pair.ok and pair.first == datetime(2023, 12, 31, 23, 58) and pair.last is None
+
+    def test_unloadable_pair_has_no_range(self):
+        def broken(**kw):
+            raise RuntimeError("нет связи")
+
+        [pair] = _run(load_candles=broken).pairs
+        assert not pair.ok and pair.first is None
