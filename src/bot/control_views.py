@@ -21,6 +21,8 @@ EMULATION_INSTRUMENTS = EMULATION + "/instruments"
 EMULATION_REMOVE = EMULATION_INSTRUMENTS + "/remove"
 EMULATION_LOG = EMULATION + "/log"
 HISTORY = "/api/v1/history"
+# Проверка прогона без постановки в очередь (add-history-preflight-api).
+HISTORY_PREFLIGHT = HISTORY + "/preflight"
 # Контур «Песочница» (add-sandbox-contour): состав — привязки, а не инструменты.
 SANDBOX = "/api/v1/sandbox"
 SANDBOX_TARGET = SANDBOX + "/target"
@@ -71,6 +73,7 @@ PROBLEM_TITLES = {
     "INSTRUMENTS_REJECTED": "Инструменты отклонены",
     "BINDINGS_REJECTED": "Привязки отклонены",
     "HISTORY_UNAVAILABLE": "Очередь истории недоступна",
+    "SOURCE_UNAVAILABLE": "Эмулятор данных недоступен",
     "INTERNAL": "Внутренняя ошибка",
     "MARKET_DATA_NOT_READY": "Рыночная база не готова",
     "JOURNAL_UNAVAILABLE": "Журнал контура недоступен",
@@ -213,6 +216,11 @@ def binding_action_list(binding: str, active: bool) -> list[dict]:
         return [_action("remove", "Убрать из песочницы", "POST", SANDBOX_REMOVE,
                         {"bindings": [binding], "mode": NO_ENTRIES})]
     return [_action("restore", "Вернуть в песочницу", "POST", SANDBOX_BINDINGS, {"bindings": [binding]})]
+
+
+def history_start_action(body: dict) -> dict:
+    """``start`` проверенного прогона: поставить в очередь с тем же телом (add-history-preflight-api)."""
+    return _action("start", "Поставить прогон в очередь", "POST", HISTORY, body)
 
 
 def run_action_list(run_id: str, names) -> list[dict]:

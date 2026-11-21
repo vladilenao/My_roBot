@@ -156,7 +156,7 @@ def _strategy_admissions(session, storage) -> tuple:
 
 def _finish_history(
     storage, session, data_cache, timeline, state_dir,
-    market_data_sync: MarketDataSync | None = None,
+    market_data_sync: MarketDataSync | None = None, bindings=None,
 ) -> None:
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
@@ -194,6 +194,7 @@ def _finish_history(
         calendar_schedule=_calendar_schedule(data_cache),
         log_rotation=log_rotation(),
         strategy_admissions=_strategy_admissions(session, storage),
+        bindings=None if bindings is None else tuple(bindings),
     )
     write_report(
         state_dir, metrics, collect_result(storage), source=str(state_dir / DATABASE_FILE)
@@ -1069,7 +1070,19 @@ class TradingContour:
         """Отчёт исторического прогона — и для штатного, и для аварийного финиша."""
         storage = None if self.runtime is None else self.runtime.storage
         _finish_history(storage, self.settings.session, self.services.data_cache, self.services.timeline,
-                        self.settings.state_dir, self.settings.market_data_sync)
+                        self.settings.state_dir, self.settings.market_data_sync, bindings=self._bindings())
+
+    def _bindings(self) -> list | None:
+        """Связки, по которым торговал прогон, — в ``report.json`` (add-history-preflight-api)."""
+        from src.history.bindings import selection_bindings
+
+        share, future = self.settings.strategies or (SHARE_STRATEGIES, FUTURE_STRATEGIES)
+        selection = getattr(self.settings.session, "contract_selection", None)
+        try:
+            return selection_bindings(selection or self.settings.instruments, share, future)
+        except Exception as exc:  # отчёт не должен падать из-за сводки связок
+            log.warning("Связки прогона для отчёта не собраны: %s", type(exc).__name__)
+            return None
 
     def close(self) -> None:
         close_channels(self.channels)

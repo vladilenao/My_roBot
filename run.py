@@ -1,5 +1,6 @@
 import src.grpc_fork  # noqa: F401  — первым, до загрузки gRPC
 from src import __version__
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 import os
@@ -65,7 +66,7 @@ from src.bot.launch import (
 from src.assembly.contour import ContourSettings, TradingContour, _family_warmup, _strategy_map
 from src.assembly.core import CoreStarter, LiveCore, _say
 from src.assembly.history import HistoricalMarketServices
-from src.assembly.history_runs import HistoryRuns, clear_attempt
+from src.assembly.history_runs import HistoryRuns, PreflightOutcome, clear_attempt, refusal_reason
 from src.assembly.core_state import CORE_DATABASE_FILE, CoreStateStore
 from src.assembly.process import JournalMigrationError, contour_dir
 from src.assembly.pulse import CorePulseWriter
@@ -75,6 +76,7 @@ from src.bot.launch_control import LaunchControl
 from src.bot.run_session import build_run_session
 from src.data.timeutil import to_naive
 from src.history.preflight import active_pairs, run_preflight, run_chain_preflight, smallest_period
+from src.history.bindings import selection_bindings
 from src.history.selection import HistorySelection
 from src.history.report import (
     MarketDataSync,
@@ -483,7 +485,7 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     history = HistoryRuns(core_state, state_dir, max_runs=CONTOURS_MAX_HISTORY_RUNS, version=__version__,
                           heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, share_strategies=SHARE_STRATEGIES,
                           future_strategies=FUTURE_STRATEGIES, log_file=LOGGING_FILE,
-                          provider_factory=EmulatorClientProvider, say=_say)
+                          provider_factory=EmulatorClientProvider, say=_say, checker=_history_preflight)
     history.recover()
     control.history = history
     core = LiveCore(state_dir, client_provider)
@@ -920,60 +922,15 @@ def _launch(
     if not isinstance(instruments, HistorySelection):
         instruments = [item if isinstance(item, Instrument) else normalize_instrument(item) for item in instruments]
 
-    selection = instruments if isinstance(instruments, HistorySelection) else None
+    check = _history_check(instruments, session=session, clock=clock, client_provider=client_provider,
+                           state_dir=state_dir)
+    selection, instruments, market_calendar, report = (check.selection, check.instruments, check.market_calendar,
+                                                       check.report)
+    if check.refusal is not None:
+        return _refused(check.refusal, progress), None, selection or instruments
     if selection is not None:
-        try:
-            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS)
-        except ValueError as exc:
-            return _refused(f"Прогон невозможен — контрактная цепочка: {exc}", progress), None, selection
-        instruments = selection.instruments
-
-    provider = client_provider
-    from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
-
-    snapshot_store = SnapshotScheduleStore()
-    market_calendar = MarketCalendar(
-        snapshot_store,
-        EmulatorScheduleSource(snapshot_store, provider),
-        schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
-        allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
-    )
-    calendar_expectation = _historical_calendar_expectation(market_calendar)
-    if selection is not None:
-        # Рубежи экспирации уточняются по расписанию цепочки до сохранения и предпроверки.
-        _preload_history_schedule(market_calendar, selection, instruments, session)
-        try:
-            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS,
-                                          cutoff_for=_history_expiry_cutoff(market_calendar))
-        except ValueError as exc:
-            return _refused(f"Прогон невозможен — контрактная цепочка: {exc}", progress), None, selection
-        instruments = selection.instruments
-        selection.save(state_dir)
         session.contract_selection = selection
-
-    if selection is not None and selection.families:
-        report = run_chain_preflight(selection,
-            requirements=_family_warmup, start=session.start, end=session.end,
-            load_candles=load_candles, client_provider=client_provider, clock=clock,
-            ping=_source_ping(client_provider),
-            coverage=_source_coverage(client_provider),
-            fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-            fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
-    else:
-        report = run_preflight(
-            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
-            start=session.start,
-            end=session.end,
-            warmup_bars=_warmup_bars(),
-            load_candles=load_candles,
-            client_provider=client_provider,
-            clock=clock,
-            ping=_source_ping(client_provider),
-            coverage=_source_coverage(client_provider),
-            calendar_expectation=calendar_expectation,
-        )
-    if not report.ok:
-        return _refused(report.message(), progress), None, selection or instruments
+    provider = client_provider
     if report.start != session.start:
         print(report.message())
         return 3, report.start, selection or instruments
@@ -1003,11 +960,132 @@ def _launch(
     return 0, None, selection or instruments
 
 
+@dataclass
+class _HistoryCheck:
+    """Итог общей проверки прогона: выбор, календарь, отчёт предпроверки или причина отказа."""
+
+    selection: HistorySelection | None
+    instruments: object
+    market_calendar: object = None
+    report: object = None
+    refusal: str | None = None
+
+
+def _history_check(instruments, *, session, clock, client_provider, state_dir=None, notices=None) -> _HistoryCheck:
+    """Цепочка контрактов, расписание участков и предпроверка данных (add-history-preflight-api).
+
+    Одна функция для процесса прогона (``_launch``) и проверки
+    ``POST /api/v1/history/preflight``: так проверка без очереди даёт тот же
+    вердикт, что прогон на тех же данных. ``state_dir`` — папка прогона, куда
+    сохраняется выбор цепочки; у проверки её нет, и файлы не пишутся.
+    ``notices`` — список для заметок о расписании вместо консоли.
+    """
+    from src.market_calendar.service import EmulatorScheduleSource, MarketCalendar, SnapshotScheduleStore
+
+    selection = instruments if isinstance(instruments, HistorySelection) else None
+    if selection is not None:
+        try:
+            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS)
+        except ValueError as exc:
+            return _HistoryCheck(selection, instruments, refusal=f"Прогон невозможен — контрактная цепочка: {exc}")
+        instruments = selection.instruments
+
+    snapshot_store = SnapshotScheduleStore()
+    market_calendar = MarketCalendar(
+        snapshot_store,
+        EmulatorScheduleSource(snapshot_store, client_provider),
+        schedule_max_age_secs=MARKET_DATA_SETTINGS.schedule_max_age_secs,
+        allow_reconstructed=HISTORICAL_SCHEDULE["use_reconstructed"],
+    )
+    calendar_expectation = _historical_calendar_expectation(market_calendar)
+    if selection is not None:
+        # Рубежи экспирации уточняются по расписанию цепочки до сохранения и предпроверки.
+        _preload_history_schedule(market_calendar, selection, instruments, session, notices=notices)
+        try:
+            selection = selection.planned(session.start, session.end, HISTORICAL_ROLLOVER, CONTRACT_EXPIRY_BLOCK_DAYS,
+                                          cutoff_for=_history_expiry_cutoff(market_calendar))
+        except ValueError as exc:
+            return _HistoryCheck(selection, instruments, market_calendar,
+                                 refusal=f"Прогон невозможен — контрактная цепочка: {exc}")
+        instruments = selection.instruments
+        if state_dir is not None:
+            selection.save(state_dir)
+
+    if selection is not None and selection.families:
+        report = run_chain_preflight(selection,
+            requirements=_family_warmup, start=session.start, end=session.end,
+            load_candles=load_candles, client_provider=client_provider, clock=clock,
+            ping=_source_ping(client_provider),
+            coverage=_source_coverage(client_provider),
+            fixed_pairs=active_pairs(selection.fixed, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            fixed_warmup=_warmup_bars(), calendar_expectation=calendar_expectation)
+    else:
+        report = run_preflight(
+            active_pairs(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES),
+            start=session.start,
+            end=session.end,
+            warmup_bars=_warmup_bars(),
+            load_candles=load_candles,
+            client_provider=client_provider,
+            clock=clock,
+            ping=_source_ping(client_provider),
+            coverage=_source_coverage(client_provider),
+            calendar_expectation=calendar_expectation,
+        )
+    return _HistoryCheck(selection, instruments, market_calendar, report,
+                         None if report.ok else report.message())
+
+
+def _history_preflight(request, provider) -> PreflightOutcome:
+    """Проверка прогона для ``POST /api/v1/history/preflight`` (add-history-preflight-api).
+
+    Те же шаги, что у процесса прогона до первого тика: разрешение инструментов
+    у эмулятора на начало диапазона, ``_history_check`` и один повтор, если
+    предпроверка сдвинула начало (как ``_run_history``). Ничего не печатает в
+    консоль робота и не пишет файлов. Недоступный эмулятор — ``EmulatorError``:
+    очередь отвечает ``503``.
+    """
+    with provider.client_context() as client:
+        client.ping()
+    start, end, pause = request.start, request.end, request.pause or 0.0
+    clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+    resolution = _resolve_request(request, provider, None, clock.now(), history=True)
+    if not resolution.ok:
+        return PreflightOutcome(start, end, rejections=tuple(
+            resolution.rejections or [Rejection("*", "Не выбрано ни одного инструмента.")]))
+    instruments = resolution.instruments
+    if not isinstance(instruments, HistorySelection):
+        instruments = [item if isinstance(item, Instrument) else normalize_instrument(item) for item in instruments]
+    bindings = selection_bindings(instruments, SHARE_STRATEGIES, FUTURE_STRATEGIES)
+    notices: list[str] = []
+    shift_notes: tuple = ()
+    for attempt in range(2):
+        clock = HistoricalClock(start, end, smallest_period(_timeframes()), pause)
+        session = build_run_session(MODE_HISTORY, clock)
+        check = _history_check(instruments, session=session, clock=clock, client_provider=provider,
+                               notices=notices)
+        report = check.report
+        if check.refusal is not None:
+            return PreflightOutcome(session.start, session.end, report=report, refusal=check.refusal,
+                                    bindings=bindings, notes=shift_notes + tuple(notices))
+        if report.start == session.start:
+            return PreflightOutcome(session.start, session.end, report=report, bindings=bindings,
+                                    notes=shift_notes + tuple(notices))
+        if attempt:
+            # Процесс прогона здесь выходит с кодом 3: начало сдвинулось повторно.
+            return PreflightOutcome(session.start, session.end, report=report, bindings=bindings,
+                                    notes=shift_notes + tuple(notices), exit_code=3)
+        shift_notes = tuple(note for note in report.notes if note.startswith("начало диапазона сдвинуто"))
+        start, notices = report.start, []
+        instruments = check.selection or check.instruments
+    raise AssertionError("недостижимо")
+
+
 def _refused(message: str, progress) -> int:
     """Прогон отклонён до первого тика: причина в консоль прогона и в ``status.json``."""
     print(message)
     if progress is not None:
-        progress.fail(message.strip().splitlines()[0] if message.strip() else "прогон отклонён")
+        progress.fail(refusal_reason(message))
     return 2
 
 
@@ -1142,14 +1220,21 @@ def _history_expiry_cutoff(market_calendar):
     return cutoff_for
 
 
-def _preload_history_schedule(market_calendar, selection, instruments, session) -> None:
-    """Расписание прогона до первого тика; пропуски для внутридневных стратегий — предупреждением."""
+def _preload_history_schedule(market_calendar, selection, instruments, session, notices=None) -> None:
+    """Расписание прогона до первого тика; пропуски для внутридневных стратегий — предупреждением.
+
+    ``notices`` — список, куда проверка без очереди собирает сообщение вместо консоли.
+    """
     from src.history.schedule_notice import preload_history_schedule, report_notice, schedule_ranges
 
     try:
         ranges = schedule_ranges(selection, instruments, session.start, session.end,
                                  INTRADAY_SETTINGS, SHARE_STRATEGIES, FUTURE_STRATEGIES)
-        report_notice(preload_history_schedule(market_calendar, ranges, session.start, INTRADAY_SETTINGS))
+        notice = preload_history_schedule(market_calendar, ranges, session.start, INTRADAY_SETTINGS)
+        if notices is None:
+            report_notice(notice)
+        elif notice is not None:
+            notices.append(notice.text)
     except Exception as exc:  # предзагрузка не должна останавливать прогон
         if getattr(exc, "code", None) == "SNAPSHOT_MISMATCH":
             raise

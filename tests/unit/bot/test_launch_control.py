@@ -2,6 +2,7 @@
 
 import json
 import threading
+from datetime import datetime
 from urllib import error, request
 
 import pytest
@@ -367,7 +368,7 @@ def test_server_needs_some_key(tmp_path):
 
 class TestContract:
     def test_version_and_control_routes(self):
-        assert SPEC["info"]["version"] == "2.12.0"
+        assert SPEC["info"]["version"] == "2.13.0"
         put = SPEC["paths"]["/api/v1/emulation/target"]["put"]
         assert put["security"] == [{"ControlToken": []}]
         assert set(put["responses"]) >= {"200", "202", "400", "401", "403", "409", "412", "422"}
@@ -403,7 +404,7 @@ class TestContract:
         srv, _ = server
         address, port = srv.address
         with request.urlopen(f"http://{address}:{port}/openapi.yaml", timeout=5) as response:
-            assert "version: 2.12.0" in response.read().decode("utf-8")
+            assert "version: 2.13.0" in response.read().decode("utf-8")
 
     def test_schemas_use_only_openapi_keywords(self):
         """Запятая в описании без кавычек превращает хвост фразы в ключ схемы — такой контракт невалиден."""
@@ -768,12 +769,12 @@ class TestCoreApi:
 def history_server(tmp_path):
     """Сервер с очередью прогонов истории (без потока очереди: прогоны остаются в queued до _fill)."""
     from src.assembly.history_runs import HistoryRuns
-    from tests.unit.assembly.test_history_runs import FakeProcess
+    from tests.unit.assembly.test_history_runs import FUTURES, SHARES, FakeProcess
 
     FakeProcess.started = []
     control, store = _controlled(tmp_path)
     queue = HistoryRuns(store, tmp_path, max_runs=1, version="7.1.0", heartbeat_timeout=30,
-                        share_strategies={"SBER": ["a"]}, future_strategies={"NG": ["a"]}, provider_factory=object,
+                        share_strategies=SHARES, future_strategies=FUTURES, provider_factory=object,
                         prepare=lambda provider: (MarketDataSync(), None, "импорт не подтверждён"),
                         process_factory=FakeProcess, say=lambda line: None)
     control.history = queue
@@ -885,3 +886,81 @@ class TestHistoryApi:
         status, payload, headers = _call(srv, "POST", "/api/v1/history", CONTROL_KEY, {**HISTORY, "instruments": ["NG", "AFLT"]})
         _problem(status, payload, headers, "INSTRUMENTS_REJECTED")
         assert payload["rejections"][0]["instrument"] == "AFLT"
+
+
+class TestHistoryPreflightApi:
+    """POST /api/v1/history/preflight — проверка прогона без очереди (add-history-preflight-api)."""
+
+    def test_check_matches_contract_and_queues_nothing(self, history_server):
+        from src.assembly.history_runs import PreflightOutcome
+        from src.history.preflight import CheckedPair, PreflightReport
+
+        srv, _, queue = history_server
+        report = PreflightReport(problems=("NG-12.26 1m: конец участка не покрыт",), notes=("заметка",),
+                                 start=datetime(2026, 9, 1, 10), pairs=(
+            CheckedPair("NG-12.26", "future", "1m", False, datetime(2026, 8, 31), None,
+                        (datetime(2026, 9, 1, 10), datetime(2026, 9, 8, 10))),))
+        queue._checker = lambda request, provider: PreflightOutcome(
+            datetime(2026, 9, 1, 10), datetime(2026, 9, 8, 10), report=report, refusal=report.message(),
+            bindings=[{"id": "future-ng-macd", "instrument": "NG", "strategy": "macd", "timeframe": "1h",
+                       "filter": "triple_screen", "management": "levels_rr"}])
+        status, payload, _ = _call(srv, "POST", "/api/v1/history/preflight", CONTROL_KEY, HISTORY)
+        assert status == 200
+        _check(payload, {"$ref": "#/components/schemas/HistoryPreflight"})
+        assert payload["ok"] is False and payload["reason"].startswith("Прогон невозможен")
+        assert payload["pairs"][0]["segment"] == {"from": "2026-09-01T10:00:00Z", "to": "2026-09-08T10:00:00Z"}
+        assert payload["pairs"][0]["found"] == {"from": "2026-08-31T00:00:00Z", "to": None}
+        assert _call(srv, "GET", "/api/v1/history", CONTROL_KEY)[1]["items"] == []
+
+    def test_ok_check_offers_start(self, history_server):
+        from src.assembly.history_runs import PreflightOutcome
+
+        srv, _, queue = history_server
+        queue._checker = lambda request, provider: PreflightOutcome(datetime(2026, 9, 1, 10), datetime(2026, 9, 8, 10))
+        status, payload, _ = _call(srv, "POST", "/api/v1/history/preflight", CONTROL_KEY, HISTORY)
+        _check(payload, {"$ref": "#/components/schemas/HistoryPreflight"})
+        [action] = payload["_actions"]
+        status, run, _ = _call(srv, action["method"], action["href"], CONTROL_KEY, action["body"])
+        assert status == 202 and run["request"] == payload["request"]
+        _check(run, {"$ref": "#/components/schemas/HistoryRun"})
+        assert [item["id"] for item in run["bindings"]] == ["future-ng-macd"]
+
+    def test_unavailable_emulator_is_503(self, history_server):
+        from src.api.emulator_client import EmulatorError
+
+        srv, _, queue = history_server
+
+        def checker(request, provider):
+            raise EmulatorError("SOURCE_UNAVAILABLE", "Эмулятор недоступен: Connection refused")
+
+        queue._checker = checker
+        status, payload, headers = _call(srv, "POST", "/api/v1/history/preflight", CONTROL_KEY, HISTORY)
+        _problem(status, payload, headers, "SOURCE_UNAVAILABLE")
+        assert status == 503 and "Эмулятор недоступен" in payload["detail"]
+        assert "8100" not in payload["detail"]
+
+    def test_rejected_and_bad_bodies(self, history_server):
+        srv, _, _ = history_server
+        status, payload, headers = _call(srv, "POST", "/api/v1/history/preflight", CONTROL_KEY,
+                                         {**HISTORY, "instruments": ["NG", "AFLT"]})
+        _problem(status, payload, headers, "INSTRUMENTS_REJECTED")
+        status, payload, headers = _call(srv, "POST", "/api/v1/history/preflight", CONTROL_KEY, {"from": "x"})
+        _problem(status, payload, headers, "INVALID_REQUEST")
+        assert _call(srv, "POST", "/api/v1/history/preflight", EXPORT_KEY, HISTORY)[0] == 401
+
+    def test_old_report_without_bindings_matches_contract(self, history_server):
+        from src.assembly.history_runs import run_dir
+
+        srv, _, queue = history_server
+        run_id = _call(srv, "POST", "/api/v1/history", CONTROL_KEY, HISTORY)[1]["id"]
+        queue._fill()
+        (run_dir(queue._data_dir, run_id) / "report.json").write_text(json.dumps(
+            {"covered": True, "stop_reason": "ok", "result": {"trades": 0, "net_pnl": "0", "fees": "0",
+                                                              "balance": "100000", "open_positions": []}}),
+            encoding="utf-8")
+        from tests.unit.assembly.test_history_runs import FakeProcess
+
+        FakeProcess.started[0].exit(0)
+        status, payload, _ = _call(srv, "GET", f"/api/v1/history/{run_id}/report", CONTROL_KEY)
+        assert status == 200 and payload["bindings"] is None
+        _check(payload, {"$ref": "#/components/schemas/HistoryReport"})

@@ -550,7 +550,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._reply(*history.stop(run.group(1)))
             return
         routes = {("PUT", views.EMULATION_TARGET), ("POST", views.EMULATION_INSTRUMENTS),
-                  ("POST", views.EMULATION_REMOVE), ("POST", views.HISTORY)}
+                  ("POST", views.EMULATION_REMOVE), ("POST", views.HISTORY), ("POST", views.HISTORY_PREFLIGHT)}
         if (self.command, path) not in routes:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
@@ -564,6 +564,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if status == HTTPStatus.ACCEPTED:
                     headers = {**(headers or {}), "Location": views.EMULATION}
                 self._reply(status, payload, headers)
+                return
+            if path == views.HISTORY_PREFLIGHT:
+                # Проверка без очереди (add-history-preflight-api): ответ — когда проверка закончена.
+                request = parse_history(body)
+                if control.history is None:
+                    self._problem(HTTPStatus.CONFLICT, "HISTORY_UNAVAILABLE", "Очередь прогонов истории не запущена.")
+                    return
+                self._reply(*control.history.preflight(request))
                 return
             if path == views.HISTORY:
                 request = parse_history(body)

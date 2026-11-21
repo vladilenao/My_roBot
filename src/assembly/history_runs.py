@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,77 @@ OPERATOR_STOP = "остановлено оператором"
 PHASE_CHECKING, PHASE_RUNNING, PHASE_FINISHING = "checking", "running", "finishing"
 # Что остаётся в папке прогона при повторе после сдвига начала.
 _KEEP = (LAUNCH_FILE, STATUS_FILE, STATUS_FILE + ".tmp", CONSOLE_LOG, LOCK_FILE)
+
+
+def refusal_reason(message: str) -> str:
+    """Причина ``failed`` прогона, отклонённого до первого тика: первая строка сообщения консоли."""
+    return message.strip().splitlines()[0] if message.strip() else "прогон отклонён"
+
+
+def rejection_reason(rejections) -> str:
+    """Причина ``failed`` прогона, у которого инструменты не разрешились у эмулятора."""
+    return "; ".join(f"{item.token}: {item.reason}" for item in rejections) or "инструменты не выбраны"
+
+
+@dataclass(frozen=True)
+class PreflightOutcome:
+    """Итог проверки прогона без постановки (add-history-preflight-api).
+
+    ``report`` — ``PreflightReport`` последней попытки, ``refusal`` — сообщение отказа
+    до первого тика, ``rejections`` — инструменты, не разрешившиеся у эмулятора,
+    ``exit_code`` — служебный код процесса (``3`` — начало сдвинулось повторно).
+    """
+
+    start: datetime
+    end: datetime
+    report: object = None
+    refusal: str | None = None
+    rejections: tuple = ()
+    bindings: list = field(default_factory=list)
+    notes: tuple = ()
+    exit_code: int | None = None
+
+    @property
+    def reason(self) -> str | None:
+        """``reason`` прогона с тем же телом — так же, как его получит ``HistoryRun``."""
+        if self.rejections:
+            return rejection_reason(self.rejections)
+        if self.refusal is not None:
+            return refusal_reason(self.refusal)
+        if self.exit_code:
+            return f"процесс прогона завершился с кодом {self.exit_code}"
+        return None
+
+    @property
+    def ok(self) -> bool:
+        return self.reason is None
+
+    def problems(self) -> list[str]:
+        if self.report is not None and getattr(self.report, "problems", ()):
+            return list(self.report.problems)
+        if self.refusal is not None:
+            return [self.refusal]
+        if self.exit_code == 3:
+            return [f"начало диапазона сдвинулось повторно, на {_iso(self.report.start)} — "
+                    "процесс прогона остановится служебным кодом 3"]
+        return []
+
+    def all_notes(self) -> list[str]:
+        own = list(getattr(self.report, "notes", ()) or ())
+        return list(self.notes) + [note for note in own if note not in self.notes]
+
+
+def _pair_payload(pair) -> dict:
+    return {"instrument": pair.instrument, "instrument_type": pair.instrument_type, "timeframe": pair.timeframe,
+            "segment": None if pair.segment is None else {"from": _iso(pair.segment[0]), "to": _iso(pair.segment[1])},
+            "found": None if pair.first is None else {"from": _iso(pair.first),
+                                                      "to": None if pair.last is None else _iso(pair.last)},
+            "ok": pair.ok}
+
+
+def _request_payload(request) -> dict:
+    return {"from": f"{request.start:%Y-%m-%d %H:%M}", "to": f"{request.end:%Y-%m-%d %H:%M}",
+            "pause": float(request.pause), "instruments": list(request.instruments)}
 
 
 def _now() -> str:
@@ -131,7 +203,7 @@ class HistoryRuns:
     def __init__(self, store, data_dir: Path, *, max_runs: int, version: str, heartbeat_timeout: float,
                  share_strategies: dict, future_strategies: dict, log_file: str = "bot_debug.log",
                  provider_factory=None, prepare=prepare_import, process_factory=None, adopt_factory=None,
-                 alive=_process_alive, say=print) -> None:
+                 alive=_process_alive, say=print, checker=None) -> None:
         self._store = store
         self._data_dir = Path(data_dir)
         self.max_runs = max_runs
@@ -146,7 +218,11 @@ class HistoryRuns:
         self._adopt_factory = adopt_factory
         self._alive = alive
         self._say = say
+        # Проверка прогона без очереди (add-history-preflight-api): шаги процесса прогона до первого тика.
+        self._checker = checker
         self._lock = threading.Lock()
+        # Сверки импорта очереди и проверки идут по одной.
+        self._sync_lock = threading.Lock()
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._processes: dict = {}
@@ -208,20 +284,61 @@ class HistoryRuns:
     def submit(self, request) -> tuple[int, dict]:
         """Прогон из команды API: привязки и конфликт проверяются сразу, остальное — процессом прогона."""
         from src.bot.launch import classify_tokens
+        from src.history.bindings import target_bindings
 
-        _, rejections = classify_tokens(request.instruments, self._share, self._future)
+        targets, rejections = classify_tokens(request.instruments, self._share, self._future)
         if rejections:
-            return 422, {"code": "INSTRUMENTS_REJECTED", "message": "Прогон не поставлен в очередь.",
-                         "rejections": [{"token": item.token, "reason": item.reason} for item in rejections]}
-        payload = {"from": f"{request.start:%Y-%m-%d %H:%M}", "to": f"{request.end:%Y-%m-%d %H:%M}",
-                   "pause": float(request.pause), "instruments": list(request.instruments)}
+            return 422, _rejected(rejections, "Прогон не поставлен в очередь.")
+        payload = _request_payload(request)
+        # Связки — на момент постановки: смена конфигурации потом их не меняет (add-history-preflight-api).
+        bindings = target_bindings(targets, self._share, self._future)
         with self._lock:
             name = self._free_name(datetime.now())
-            run = self._store.add_history_run(RUN_PREFIX + name, f"{name}", payload)
+            run = self._store.add_history_run(RUN_PREFIX + name, f"{name}", payload, bindings=bindings)
         log.info("Прогон %s принят: %s — %s, %s", name, payload["from"], payload["to"],
                  ",".join(payload["instruments"]))
         self._wake.set()
         return 202, self.payload(run)
+
+    def preflight(self, request) -> tuple[int, dict]:
+        """Проверка прогона без очереди: те же отказы, сверка и предпроверка, что у прогона; файлов нет."""
+        from src.api.emulator_client import EmulatorError
+        from src.bot import control_views as views
+        from src.bot.launch import classify_tokens
+
+        _, rejections = classify_tokens(request.instruments, self._share, self._future)
+        if rejections:
+            return 422, _rejected(rejections, "Прогон не проверен.")
+        if self._checker is None:
+            return 409, {"code": "HISTORY_UNAVAILABLE", "message": "Проверка прогона не подключена."}
+        provider = self._provider_factory() if self._provider_factory is not None else _emulator_provider()
+        try:
+            with self._sync_lock:
+                sync, _, _ = self._prepare(provider)
+            outcome = self._checker(request, provider)
+        except EmulatorError as exc:
+            log.warning("Проверка прогона не выполнена: эмулятор данных — %s", exc.code)
+            return 503, {"code": "SOURCE_UNAVAILABLE", "message": f"Проверка не выполнена — {exc.message}"
+                         if exc.code in ("SOURCE_UNAVAILABLE", "SOURCE_TIMEOUT")
+                         else f"Проверка не выполнена — эмулятор данных ответил ошибкой {exc.code}: {exc.message}"}
+        except Exception as exc:  # сбой проверки — ответ 500 с типом, подробности в журнале робота
+            log.exception("Проверка прогона не выполнена")
+            return 500, {"code": "INTERNAL", "message": f"Проверка прогона не выполнена ({type(exc).__name__})."}
+        body = _request_payload(request)
+        report = outcome.report
+        ok = outcome.ok
+        log.info("Проверка прогона %s — %s, %s: %s", body["from"], body["to"], ",".join(body["instruments"]),
+                 "пройдена" if ok else outcome.reason)
+        return 200, {
+            "ok": ok, "request": body, "start": _iso(outcome.start), "end": _iso(outcome.end),
+            "market_data_sync": {"status": sync.status, "snapshot_generation": sync.snapshot_generation},
+            "pairs": [_pair_payload(item) for item in getattr(report, "pairs", ()) or ()],
+            "problems": outcome.problems(), "notes": outcome.all_notes(),
+            "rejections": [{"instrument": item.token, "reason": item.reason} for item in outcome.rejections],
+            "reason": outcome.reason, "bindings": list(outcome.bindings),
+            "_links": views.links(history=views.HISTORY),
+            "_actions": [views.history_start_action(body)] if ok else [],
+        }
 
     def _free_name(self, moment: datetime) -> str:
         base = moment.strftime("%Y%m%d-%H%M%S")
@@ -287,6 +404,8 @@ class HistoryRuns:
             "trades": summary.get("trades"), "net_pnl": _money(summary.get("net_pnl")),
             "fees": _money(summary.get("fees")), "balance": _money(summary.get("balance")),
             "open_positions": list(summary.get("open_positions") or ()),
+            # Связки, по которым шёл прогон; отчёт прежней версии — null (add-history-preflight-api).
+            "bindings": report.get("bindings"),
             "_links": views.links(run=views.run_href(run_id)),
         }
 
@@ -326,7 +445,7 @@ class HistoryRuns:
             "queue_position": position, "reason": run.reason,
             "market_data_sync": None if sync is None else {"status": sync.get("status"),
                                                            "snapshot_generation": sync.get("snapshot_generation")},
-            "progress": progress, "process": process,
+            "progress": progress, "process": process, "bindings": run.bindings,
             "_links": links, "_actions": views.run_action_list(run_id, views.run_actions(run.state)),
         }
 
@@ -359,7 +478,8 @@ class HistoryRuns:
         directory = run_dir(self._data_dir, run_id)
         self._store.update_history_run(run_id, state=RUN_STARTING, started_at=_now())
         provider = self._provider_factory() if self._provider_factory is not None else _emulator_provider()
-        sync, generation, message = self._prepare(provider)
+        with self._sync_lock:
+            sync, generation, message = self._prepare(provider)
         self._say(f"Прогон {run_id}: {message}")
         current = self._store.history_run(run_id)
         if current is None or current.stop_requested or self._halt.is_set():
@@ -415,6 +535,11 @@ class HistoryRuns:
         self._store.update_history_run(run_id, state=state, finished_at=_now(), exit_code=code, reason=reason)
         self._say(f"Прогон {run_id}: {state}" + (f" — {reason}" if reason and state == RUN_FAILED else ""))
         self._wake.set()
+
+
+def _rejected(rejections, message: str) -> dict:
+    return {"code": "INSTRUMENTS_REJECTED", "message": message,
+            "rejections": [{"token": item.token, "reason": item.reason} for item in rejections]}
 
 
 def _pid() -> int:
@@ -474,7 +599,7 @@ class HistoryProgress:
     def reject(self, rejections) -> None:
         with self._lock:
             self._rejections = [{"token": item.token, "reason": item.reason} for item in rejections]
-            self._reason = "; ".join(f"{item.token}: {item.reason}" for item in rejections) or "инструменты не выбраны"
+            self._reason = rejection_reason(rejections)
         self.write()
 
     def fail(self, reason: str) -> None:

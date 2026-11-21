@@ -206,3 +206,22 @@ def test_history_stop_flag_on_old_base_without_table(tmp_path):
         conn.execute("CREATE TABLE contours (contour_id TEXT)")
     assert read_history_stop(old, "history-a") is False
     assert read_history_stop(tmp_path / "absent.sqlite3", "history-a") is False
+
+
+def test_history_runs_of_previous_schema_get_bindings_column(tmp_path):
+    """База ядра до add-history-preflight-api: колонка связок добавляется, прежние строки читаются с None."""
+    path = tmp_path / "core.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE history_runs (run_id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+            request_json TEXT NOT NULL, state TEXT NOT NULL, accepted_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, pid INTEGER, exit_code INTEGER, reason TEXT,
+            stop_requested INTEGER NOT NULL DEFAULT 0, sync_json TEXT)""")
+        conn.execute("INSERT INTO history_runs(run_id,directory,request_json,state,accepted_at) "
+                     "VALUES('history-1','1','{}','finished','2026-10-24T09:10:00Z')")
+    conn.close()
+    store = CoreStateStore(path)
+    assert store.history_run("history-1").bindings is None
+    rows = [{"id": "future-ng-macd", "instrument": "NG"}]
+    store.add_history_run("history-2", "2", {"instruments": ["NG"]}, bindings=rows)
+    assert store.history_run("history-2").bindings == rows
+    assert CoreStateStore(path).history_run("history-2").bindings == rows

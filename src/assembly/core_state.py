@@ -134,6 +134,8 @@ class HistoryRun:
     reason: str | None = None
     stop_requested: bool = False
     market_data_sync: dict | None = None
+    # Связки прогона на момент постановки (add-history-preflight-api); у прежних строк — None.
+    bindings: list | None = None
 
     @property
     def active(self) -> bool:
@@ -146,7 +148,15 @@ def _history_run(row) -> HistoryRun | None:
     return HistoryRun(row["run_id"], row["directory"], json.loads(row["request_json"]), row["state"],
                       row["accepted_at"], row["started_at"], row["finished_at"], row["pid"], row["exit_code"],
                       row["reason"], bool(row["stop_requested"]),
-                      None if row["sync_json"] is None else json.loads(row["sync_json"]))
+                      None if row["sync_json"] is None else json.loads(row["sync_json"]),
+                      _json_or_none(row, "bindings_json"))
+
+
+def _json_or_none(row, column: str):
+    """Колонка JSON строки; нет колонки (база прежней версии) или пусто — ``None``."""
+    if column not in row.keys() or row[column] is None:
+        return None
+    return json.loads(row[column])
 
 
 def read_history_stop(path: Path, run_id: str) -> bool:
@@ -336,12 +346,16 @@ class CoreStateStore:
                     exit_code INTEGER,
                     reason TEXT,
                     stop_requested INTEGER NOT NULL DEFAULT 0,
-                    sync_json TEXT
+                    sync_json TEXT,
+                    bindings_json TEXT
                 );
             """)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(contours)")}
             if "guards_reset" not in columns:      # база ядра до add-account-guards
                 conn.execute("ALTER TABLE contours ADD COLUMN guards_reset INTEGER NOT NULL DEFAULT 0")
+            runs = {row[1] for row in conn.execute("PRAGMA table_info(history_runs)")}
+            if "bindings_json" not in runs:        # база ядра до add-history-preflight-api
+                conn.execute("ALTER TABLE history_runs ADD COLUMN bindings_json TEXT")
             conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
 
@@ -388,13 +402,16 @@ class CoreStateStore:
 
     # ── Прогоны истории (add-history-contour) ──
 
-    def add_history_run(self, run_id: str, directory: str, request: dict) -> HistoryRun:
-        """Новый прогон в очереди; ``run_id`` уникален — его подбирает очередь."""
+    def add_history_run(self, run_id: str, directory: str, request: dict, bindings: list | None = None) -> HistoryRun:
+        """Новый прогон в очереди; ``run_id`` уникален — его подбирает очередь; ``bindings`` — связки при постановке."""
         now = _now()
+        stored = None if bindings is None else json.dumps(bindings, ensure_ascii=False)
         with self._lock, self._connect() as conn:
-            conn.execute("""INSERT INTO history_runs(run_id,directory,request_json,state,accepted_at)
-                VALUES(?,?,?,?,?)""", (run_id, directory, json.dumps(request, ensure_ascii=False), RUN_QUEUED, now))
-        return HistoryRun(run_id, directory, dict(request), RUN_QUEUED, now)
+            conn.execute("""INSERT INTO history_runs(run_id,directory,request_json,state,accepted_at,bindings_json)
+                VALUES(?,?,?,?,?,?)""", (run_id, directory, json.dumps(request, ensure_ascii=False), RUN_QUEUED, now,
+                                         stored))
+        return HistoryRun(run_id, directory, dict(request), RUN_QUEUED, now,
+                          bindings=None if bindings is None else list(bindings))
 
     def update_history_run(self, run_id: str, **fields) -> HistoryRun | None:
         """Поля прогона: ``state``, времена, ``pid``, ``exit_code``, ``reason``, ``stop_requested``, ``market_data_sync``."""

@@ -248,6 +248,28 @@ def active_pairs(
 
 
 @dataclass(frozen=True)
+class CheckedPair:
+    """Проверенная пара для API (add-history-preflight-api): найденные бары и итог пары.
+
+    ``instrument`` — тикер акции или короткое имя контракта, ``segment`` — участок
+    цепочки (у фиксированного инструмента ``None``), ``first`` — первый бар с прогревом,
+    ``last`` — последний бар у правой границы.
+    """
+
+    instrument: str
+    instrument_type: str
+    timeframe: str
+    ok: bool
+    first: datetime | None = None
+    last: datetime | None = None
+    segment: tuple[datetime, datetime] | None = None
+
+
+def _pair_name(pair: Pair) -> str:
+    return pair.short_name or (pair.ticker if pair.instrument_type == "share" else "контракт не указан")
+
+
+@dataclass(frozen=True)
 class PreflightReport:
     """Итог проверки: список проблем и понятное пользователю сообщение."""
 
@@ -258,6 +280,7 @@ class PreflightReport:
     checked_pairs: int = 0
     detail: list[str] = field(default_factory=list)
     boundaries: tuple[BoundaryCheck, ...] = ()
+    pairs: tuple[CheckedPair, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -373,6 +396,7 @@ def run_preflight(
             checked_pairs=shifted.checked_pairs,
             detail=shifted.detail,
             boundaries=shifted.boundaries,
+            pairs=shifted.pairs,
         )
     elif not report.ok:
         return report
@@ -418,6 +442,7 @@ def _with_coverage_note(
         checked_pairs=report.checked_pairs,
         detail=report.detail,
         boundaries=report.boundaries,
+        pairs=report.pairs,
     )
 
 
@@ -486,6 +511,7 @@ def _check_all(
     problems: list[str] = []
     detail: list[str] = []
     boundaries = []
+    checked: list[CheckedPair] = []
     if ping_problem is not None:
         problems.append(ping_problem)
 
@@ -504,6 +530,7 @@ def _check_all(
             boundary_results=boundaries,
             is_driver=_period(pair.timeframe) == driver_period,
             calendar_expectation=calendar_expectation,
+            checked=checked,
         )
         detail.append(line)
         problems.extend(pair_problems)
@@ -520,6 +547,7 @@ def _check_all(
         checked_pairs=len(pairs),
         detail=detail,
         boundaries=tuple(boundaries),
+        pairs=tuple(checked),
     )
 
 
@@ -548,6 +576,7 @@ def _check_pair(
     boundary_results=None,
     is_driver: bool = True,
     calendar_expectation=None,
+    checked: list | None = None,
 ) -> tuple[str, list[str], datetime | None]:
     """Проверяет одну пару и возвращает строку отчёта, проблемы и возможный сдвиг.
 
@@ -559,6 +588,10 @@ def _check_pair(
     из закрытого прогрева до начала, поэтому бар, открывшийся до начала, его не
     переносит.
     """
+    def mark(ok, first=None, last=None):
+        if checked is not None:
+            checked.append(CheckedPair(_pair_name(pair), pair.instrument_type, pair.timeframe, ok, first, last))
+
     period = _period(pair.timeframe)
     warmup_span = max(1, warmup_bars) * period
     head_from = start_dt - warmup_span
@@ -578,6 +611,7 @@ def _check_pair(
         if isinstance(uid, str) and uid:
             pair = replace(pair, instrument_id=uid)
     except Exception as exc:
+        mark(False)
         return f"{pair}: загрузка не удалась ({exc})", [
             f"{pair}: инструмент не разрешается или данные недоступны ({exc})"
         ], None
@@ -591,6 +625,7 @@ def _check_pair(
         # прогон, если прогрев и конец диапазона покрыты.
         ahead = _nearest_after(pair, start_dt, load_candles, client_provider, clock) if is_driver else None
         hint = f" — ближайшая свеча {ahead:%Y-%m-%d %H:%M}" if ahead else ""
+        mark(False)
         return f"{pair}: нет свечей в начале диапазона{hint}", [
             f"{pair}: свечи не покрывают начало диапазона {start_dt:%Y-%m-%d %H:%M}{hint}"
         ], ahead
@@ -600,6 +635,7 @@ def _check_pair(
         # доступный бар — так повторная проверка не сдвигает начало снова.
         ahead = _nearest_after(pair, start_dt, load_candles, client_provider, clock)
         hint = f" — ближайшая свеча {ahead:%Y-%m-%d %H:%M}" if ahead else ""
+        mark(False, first_seen, head_last)
         return f"{pair}: нет бара, открывшегося в {start_dt:%Y-%m-%d %H:%M}{hint}", [
             f"{pair}: нет бара, открывшегося в {start_dt:%Y-%m-%d %H:%M} — начало диапазона не покрыто{hint}"
         ], ahead
@@ -629,6 +665,7 @@ def _check_pair(
         behind = _nearest_before(pair, expected_last, load_candles, client_provider, clock)
         hint = f" — ближайшая свеча {behind:%Y-%m-%d %H:%M}" if behind else ""
         problems.append(check.message()+hint)
+    mark(not problems, first_seen, check.last_before)
     return f"{pair}: {first_seen:%Y-%m-%d %H:%M} … {check.last_before or 'хвост не подтверждён'}", problems, None
 
 
@@ -679,7 +716,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         fixed_pairs=(), fixed_warmup=1, coverage=None, calendar_expectation=None):
     """Проверить назначенные участки, не требуя годы истории каждого выпуска."""
     problems, notes, detail = [], [], []
-    boundaries = []
+    boundaries, pairs = [], []
     checked = 0
     shifted = to_naive(start).to_pydatetime()
     if fixed_pairs:
@@ -691,6 +728,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
         notes.extend(fixed.notes)
         detail.extend(fixed.detail)
         boundaries.extend(fixed.boundaries)
+        pairs.extend(fixed.pairs)
         checked += fixed.checked_pairs
         shifted = max(shifted, fixed.start or shifted)
     elif ping is not None:
@@ -717,6 +755,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                 is_driver = tf == driver_tf
                 period = _period(tf)
                 label = f"{card.short_name or 'контракт не указан'} {tf}"
+                seen: dict = {}
                 try:
                     # Расширяем окно назад по числу реально закрытых баров.
                     span = max(LOOKAHEAD, needed*period)
@@ -725,6 +764,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         head = fetch(tf, lower, min(segment.end, segment.start+LOOKAHEAD))
                         if head.empty:
                             raise LookupError("нет свечей в начале участка")
+                        seen["first"] = head["datetime"].min().to_pydatetime()
                         times = pd.to_datetime(head["datetime"])
                         prior = head.loc[times+period <= segment.start]
                         if len(prior) >= needed or lower == card.first_trade_date:
@@ -749,6 +789,7 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                         role="end" if segment.end == end else "cutoff",
                         calendar_expectation=calendar_expectation)
                     boundaries.append(check)
+                    seen["last"] = check.last_before
                     if not check.ok:
                         raise LookupError(f"конец участка не покрыт: {check.message()}")
                     detail.append(f"{label}: участок {segment.start:%Y-%m-%d %H:%M} — {segment.end:%Y-%m-%d %H:%M}, прогрев {len(prior)}/{needed}")
@@ -764,6 +805,9 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
                             notes.append(f"{label}: сведения о покрытии не получены ({exc})")
                 except Exception as exc:
                     problems.append(f"{label}: {exc}")
+                    seen["ok"] = False
+                pairs.append(CheckedPair(card.short_name or "контракт не указан", "future", tf, seen.get("ok", True),
+                                         seen.get("first"), seen.get("last"), (segment.start, segment.end)))
             if segment.end == segment.cutoff and segment.cutoff < end:
                 try:
                     exit_end = min(segment.deadline, end)
@@ -777,4 +821,4 @@ def run_chain_preflight(selection, *, requirements, start, end, load_candles,
     if shifted > start:
         notes.append(f"начало диапазона сдвинуто с {start} на {shifted}: первая доступная рабочая свеча")
     return PreflightReport(problems=tuple(problems), notes=tuple(notes), start=shifted,
-                           checked_pairs=checked, detail=detail, boundaries=tuple(boundaries))
+                           checked_pairs=checked, detail=detail, boundaries=tuple(boundaries), pairs=tuple(pairs))
