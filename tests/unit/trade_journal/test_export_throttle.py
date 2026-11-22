@@ -144,6 +144,45 @@ def test_failed_export_stays_pending_for_flush(tmp_path, monkeypatch):
         storage.close()
 
 
+def test_quiet_period_projection_is_written_by_tick_check_after_interval(tmp_path):
+    monotonic = FakeMonotonic()
+    summary = tmp_path / "trade_summary.csv"
+    storage = _storage(tmp_path, monotonic)
+    try:
+        monotonic.value += 5
+        _open_trade(storage, "trade-1")  # серия транзакций, затем затишье
+        assert storage.export_if_due()
+        assert _summary_rows(summary) == []  # интервал ещё не прошёл
+
+        monotonic.value += 30
+        assert storage.export_if_due()
+        assert len(_summary_rows(summary)) == 1
+        required, exported = _revisions(storage)
+        assert exported == required
+
+        summary.unlink()
+        monotonic.value += 60
+        assert storage.export_if_due()
+        assert not summary.exists()  # без отложенных изменений файлы не трогаются
+    finally:
+        storage.close()
+
+
+def test_tick_check_is_noop_without_interval(tmp_path, monkeypatch):
+    storage = _storage(tmp_path, FakeMonotonic(), interval=None)
+    try:
+        monkeypatch.setattr(storage._exporter, "export", lambda: False)
+        _open_trade(storage, "trade-1")  # неудачный экспорт боевого режима
+        monkeypatch.undo()
+        calls = []
+        monkeypatch.setattr(storage, "export", lambda: calls.append(1) or True)
+        assert storage.export_if_due()
+        assert calls == []  # боевой режим повторяет экспорт после транзакции, не на тике
+    finally:
+        monkeypatch.undo()
+        storage.close()
+
+
 def test_without_interval_every_transaction_exports(tmp_path):
     storage = _storage(tmp_path, FakeMonotonic(), interval=None)
     try:

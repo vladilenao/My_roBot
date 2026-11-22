@@ -350,3 +350,43 @@ def test_roster_admits_and_retires_instrument_everywhere():
     assert [item.ticker for item in bot._instruments] == ["SBER"] and lifecycle.instruments == [SBER]
     assert runtime.execution_instruments == [SBER] and runtime.execution_aliases == {}
     assert calls[-1] == ("forget", "NGZ6") and forgotten == ["NGZ6"]
+
+
+def test_tick_writes_due_journal_projections_after_execution(monkeypatch):
+    order = []
+
+    class Bot:
+        def __init__(self, **kwargs):
+            self.post_tick = kwargs["post_tick"]
+
+        def run(self):
+            self.post_tick({"1m"})
+
+    class Storage:
+        def export_if_due(self):
+            order.append("export")
+
+    monkeypatch.setattr(contour, "TradingBot", Bot)
+    runtime = contour._Runtime(post_tick=lambda ready: order.append("execute") or True, storage=Storage())
+    contour._run_bot([], None, runtime, data_cache=None, timeline=None, after_tick=lambda: order.append("ack"))
+    assert order == ["execute", "export", "ack"]
+
+
+def test_failed_projection_refresh_does_not_break_tick(monkeypatch):
+    acks = []
+
+    class Bot:
+        def __init__(self, **kwargs):
+            self.post_tick = kwargs["post_tick"]
+
+        def run(self):
+            self.post_tick({"1m"})
+
+    class Storage:
+        def export_if_due(self):
+            raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(contour, "TradingBot", Bot)
+    runtime = contour._Runtime(post_tick=lambda ready: True, storage=Storage())
+    contour._run_bot([], None, runtime, data_cache=None, timeline=None, after_tick=lambda: acks.append(1))
+    assert acks == [1]

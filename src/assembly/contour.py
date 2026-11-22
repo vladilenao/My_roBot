@@ -227,6 +227,12 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
                 runtime.storage.execution_bar_boundaries(), runtime.execution_aliases,
                 runtime.execution_instruments, data_cache))
         result = runtime.post_tick(ready_tfs) if runtime.post_tick is not None else True
+        if runtime.storage is not None:
+            # Отложенные проекции журнала догоняют базу и в затишье без транзакций.
+            try:
+                runtime.storage.export_if_due()
+            except Exception as exc:
+                log.warning("Не удалось обновить CSV и аудит журнала сделок: %s", type(exc).__name__)
         if control is not None:
             control.after_tick()
         # Курсор ленты подтверждается только после commit тика.

@@ -244,9 +244,21 @@ class Storage:
             self.export()
             return
         self._export_pending = True
+        self.export_if_due()
+
+    def export_if_due(self) -> bool:
+        """Write deferred projections once ``export_interval`` has passed.
+
+        Вызывается и после коммита, и на каждом тике: без этого после серии
+        транзакций и затишья CSV ждали бы следующей транзакции сколь угодно
+        долго. Без интервала и без отложенного — ничего не делает.
+        """
+        if self._export_interval is None or not self._export_pending:
+            return True
         last = self._last_export_at
-        if last is None or self._monotonic() - last >= self._export_interval:
-            self.export()
+        if last is not None and self._monotonic() - last < self._export_interval:
+            return True
+        return self.export()
 
     def export(self) -> bool:
         """Retry configured projections without affecting durable state."""
