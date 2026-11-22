@@ -751,6 +751,9 @@ class AuditExporter:
             encoding="utf-8",
             delay=True,
         )
+        # Расчёты только дописываются, rowid растёт: всё не выше метки уже
+        # выгружено, и повтор не перебирает всю таблицу расчётов заново.
+        self._exported_rowid = 0
 
     def export(self) -> bool:
         """Retry unexported traces without changing their SQLite records."""
@@ -759,14 +762,16 @@ class AuditExporter:
         ).fetchone()[0]
         rows = self._connection.execute(
             """
-            SELECT calculation_id, source_data_id, trade_id, command_id, event_id,
+            SELECT rowid, calculation_id, source_data_id, trade_id, command_id, event_id,
                    assignment_id, signal_id, service_uid, correlation_id, algorithm,
                    algorithm_version, input_json, steps_json, rounding_json, output_json,
                    outcome, reason, created_at
             FROM calculations
-            WHERE calculation_id NOT IN (SELECT calculation_id FROM audit_exports)
+            WHERE rowid > ?
+              AND calculation_id NOT IN (SELECT calculation_id FROM audit_exports)
             ORDER BY created_at, calculation_id
-            """
+            """,
+            (self._exported_rowid,),
         ).fetchall()
         columns = (
             "calculation_id", "source_data_id", "trade_id", "command_id", "event_id",
@@ -775,7 +780,7 @@ class AuditExporter:
             "reason", "created_at",
         )
         try:
-            for row in rows:
+            for _, *row in rows:
                 record = dict(zip(columns, row, strict=True))
                 for field in ("inputs", "steps", "rounding", "result"):
                     record[field] = json.loads(record[field])
@@ -789,6 +794,8 @@ class AuditExporter:
             self._record_failure(revision, error)
             log.error("trade audit export revision %s failed: %s", revision, error)
             return False
+        if rows:
+            self._exported_rowid = max(self._exported_rowid, max(row[0] for row in rows))
         with self._connection:
             self._connection.execute(
                 "UPDATE export_state SET audit_exported_revision = ?, audit_failed_revision = NULL, "

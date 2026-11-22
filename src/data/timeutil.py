@@ -30,6 +30,21 @@ def to_aware_utc(dt) -> pd.Timestamp:
     return ts
 
 
+def to_aware_utc_series(values: pd.Series) -> pd.Series:
+    """``values.map(to_aware_utc)`` одной векторной операцией.
+
+    Столбец времени минутной истории контракта переводится в aware UTC на
+    каждом тике; поэлементный ``map`` стоил десятки миллисекунд на тысячах
+    свечей и дорожал с каждой минутой прогона. Столбец без единого
+    datetime-типа (смесь значений) переводится поэлементно, как прежде.
+    """
+    if pd.api.types.is_datetime64_any_dtype(values.dtype):
+        if values.dt.tz is None:
+            return values.dt.tz_localize("UTC")
+        return values.dt.tz_convert("UTC")
+    return values.map(to_aware_utc)
+
+
 def to_utc_naive(dt) -> pd.Timestamp:
     """Входной факт сначала конвертируется в UTC, потом лишается зоны.
 

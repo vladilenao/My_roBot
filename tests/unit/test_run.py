@@ -328,6 +328,7 @@ class TestRuntimeComposition:
             audit_backup_count=contour.AUDIT_BACKUP_COUNT,
             initial_deposit=str(contour.INITIAL_DEPOSIT),
             clock=None,
+            export_interval=None,
         )
         broker_factory.assert_called_once_with(
             contour.INITIAL_DEPOSIT, contour.CLEARING_TIMES, contract_names={}
@@ -653,6 +654,28 @@ class TestFinishHistoryReportsCheckedHorizon:
         payload = json.loads((state_dir / "report.json").read_text(encoding="utf-8"))
         text = (state_dir / "report.txt").read_text(encoding="utf-8")
         return payload, text
+
+    def test_deferred_journal_projections_are_written_before_report(self, tmp_path):
+        storage = Storage(
+            tmp_path / "trades.sqlite3", initial_deposit="100000",
+            journal_path=tmp_path / "trade_event.csv", positions_path=tmp_path / "trade_summary.csv",
+            export_interval=3600,
+        )
+        with storage.transaction() as connection:
+            connection.execute("UPDATE account SET balance = '99000'")
+        assert storage._export_pending
+        cache = MagicMock(missed_bars=0, gaps=0, longest_gap=None)
+        timeline = MagicMock()
+        timeline.now.return_value = pd.Timestamp("2026-09-25 12:05")
+
+        contour._finish_history(storage, self._session(None), cache, timeline, tmp_path / "run-1")
+
+        assert not storage._export_pending
+        required, exported = storage.connection.execute(
+            "SELECT required_revision, exported_revision FROM export_state"
+        ).fetchone()
+        assert exported == required
+        storage.close()
 
     def test_limited_horizon_is_reported_as_limited(self, tmp_path):
         session = self._session(

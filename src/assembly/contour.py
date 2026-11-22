@@ -39,7 +39,7 @@ from src.config import (
     trading_enabled,
     TIMEFRAMES,
 )
-from src.data.timeutil import to_aware_utc, to_naive
+from src.data.timeutil import to_aware_utc, to_aware_utc_series, to_naive
 from src.history.preflight import active_pairs
 from src.history.selection import HistorySelection
 from src.history.warmup import obligation_requirements, warmup_requirements
@@ -154,6 +154,12 @@ def _strategy_admissions(session, storage) -> tuple:
         return ()
 
 
+# Исторический прогон переписывает CSV и аудит не чаще раза в столько секунд
+# настоящего времени: проекции собираются из всей истории журнала, и экспорт после
+# каждой транзакции замедлял тик пропорционально числу накопленных сделок.
+HISTORY_EXPORT_INTERVAL_SEC = 30.0
+
+
 def _finish_history(
     storage, session, data_cache, timeline, state_dir,
     market_data_sync: MarketDataSync | None = None,
@@ -161,6 +167,11 @@ def _finish_history(
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
+    # Отложенные проекции — до отчёта: CSV на диске совпадают с базой и при аварийном финише.
+    try:
+        storage.flush_exports()
+    except Exception as exc:
+        log.warning("Не удалось дописать CSV и аудит журнала сделок: %s", type(exc).__name__)
     original_reason = session.stop_reason()
     lifecycle = getattr(session, "contract_lifecycle", None)
     if isinstance(lifecycle, RolloverLifecycle):
@@ -477,6 +488,7 @@ def _build_runtime(
             audit_backup_count=AUDIT_BACKUP_COUNT,
             initial_deposit=str(deposit),
             clock=clock,
+            export_interval=HISTORY_EXPORT_INTERVAL_SEC if historical else None,
         )
         if broker_trading is not None:
             broker = broker_trading.broker_factory(storage)
@@ -686,7 +698,7 @@ def _build_runtime(
                     continue
                 try:
                     ticker = instrument_key(instrument)
-                    stamps = frame["datetime"].map(to_aware_utc)
+                    stamps = to_aware_utc_series(frame["datetime"])
                     boundary = execution_cursors.get(ticker)
                     if boundary is None:
                         if initial_boundaries is None:

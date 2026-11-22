@@ -329,6 +329,20 @@ CREATE TABLE rollover_commands (
 """
 SCHEMA_SQL += MIGRATE_V10_TO_V11_SQL
 
+# Индексы поиска по сделке и инструменту. Без них выборки «исполнения, события,
+# заявки, расчёты сделки» перебирают таблицы целиком, и тик дорожает с каждой
+# сделкой. Версию схемы они не меняют: создаются IF NOT EXISTS при каждом
+# открытии, и база остаётся открываемой прежними версиями робота.
+LOOKUP_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS fills_by_trade ON fills(trade_id);
+CREATE INDEX IF NOT EXISTS events_by_trade ON events(trade_id);
+CREATE INDEX IF NOT EXISTS orders_by_trade ON orders(trade_id);
+CREATE INDEX IF NOT EXISTS calculations_by_trade ON calculations(trade_id);
+CREATE INDEX IF NOT EXISTS trades_by_instrument ON trades(instrument_id);
+CREATE INDEX IF NOT EXISTS observations_by_instrument
+    ON trade_market_observations(instrument_id, timeframe, bar_id);
+"""
+
 
 def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | None = None) -> None:
     """Create the current schema or reject a database from another version.
@@ -369,6 +383,7 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
                     if version == 3:
                         _backfill_net_realized_pnl(connection)
                 version += 1
+        _execute_sql(connection, LOOKUP_INDEXES_SQL)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
