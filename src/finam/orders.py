@@ -179,14 +179,20 @@ class Streams:
         return found
 
     def wait_order_event(self, match: Callable, timeout: float, sleep) -> bool:
-        handle = self.handles.get("SubscribeOrders")
-        other = self.handles.get("SubscribeOrderTrade")
-        waited, step = 0.0, 0.5
+        """Ждать событие в каждом открытом стриме заявок; «да», если пришло хотя бы в один.
+
+        Стримы приносят одно и то же событие с разной задержкой (прогон 23.11: SubscribeOrderTrade
+        через 1 мс после ответа PlaceOrder, SubscribeOrders — через 160 мс), поэтому итог по первому
+        пришедшему терял второй стрим.
+        """
+        names = ("SubscribeOrders", "SubscribeOrderTrade")
+        waited, step = 0.0, 0.1
         while True:
-            if any(events for events in self.order_events(match).values()):
-                return True
-            if waited >= timeout or all(h is None or h.closed.is_set() for h in (handle, other)):
-                return any(events for events in self.order_events(match).values())
+            events = self.order_events(match)
+            pending = [name for name in names if (handle := self.handles.get(name)) is not None
+                       and not handle.closed.is_set() and not events.get(name)]
+            if not pending or waited >= timeout:
+                return any(events.values())
             sleep(step)
             waited += step
 

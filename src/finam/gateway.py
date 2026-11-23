@@ -83,6 +83,18 @@ def _pushback_secs(exc: BaseException) -> float | None:
     return None
 
 
+def clean_details(details: str | None) -> str:
+    """Описание ошибки Финама в одну строку.
+
+    Финам пишет текст на двух языках через перевод страницы (``\x0c``) и повторяет код gRPC в начале
+    (прогон 23.11: ``INVALID_ARGUMENT: [145]No enough coverage…\x0cНедостаток обеспечения…``).
+    """
+    text = str(details or "")
+    for code in ("INVALID_ARGUMENT", "FAILED_PRECONDITION", "NOT_FOUND", "RESOURCE_EXHAUSTED", "ALREADY_EXISTS"):
+        text = text.removeprefix(f"{code}: ")
+    return " ".join(text.replace("\x0c", " / ").split())
+
+
 @dataclass
 class StreamHandle:
     """Стрим в потоке-демоне: сообщения с временем прихода, ошибка конца, отмена."""
@@ -267,7 +279,7 @@ class FinamGateway:
                 details = exc.details() if hasattr(exc, "details") else ""
             except Exception:  # noqa: BLE001
                 return BrokerCallError(method, type(exc).__name__)
-            return BrokerCallError(method, getattr(status, "name", str(status)), self.describe(details or ""))
+            return BrokerCallError(method, getattr(status, "name", str(status)), self.describe(clean_details(details)))
         return BrokerCallError(method, type(exc).__name__)
 
     def _record(self, method, request, started, *, response=None, error=None, metadata=None) -> None:

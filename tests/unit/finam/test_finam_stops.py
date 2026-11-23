@@ -67,3 +67,12 @@ def test_trigger_cleanup_closes_only_own_volume(run, broker):
     result = run("probe-trigger", "NG", "--real")
     assert result.code == 0, result.report()
     assert broker.positions[NG] == Decimal(2)
+
+
+def test_stop_probe_time_in_force(run, broker):
+    broker.trigger_after_polls = None
+    result = run("probe-stops", "NG", "--keep", "--tif", "gtc")
+    assert "--tif gtc" in result.report()
+    [stop] = stops(broker)
+    assert stop.order.time_in_force == orders_pb2.TIME_IN_FORCE_GOOD_TILL_CANCEL
+    assert "time_in_force TIME_IN_FORCE_GOOD_TILL_CANCEL" in result.row("Ф0.21")[1]

@@ -32,6 +32,12 @@ _TRANSIENT = frozenset({"RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE_EXCEEDED"
                         "PERMISSION_DENIED", "INTERNAL"})
 
 
+def no_coverage(error: BrokerCallError) -> bool:
+    """Отказ из-за нехватки денег под ГО: повтор с другим ключом или ценой ничего не даст (прогон 23.11, код [145])."""
+    text = error.details.lower()
+    return "[145]" in text or "coverage" in text or "обеспечени" in text
+
+
 class OrderRun(Run):
     """Общее у действий с заявками: инструмент, торги, стримы, уборка заявок разведки."""
 
@@ -194,6 +200,9 @@ class LimitProbe(OrderRun):
         except BrokerCallError as first:
             if first.code in _TRANSIENT:
                 raise
+            if no_coverage(first):
+                self._set("Ф0.12", ERROR, f"недостаточно обеспечения — пополните счёт: {first}")
+                return False
             # Отказ с K1: из-за ключа или из-за цены? Тот же запрос с новым ключом отвечает.
             second_key = self.new_key()
             try:
@@ -220,6 +229,8 @@ class LimitProbe(OrderRun):
         try:
             state = self._limit(key, price)
         except BrokerCallError as exc:
+            if no_coverage(exc):
+                prefix += "недостаточно обеспечения — пополните счёт; "
             self._set(code, ERROR, f"{prefix}заявку поставить не удалось: {exc}")
             return None
         self._remember(state)

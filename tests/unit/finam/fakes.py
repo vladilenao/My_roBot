@@ -131,6 +131,7 @@ class FakeFinam:
     trigger_after_polls: int | None = 1  # стоп срабатывает на N-м GetOrder; None — не срабатывает
     exhaust_clock_after: int | None = None
     exhaust_place: bool = False
+    no_money: bool = False  # заявки отклоняются по обеспечению, как на пустом счёте 23.11
     fail_after_place: bool = False  # первый GetOrders после приёма заявки — UNAVAILABLE
     jwt_life_min: int = 15
     streams_die_on_expiry: bool = True
@@ -358,6 +359,9 @@ class _Api:
             b.orders[b.next_id("rej")] = orders_pb2.OrderState(order_id="", status=S.ORDER_STATUS_REJECTED,
                                                                 order=order)
             raise FakeRpcError(StatusCode.INVALID_ARGUMENT, "цена не кратна шагу")
+        if b.no_money:
+            raise FakeRpcError(StatusCode.INVALID_ARGUMENT, "INVALID_ARGUMENT: [145]No enough coverage. You need "
+                               f"9897.72 RUR, счёт {order.account_id}\x0cНедостаток обеспечения в сумме 9897.72 RUR")
         if (order.type == orders_pb2.ORDER_TYPE_LIMIT and b.band_pct is not None
                 and price < b.last[order.symbol] * (1 - b.band_pct / 100)):
             raise FakeRpcError(StatusCode.INVALID_ARGUMENT, "цена вне лимитов")

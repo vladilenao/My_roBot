@@ -23,7 +23,9 @@ def test_full_limit_probe(run, broker):
     assert "не по шагу отклонена" in result.row("Ф0.11")[1]
     assert "тот же ключ после ошибки принят" in result.row("Ф0.12")[1]
     assert "повтор отклонён: ALREADY_EXISTS" in result.row("Ф0.14")[1]
-    assert "номер в первом совпал" in result.row("Ф0.15")[1]
+    events = result.row("Ф0.15")[1]
+    assert "SubscribeOrders: 1 событий, номер в первом совпал" in events
+    assert "SubscribeOrderTrade: 1 событий, номер в первом совпал" in events
     assert "CANCELED" in result.row("Ф0.17")[1]
     # Покупка ниже рынка на 3%, к шагу 0.001: 3.000 * 0.97 = 2.910.
     assert "лимит 2.91" in result.row("Ф0.12")[1]
@@ -111,3 +113,14 @@ def test_clearing_is_not_trading(run, broker):
     assert result.code == 1
     assert "сессия сейчас: CLEARING" in result.row("Ф0.10")[1]
     assert placed(broker) == 0
+
+
+def test_no_money_stops_without_retries(run, broker):
+    broker.no_money = True
+    result = run("probe", "NG")
+    outcome, detail = result.row("Ф0.12")
+    assert outcome == "ошибка"
+    assert detail.startswith("недостаточно обеспечения — пополните счёт: INVALID_ARGUMENT [145]No enough coverage.")
+    assert "\x0c" not in result.report() and " / Недостаток обеспечения" in detail
+    assert "INVALID_ARGUMENT INVALID_ARGUMENT" not in detail
+    assert placed(broker) == 2  # ошибочная по шагу и одна правильная — без повторов

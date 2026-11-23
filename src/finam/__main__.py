@@ -44,8 +44,9 @@ USAGE = """Разведка Finam Trade API: python -m src.finam <действи
 С заявками (далеко от рынка, не исполняются):
   probe [инструмент] [--offset-pct P]
                           лимитная заявка 1 лот на P% ниже рынка (NG, 3%)
-  probe-stops [инструмент] [--offset-pct P] [--side buy|sell] [--keep]
-                          стоп-заявка 1 лот в P% от рынка (NG, 10%, покупка)
+  probe-stops [инструмент] [--offset-pct P] [--side buy|sell] [--keep] [--tif unset|day|gtc]
+                          стоп-заявка 1 лот в P% от рынка (NG, 10%, покупка);
+                          --tif — time_in_force стопа (по умолчанию не задаётся)
   cleanup                 снять заявки разведки, чужие не трогать
 
 Со сделкой (только по подтверждению):
@@ -133,6 +134,7 @@ def _parser() -> argparse.ArgumentParser:
     stops.add_argument("--offset-pct", type=_percent, default=Decimal(10))
     stops.add_argument("--side", choices=("buy", "sell"), default="buy")
     stops.add_argument("--keep", action="store_true")
+    stops.add_argument("--tif", choices=("unset", "day", "gtc"), default="unset")
     trigger = actions.add_parser("probe-trigger", add_help=False)
     trigger.add_argument("instrument", nargs="?", default=DEFAULT_INSTRUMENT)
     trigger.add_argument("--ticks", type=_positive, default=1)
@@ -251,7 +253,7 @@ def _build(args, gateway, instruments, common: dict, secret: str):
                           **common)
     if args.action == "probe-stops":
         return StopProbe(gateway, instruments=instruments, instrument=args.instrument, offset_pct=args.offset_pct,
-                         side=args.side, keep=args.keep, **common)
+                         side=args.side, keep=args.keep, tif=args.tif, **common)
     if args.action == "probe-trigger":
         return TriggerProbe(gateway, instruments=instruments, instrument=args.instrument, ticks=args.ticks,
                             side=args.side, wait_min=args.wait, **common)

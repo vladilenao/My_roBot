@@ -30,6 +30,8 @@ from src.finam.proto.grpc.tradeapi.v1.orders import orders_service_pb2 as orders
 from src.sandbox.gateway import BrokerCallError
 
 SIDES = {"buy": side_pb2.SIDE_BUY, "sell": side_pb2.SIDE_SELL}
+# --tif стоп-заявки: не задавать (Финам вернул DAY, прогон 23.11), «день» или «до отмены».
+TIME_IN_FORCE = {"unset": 0, "day": orders_pb2.TIME_IN_FORCE_DAY, "gtc": orders_pb2.TIME_IN_FORCE_GOOD_TILL_CANCEL}
 OPPOSITE = {side_pb2.SIDE_BUY: side_pb2.SIDE_SELL, side_pb2.SIDE_SELL: side_pb2.SIDE_BUY}
 KEEP_NOTE = ("Стоп-заявка оставлена по --keep. Проверьте её `python -m src.finam account{demo}` утром и после "
              "выходных, затем снимите `python -m src.finam cleanup{demo}`.")
@@ -38,9 +40,10 @@ KEEP_NOTE = ("Стоп-заявка оставлена по --keep. Провер
 class StopRunBase(OrderRun):
     """Стоп-заявка на 1 лот: покупка ``LAST_UP`` выше рынка или продажа ``LAST_DOWN`` ниже."""
 
-    def __init__(self, *args, side: str = "buy", **kwargs):
+    def __init__(self, *args, side: str = "buy", tif: str = "unset", **kwargs):
         super().__init__(*args, **kwargs)
         self.side = SIDES[side]
+        self.time_in_force = TIME_IN_FORCE[tif]
         self.stop_key = ""
         self.stop_id = ""
         self.stop_price = Decimal(0)
@@ -52,7 +55,7 @@ class StopRunBase(OrderRun):
     def place_stop(self, key: str, price: Decimal):
         return self.place(side=self.side, kind=orders_pb2.ORDER_TYPE_STOP, quantity=self.quantity_of(self.item),
                           key=key, stop_price=price, stop_condition=self.condition,
-                          valid_before=orders_pb2.VALID_BEFORE_GOOD_TILL_CANCEL)
+                          valid_before=orders_pb2.VALID_BEFORE_GOOD_TILL_CANCEL, time_in_force=self.time_in_force)
 
     def guard_fill(self, state) -> None:
         # У стоп-заявки «исполнена» значит «сработала»: это проверяет probe-trigger, а не сбой разведки.
