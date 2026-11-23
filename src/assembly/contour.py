@@ -154,9 +154,10 @@ def _strategy_admissions(session, storage) -> tuple:
         return ()
 
 
-# Исторический прогон переписывает CSV и аудит не чаще раза в столько секунд
-# настоящего времени: проекции собираются из всей истории журнала, и экспорт после
-# каждой транзакции замедлял тик пропорционально числу накопленных сделок.
+# Исторический прогон переписывает аудит не чаще раза в столько секунд
+# настоящего времени, а CSV собирает один раз в конце: проекции собираются из всей
+# истории журнала, и экспорт после каждой транзакции замедлял тик пропорционально
+# числу накопленных сделок. По ходу прогона данные сделок — в базе журнала.
 HISTORY_EXPORT_INTERVAL_SEC = 30.0
 
 
@@ -167,7 +168,7 @@ def _finish_history(
     """Отчёт и одна строка консоли — и для штатного, и для аварийного финиша."""
     if storage is None:
         return
-    # Отложенные проекции — до отчёта: CSV на диске совпадают с базой и при аварийном финише.
+    # CSV прогона собираются здесь, до отчёта: на диске они совпадают с базой и при аварийном финише.
     try:
         storage.flush_exports()
     except Exception as exc:
@@ -228,7 +229,7 @@ def _run_bot(instruments, bus, runtime, data_cache, timeline, session=None, live
                 runtime.execution_instruments, data_cache))
         result = runtime.post_tick(ready_tfs) if runtime.post_tick is not None else True
         if runtime.storage is not None:
-            # Отложенные проекции журнала догоняют базу и в затишье без транзакций.
+            # Отложенный аудит журнала догоняет базу и в затишье без транзакций.
             try:
                 runtime.storage.export_if_due()
             except Exception as exc:
@@ -495,6 +496,7 @@ def _build_runtime(
             initial_deposit=str(deposit),
             clock=clock,
             export_interval=HISTORY_EXPORT_INTERVAL_SEC if historical else None,
+            csv_on_flush_only=historical,
         )
         if broker_trading is not None:
             broker = broker_trading.broker_factory(storage)

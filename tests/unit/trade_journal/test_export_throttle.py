@@ -289,3 +289,92 @@ def test_trade_lookups_do_not_scan_whole_tables(tmp_path, query):
     with Storage(tmp_path / "trades.sqlite3") as storage:
         plan = " ".join(row[3] for row in storage.connection.execute("EXPLAIN QUERY PLAN " + query))
     assert "SCAN" not in plan, plan
+
+
+def _history_storage(tmp_path, monotonic):
+    """Журнал исторического прогона: аудит раз в интервал, CSV — только в конце."""
+    return Storage(
+        tmp_path / "trades.sqlite3",
+        journal_path=tmp_path / "trade_event.csv",
+        positions_path=tmp_path / "trade_summary.csv",
+        audit_path=tmp_path / "trade_decision_trace.log",
+        export_interval=30.0,
+        csv_on_flush_only=True,
+        monotonic=monotonic,
+    )
+
+
+def _audit_ids(path):
+    if not path.exists():
+        return []
+    return [json.loads(line)["calculation_id"] for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_history_csv_is_not_written_during_run_while_audit_keeps_its_interval(tmp_path):
+    monotonic = FakeMonotonic()
+    storage = _history_storage(tmp_path, monotonic)
+    try:
+        assert not (tmp_path / "trade_summary.csv").exists()  # и стартового экспорта нет
+        _open_trade(storage, "trade-1")
+        assert CalculationTraceRepository(storage).record(_trace("calculation-1"))
+        monotonic.value += 60
+        assert storage.export_if_due()
+        _open_trade(storage, "trade-2")
+        monotonic.value += 60
+        assert storage.export_if_due()
+
+        assert not (tmp_path / "trade_event.csv").exists()
+        assert not (tmp_path / "trade_summary.csv").exists()
+        required, exported = _revisions(storage)
+        assert exported < required
+        assert _audit_ids(tmp_path / "trade_decision_trace.log") == ["calculation-1"]
+    finally:
+        storage.close()
+
+
+def test_history_names_and_contract_metadata_do_not_write_csv_mid_run(tmp_path):
+    storage = _history_storage(tmp_path, FakeMonotonic())
+    try:
+        _open_trade(storage, "trade-1")
+        storage.set_names({"NGV6": "NG-10.26"})
+        storage.set_contract_metadata({})
+        assert not (tmp_path / "trade_summary.csv").exists()
+    finally:
+        storage.close()
+
+
+def test_history_csv_is_written_once_by_flush_and_matches_journal(tmp_path):
+    storage = _history_storage(tmp_path, FakeMonotonic())
+    try:
+        _open_trade(storage, "trade-1")
+        _open_trade(storage, "trade-2")
+
+        assert storage.flush_exports()
+
+        assert len(_summary_rows(tmp_path / "trade_summary.csv")) == 2
+        required, exported = _revisions(storage)
+        assert exported == required
+    finally:
+        storage.close()
+
+
+def test_history_close_writes_csv_even_without_transactions(tmp_path):
+    storage = _history_storage(tmp_path, FakeMonotonic())
+    storage.close()
+
+    assert _summary_rows(tmp_path / "trade_summary.csv") == []
+    assert (tmp_path / "trade_event.csv").exists()
+
+
+def test_history_failed_final_csv_stays_pending_for_retry(tmp_path, monkeypatch):
+    storage = _history_storage(tmp_path, FakeMonotonic())
+    try:
+        _open_trade(storage, "trade-1")
+        monkeypatch.setattr(storage._exporter, "export", lambda: False)
+        assert not storage.flush_exports()
+        monkeypatch.undo()
+
+        assert storage.flush_exports()
+        assert len(_summary_rows(tmp_path / "trade_summary.csv")) == 1
+    finally:
+        storage.close()

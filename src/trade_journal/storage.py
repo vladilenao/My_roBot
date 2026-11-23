@@ -158,6 +158,7 @@ class Storage:
         initial_deposit: str | None = None,
         clock: Clock | Callable[[], datetime] | None = None,
         export_interval: float | None = None,
+        csv_on_flush_only: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """``export_interval`` — не чаще раза в столько секунд настоящего времени
@@ -167,6 +168,10 @@ class Storage:
         историческом прогоне экспорт после каждой транзакции делает тик тем
         дороже, чем больше сделок накоплено. Отложенный экспорт догоняется
         ``flush_exports()`` и при ``close()``.
+
+        ``csv_on_flush_only`` — CSV пишутся только ``flush_exports()`` и при
+        ``close()``: исторический прогон собирает их один раз в конце, по ходу
+        прогона данные — в базе. Аудит идёт по ``export_interval`` как прежде.
         """
         if export_interval is not None and export_interval < 0:
             raise ValueError("export interval must not be negative")
@@ -185,8 +190,10 @@ class Storage:
         self._clock = as_clock(clock)
         self._export_interval = export_interval
         self._monotonic = monotonic
+        self._csv_on_flush_only = csv_on_flush_only
         self._last_export_at: float | None = None
-        self._export_pending = False
+        self._csv_pending = False
+        self._audit_pending = False
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
             CsvExporter(self.connection, Path(journal_path), Path(positions_path), names=self.instrument_names())
@@ -240,40 +247,73 @@ class Storage:
     def _export_after_commit(self) -> None:
         if self._exporter is None and self._audit_exporter is None:
             return
+        self._csv_pending = self._csv_pending or self._exporter is not None
+        self._audit_pending = self._audit_pending or self._audit_exporter is not None
         if self._export_interval is None:
-            self.export()
+            self._export_due()
             return
-        self._export_pending = True
         self.export_if_due()
 
     def export_if_due(self) -> bool:
         """Write deferred projections once ``export_interval`` has passed.
 
         Вызывается и после коммита, и на каждом тике: без этого после серии
-        транзакций и затишья CSV ждали бы следующей транзакции сколь угодно
-        долго. Без интервала и без отложенного — ничего не делает.
+        транзакций и затишья проекции ждали бы следующей транзакции сколь угодно
+        долго. Без интервала и без отложенного — ничего не делает. CSV при
+        ``csv_on_flush_only`` здесь не пишутся.
         """
-        if self._export_interval is None or not self._export_pending:
+        if self._export_interval is None or not self._due_pending():
             return True
         last = self._last_export_at
         if last is not None and self._monotonic() - last < self._export_interval:
             return True
-        return self.export()
+        return self._export_due()
 
     def export(self) -> bool:
-        """Retry configured projections without affecting durable state."""
-        csv_exported = self._exporter.export() if self._exporter is not None else True
-        audit_exported = self._audit_exporter.export() if self._audit_exporter is not None else True
-        exported = csv_exported and audit_exported
-        self._last_export_at = self._monotonic()
-        self._export_pending = not exported
-        return exported
+        """Retry configured projections without affecting durable state.
+
+        При ``csv_on_flush_only`` CSV только отмечаются отложенными: их пишет
+        ``flush_exports()``.
+        """
+        if self._exporter is not None:
+            self._csv_pending = True
+        if self._audit_exporter is not None:
+            self._audit_pending = True
+        return self._export_due()
 
     def flush_exports(self) -> bool:
-        """Write projections deferred by ``export_interval`` right now."""
-        if not self._export_pending:
+        """Write every deferred projection right now, CSV included."""
+        if not (self._csv_pending or self._audit_pending):
             return True
-        return self.export()
+        exported = True
+        if self._csv_pending:
+            exported = self._export_csv() and exported
+        if self._audit_pending:
+            exported = self._export_audit() and exported
+        self._last_export_at = self._monotonic()
+        return exported
+
+    def _due_pending(self) -> bool:
+        return self._audit_pending or (self._csv_pending and not self._csv_on_flush_only)
+
+    def _export_due(self) -> bool:
+        exported = True
+        if self._csv_pending and not self._csv_on_flush_only:
+            exported = self._export_csv() and exported
+        if self._audit_pending:
+            exported = self._export_audit() and exported
+        self._last_export_at = self._monotonic()
+        return exported
+
+    def _export_csv(self) -> bool:
+        exported = self._exporter.export() if self._exporter is not None else True
+        self._csv_pending = not exported
+        return exported
+
+    def _export_audit(self) -> bool:
+        exported = self._audit_exporter.export() if self._audit_exporter is not None else True
+        self._audit_pending = not exported
+        return exported
 
     def set_contract_metadata(self, contracts: Mapping[str, object]) -> None:
         """Hand broker contract metadata to the CSV card projection."""

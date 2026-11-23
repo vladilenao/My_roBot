@@ -329,6 +329,7 @@ class TestRuntimeComposition:
             initial_deposit=str(contour.INITIAL_DEPOSIT),
             clock=None,
             export_interval=None,
+            csv_on_flush_only=False,
         )
         broker_factory.assert_called_once_with(
             contour.INITIAL_DEPOSIT, contour.CLEARING_TIMES, contract_names={}
@@ -659,18 +660,18 @@ class TestFinishHistoryReportsCheckedHorizon:
         storage = Storage(
             tmp_path / "trades.sqlite3", initial_deposit="100000",
             journal_path=tmp_path / "trade_event.csv", positions_path=tmp_path / "trade_summary.csv",
-            export_interval=3600,
+            export_interval=3600, csv_on_flush_only=True,
         )
         with storage.transaction() as connection:
             connection.execute("UPDATE account SET balance = '99000'")
-        assert storage._export_pending
+        assert storage._csv_pending
         cache = MagicMock(missed_bars=0, gaps=0, longest_gap=None)
         timeline = MagicMock()
         timeline.now.return_value = pd.Timestamp("2026-09-25 12:05")
 
         contour._finish_history(storage, self._session(None), cache, timeline, tmp_path / "run-1")
 
-        assert not storage._export_pending
+        assert not storage._csv_pending
         required, exported = storage.connection.execute(
             "SELECT required_revision, exported_revision FROM export_state"
         ).fetchone()

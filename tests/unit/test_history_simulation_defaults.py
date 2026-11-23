@@ -50,6 +50,8 @@ def test_history_defers_journal_projections_but_live_exports_each_transaction(tm
     try:
         assert history.storage._export_interval == contour.HISTORY_EXPORT_INTERVAL_SEC
         assert live.storage._export_interval is None
+        assert history.storage._csv_on_flush_only is True
+        assert live.storage._csv_on_flush_only is False
     finally:
         history.storage.close()
         live.storage.close()
