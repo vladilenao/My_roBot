@@ -224,10 +224,11 @@ class TriggerProbe(StopRunBase):
         if not self._step("Ф0.31", self._wait_trigger):
             self._skip(self._rest("Ф0.31")[:-1], "стоп не сработал")
             return
+        # Позиция живёт секунды: снимок и закрытие сразу, сделки и комиссия — уже после закрытия.
         self._step("Ф0.32", self._triggered_order)
-        self._step("Ф0.33", self._trade)
         self._step("Ф0.34", self._position)
         self._step("Ф0.35", self._close)
+        self._step("Ф0.33", self._trade)
         self._step("Ф0.36", self._fees)
 
     def _place(self) -> bool:
@@ -291,7 +292,7 @@ class TriggerProbe(StopRunBase):
 
     def _trade(self) -> bool:
         def ours(trade) -> bool:
-            return trade.order_id == self.triggered_id
+            return trade.order_id in (self.triggered_id, self.close_id)
 
         self.streams.wait_trade_event(ours, self.timing.event_wait_secs, self.timing.sleep)
         streamed = self.streams.trade_events(ours)

@@ -50,6 +50,10 @@ def test_trigger_trades_and_closes(run, broker):
     assert "комиссия 1.5 RUB" in result.row("Ф0.33")[1]
     assert "позиция до 0, после 1" in result.row("Ф0.34")[1]
     assert broker.positions[NG] == Decimal(0)
+    # Закрытие идёт до ожидания комиссии: обе сделки — открытие и закрытие — в одну минуту.
+    trades = result.row("Ф0.33")[1]
+    assert "покупка цена 3.001" in trades and "продажа цена" in trades
+    assert "10:00:00 UTC продажа" in trades
 
 
 def test_trigger_not_reached(run, broker):
