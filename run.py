@@ -26,6 +26,10 @@ from src.config import (
     TINKOFF_SANDBOX_TOKEN,
     TINKOFF_TRADE_TOKEN,
     TINKOFF_ACCOUNT_ID,
+    FINAM_SECRET_TOKEN,
+    FINAM_ACCOUNT_ID,
+    FINAM_DEMO_SECRET_TOKEN,
+    FINAM_DEMO_ACCOUNT_ID,
     account_bot_token,
     sandbox_bot_token,
     sandbox_channel_id,
@@ -93,7 +97,8 @@ log = get_logger(__name__)
 _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             MARKET_DATA_EXPORT_TOKEN, ROBOT_CONTROL_TOKEN, MARKET_STRUCTURE_REDIS_PASSWORD,
             TINKOFF_SANDBOX_TOKEN, sandbox_bot_token(),
-            TINKOFF_TRADE_TOKEN, TINKOFF_ACCOUNT_ID, account_bot_token())
+            TINKOFF_TRADE_TOKEN, TINKOFF_ACCOUNT_ID, account_bot_token(),
+            FINAM_SECRET_TOKEN, FINAM_ACCOUNT_ID, FINAM_DEMO_SECRET_TOKEN, FINAM_DEMO_ACCOUNT_ID)
 
 
 _OPEN_FILES = None  # итог подъёма предела открытых файлов при запуске процесса (fix-sqlite-connection-close)
