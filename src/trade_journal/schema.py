@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from decimal import Decimal
 
@@ -337,11 +338,13 @@ LOOKUP_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS fills_by_trade ON fills(trade_id);
 CREATE INDEX IF NOT EXISTS events_by_trade ON events(trade_id);
 CREATE INDEX IF NOT EXISTS orders_by_trade ON orders(trade_id);
+CREATE INDEX IF NOT EXISTS outbox_by_trade ON outbox(trade_id);
 CREATE INDEX IF NOT EXISTS calculations_by_trade ON calculations(trade_id);
 CREATE INDEX IF NOT EXISTS trades_by_instrument ON trades(instrument_id);
 CREATE INDEX IF NOT EXISTS observations_by_instrument
     ON trade_market_observations(instrument_id, timeframe, bar_id);
 """
+LOOKUP_INDEX_NAMES = frozenset(re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)", LOOKUP_INDEXES_SQL))
 
 
 def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | None = None) -> None:
@@ -358,6 +361,10 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
             f"unsupported SQLite schema version {version}; expected {SCHEMA_VERSION}"
         )
 
+    # Чтение схемы — до SAVEPOINT, как и версия: чтение внутри транзакции
+    # закрепляет снимок WAL, и запись следом падает «database is locked» без
+    # ожидания, если другое соединение успело записать между ними.
+    indexes_missing = _lookup_indexes_missing(connection)
     connection.execute("SAVEPOINT schema_migration")
     try:
         if version == 0:
@@ -383,7 +390,8 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
                     if version == 3:
                         _backfill_net_realized_pnl(connection)
                 version += 1
-        _execute_sql(connection, LOOKUP_INDEXES_SQL)
+        if indexes_missing:
+            _execute_sql(connection, LOOKUP_INDEXES_SQL)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
@@ -393,6 +401,17 @@ def initialize_schema(connection: sqlite3.Connection, *, initial_balance: str | 
         connection.execute("ROLLBACK TO schema_migration")
         connection.execute("RELEASE schema_migration")
         raise
+
+
+def _lookup_indexes_missing(connection: sqlite3.Connection) -> bool:
+    """Нет ли какого-то индекса поиска.
+
+    ``CREATE INDEX IF NOT EXISTS`` SQLite считает записью даже на базе, где
+    индексы уже есть: такое открытие журнала спорило бы за блокировку записи
+    с другими соединениями. Полная база индексов не пересоздаёт.
+    """
+    present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    return not LOOKUP_INDEX_NAMES <= present
 
 
 def _execute_sql(connection: sqlite3.Connection, script: str) -> None:

@@ -605,6 +605,27 @@ class Storage:
             for row in cursor.fetchall()
         )
 
+    def load_rejected_with_pending_close(self) -> tuple[RecoveredTrade, ...]:
+        """REJECTED-сделки, у которых в outbox ещё ждёт отправки CLOSE.
+
+        Только такие отклонённые сделки могут нести закрытие защиты входа на
+        гэпе, которое надо поднять при восстановлении. Отбор — в SQL: полная
+        выгрузка всех завершённых сделок на каждом восстановлении делала тик
+        тем дороже, чем больше сделок в журнале (fix-history-export-throughput).
+        """
+        cursor = self.connection.execute(
+            "SELECT * FROM trades t WHERE t.phase = 'REJECTED' AND EXISTS ("
+            "SELECT 1 FROM outbox b JOIN orders o ON o.command_id = b.command_id "
+            "WHERE b.trade_id = t.trade_id AND b.status = 'PENDING' "
+            "AND o.action_type = 'CLOSE' AND o.status = 'PENDING') "
+            "ORDER BY created_at, trade_id"
+        )
+        columns = tuple(column[0] for column in cursor.description)
+        return tuple(
+            self._load_trade(dict(zip(columns, row, strict=True)))
+            for row in cursor.fetchall()
+        )
+
     def execution_bar_boundaries(self) -> dict[str, tuple[datetime, bool]]:
         """Safe replay starts for instruments with durable pending/open trades.
 

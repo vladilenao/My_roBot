@@ -244,7 +244,7 @@ def test_new_audit_exporter_retries_traces_left_unexported(tmp_path):
 
 
 LOOKUP_INDEXES = {
-    "fills_by_trade", "events_by_trade", "orders_by_trade", "calculations_by_trade",
+    "fills_by_trade", "events_by_trade", "orders_by_trade", "outbox_by_trade", "calculations_by_trade",
     "trades_by_instrument", "observations_by_instrument",
 }
 
@@ -279,6 +279,7 @@ def test_existing_current_database_gains_lookup_indexes_on_open(tmp_path):
         "SELECT 1 FROM fills WHERE trade_id='t'",
         "SELECT 1 FROM events WHERE trade_id='t'",
         "SELECT 1 FROM orders WHERE trade_id='t' AND action_type='OPEN'",
+        "SELECT 1 FROM outbox WHERE trade_id='t' AND status='PENDING'",
         "SELECT 1 FROM calculations WHERE trade_id='t' AND algorithm='a'",
         "SELECT trade_id FROM trades WHERE instrument_id='i'",
         "SELECT bar_id FROM trade_market_observations WHERE instrument_id='i' AND timeframe='1m'",
