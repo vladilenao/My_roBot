@@ -19,7 +19,7 @@ from pathlib import Path
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from src.finam.gateway import FinamGateway
-from src.finam.instruments import FinamInstrument, Instruments, InstrumentNameError, dec
+from src.finam.instruments import MOEX_MICS, FinamInstrument, Instruments, InstrumentNameError, dec
 from src.finam.proto.google.type import interval_pb2
 from src.finam.proto.grpc.tradeapi.v1.assets import assets_service_pb2 as assets_pb2
 from src.finam.proto.grpc.tradeapi.v1.auth import auth_service_pb2 as auth_pb2
@@ -225,13 +225,19 @@ class Run:
         if self.token.expires_at and self.token.created_at:
             minutes = (self.token.expires_at - self.token.created_at).total_seconds() / 60
             life = f", живёт {minutes:g} мин"
-        perms = []
+        # Площадок у токена десятки (прогон 23.11): в отчёте — Мосбиржа и число остальных, весь список — в записях.
+        perms, others = [], 0
         for perm in details.md_permissions:
             where = perm.WhichOneof("condition") or "везде"
             place = getattr(perm, where) if where != "везде" else ""
+            if place not in MOEX_MICS:
+                others += 1
+                continue
             level = perm.QuoteLevel.Name(perm.quote_level).removeprefix("QUOTE_LEVEL_")
-            perms.append(f"{place or where}: {level}" + (f" с задержкой {perm.delay_minutes} мин"
-                                                         if perm.delay_minutes else ""))
+            perms.append(f"{place}: {level}" + (f" с задержкой {perm.delay_minutes} мин"
+                                                if perm.delay_minutes else " без задержки"))
+        if others:
+            perms.append(f"других площадок {others}")
         kind = "демо" if self.demo else "реальный"
         detail = (f"JWT получен (создан {ts(details.created_at)}, истекает {ts(details.expires_at)}{life}); "
                   f"readonly {'да' if details.readonly else 'нет'}; счета токена: {accounts}; "
