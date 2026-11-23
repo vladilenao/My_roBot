@@ -238,7 +238,11 @@ class _Api:
         return auth_pb2.AuthResponse(token=self.b.issue())
 
     def auth__TokenDetails(self, request, metadata):
-        self.b.check("auth.TokenDetails", metadata)
+        self.b.calls.append(("auth.TokenDetails", dict(metadata or ())))
+        if dict(metadata or ()).get("authorization"):  # как у Финама 23.11: JWT только в теле
+            raise FakeRpcError(StatusCode.INVALID_ARGUMENT, "Token is invalid or malformed")
+        if self.b.jwt_expired(request.token):
+            raise FakeRpcError(StatusCode.UNAUTHENTICATED, "JWT истёк или неверен")
         issued = self.b.jwts.get(request.token, self.b.now)
         return auth_pb2.TokenDetailsResponse(
             created_at=stamp(issued), expires_at=stamp(issued + timedelta(minutes=self.b.jwt_life_min)),
@@ -247,6 +251,7 @@ class _Api:
                                                   mic="RTSX")])
 
     def auth__SubscribeJwtRenewal(self, request, metadata):
+        assert not dict(metadata or ()).get("authorization"), "AuthService — без заголовка authorization"
         return RenewalStream(self.b)
 
     # accounts

@@ -41,6 +41,9 @@ RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECS = (1, 2, 4)
 RATE_LIMIT_MAX_WAIT_SECS = 10
 PUSHBACK_KEY = "grpc-retry-pushback-ms"
+# AuthService принимает секрет или JWT только в теле запроса: с заголовком authorization
+# TokenDetails отвечает INVALID_ARGUMENT «Token is invalid or malformed» (прогон 23.11).
+BODY_AUTH_SERVICE = "auth"
 # Изменяющие вызовы не повторяются автоматически ни при каком ответе.
 WRITE_METHODS = frozenset({"orders.PlaceOrder", "orders.CancelOrder", "orders.PlaceSLTPOrder"})
 
@@ -198,7 +201,9 @@ class FinamGateway:
     def jwt_label(self, token: str) -> str:
         return self.scrub(token) if token else "нет"
 
-    def _metadata(self, jwt: str | None = None) -> tuple:
+    def _metadata(self, jwt: str | None = None, method: str = "") -> tuple:
+        if method.split(".", 1)[0] == BODY_AUTH_SERVICE:
+            return ()
         token = jwt if jwt is not None else self.jwt
         return (("authorization", token),) if token else ()
 
@@ -231,7 +236,7 @@ class FinamGateway:
         for attempt in range(attempts):
             started = self._monotonic()
             try:
-                response = self._stub_method(method)(request, metadata=self._metadata(jwt) if auth else (),
+                response = self._stub_method(method)(request, metadata=self._metadata(jwt, method) if auth else (),
                                                      timeout=DEADLINE_SECS)
             except Exception as exc:  # noqa: BLE001 — любой сбой вызова становится BrokerCallError
                 error = self._error(method, exc)
@@ -290,7 +295,7 @@ class FinamGateway:
         ``on_message`` вызывается до записи сообщения: так новый JWT становится секретом раньше, чем попадёт в записи.
         """
         handle = StreamHandle(method)
-        metadata = self._metadata(jwt)
+        metadata = self._metadata(jwt, method)
         started = self._monotonic()
 
         def requests() -> Iterator:

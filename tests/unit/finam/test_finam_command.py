@@ -119,8 +119,10 @@ def test_futures_without_tinkoff_token(run, broker):
 
 def test_jwt_is_sent_in_metadata(run, broker):
     run("account", "SBER")
-    jwts = [meta.get("authorization") for method, meta in broker.calls if method != "auth.Auth"]
+    jwts = [meta.get("authorization") for method, meta in broker.calls if not method.startswith("auth.")]
     assert jwts and all(token in broker.jwts for token in jwts)
+    # AuthService получает секрет и JWT только в теле запроса.
+    assert all(not meta for method, meta in broker.calls if method.startswith("auth."))
     assert broker.auth_calls == 1
 
 
