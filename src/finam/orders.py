@@ -106,12 +106,19 @@ class OrderDesk:
     def by_key(self, key: str) -> list:
         return [state for state in self.orders() if state.order.client_order_id == key]
 
-    def cancel_probe_orders(self, symbol: str | None = None) -> tuple[list, list]:
-        """Снять активные заявки разведки (ключ ``fp…``); вернуть снятые и отказы."""
+    def cancel_probe_orders(self, symbol: str | None = None, keys: set | None = None) -> tuple[list, list]:
+        """Снять активные заявки разведки; вернуть снятые и отказы.
+
+        ``keys`` — только заявки с этими ключами: уборка действия снимает лишь свои заявки. Без ``keys``
+        снимается всё с префиксом ``fp`` — так работает только ``cleanup`` по команде владельца
+        (23.11 уборка второго ``probe-stops`` сняла стоп, оставленный первым по ``--keep``).
+        """
         cancelled, failed = [], []
         for state in self.orders():
             order = state.order
             if not (is_active(state) and order.client_order_id.startswith(KEY_PREFIX)):
+                continue
+            if keys is not None and order.client_order_id not in keys:
                 continue
             if symbol is not None and order.symbol != symbol:
                 continue

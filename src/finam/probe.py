@@ -98,7 +98,7 @@ class OrderRun(Run):
                             "позиция — разведка её не закрывает, проверьте `account` и решите сами.")
 
     def cleanup(self) -> None:
-        cancelled, failed = self.desk.cancel_probe_orders(self.item.symbol if self.item else None)
+        cancelled, failed = self.desk.cancel_probe_orders(keys=self.keys)
         left = [state for state in self.desk.orders()
                 if is_active(state) and state.order.client_order_id in self.keys]
         detail = f"снято при уборке {len(cancelled)}" + (f", не снято {len(failed)}" if failed else "")

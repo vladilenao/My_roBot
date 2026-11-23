@@ -76,3 +76,19 @@ def test_stop_probe_time_in_force(run, broker):
     [stop] = stops(broker)
     assert stop.order.time_in_force == orders_pb2.TIME_IN_FORCE_GOOD_TILL_CANCEL
     assert "time_in_force TIME_IN_FORCE_GOOD_TILL_CANCEL" in result.row("Ф0.21")[1]
+
+
+def test_probes_do_not_touch_kept_stop_of_earlier_run(run, broker):
+    """23.11: уборка второго probe-stops сняла стоп, оставленный первым по --keep."""
+    broker.trigger_after_polls = None
+    run("probe-stops", "NG", "--keep")
+    [kept] = stops(broker)
+    broker.no_money = True  # второй стоп не встаёт, как с --tif gtc 23.11
+    run("probe-stops", "NG", "--keep", "--side", "sell")
+    broker.no_money = False
+    run("probe-stops", "NG")
+    run("probe", "NG")
+    assert broker.orders[kept.order_id].status == orders_pb2.ORDER_STATUS_WATCHING
+    result = run("cleanup")
+    assert broker.orders[kept.order_id].status == orders_pb2.ORDER_STATUS_CANCELED
+    assert "снято заявок разведки: 1" in result.text

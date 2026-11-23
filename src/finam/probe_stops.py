@@ -170,15 +170,10 @@ class StopProbe(StopRunBase):
         if not self.keep:
             super().cleanup()
             return
-        # С --keep снимаются только лишние заявки разведки, сама стоп-заявка остаётся.
-        for state in self.desk.orders():
-            order = state.order
-            if (is_active(state) and order.client_order_id.startswith("fp") and state.order_id != self.stop_id
-                    and order.symbol == self.item.symbol):
-                try:
-                    self.desk.cancel(state.order_id)
-                except BrokerCallError as exc:
-                    self.notes.append(f"снять {state.order_id} не удалось: {exc}")
+        # С --keep снимаются только лишние заявки этого запуска, сама стоп-заявка остаётся.
+        _, failed = self.desk.cancel_probe_orders(keys=self.keys - {self.stop_key})
+        for state, exc in failed:
+            self.notes.append(f"снять {state.order_id} не удалось: {exc}")
         kept = self.desk.get(self.stop_id) if self.stop_id else None
         self._set("Ф0.99", YES, "стоп-заявка оставлена: " + (describe(kept, self.instruments) if kept else "нет"))
         self.streams.close()
@@ -401,7 +396,7 @@ class TriggerProbe(StopRunBase):
                     notes.append("стоп снят")
             except BrokerCallError as exc:
                 notes.append(f"стоп не снят: {exc}")
-        cancelled, failed = self.desk.cancel_probe_orders(self.item.symbol)
+        cancelled, failed = self.desk.cancel_probe_orders(keys=self.keys)
         if cancelled:
             notes.append(f"снято заявок разведки {len(cancelled)}")
         try:
