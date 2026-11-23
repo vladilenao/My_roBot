@@ -451,3 +451,51 @@ def test_stop_move_of_other_revision_does_not_refresh_old_exit(tmp_path):
 
         assert status(storage, reduce.command_id) == "PENDING"
         assert manager.dispatch_block_reasons[reduce.command_id] == "stale-state-revision"
+
+
+def _guarded_restart_journal(path):
+    """Журнал с отклонённой сделкой, чьё закрытие защиты входа ждёт отправки, и обычной закрытой сделкой."""
+    moment = NOW + timedelta(minutes=1)
+    with Storage(path) as storage:
+        broker = create_addressable_journal_broker(1000, [])
+        manager = TradeManager(storage, broker, initial_balance=Decimal(1000), clock=lambda: moment)
+        queue_entry(manager, "A")
+        manager.dispatch(NOW)
+        broker.track_bar(moment, {"A": (102, 102, 102, 102)}, {}, bar_times={"A": moment})
+        for event in broker.drain_addressed_events():
+            manager.consume(event)
+        queue_entry(manager, "C")
+        storage.connection.execute("UPDATE trades SET phase='CLOSED' WHERE trade_id='trade-C'")
+        storage.connection.commit()
+    return moment
+
+
+def test_journal_selects_only_rejected_trades_with_pending_close(tmp_path):
+    path = tmp_path / "trades.sqlite3"
+    _guarded_restart_journal(path)
+    with Storage(path) as storage:
+        assert [t.plan.trade_id for t in storage.load_rejected_with_pending_close()] == ["trade-A"]
+        storage.connection.execute("UPDATE outbox SET status='SENT' WHERE trade_id='trade-A'")
+        assert storage.load_rejected_with_pending_close() == ()
+
+
+def test_restore_does_not_load_every_terminal_trade(tmp_path):
+    # Восстановление зовётся несколько раз за тик: полная выгрузка завершённых
+    # сделок делала тик тем дороже, чем длиннее журнал (fix-history-export-throughput).
+    path = tmp_path / "trades.sqlite3"
+    moment = _guarded_restart_journal(path)
+    with Storage(path) as storage:
+        loads = []
+        original = storage.load_trades
+
+        def recording(*, include_terminal=False):
+            loads.append(include_terminal)
+            return original(include_terminal=include_terminal)
+
+        storage.load_trades = recording
+        broker = create_addressable_journal_broker(1000, [])
+        manager = TradeManager(storage, broker, initial_balance=Decimal(1000), clock=lambda: moment)
+        assert manager.restore() == ()
+        assert True not in loads
+        assert broker.trade_state("trade-A") is not None
+        assert broker.trade_state("trade-C") is None

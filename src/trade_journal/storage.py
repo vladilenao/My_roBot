@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -156,7 +157,24 @@ class Storage:
         audit_backup_count: int = 5,
         initial_deposit: str | None = None,
         clock: Clock | Callable[[], datetime] | None = None,
+        export_interval: float | None = None,
+        csv_on_flush_only: bool = False,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        """``export_interval`` — не чаще раза в столько секунд настоящего времени
+        переписывать CSV и аудит после транзакций (``None`` — после каждой).
+
+        Каждая проекция пересобирается из всей истории журнала, поэтому в
+        историческом прогоне экспорт после каждой транзакции делает тик тем
+        дороже, чем больше сделок накоплено. Отложенный экспорт догоняется
+        ``flush_exports()`` и при ``close()``.
+
+        ``csv_on_flush_only`` — CSV пишутся только ``flush_exports()`` и при
+        ``close()``: исторический прогон собирает их один раз в конце, по ходу
+        прогона данные — в базе. Аудит идёт по ``export_interval`` как прежде.
+        """
+        if export_interval is not None and export_interval < 0:
+            raise ValueError("export interval must not be negative")
         if (journal_path is None) != (positions_path is None):
             raise ValueError("journal and positions export paths must be configured together")
         if journal_path is not None:
@@ -170,6 +188,12 @@ class Storage:
         self._outbox_guard_factory = None
         self._outbox_guard_local = local()
         self._clock = as_clock(clock)
+        self._export_interval = export_interval
+        self._monotonic = monotonic
+        self._csv_on_flush_only = csv_on_flush_only
+        self._last_export_at: float | None = None
+        self._csv_pending = False
+        self._audit_pending = False
         self._trace_repository = CalculationTraceRepository(self)
         self._exporter = (
             CsvExporter(self.connection, Path(journal_path), Path(positions_path), names=self.instrument_names())
@@ -189,9 +213,12 @@ class Storage:
         self.export()
 
     def close(self) -> None:
-        if self._audit_exporter is not None:
-            self._audit_exporter.close()
-        self.connection.close()
+        try:
+            self.flush_exports()
+        finally:
+            if self._audit_exporter is not None:
+                self._audit_exporter.close()
+            self.connection.close()
 
     def __enter__(self) -> "Storage":
         return self
@@ -215,13 +242,78 @@ class Storage:
         else:
             self.connection.commit()
             self._mark_export_required()
-            self.export()
+            self._export_after_commit()
+
+    def _export_after_commit(self) -> None:
+        if self._exporter is None and self._audit_exporter is None:
+            return
+        self._csv_pending = self._csv_pending or self._exporter is not None
+        self._audit_pending = self._audit_pending or self._audit_exporter is not None
+        if self._export_interval is None:
+            self._export_due()
+            return
+        self.export_if_due()
+
+    def export_if_due(self) -> bool:
+        """Write deferred projections once ``export_interval`` has passed.
+
+        Вызывается и после коммита, и на каждом тике: без этого после серии
+        транзакций и затишья проекции ждали бы следующей транзакции сколь угодно
+        долго. Без интервала и без отложенного — ничего не делает. CSV при
+        ``csv_on_flush_only`` здесь не пишутся.
+        """
+        if self._export_interval is None or not self._due_pending():
+            return True
+        last = self._last_export_at
+        if last is not None and self._monotonic() - last < self._export_interval:
+            return True
+        return self._export_due()
 
     def export(self) -> bool:
-        """Retry configured projections without affecting durable state."""
-        csv_exported = self._exporter.export() if self._exporter is not None else True
-        audit_exported = self._audit_exporter.export() if self._audit_exporter is not None else True
-        return csv_exported and audit_exported
+        """Retry configured projections without affecting durable state.
+
+        При ``csv_on_flush_only`` CSV только отмечаются отложенными: их пишет
+        ``flush_exports()``.
+        """
+        if self._exporter is not None:
+            self._csv_pending = True
+        if self._audit_exporter is not None:
+            self._audit_pending = True
+        return self._export_due()
+
+    def flush_exports(self) -> bool:
+        """Write every deferred projection right now, CSV included."""
+        if not (self._csv_pending or self._audit_pending):
+            return True
+        exported = True
+        if self._csv_pending:
+            exported = self._export_csv() and exported
+        if self._audit_pending:
+            exported = self._export_audit() and exported
+        self._last_export_at = self._monotonic()
+        return exported
+
+    def _due_pending(self) -> bool:
+        return self._audit_pending or (self._csv_pending and not self._csv_on_flush_only)
+
+    def _export_due(self) -> bool:
+        exported = True
+        if self._csv_pending and not self._csv_on_flush_only:
+            exported = self._export_csv() and exported
+        if self._audit_pending:
+            exported = self._export_audit() and exported
+        self._last_export_at = self._monotonic()
+        return exported
+
+    def _export_csv(self) -> bool:
+        exported = self._exporter.export() if self._exporter is not None else True
+        self._csv_pending = not exported
+        return exported
+
+    def _export_audit(self) -> bool:
+        exported = self._audit_exporter.export() if self._audit_exporter is not None else True
+        self._audit_pending = not exported
+        return exported
 
     def set_contract_metadata(self, contracts: Mapping[str, object]) -> None:
         """Hand broker contract metadata to the CSV card projection."""
@@ -547,6 +639,27 @@ class Storage:
             query += " WHERE phase NOT IN ('CLOSED', 'CANCELLED', 'REJECTED', 'ERROR')"
         query += " ORDER BY created_at, trade_id"
         cursor = self.connection.execute(query)
+        columns = tuple(column[0] for column in cursor.description)
+        return tuple(
+            self._load_trade(dict(zip(columns, row, strict=True)))
+            for row in cursor.fetchall()
+        )
+
+    def load_rejected_with_pending_close(self) -> tuple[RecoveredTrade, ...]:
+        """REJECTED-сделки, у которых в outbox ещё ждёт отправки CLOSE.
+
+        Только такие отклонённые сделки могут нести закрытие защиты входа на
+        гэпе, которое надо поднять при восстановлении. Отбор — в SQL: полная
+        выгрузка всех завершённых сделок на каждом восстановлении делала тик
+        тем дороже, чем больше сделок в журнале (fix-history-export-throughput).
+        """
+        cursor = self.connection.execute(
+            "SELECT * FROM trades t WHERE t.phase = 'REJECTED' AND EXISTS ("
+            "SELECT 1 FROM outbox b JOIN orders o ON o.command_id = b.command_id "
+            "WHERE b.trade_id = t.trade_id AND b.status = 'PENDING' "
+            "AND o.action_type = 'CLOSE' AND o.status = 'PENDING') "
+            "ORDER BY created_at, trade_id"
+        )
         columns = tuple(column[0] for column in cursor.description)
         return tuple(
             self._load_trade(dict(zip(columns, row, strict=True)))

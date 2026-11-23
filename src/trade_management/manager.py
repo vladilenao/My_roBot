@@ -560,7 +560,7 @@ class TradeManager:
         # restart; it remains absent from the ordinary active recovery result.
         resume_guard = getattr(self._broker, "resume_gap_entry_guard_close", None)
         if callable(register) and callable(resume) and callable(resume_guard):
-            for trade in self._storage.load_trades(include_terminal=True):
+            for trade in self._storage.load_rejected_with_pending_close():
                 if trade.state.phase is not TradePhase.REJECTED or trade.state.quantity <= 0:
                     continue
                 for action in self._pending_proven_gap_guard_closes(trade):
