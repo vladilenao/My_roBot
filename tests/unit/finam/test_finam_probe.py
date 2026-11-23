@@ -103,3 +103,11 @@ def test_share_quantity_is_one_lot_in_shares(run, broker):
     result = run("probe", "SBER")
     assert result.code == 0, result.report()
     assert "SBER LIMIT покупка 10" in result.row("Ф0.12")[1]
+
+
+def test_clearing_is_not_trading(run, broker):
+    broker.session_type = "CLEARING"
+    result = run("probe", "NG")
+    assert result.code == 1
+    assert "сессия сейчас: CLEARING" in result.row("Ф0.10")[1]
+    assert placed(broker) == 0

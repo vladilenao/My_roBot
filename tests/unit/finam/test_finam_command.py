@@ -99,8 +99,9 @@ def test_account_reads_everything(run, broker):
     assert "лот совпал, шаг совпал, стоимость шага — нет в API Финама" in instruments
     assert "одна шкала" in result.row("Ф0.7")[1]
     assert "NG-12.26 quantity 1" in result.row("Ф0.2")[1]
-    assert "CORE_TRADING" in result.row("Ф0.8")[1]
-    assert "assets.Clock: 199 из 200" in result.row("Ф0.9")[1]
+    assert "NG-12.26: UTC CORE_TRADING 09:00–12:00; дни в ответе: Tue 24.11" in result.row("Ф0.8")[1]
+    assert "SBER: как у NG-12.26" in result.row("Ф0.8")[1]
+    assert "квот 1, лимит 200 у 1; израсходовано: assets.Clock 199 из 200" in result.row("Ф0.9")[1]
     # Только чтение: ни одной заявки.
     assert not {"orders.PlaceOrder", "orders.CancelOrder"} & set(network_calls(broker))
     # Биржевой тикер фьючерса и символ Финама — только в записях вызовов.

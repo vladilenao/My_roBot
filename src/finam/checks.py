@@ -37,7 +37,8 @@ KEY_PREFIX = "fp"
 KEY_MAX = 20
 _BASE36 = string.digits + string.ascii_lowercase
 # Сессии расписания, в которые заявки разведки не ставятся (названия Финама неизвестны — по словам).
-_CLOSED_WORDS = ("CLOSE", "BREAK", "MAINTENANCE", "HALT", "AUCTION")
+# Типы из ответа Schedule 23.11: CLOSED, OPENING_AUCTION, CLOSING_AUCTION, CLEARING, EARLY/CORE/LATE_TRADING.
+_CLOSED_WORDS = ("CLOSE", "BREAK", "MAINTENANCE", "HALT", "AUCTION", "CLEARING")
 
 
 def _base36(value: int) -> str:

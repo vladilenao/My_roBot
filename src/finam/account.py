@@ -32,10 +32,20 @@ def money(value) -> str:
 
 
 def usage_metrics(gateway) -> str:
+    """Квоты кратко: обычный лимит и число методов с ним, отличные от него, израсходованные сейчас."""
     response = gateway.call("metrics.GetUsageMetrics", metrics_pb2.GetUsageMetricsRequest())
-    parts = [f"{quota.name}: {quota.remaining} из {quota.limit}, сброс {ts(quota.reset_time)}"
-             for quota in response.quotas]
-    return "; ".join(parts) or "квот нет"
+    quotas = list(response.quotas)
+    if not quotas:
+        return "квот нет"
+    usual, count = Counter(quota.limit for quota in quotas).most_common(1)[0]
+    parts = [f"квот {len(quotas)}, лимит {usual} у {count}"]
+    other = [f"{quota.name} {quota.limit}" for quota in quotas if quota.limit != usual]
+    if other:
+        parts.append("другие лимиты: " + ", ".join(other))
+    used = [f"{quota.name} {quota.remaining} из {quota.limit} (сброс {ts(quota.reset_time)})"
+            for quota in quotas if quota.remaining < quota.limit]
+    parts.append("израсходовано: " + (", ".join(used) if used else "нет"))
+    return "; ".join(parts)
 
 
 class AccountRun(Run):
@@ -187,7 +197,7 @@ class AccountRun(Run):
         head = f"{item.chosen + ' ; ' if item.chosen else ''}{item.name}: символ найден, площадка {item.mic}"
         if len(item.candidates) > 1:
             head += f" (кандидатов {len(item.candidates)})"
-        finam = (f"Финам: тип {asset.type}, лот {num(item.lot_size)}, шаг {num(item.price_step)} (min_step "
+        finam = (f"Финам: тип {asset.type}, lot_size {num(item.lot_size)}, шаг {num(item.price_step)} (min_step "
                  f"{asset.min_step}, decimals {asset.decimals}), валюта {asset.quote_currency or 'нет'}")
         if asset.WhichOneof("asset_details") == "future_details":
             finam += (f", contract_size {num(dec(asset.future_details.contract_size))}, экспирация "
@@ -205,7 +215,10 @@ class AccountRun(Run):
             tinvest += f", стоимость шага {num(card.step_cost)}"
         if item.tinvest_go_buy is not None:
             tinvest += f", ГО лонг {num(item.tinvest_go_buy)}, ГО шорт {num(item.tinvest_go_sell)}"
-        lot_same = item.lot_size is not None and item.lot_size == Decimal(card.lot)
+        # У фьючерса lot_size Финама — размер контракта в базовом активе (Si 1000, NG 100, прогон 23.11),
+        # а число контрактов в лоте — trade_lot_size. У акции лот — lot_size.
+        lot = Decimal(params.trade_lot_size) if item.kind == "future" else item.lot_size
+        lot_same = lot is not None and lot == Decimal(card.lot)
         step_same = item.price_step is not None and item.price_step == card.price_step
         verdict = (f"лот {'совпал' if lot_same else 'не совпал'}, шаг {'совпал' if step_same else 'не совпал'}, "
                    "стоимость шага — нет в API Финама")
@@ -245,17 +258,31 @@ class AccountRun(Run):
     def _check_schedule(self) -> bool:
         clock = self.gateway.call("assets.Clock", assets_pb2.ClockRequest())
         lines = [f"время сервера {ts(clock.timestamp)}"]
+        seen: dict[str, str] = {}
         for item in self.items:
             schedule = self.gateway.call("assets.Schedule", assets_pb2.ScheduleRequest(symbol=item.symbol))
-            sessions = []
-            for session in schedule.sessions:
-                start = session.interval.start_time.ToDatetime(tzinfo=timezone.utc)
-                end = session.interval.end_time.ToDatetime(tzinfo=timezone.utc)
-                sessions.append(f"{session.type} {start:%a %d.%m %H:%M}–{end:%H:%M} UTC")
-            kinds = Counter(session.type for session in schedule.sessions)
-            lines.append(f"{item.name}: сессий {len(sessions)}, типы {dict(kinds)}: " + "; ".join(sessions[:30]))
+            text = schedule_summary(schedule.sessions)
+            same = next((name for name, other in seen.items() if other == text), None)
+            lines.append(f"{item.name}: как у {same}" if same else f"{item.name}: {text}")
+            seen[item.name] = text
         self._set("Ф0.8", YES, "; ".join(lines))
         return True
+
+
+def schedule_summary(sessions) -> str:
+    """Сессии по времени суток без повторов по дням: «тип ЧЧ:ММ–ЧЧ:ММ», затем дни, которые покрывает ответ."""
+    slots: dict[tuple, None] = {}
+    days: dict[str, None] = {}
+    for session in sorted(sessions, key=lambda item: item.interval.start_time.seconds):
+        start = session.interval.start_time.ToDatetime(tzinfo=timezone.utc)
+        end = session.interval.end_time.ToDatetime(tzinfo=timezone.utc)
+        if end <= start:
+            continue  # нулевые интервалы-метки между сессиями
+        slots[(session.type, f"{start:%H:%M}", f"{end:%H:%M}")] = None
+        days[f"{start:%a %d.%m}"] = None
+    order = sorted(slots, key=lambda slot: (slot[1], slot[0]))
+    return ("UTC " + "; ".join(f"{kind} {start}–{end}" for kind, start, end in order)
+            + f"; дни в ответе: {', '.join(days)}")
 
 
 def accounts_status(value) -> str:

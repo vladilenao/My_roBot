@@ -122,6 +122,7 @@ class FakeFinam:
     now: datetime = NOW
     last: dict = field(default_factory=lambda: {NG: Decimal("3.000"), SBER: Decimal("300.00")})
     trading: bool = True
+    session_type: str = "CORE_TRADING"
     reject_off_step: bool = True
     repeat_after_error: str = "accept"  # accept | reject — тот же ключ после отказа
     repeat_key: str = "reject"  # reject | same | new — тот же ключ после приёма
@@ -287,7 +288,7 @@ class _Api:
         self.b.check("assets.GetAsset", metadata)
         if request.symbol == NG:
             return assets_pb2.GetAssetResponse(ticker="NGZ6", mic="RTSX", type="FUTURES", decimals=3, min_step=1,
-                                               lot_size=d(1), future_details=assets_pb2.GetAssetResponse.FutureDetails(
+                                               lot_size=d(100), future_details=assets_pb2.GetAssetResponse.FutureDetails(
                                                    contract_size=d(100)))
         return assets_pb2.GetAssetResponse(ticker="SBER", mic="MISX", type="EQUITIES", decimals=2, min_step=1,
                                            lot_size=d(10))
@@ -297,13 +298,13 @@ class _Api:
         from google.protobuf.wrappers_pb2 import BoolValue
 
         return assets_pb2.GetAssetParamsResponse(
-            symbol=request.symbol, is_tradable=BoolValue(value=True),
+            symbol=request.symbol, is_tradable=BoolValue(value=True), trade_lot_size=1,
             long_initial_margin=money_pb2.Money(currency_code="RUB", units=16000),
             short_initial_margin=money_pb2.Money(currency_code="RUB", units=16500))
 
     def assets__Schedule(self, request, metadata):
         self.b.check("assets.Schedule", metadata)
-        kind = "CORE_TRADING" if self.b.trading else "CLOSED"
+        kind = self.b.session_type if self.b.trading else "CLOSED"
         session = assets_pb2.ScheduleResponse.Sessions(type=kind, interval=interval_pb2.Interval(
             start_time=stamp(self.b.now - timedelta(hours=1)), end_time=stamp(self.b.now + timedelta(hours=2))))
         return assets_pb2.ScheduleResponse(symbol=request.symbol, sessions=[session])
