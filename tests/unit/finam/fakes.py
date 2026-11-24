@@ -129,6 +129,7 @@ class FakeFinam:
     band_pct: Decimal | None = None  # цены ниже last*(1-band) отклоняются
     fill_limit: bool = False  # лимитная заявка сразу исполняется (сбой разведки)
     trigger_after_polls: int | None = 1  # стоп срабатывает на N-м GetOrder; None — не срабатывает
+    stop_lookup_returns_child: bool = True  # как 24.11: GetOrder по номеру сработавшего стопа отдаёт порождённую
     exhaust_clock_after: int | None = None
     exhaust_place: bool = False
     no_money: bool = False  # заявки отклоняются по обеспечению, как на пустом счёте 23.11
@@ -395,11 +396,14 @@ class _Api:
             if b._stop_polls >= b.trigger_after_polls:
                 market = orders_pb2.Order(account_id=state.order.account_id, symbol=state.order.symbol,
                                           quantity=state.order.quantity, side=state.order.side,
-                                          type=orders_pb2.ORDER_TYPE_MARKET)
+                                          type=orders_pb2.ORDER_TYPE_MARKET,
+                                          client_order_id=state.order.client_order_id)
                 child = b.execute(market, price=Decimal(state.order.stop_price.value))
                 state.status = S.ORDER_STATUS_EXECUTED
                 state.triggered_order_id = child.order_id
                 b.push(state)
+        if state.triggered_order_id and b.stop_lookup_returns_child:
+            return b.orders[state.triggered_order_id]
         return state
 
     def orders__CancelOrder(self, request, metadata):

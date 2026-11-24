@@ -249,19 +249,38 @@ class TriggerProbe(StopRunBase):
                                 f"{describe(state, self.instruments)}")
         return True
 
+    def _stop_state(self):
+        """Стоп по номеру.
+
+        Прогон 24.11: после срабатывания ``GetOrder`` по номеру стопа отдаёт уже порождённую рыночную
+        заявку (другой номер, тот же ключ), а сам стоп со статусом ``EXECUTED`` и ``triggered_order_id``
+        виден только в ``GetOrders`` и в стримах. Возвращает пару: стоп и ответ ``GetOrder``.
+        """
+        got = self.desk.get(self.stop_id)
+        if got.order_id == self.stop_id:
+            return got, got
+        stop = next((item for item in self.desk.orders() if item.order_id == self.stop_id), got)
+        return stop, got
+
     def _wait_trigger(self) -> bool:
         history: list[str] = []
         last_status = None
         deadline = self.timing.clock() + timedelta(minutes=self.wait_min)
         while True:
-            state = self.desk.get(self.stop_id)
+            state, got = self._stop_state()
             if state.status != last_status:
                 last_status = state.status
                 history.append(f"{self.timing.clock():%H:%M:%S} {status_name(state.status)}")
-            if state.triggered_order_id:
-                self.triggered_id = state.triggered_order_id
-                self._set("Ф0.31", YES, f"сработал: статусы {' → '.join(history)}; triggered_order_id "
-                                        f"{self.triggered_id}; {describe(state, self.instruments)}")
+            substituted = got.order_id != self.stop_id
+            triggered = state.triggered_order_id or (got.order_id if substituted else "")
+            if triggered:
+                self.triggered_id = triggered
+                detail = (f"сработал: статусы {' → '.join(history)}; triggered_order_id "
+                          f"{state.triggered_order_id or 'пуст'}; {describe(state, self.instruments)}")
+                if substituted:
+                    detail += (f"; GetOrder по номеру стопа {self.stop_id} отдал порождённую заявку: "
+                               f"{describe(got, self.instruments)}")
+                self._set("Ф0.31", YES, detail)
                 return True
             if state.status in FINAL_STATUSES:
                 self._set("Ф0.31", NO, f"стоп завершился без triggered_order_id: статусы {' → '.join(history)}; "
@@ -284,7 +303,7 @@ class TriggerProbe(StopRunBase):
             return item.order_id == self.triggered_id
 
         events = events_summary(self.streams.order_events(ours), self.triggered_id)
-        stop = self.desk.get(self.stop_id)
+        stop, _ = self._stop_state()
         self._set("Ф0.32", YES if executed(state) > 0 else NO,
                   f"порождённая: {describe(state, self.instruments)}; стоп после срабатывания: "
                   f"{describe(stop, self.instruments)}; стримы: {events}")
@@ -391,7 +410,7 @@ class TriggerProbe(StopRunBase):
         notes = []
         if self.stop_id:
             try:
-                stop = self.desk.get(self.stop_id)
+                stop, _ = self._stop_state()
                 if is_active(stop):
                     self.desk.cancel(self.stop_id)
                     notes.append("стоп снят")

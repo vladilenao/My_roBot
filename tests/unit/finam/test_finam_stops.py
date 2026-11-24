@@ -47,6 +47,8 @@ def test_trigger_trades_and_closes(run, broker):
         assert result.row(code)[0] == "да", (code, result.row(code))
     assert "стоп покупка по 3.001" in result.row("Ф0.30")[1]
     assert "triggered_order_id" in result.row("Ф0.31")[1]
+    assert "GetOrder по номеру стопа" in result.row("Ф0.31")[1]
+    assert "EXECUTED" in result.row("Ф0.32")[1]
     assert "комиссия 1.5 RUB" in result.row("Ф0.33")[1]
     assert "позиция до 0, после 1" in result.row("Ф0.34")[1]
     assert broker.positions[NG] == Decimal(0)
@@ -96,3 +98,12 @@ def test_probes_do_not_touch_kept_stop_of_earlier_run(run, broker):
     result = run("cleanup")
     assert broker.orders[kept.order_id].status == orders_pb2.ORDER_STATUS_CANCELED
     assert "снято заявок разведки: 1" in result.text
+
+
+def test_trigger_when_get_order_returns_stop_itself(run, broker):
+    """Если брокер отдаст по номеру стопа сам стоп, срабатывание видно по triggered_order_id."""
+    broker.stop_lookup_returns_child = False
+    result = run("probe-trigger", "NG", "--demo")
+    assert result.row("Ф0.31")[0] == "да", result.row("Ф0.31")
+    assert "GetOrder по номеру стопа" not in result.row("Ф0.31")[1]
+    assert result.row("Ф0.35")[0] == "да" and broker.positions[NG] == Decimal(0)
