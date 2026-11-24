@@ -62,38 +62,47 @@
 
 ## 5. API
 
-- [ ] 5.1 `AccountControl` — параметры экземпляра: контур, база, заголовок, провайдер, `orders_enabled`, `reconcile_extras`, сравнение; `routes()`; `broker` в сводке и `GET`.
-- [ ] 5.2 `comparison_view.py`: `AccountComparison` с именем своей стороны, `SIDES` от него.
-- [ ] 5.3 `export_api.py`:
+- [x] 5.1 `AccountControl` — параметры экземпляра: контур, база, заголовок, провайдер, `orders_enabled`, `reconcile_extras`, сравнение; `routes()`; `broker` в сводке и `GET`.
+- [x] 5.2 `comparison_view.py`: `AccountComparison` с именем своей стороны, `SIDES` от него.
+- [x] 5.3 `export_api.py`:
   - таблица `LIVE` «базовый путь → ресурс» вместо `_account_get` / `_account_command` по `views.ACCOUNT`;
   - `GET /api/v1` по таблице;
   - ресурсы торговли `finam`.
-- [ ] 5.4 `run.py`: ресурсы `account` и `finam` с их частями; журнал торговли `finam`.
-- [ ] 5.5 `docs/api/openapi.yaml` 2.14.0:
+- [x] 5.4 `run.py`: ресурсы `account` и `finam` с их частями; журнал торговли `finam`.
+- [x] 5.5 `docs/api/openapi.yaml` 2.14.0:
   - тег «Счёт Финам», пути;
   - `Finam`, `FinamCurrent`, `FinamAdmission`;
   - `broker` у `Account`;
   - `account_link: maintenance`.
 
   Тест схемы.
-- [ ] 5.6 Тесты API: чтения `finam`, `409 ACCOUNT_READ_ONLY`, `404` сравнения и предохранителей, ключ `finam`, `broker`; ответы `account` и `sandbox` прежние.
+- [x] 5.6 Тесты API: чтения `finam`, `409 ACCOUNT_READ_ONLY`, `404` сравнения и предохранителей, ключ `finam`, `broker`; ответы `account` и `sandbox` прежние.
+
+  Сделано 24.11 (de3dd39): полный `pytest` на снимке коммита — 4479 passed, `ruff` чистый. Изменённые проверки: версия контракта 2.14.0 (`test_launch_control`); сборка ресурса «Счёта» в `test_account_api` передаёт разведку комиссий, как `run.py`.
 
 ## 6. Регресс — автотесты
 
-- [ ] 6.1 Маскирование: `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID`, каждый JWT и номера счетов `TokenDetails` — нет в логе, `status.json`, событиях канала, ответах API.
-- [ ] 6.2 Два живых контура одновременно: `account` и `finam` — свои каталоги, базы, отпечатки; отпечаток `finam` не принимает чужой счёт.
-- [ ] 6.3 Конфиг `[contours.finam]`.
-- [ ] 6.4 Полный `pytest` и `ruff check src tests run.py`.
-- [ ] 6.5 PyInstaller: `run.spec` собирает; собранный `--contour finam` без секрета отказывает «Не задан FINAM_SECRET_TOKEN».
+- [x] 6.1 Маскирование: `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID`, каждый JWT и номера счетов `TokenDetails` — нет в логе, `status.json`, событиях канала, ответах API.
+- [x] 6.2 Два живых контура одновременно: `account` и `finam` — свои каталоги, базы, отпечатки; отпечаток `finam` не принимает чужой счёт.
+- [x] 6.3 Конфиг `[contours.finam]`.
+- [x] 6.4 Полный `pytest` и `ruff check src tests run.py`.
+  6.1 — `test_finam_contour.py::test_secrets_nowhere`, `test_finam_transport.py`; 6.2 — `test_account_and_finam_side_by_side`, `test_foreign_fingerprint_refused_with_alarm`; 6.3 — `test_contour_config.py` (finam). Итог — 4479 passed.
+- [x] 6.5 PyInstaller: `run.spec` собирает; собранный `--contour finam` без секрета отказывает «Не задан FINAM_SECRET_TOKEN».
+  Сделано 24.11: сборка прошла, в PYZ есть `src.broker_contour.finam.*`, `src.broker_contour.tinvest.catalog` и заглушки `src.finam.proto`; собранный `run --contour finam` собрал адаптер без ошибок импорта и вышел с кодом 2 «Не задан FINAM_SECRET_TOKEN».
 
 ## 7. UI (репозиторий `UI`, ветка `feature/ui-finam-contour`)
 
-- [ ] 7.1 `TradingContour`, `BrokerContour` += `'finam'`; таблица `CONTOUR_BASE` в `queries.ts`.
-- [ ] 7.2 `AccountPage` с параметром `contour`, маршрут `/finam`, пункт меню «Счёт Финам» при ключе `finam` в `GET /api/v1`; блок допуска показывает общие поля и поля своего брокера, если они есть.
-- [ ] 7.3 Карточка в «Обзоре», строка в «Аварийной остановке», метка брокера в шапке.
-- [ ] 7.4 Типы из OpenAPI 2.14.0, `npm run build`, проверка на тестовом роботе 8102.
+- [x] 7.1 `TradingContour`, `BrokerContour` += `'finam'`; таблица `CONTOUR_BASE` в `queries.ts`.
+- [x] 7.2 `AccountPage` с параметром `contour`, маршрут `/finam`, пункт меню «Счёт Финам» при ключе `finam` в `GET /api/v1`; блок допуска показывает общие поля и поля своего брокера, если они есть.
+- [x] 7.3 Карточка в «Обзоре», строка в «Аварийной остановке», метка брокера в шапке.
+- [x] 7.4 Типы из OpenAPI 2.14.0, `npm run build`; проверка на тестовом роботе 8102 — в 8.5.
+
+  Сделано 24.11 в репозитории UI, ветка `feature/ui-finam-contour` (3bb6ecf): контракт 2.14.0, `npm run check` — 316 тестов, lint и формат чистые; `npm run build` собран. Маршрут — `/contours/finam`, как у остальных контуров (`/contours/account`). Сравнение контуров на странице Финама не показывается до Ф4. В браузере не проверено — проверка в 8.5.
 
 ## 8. Ручная проверка владельца — тестовый робот 8102, не ПРОМ
+
+Пошаговая инструкция — `regress.md`.
+
 
 - [ ] 8.1 Контур `finam` стартует и проходит допуск на реальном счёте Финама. Карточка старта в канале Финама с меткой «СЧЁТ ФИНАМ» и последними 4 символами счёта.
 - [ ] 8.2 Сверка «ок». Расхождение видно: ручная заявка владельца в терминале Финама → тревога сверки; заявка снята → сверка снова «ок».
