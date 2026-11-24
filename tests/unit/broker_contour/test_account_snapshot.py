@@ -22,6 +22,7 @@ from tests.unit.broker_contour.test_broker_contour import (
     FakeTradingPart,
     Stop,
     _gateway,
+    _sessions,
     _launch,
     _run_in_thread,
     _settings,
@@ -118,7 +119,7 @@ def test_glitched_portfolio_skips_reconcile_and_keeps_stop_guard_snapshot(tmp_pa
         return parts[-1]
 
     from src.broker_contour.process import BrokerContour
-    contour = BrokerContour(_settings(tmp_path, orders=True), gateway_factory=_gateway(broker), bus=bus, stop=stop,
+    contour = BrokerContour(_settings(tmp_path, orders=True), session_factory=_sessions(broker), bus=bus, stop=stop,
                             pid=4242, trading_factory=factory)
     thread, _ = _run_in_thread(contour)
     assert _wait(lambda: (tmp_path / "contours/sandbox/status.json").exists()

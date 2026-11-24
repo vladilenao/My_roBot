@@ -18,6 +18,8 @@ from src.broker_contour.reconcile import JournalView, Reconciler, compare
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore, read_last_report
 from src.events.bus import EventBus
 from src.events.types import EventType
+from src.broker_contour.tinvest.account import robot_account as sandbox_rule
+from src.broker_contour.tinvest.session import TInvestSession, adapter
 from src.sandbox.gateway import SandboxGateway
 from tests.unit.sandbox.fakes import ACCOUNT_ID, NG_UID, TOKEN, FakeBroker, FakeClient, robot_account
 
@@ -63,6 +65,11 @@ class Stop:
 def _gateway(broker):
     return lambda token: SandboxGateway(token, client_factory=lambda value: FakeClient(broker, value),
                                         sleep=lambda seconds: None)
+
+
+def _sessions(broker):
+    """Сессии Т-Инвест песочницы на фейковом брокере (refactor-broker-port)."""
+    return adapter("sandbox", token=TOKEN, gateway_factory=_gateway(broker))
 
 
 def _settings(tmp_path, **overrides):
@@ -111,7 +118,7 @@ def test_first_start_opens_account_and_writes_fingerprint(tmp_path):
     broker = FakeBroker(rub=Decimal(0))
     store = BrokerStore(tmp_path / BROKER_DATABASE_FILE)
     with _gateway(broker)(TOKEN) as gateway:
-        admitted = admit_account(gateway, store, broker="sandbox")
+        admitted = admit_account(TInvestSession(gateway, rule=sandbox_rule), store, broker="sandbox")
     assert admitted.fingerprint_created and admitted.account.opened
     fingerprint = store.fingerprint()
     assert fingerprint.account_tail == "…a1b2" and ACCOUNT_ID not in (tmp_path / BROKER_DATABASE_FILE).read_bytes().decode(
@@ -125,7 +132,7 @@ def test_foreign_fingerprint_refused(tmp_path):
     from src.broker_contour.fingerprint import fingerprint_of
     store.save_fingerprint(fingerprint_of("sandbox", "sbx-other-account-09c3"))
     with _gateway(broker)(TOKEN) as gateway, pytest.raises(AdmissionError) as exc:
-        admit_account(gateway, store, broker="sandbox")
+        admit_account(TInvestSession(gateway, rule=sandbox_rule), store, broker="sandbox")
     assert "другому счёту …09c3" in exc.value.reason and exc.value.alarm
     assert store.fingerprint().account_tail == "…09c3"
 
@@ -135,7 +142,7 @@ def test_two_robot_accounts_refused(tmp_path):
         s.Account(id="sbx-first-0001", name="My_roBot", status=s.AccountStatus.ACCOUNT_STATUS_OPEN),
         s.Account(id="sbx-second-0002", name="My_roBot", status=s.AccountStatus.ACCOUNT_STATUS_OPEN)])
     with _gateway(broker)(TOKEN) as gateway, pytest.raises(AdmissionError) as exc:
-        admit_account(gateway, BrokerStore(tmp_path / BROKER_DATABASE_FILE), broker="sandbox")
+        admit_account(TInvestSession(gateway, rule=sandbox_rule), BrokerStore(tmp_path / BROKER_DATABASE_FILE), broker="sandbox")
     assert "…0001" in exc.value.reason and "…0002" in exc.value.reason
 
 
@@ -189,7 +196,7 @@ def test_reconciler_schedule():
 def _contour(tmp_path, broker, **overrides):
     bus, collector, stop = EventBus(), Collector(), Stop()
     bus.subscribe(collector)
-    contour = BrokerContour(_settings(tmp_path, **overrides), gateway_factory=_gateway(broker), bus=bus, stop=stop,
+    contour = BrokerContour(_settings(tmp_path, **overrides), session_factory=_sessions(broker), bus=bus, stop=stop,
                             pid=4242)
     return contour, collector, stop
 
@@ -349,7 +356,7 @@ def test_process_with_orders_recovers_reconciles_and_stops(tmp_path):
         parts.append(FakeTradingPart(trading, control, strategies, stop))
         return parts[-1]
 
-    contour = BrokerContour(_settings(tmp_path, orders=True), gateway_factory=_gateway(broker), bus=bus, stop=stop,
+    contour = BrokerContour(_settings(tmp_path, orders=True), session_factory=_sessions(broker), bus=bus, stop=stop,
                             pid=4242, trading_factory=factory)
     thread, result = _run_in_thread(contour)
     assert _wait(lambda: (tmp_path / "contours/sandbox/status.json").exists()
@@ -387,7 +394,7 @@ def test_stopped_status_shows_account_after_stop_not_last_reconcile(tmp_path):
     def factory(trading, control, strategies):
         return FakeTradingPart(trading, control, strategies, stop)
 
-    contour = BrokerContour(_settings(tmp_path, orders=True, reconcile_every_secs=3600), gateway_factory=_gateway(broker),
+    contour = BrokerContour(_settings(tmp_path, orders=True, reconcile_every_secs=3600), session_factory=_sessions(broker),
                             bus=bus, stop=stop, pid=4242, trading_factory=factory)
     thread, result = _run_in_thread(contour)
     assert _wait(lambda: (tmp_path / "contours/sandbox/status.json").exists() and _status(tmp_path).get("members"))

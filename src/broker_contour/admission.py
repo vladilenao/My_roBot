@@ -6,13 +6,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from src.broker_contour.fingerprint import FingerprintMismatch, check_fingerprint
-from src.broker_contour.port import AccountRuleError, AccountSnapshot, BrokerCallError, RobotAccount  # noqa: F401
+from src.broker_contour.port import AccountRuleError, AccountSnapshot, BrokerCallError, BrokerSession, RobotAccount
 from src.broker_contour.store import BrokerStore
-from src.broker_contour.tinvest.account import read_account, robot_account
 
 
 class AdmissionError(Exception):
@@ -50,26 +48,24 @@ def check_settings(*, token: str | None, token_env: str, bot_token: str | None, 
         raise AdmissionError(f"Не задан {channel_env} — канал контура обязателен: сделки без уведомлений недопустимы")
 
 
-def admit_account(gateway, store: BrokerStore, *, broker: str, find_account: Callable = robot_account,
-                  read_facts: Callable | None = None) -> Admitted:
+def admit_account(session: BrokerSession, store: BrokerStore, *, broker: str) -> Admitted:
     """Сетевые проверки: счёт робота, факты допуска (у «Счёта»), отпечаток, снимок счёта.
 
-    ``find_account(gateway)`` — правило счёта вида; ``read_facts(gateway, account)`` — права токена и
-    допуски брокера, отказ — ``AdmissionError``.
+    Правило счёта и факты допуска — у сессии брокера; отказ фактов — ``AdmissionError``.
     """
     try:
-        account = find_account(gateway)
+        account = session.find_account()
     except AccountRuleError as exc:
         raise AdmissionError(str(exc), alarm=True) from None
     except BrokerCallError as exc:
         raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True) from None
-    facts = read_facts(gateway, account) if read_facts is not None else None
+    facts = session.read_facts(account)
     try:
         _, created = check_fingerprint(store, broker, account.account_id)
     except FingerprintMismatch as exc:
         raise AdmissionError(str(exc), alarm=True, account_tail=account.masked) from None
     try:
-        snapshot = read_account(gateway, account)
+        snapshot = session.read_account(account)
     except BrokerCallError as exc:
         raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True, account_tail=account.masked) from None
     return Admitted(account, snapshot, created, facts)

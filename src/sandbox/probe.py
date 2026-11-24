@@ -72,7 +72,7 @@ CHECKS = (
     ("П12", "Операции"),
     ("П13", "Стоп-заявка ставится"),
     ("П14", "Стоп-заявка исполняется"),
-    # С3 (add-tinvest-orders): допущения TInvestBroker.
+    # С3 (add-tinvest-orders): допущения LiveBroker.
     ("П16", "Сделки исполнения в стриме и stages"),
     ("П17", "Лимит вне коридора"),
     ("П18", "Поиск незнакомого ключа"),
@@ -504,7 +504,7 @@ class Probe:
             self.timing.sleep(self.timing.poll_secs)
             waited += self.timing.poll_secs
 
-    # --- П16–П18: допущения TInvestBroker (add-tinvest-orders) ----------------
+    # --- П16–П18: допущения LiveBroker (add-tinvest-orders) ----------------
     def _check_trades(self) -> bool:
         """Сделки биржи рыночной покупки: номера и цена в стриме (котировка) и в ``GetOrderState.stages``."""
         event = self._wait_event(lambda item: item.order_id == self._market_id and bool(getattr(item, "trades", None)))
@@ -548,7 +548,7 @@ class Probe:
         return False
 
     def _unknown_key(self) -> bool:
-        """``GetOrderState`` по случайному ключу: ``TInvestBroker`` считает «не найдена» по коду NOT_FOUND."""
+        """``GetOrderState`` по случайному ключу: ``LiveBroker`` считает «не найдена» по коду NOT_FOUND."""
         try:
             self.gateway.call("orders.get_order_state", account_id=self.account.account_id, order_id=new_key(),
                               order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST)

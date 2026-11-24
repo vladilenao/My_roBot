@@ -1,15 +1,15 @@
 """Узкий адаптер API Т-Инвест для контура на брокере (add-tinvest-orders, refactor-broker-port).
 
-``TInvestBroker`` не знает SDK: он получает отчёты ``OrderReport`` и ошибки
-``OrderFailure`` с понятным видом. Котировка без валюты (``Quotation``) — цена
-в пунктах; сумма с валютой (``MoneyValue``) у фьючерса — рубли за контракт,
-их переводит ``prices.points_from_rub``. Разведка С1: цены сделок биржи в
-стриме приходят в пунктах, суммы заявки — в рублях.
+``TInvestApi`` — единственное место вызовов SDK у брокера контура: отчёты Т-Инвест
+(``TInvestOrderReport``) и ошибки ``OrderFailure`` с понятным видом. Котировка без валюты
+(``Quotation``) — цена в пунктах; сумма с валютой (``MoneyValue``) у фьючерса — рубли за
+контракт, их переводит в пункты ``TInvestPort`` (``tinvest/prices.py``). Разведка С1: цены
+сделок биржи в стриме приходят в пунктах, суммы заявки — в рублях.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Iterator
@@ -17,8 +17,7 @@ from typing import Iterator
 from t_tech.invest import schemas as s
 from t_tech.invest.utils import money_to_decimal, quotation_to_decimal
 
-from src.broker_contour.port import (BrokerCallError, BrokerTrade, OperationReport, OrderFailure,  # noqa: F401
-                                     OrderReport, StopReport)
+from src.broker_contour.port import BrokerCallError, OrderFailure
 
 # Обрыв или тайм-аут: брокер мог принять заявку — её ищут по ключу (design.md, решение 8).
 TRANSPORT_CODES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "UNKNOWN", "CANCELLED", "ABORTED"})
@@ -50,6 +49,84 @@ _STOP_STATUS = {
     s.StopOrderStatusOption.STOP_ORDER_STATUS_CANCELED: "cancelled",
     s.StopOrderStatusOption.STOP_ORDER_STATUS_EXPIRED: "expired",
 }
+
+
+# --- отчёты Т-Инвест как прислал брокер; в пункты их переводит ``TInvestPort`` ----------
+@dataclass(frozen=True)
+class TInvestTrade:
+    """Сделка биржи по заявке: номер, цена, количество (как прислал брокер), время.
+
+    ``in_rub`` — цена пришла суммой (``OrderStage`` в ``GetOrderState``): у фьючерса это рубли за
+    контракт. Цена сделки стрима (``OrderTrade``) — котировка в пунктах.
+    """
+
+    trade_id: str
+    price: Decimal
+    quantity: int
+    at: datetime
+    in_rub: bool = False
+
+
+@dataclass(frozen=True)
+class TInvestOrderReport:
+    """Состояние заявки у брокера: из ответа ``PostOrder``, ``GetOrderState`` или стрима."""
+
+    broker_order_id: str
+    key: str | None
+    status: str                        # new · partial · fill · cancelled · rejected · unknown
+    lots_requested: int
+    lots_executed: int
+    instrument_uid: str = ""
+    trades: tuple[TInvestTrade, ...] = ()
+    executed_rub: Decimal | None = None   # сумма исполнения ``executed_order_price`` (рубли у фьючерса)
+    initial_rub: Decimal | None = None    # сумма заявки ``initial_order_price``: запрошенные лоты × цена лота
+    temporary: bool = False               # первое событие стрима с временным номером заявки
+    at: datetime | None = None
+    executed_fee: Decimal | None = None   # ``executed_commission`` состояния заявки; ноль и нет поля — ``None``
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in {"fill", "cancelled", "rejected"}
+
+
+@dataclass(frozen=True)
+class TInvestStopReport:
+    """Стоп-заявка у брокера из ``GetStopOrders``.
+
+    ``stop_price`` — как прислал брокер: у фьючерса это может быть рубли за контракт, а не пункты
+    (разведка П19); поиск сравнивает оба прочтения. Нашего ключа у стоп-заявки в ответе нет.
+    """
+
+    stop_order_id: str
+    instrument_uid: str
+    side: str                     # BUY · SELL
+    lots: int
+    stop_price: Decimal | None
+    status: str                   # active · executed · cancelled · expired · unknown
+    exchange_order_id: str = ""
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class OperationReport:
+    """Операция счёта из ``GetOperationsByCursor`` (add-account-vs-emulation-report, решение 6).
+
+    ``kind`` — ``trade`` (покупка или продажа) или ``fee`` («комиссия брокера»); ``amount`` — модуль
+    суммы операции; ``commission`` — модуль поля комиссии или ``None``, если поле не задано;
+    ``trades`` — номера сделок биржи с количеством из ``trades_info``.
+    """
+
+    operation_id: str
+    parent_id: str
+    kind: str
+    at: datetime | None
+    amount: Decimal
+    commission: Decimal | None
+    trades: tuple[tuple[str, int], ...] = ()
+
+
+# Прежние имена отчётов внутри адаптера Т-Инвест.
+BrokerTrade, OrderReport, StopReport = TInvestTrade, TInvestOrderReport, TInvestStopReport
 
 
 def classify(error: BrokerCallError) -> OrderFailure:

@@ -1,4 +1,6 @@
-"""``TInvestBroker`` — исполнение команд ``TradeManager`` настоящими заявками (add-tinvest-orders).
+"""``LiveBroker`` — исполнение команд ``TradeManager`` настоящими заявками (add-tinvest-orders, refactor-broker-port).
+
+Брокер — через порты ``src.broker_contour.port``: адаптер передаёт сборка, SDK здесь неизвестен.
 
 ``submit`` отвечает сразу: ``ACK`` (принята или судьба неизвестна) либо
 ``REJECT``. Исполнения, подтверждённые снятия и поздние отказы приходят позже:
@@ -23,13 +25,12 @@ from typing import Callable, Mapping
 
 from src.broker.journal_broker import JournalBroker, stop_triggered
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeSource
-from src.broker_contour.port import OrderFailure, OrderReport
+from src.broker_contour.port import BrokerApi, MarginLimits, OrderFailure, OrderReport
 from src.broker_contour.orders import (ACCEPTED, CANCELLED, CANCELLING, FILLED, PARTIAL, REJECTED, SENDING, UNKNOWN,
                                        LedgerExecution, LedgerOrder, OrderLedger, order_key)
 from src.broker_contour.stops import StopKeeping, StopLedger
-from src.broker_contour.prices import (PriceCard, card_from_meta, entry_limit, executed_lots, exit_limit,
-                                       fill_average, in_band, target_limit, to_step, trade_lots, trade_price,
-                                       with_margin)
+from src.broker_contour.prices import (PriceBook, PriceCard, card_from_meta, entry_limit, executed_lots, exit_limit,
+                                       in_band, target_limit, to_step, trade_lots, with_margin)
 from src.events.event import Event
 from src.events.types import EventType
 from src.logging_setup import get_logger
@@ -44,10 +45,8 @@ ENTRY_KINDS = ("entry", "add")
 EXIT_KINDS = ("exit", "stop", "emergency", "broker_stop")
 CANCEL_CONFIRM_SECS = 10
 SYNC_EVERY_SECS = 60
-MARGIN_EVERY = timedelta(days=1)
 MINUTE = timedelta(minutes=1)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-BY_ORDER = "tinvest-order:"    # исполнение без сделок биржи: tinvest-order:<номер заявки>:<итог lots_executed>
 _CENT = Decimal("0.01")
 
 
@@ -113,17 +112,27 @@ class ExitJob:
     rejected_reported: bool = False
 
 
-class TInvestBroker(StopKeeping, BrokerPort):
-    def __init__(self, api, ledger: OrderLedger, *, contour: str, policy: ExitPolicy = ExitPolicy(),
+class LiveBroker(StopKeeping, BrokerPort):
+    """Брокер контура на настоящих заявках.
+
+    ``book`` — карточки цен, общие с адаптером; ``margin_limits`` — объём по обеспечению брокера (только у
+    «Счёта»); ``fills_prefix`` — номера исполнений ``<префикс>:<сделка>`` и ``<префикс>-order:<заявка>:<лоты>``
+    (у Т-Инвест ``tinvest``: номера старых баз не меняются); ``margin_every`` — как часто перечитывать ГО.
+    """
+
+    def __init__(self, api: BrokerApi, ledger: OrderLedger, *, contour: str, book: PriceBook, fills_prefix: str,
+                 margin_every: timedelta, margin_limits: MarginLimits | None = None, policy: ExitPolicy = ExitPolicy(),
                  publish: Callable[[Event], None] = lambda event: None,
                  journal_has: Callable[[str], bool] = lambda execution_id: False,
                  entry_ttl: Callable[[str], int] = lambda timeframe: 3600,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  stops: StopLedger | None = None,
-                 order_outcome: Callable[[bool, str], None] = lambda accepted, reason: None,
-                 ask_max_lots: bool = False):
+                 order_outcome: Callable[[bool, str], None] = lambda accepted, reason: None):
         self._api = api
-        self._ask_max_lots = ask_max_lots   # «Счёт»: объём входа не больше GetMaxLots (fix 30042)
+        self._margin_limits = margin_limits   # «Счёт»: объём входа не больше GetMaxLots (fix 30042)
+        self._fill = f"{fills_prefix}:"              # исполнение по сделке биржи: <префикс>:<номер сделки>
+        self._by_order = f"{fills_prefix}-order:"    # без сделок биржи: <префикс>-order:<заявка>:<итог lots_executed>
+        self._margin_every = margin_every
         self._ledger = ledger
         ledger.clock = clock
         self._contour = contour
@@ -141,11 +150,12 @@ class TInvestBroker(StopKeeping, BrokerPort):
         self._emitted: set[str] = set()
         self._applied: dict[str, tuple[str, dict]] = {}   # исполнение → (сделка, что оно изменило в представлении)
         self._contracts: dict = {}
-        self._cards: dict[str, PriceCard] = {}
+        self._book = book
+        self._cards: dict[str, PriceCard] = book.cards
         self._margins: dict[str, dict] = {}
         self._margin_at: dict[str, datetime] = {}
         self._names: dict[str, str] = {}
-        self._keys: dict[str, str] = {}              # UID брокера → ключ инструмента контура (тикер или UID)
+        self._keys: dict[str, str] = book.keys       # UID брокера → ключ инструмента контура (тикер или UID)
         self._last_close: dict[str, Decimal] = {}
         self._processed_bars: set[tuple[str, datetime]] = set()
         self._sync: set[str] = set()
@@ -180,23 +190,23 @@ class TInvestBroker(StopKeeping, BrokerPort):
         Цена — та же, что уйдёт в заявку (на сетке шага в безопасную сторону).
         Сбой запроса не запрещает вход: остаётся проверка ГО бюджета.
         """
-        if not self._ask_max_lots:
+        if self._margin_limits is None:
             return None
         card = self._card_for(key)
         if card is None:
             return None
         try:
-            return int(self._api.max_lots(card.uid, side, entry_limit(card, Decimal(str(price)), side)))
+            return int(self._margin_limits.max_lots(card.uid, side, entry_limit(card, Decimal(str(price)), side)))
         except OrderFailure as failure:
             log.warning("Лимит лотов %s у брокера не прочитан: %s", self._display(key), failure.kind)
             return None
 
     def refresh_margins(self, now: datetime) -> list[str]:
-        """ГО фьючерсов из ``GetFuturesMargin``: при допуске инструмента и раз в сутки."""
+        """ГО фьючерсов у брокера: при допуске инструмента и раз в ``margin_every``."""
         updated = []
         for uid in list(self._cards):
             card = self._card_for(uid)
-            if card is None or not card.future or (uid in self._margin_at and now - self._margin_at[uid] < MARGIN_EVERY):
+            if card is None or not card.future or (uid in self._margin_at and now - self._margin_at[uid] < self._margin_every):
                 continue
             try:
                 margin = self._api.futures_margin(card.uid)
@@ -234,7 +244,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
         return card
 
     def _card_by_uid(self, uid: str) -> PriceCard:
-        return self._cards.get(self._keys.get(uid, uid)) or PriceCard(uid, Decimal(0), Decimal(0))
+        return self._book.by_uid(uid)
 
     def key_for(self, uid: str) -> str:
         return self._keys.get(uid, uid)
@@ -448,13 +458,13 @@ class TInvestBroker(StopKeeping, BrokerPort):
         card = self._card_by_uid(row.instrument_uid)
         known = self._ledger.executions(row.key)
         seen = {e.execution_id for e in known}
-        fresh = [trade for trade in report.trades if f"tinvest:{trade.trade_id}" not in seen]
+        fresh = [trade for trade in report.trades if f"{self._fill}{trade.trade_id}" not in seen]
         if fresh:
             self.note_fill(row.instrument_uid)
             lots = trade_lots(card, [t.quantity for t in fresh], report.lots_executed - sum(e.lots for e in known))
             for trade, quantity in zip(fresh, lots):
-                self._ledger.add_execution(LedgerExecution(f"tinvest:{trade.trade_id}", row.key, quantity,
-                                                           trade_price(card, trade.price, trade.in_rub), trade.at))
+                self._ledger.add_execution(LedgerExecution(f"{self._fill}{trade.trade_id}", row.key, quantity,
+                                                           trade.price, trade.at))
             self._settle(row)
         values = self._executed(row)
         if min(report.lots_executed, row.lots) > values["lots_executed"]:
@@ -484,20 +494,20 @@ class TInvestBroker(StopKeeping, BrokerPort):
     def _settle(self, row: LedgerOrder) -> bool:
         """Объём исполнений заявки не больше её лотов и итога брокера; ``True`` — что-то перекрыто.
 
-        Исполнение ``tinvest-order:`` пишется по сумме заявки, когда сделок биржи ещё нет. Сделки стрима,
+        Исполнение ``<префикс>-order:`` пишется по сумме заявки, когда сделок биржи ещё нет. Сделки стрима,
         пришедшие после, — те же лоты: лишнее снимается с непроведённых исполнений, сначала с исполнения
         без сделок, затем с последних сделок. Проведённое в журнал сделок не трогается.
         """
         executions = self._ledger.executions(row.key)
         limit = min([row.lots, *(int(e.execution_id.rsplit(":", 1)[1]) for e in executions
-                                 if e.execution_id.startswith(BY_ORDER))])
+                                 if e.execution_id.startswith(self._by_order))])
         excess = sum(e.lots for e in executions) - limit
         if excess <= 0:
             return False
         free = [e for e in executions if not e.consumed and e.execution_id not in self._emitted
                 and not self._journal_has(e.execution_id)]
-        free = [e for e in free if e.execution_id.startswith(BY_ORDER)] + [
-            e for e in reversed(free) if not e.execution_id.startswith(BY_ORDER)]
+        free = [e for e in free if e.execution_id.startswith(self._by_order)] + [
+            e for e in reversed(free) if not e.execution_id.startswith(self._by_order)]
         log.warning("Исполнения заявки %s %s сверх итога брокера на %d лот.: лишнее перекрыто",
                     row.kind, self._display(row.instrument_uid), excess)
         for execution in free:
@@ -515,7 +525,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
     def _resolve(self, row: LedgerOrder, now: datetime) -> None:
         """Поиск по ключу: найдена — её состояние; пусто — повтор тем же ключом или итог «не дошла»."""
         try:
-            report = self._api.order_by_key(row.key)
+            report = self._api.order_state(row.instrument_uid, row.key, row.broker_order_id or None)
         except OrderFailure as failure:
             log.warning("Поиск заявки по ключу не удался: %s", failure.kind)
             return
@@ -580,8 +590,9 @@ class TInvestBroker(StopKeeping, BrokerPort):
 
     def _refresh(self, row: LedgerOrder, now: datetime) -> None:
         try:
-            report = (self._api.order_by_exchange_id(row.broker_order_id) if row.kind == "broker_stop"
-                      else self._api.order_by_key(row.key))
+            # Заявку, порождённую стоп-заявкой, брокер знает только по номеру: нашего ключа у неё нет.
+            report = self._api.order_state(row.instrument_uid, None if row.kind == "broker_stop" else row.key,
+                                           row.broker_order_id or None)
             if report is not None and row.kind == "broker_stop":
                 report = replace(report, key=row.key)
         except OrderFailure as failure:
@@ -594,13 +605,12 @@ class TInvestBroker(StopKeeping, BrokerPort):
         self._apply_report(row, report, now)
         executed = sum(e.lots for e in self._ledger.executions(row.key))
         rest = min(report.lots_executed, row.lots) - executed
-        if report.terminal and rest > 0 and not report.trades and report.executed_rub:
+        if report.terminal and rest > 0 and not report.trades and report.average is not None:
             # Брокер сообщил исполнение без сделок биржи и в stages (в песочнице stages всегда пусты):
             # остаток проводится по средней заявки за вычетом уже известных сделок.
             card = self._card_by_uid(row.instrument_uid)
             known = self._ledger.executions(row.key)
-            average = fill_average(card, report.executed_rub, report.lots_executed, report.initial_rub,
-                                   report.lots_requested)
+            average = report.average
             price = average
             if known:
                 price = to_step((average * report.lots_executed - sum(e.price * e.lots for e in known)) / rest,
@@ -612,7 +622,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
             # по операциям её не сопоставить, номера сделки биржи у заглушки нет.
             fee = fee_share(report.executed_fee, rest, report.lots_executed)
             self._ledger.add_execution(LedgerExecution(
-                f"tinvest-order:{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now, fee=fee))
+                f"{self._by_order}{report.broker_order_id}:{report.lots_executed}", row.key, rest, price, now, fee=fee))
             self._apply_report(self._ledger.get(row.key), replace(report, trades=()), now)
 
     # --- обслуживание: выходы, цели, итоги ------------------------------------
@@ -922,7 +932,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
             view.target_filled[row.target_id] = view.target_filled.get(row.target_id, 0) + execution.lots
             applied["target"] = (row.target_id, execution.lots)
             target = next((t for t in plan.targets if t.target_id == row.target_id), None)
-            command = f"{row.trade_id}:pv:tp:{row.target_id}:{execution.execution_id.removeprefix('tinvest:')}"
+            command = f"{row.trade_id}:pv:tp:{row.target_id}:{execution.execution_id.removeprefix(self._fill)}"
             return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL,
                                   reason=f"tp:{row.target_id}",
                                   reference_price=None if target is None else target.price, reference_kind="target",
@@ -932,7 +942,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
             job.executed += execution.lots
             applied["job"] = (job.job_id, execution.lots)
         if ":pv:stop:" in row.job:
-            command = f"{row.job}:{execution.execution_id.removeprefix('tinvest:')}"
+            command = f"{row.job}:{execution.execution_id.removeprefix(self._fill)}"
             return ExecutionEvent(command_id=command, order_id=command, status=ExecutionStatus.FILL, reason="protective",
                                   reference_price=view.confirmed_stop, reference_kind="stop",
                                   order_side=view.exit_side, slippage_source="broker", **common)
@@ -1043,7 +1053,7 @@ class TInvestBroker(StopKeeping, BrokerPort):
 
     @staticmethod
     def _outcome(action: TradeAction, now: datetime, status: ExecutionStatus, reason: str) -> ExecutionEvent:
-        return TInvestBroker._outcome_ids(action.command_id, action.trade_id, now, status, reason)
+        return LiveBroker._outcome_ids(action.command_id, action.trade_id, now, status, reason)
 
     @staticmethod
     def _outcome_ids(command_id: str, trade_id: str, now: datetime, status: ExecutionStatus,

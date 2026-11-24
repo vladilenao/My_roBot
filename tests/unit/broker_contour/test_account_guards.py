@@ -149,16 +149,16 @@ def test_rejects_counter_survives_restart(tmp_path):
 def test_broker_counts_only_broker_rejects(tmp_path):
     """Отказ брокера на вход и стоп-заявку — в счётчик; проверки до отправки и «торги закрыты» — нет."""
     from src.broker_contour.port import OrderFailure
-    from src.broker_contour.broker import ExitPolicy, TInvestBroker
+    from src.broker_contour.broker import ExitPolicy
     from src.broker_contour.orders import order_key
     from src.broker_contour.stops import StopLedger
     from src.trade_management.actions import EntryOrderType, OpenTrade
-    from tests.unit.broker_contour.fake_api import NG, NG_META, Clock as ApiClock, FakeApi
+    from tests.unit.broker_contour.fake_api import NG, NG_META, Clock as ApiClock, FakeApi, live_broker
     from tests.unit.broker_contour.test_tinvest_broker import _plan
 
     outcomes = []
     api, ledger = FakeApi(), OrderLedger(tmp_path / "b.sqlite3")
-    broker = TInvestBroker(api, ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60), clock=ApiClock(),
+    broker = live_broker(api, ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60), clock=ApiClock(),
                            stops=StopLedger(ledger), order_outcome=lambda ok, reason: outcomes.append((ok, reason)))
     broker.set_contracts({NG: NG_META})
     broker.register_trade(_plan())

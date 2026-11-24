@@ -1,4 +1,4 @@
-"""``TInvestBroker`` (add-tinvest-orders): заявки, журнал заявок, восстановление по ключу, выходы лимитом."""
+"""``LiveBroker`` на адаптере Т-Инвест (add-tinvest-orders, refactor-broker-port): заявки, журнал заявок, восстановление по ключу, выходы лимитом."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import pytest
 
 from src.broker.port import ExecutionStatus
 from src.broker_contour.port import OrderFailure
-from src.broker_contour.broker import ExitPolicy, TInvestBroker
+from src.broker_contour.broker import ExitPolicy
 from src.broker_contour.orders import CANCELLED, CANCELLING, OrderLedger, order_key
-from src.broker_contour.prices import (PriceCard, entry_limit, executed_lots, exit_limit, fill_average, points_from_rub,
-                                       trade_lots)
+from src.broker_contour.prices import PriceCard, entry_limit, executed_lots, exit_limit, trade_lots
+from src.broker_contour.tinvest.prices import fill_average, points_from_rub
 from src.events.types import EventType
 from src.trade_management.actions import CancelEntry, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
 from src.trade_management.models import (CURRENT_ALGORITHM, CostSnapshot, ProfileSnapshot, TargetPlan, TradePlan)
-from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi
+from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi, live_broker
 
 D = Decimal
 
@@ -36,7 +36,7 @@ class Harness:
         self.api, self.clock, self.published = FakeApi(), Clock(), []
         self.journal = set() if journal is None else journal
         self.ledger = OrderLedger(tmp_path / "broker.sqlite3")
-        self.broker = TInvestBroker(self.api, self.ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60),
+        self.broker = live_broker(self.api, self.ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60),
                                     publish=self.published.append, journal_has=self.journal.__contains__,
                                     clock=self.clock)
         self.broker.set_contracts({NG: NG_META})
@@ -123,7 +123,7 @@ def _stream_fill(h, key, lots, price, trade_id="exch-stream-1"):
     """Событие стрима «исполнена» со сделкой биржи на все лоты."""
     from dataclasses import replace
 
-    from src.broker_contour.port import BrokerTrade
+    from src.broker_contour.tinvest.api import BrokerTrade
 
     return replace(h.api.orders[key], status="fill", lots_executed=lots, executed_rub=None,
                    trades=(BrokerTrade(trade_id, D(price), lots, NOW),))
@@ -257,7 +257,7 @@ def test_lost_answer_found_by_key_after_restart(tmp_path):
     assert answer.status is ExecutionStatus.ACK and answer.reason == "broker-unknown"
     assert h.kinds() == ["sent", "unknown"]
     # Новый процесс: тот же журнал заявок, поиск по ключу до первого тика.
-    restarted = TInvestBroker(h.api, OrderLedger(tmp_path / "broker.sqlite3"), contour="sandbox",
+    restarted = live_broker(h.api, OrderLedger(tmp_path / "broker.sqlite3"), contour="sandbox",
                               publish=h.published.append, clock=h.clock)
     restarted.set_contracts({NG: NG_META})
     restarted.register_trade(_plan())
@@ -607,8 +607,8 @@ def test_entry_lots_limit_asks_broker_only_on_account(tmp_path):
     assert not [call for call in sandbox.api.calls if call[0] == "max-lots"]
 
     api, clock = FakeApi(), Clock()
-    broker = TInvestBroker(api, OrderLedger(tmp_path / "account.sqlite3"), contour="account", clock=clock,
-                           ask_max_lots=True)
+    broker = live_broker(api, OrderLedger(tmp_path / "account.sqlite3"), contour="account", clock=clock,
+                           margin=True)
     broker.set_contracts({NG: NG_META})
     api.max_lots_answer = 2
     assert broker.entry_lots_limit(NG, "SELL", D("2.8451")) == 2

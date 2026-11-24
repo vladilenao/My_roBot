@@ -219,7 +219,7 @@ def _run_broker_contour(kind: str) -> int:
                             NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
     from src.events.bus import EventBus
     from src.notifier.factory import close_channels
-    from src.sandbox.gateway import SandboxGateway
+    from src.broker_contour.tinvest.session import adapter
 
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -264,7 +264,8 @@ def _run_broker_contour(kind: str) -> int:
                                   max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                                   contour=kind, orders=settings.orders)
         bus.subscribe_all(channels)
-    contour = BrokerContour(settings, gateway_factory=SandboxGateway, bus=bus, stop=stop, pid=os.getpid(),
+    contour = BrokerContour(settings, session_factory=adapter("sandbox", token=settings.token), bus=bus, stop=stop,
+                            pid=os.getpid(),
                             trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
     pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
                       timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
@@ -278,10 +279,6 @@ def _run_broker_contour(kind: str) -> int:
 
 def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, kind: str) -> int:
     """Процесс контура «Счёт»: только чтение счёта (add-account-contour) или торговля привязками (enable-live-trading)."""
-    from functools import partial
-
-    from src.broker_contour.tinvest.account import account_by_id
-    from src.broker_contour.tinvest.admission import read_facts
     from src.account.fee_probes import FeeProbes
     from src.assembly.pulse import CorePulse
     from src.broker_contour import ACCOUNT
@@ -297,7 +294,7 @@ def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, ki
                             NOTIFIER_TELEGRAM_REQUEST_TIMEOUT, account_channel_id)
     from src.events.bus import EventBus
     from src.notifier.factory import close_channels
-    from src.sandbox.gateway import AccountGateway
+    from src.broker_contour.tinvest.session import adapter
 
     orders = bool(CONTOUR_ACCOUNT_ORDERS)       # true — настоящие заявки (enable-live-trading); включает владелец
     settings = BrokerContourSettings(
@@ -319,11 +316,10 @@ def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, ki
                                   max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
                                   contour=ACCOUNT, orders=orders)
         bus.subscribe_all(channels)
-    contour = BrokerContour(settings, gateway_factory=AccountGateway, bus=bus, stop=stop, pid=os.getpid(),
-                            find_account=lambda gateway: account_by_id(gateway, TINKOFF_ACCOUNT_ID or ""),
-                            read_facts=partial(read_facts, orders=orders),
-                            # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
-                            fee_probes_factory=None if orders else FeeProbes,
+    # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
+    sessions = adapter("account", token=settings.token, account_id=TINKOFF_ACCOUNT_ID, orders=orders,
+                       fee_probes=None if orders else FeeProbes)
+    contour = BrokerContour(settings, session_factory=sessions, bus=bus, stop=stop, pid=os.getpid(),
                             trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
     pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
                       timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)

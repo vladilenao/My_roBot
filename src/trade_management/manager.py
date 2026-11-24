@@ -2503,7 +2503,7 @@ class TradeManager:
     def _broker_lots_limit(self, instrument_id: str, side: str, price) -> int | None:
         """Сколько лотов брокер даёт по обеспечению счёта; ``None`` — брокер не спрашивается.
 
-        Только у контура «Счёт» (``TInvestBroker.entry_lots_limit``): требование
+        Только у контура «Счёт» (``LiveBroker.entry_lots_limit``, ``MarginLimits``): требование
         брокера к марже не равно биржевому ГО (fix 30042, 18.11), поэтому объём
         входа и добора не больше, чем брокер разрешает сейчас.
         """

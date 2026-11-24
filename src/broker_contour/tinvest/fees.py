@@ -1,4 +1,4 @@
-"""Настоящие комиссии из операций брокера (add-account-vs-emulation-report, решение 6).
+"""Настоящие комиссии из операций Т-Инвест (add-account-vs-emulation-report, решение 6; refactor-broker-port).
 
 Брокер контура отдаёт исполнение без комиссии, и менеджер сделок ставит оценку
 из настроек (``fee_source = configured``). На каждом проходе сверщика
@@ -25,13 +25,15 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from src.broker.port import FeeAdjustment
-from src.broker_contour.port import OperationReport, OrderFailure
+from src.broker_contour.port import OrderFailure
 from src.broker_contour.broker import fee_share
+from src.broker_contour.tinvest.api import OperationReport
 
 log = logging.getLogger(__name__)
 
-EXECUTION_PREFIX = "tinvest:"
-ORDER_PREFIX = "tinvest-order:"
+FILLS_PREFIX = "tinvest"                    # номера исполнений контура у Т-Инвест (LiveBroker, fills_prefix)
+EXECUTION_PREFIX = f"{FILLS_PREFIX}:"
+ORDER_PREFIX = f"{FILLS_PREFIX}-order:"
 ORDER_RETRY = timedelta(minutes=15)
 HORIZON = timedelta(days=7)
 FALLBACK_AFTER = timedelta(minutes=15)

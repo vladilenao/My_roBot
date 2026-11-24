@@ -1,4 +1,4 @@
-"""Фейковый API Т-Инвест для ``TInvestBroker``: заявки по ключу, снятие, сделки биржи — без сети."""
+"""Фейковый ``TInvestApi`` для ``LiveBroker`` на адаптере Т-Инвест: заявки по ключу, снятие, сделки биржи — без сети."""
 
 from __future__ import annotations
 
@@ -6,7 +6,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from src.broker_contour.port import BrokerTrade, OrderFailure, OrderReport, StopReport
+from src.broker_contour.broker import LiveBroker
+from src.broker_contour.port import OrderFailure
+from src.broker_contour.prices import PriceBook
+from src.broker_contour.tinvest.api import BrokerTrade, OrderReport, StopReport
+from src.broker_contour.tinvest.fees import FILLS_PREFIX
+from src.broker_contour.tinvest.port import TInvestPort
+from src.broker_contour.tinvest.session import MARGIN_EVERY
 from src.portfolio import ContractMeta
 
 NOW = datetime(2026, 10, 30, 10, 0, tzinfo=timezone.utc)
@@ -177,3 +183,11 @@ class FakeApi:
 
     def posts(self, kind: str | None = None) -> list[tuple]:
         return [call for call in self.calls if call[0] == "post" and (kind is None or call[1] == kind)]
+
+
+def live_broker(api, ledger, *, margin: bool = False, **kwargs) -> LiveBroker:
+    """``LiveBroker`` на адаптере Т-Инвест поверх фейка (refactor-broker-port); ``margin`` — ``GetMaxLots`` «Счёта»."""
+    book = PriceBook()
+    port = TInvestPort(api, book)
+    return LiveBroker(port, ledger, book=book, fills_prefix=FILLS_PREFIX, margin_every=MARGIN_EVERY,
+                      margin_limits=port if margin else None, **kwargs)
