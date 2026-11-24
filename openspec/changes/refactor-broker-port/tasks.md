@@ -37,18 +37,19 @@
 
 ## 3. Шаг 3 — описание контура
 
-- [ ] 3.1 `src/broker_contour/contours.py`: `LiveContour`, `LIVE_CONTOURS` («Счёт», песочница), чтение `[contours.<номер>]` по номеру.
-- [ ] 3.2 `run.py`:
+- [x] 3.1 `src/broker_contour/contours.py`: `LiveContour`, `LIVE_CONTOURS` («Счёт», песочница), чтение `[contours.<номер>]` по номеру.
+- [x] 3.2 `run.py`:
   - одна функция запуска контура на брокере, сборка адаптера по описанию;
   - надзиратели циклом по описаниям, `BrokerContourSupervisor(contour_id, kind)`;
   - `kind` в `status.json` из описания;
   - `CONTOUR_TITLES` из описаний.
-- [ ] 3.3 Тесты:
+- [x] 3.3 Тесты:
   - `status.json` и `launch.json` у `sandbox` и `account` прежние;
   - заголовки «ПЕСОЧНИЦА» и «СЧЁТ»;
   - «Счёт» поднимается первым;
   - у каждого контура свой каталог, база, отпечаток и канал.
-- [ ] 3.4 Полный `pytest` и `ruff`, коммит.
+- [x] 3.4 Полный `pytest` и `ruff`, коммит.
+  Сделано 24.11.2026: `tests/unit/broker_contour/test_live_contours.py`; `_run_broker_contour(номер)` — одна функция по описанию, адаптер выбирает `_broker_sessions`, надзиратели — `_broker_supervisors`. Слой API (`SandboxControl`, `AccountControl`) получает номер контура от надзирателя, остальное в нём — Ф2. `_contour_portfolio_pct` и `_contour_commission_pct` оставлены прежними: на их константы опирается `test_contour_config`.
 
 ## 4. Сборка
 

@@ -73,7 +73,7 @@ def _sessions(broker):
 
 
 def _settings(tmp_path, **overrides):
-    values = dict(contour_id="sandbox", broker="sandbox", directory=tmp_path / "contours" / "sandbox",
+    values = dict(contour_id="sandbox", kind="sandbox", broker="sandbox", directory=tmp_path / "contours" / "sandbox",
                   core_db=tmp_path / "core.sqlite3", version="9.9.9", token=TOKEN, token_env="TINKOFF_SANDBOX_TOKEN",
                   bot_token="123456:fake-bot-token-abcdef", bot_env="TELEGRAM_ACCOUNT_BOT_TOKEN",
                   channel_id="-100500", channel_env="TELEGRAM_SANDBOX_CHANNEL_ID", reconcile_every_secs=0,

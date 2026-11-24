@@ -14,7 +14,7 @@ from tests.unit.broker_contour.fake_api import FakeApi
 
 PACKAGE = Path(__file__).resolve().parents[3] / "src" / "broker_contour"
 COMMON = ("broker", "stops", "stream", "process", "admission", "prices", "orders", "reconcile", "guards", "control",
-          "notify", "fingerprint", "store", "bindings", "port", "__init__")
+          "notify", "fingerprint", "store", "bindings", "port", "contours", "__init__")
 FORBIDDEN = ("t_tech", "grpc", "src.sandbox", "src.account", "src.broker_contour.tinvest", "src.broker_contour.finam")
 
 

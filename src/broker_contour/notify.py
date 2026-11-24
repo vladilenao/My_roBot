@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+from src.broker_contour.contours import CONTOUR_TITLES
 from src.broker_contour.port import AccountSnapshot
 from src.events.bus import EventBus
 from src.events.event import Event
@@ -17,8 +18,6 @@ from src.events.types import TRADING_EVENT_TYPES, EventType
 
 DELIVERY_FILE = "telegram_delivery.sqlite3"
 
-
-CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
 BROKER_TYPES = frozenset({EventType.BROKER_ACCOUNT, EventType.BROKER_ORDER})
 TRADING_TYPES = BROKER_TYPES | TRADING_EVENT_TYPES | {EventType.ORDER_ACCEPTED}
 CONSOLE_TRADING_TYPES = TRADING_TYPES | {EventType.REJECTED, EventType.RISK_LIMIT_HIT, EventType.ERROR}

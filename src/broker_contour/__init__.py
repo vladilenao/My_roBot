@@ -1,9 +1,8 @@
 """Контур на брокере (add-sandbox-contour): допуск, отпечаток счёта, сверщик, шаг процесса.
 
-Пакет не знает, песочница это или боевой счёт: шлюз и правило счёта передаются
-при сборке. Виды: ``sandbox`` — песочница Т-Инвест, ``account`` — брокерский счёт робота
-(add-account-contour, до Р2 только чтение).
+Общий код не знает брокера: адаптер (``tinvest/``, на Ф2–Ф3 ``finam/``) передаёт точка сборки
+``run.py`` по описанию контура (``contours.py``, refactor-broker-port). Виды: ``sandbox`` — песочница
+Т-Инвест, ``account`` — брокерский счёт робота (add-account-contour).
 """
 
-SANDBOX = "sandbox"
-ACCOUNT = "account"        # брокерский счёт робота (add-account-contour)
+from src.broker_contour.contours import ACCOUNT, SANDBOX  # noqa: F401

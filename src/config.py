@@ -243,6 +243,17 @@ CONTOUR_SANDBOX_COMMISSION_PCT = _CONFIG.get("contours_sandbox_commission_pct")
 CONTOUR_ACCOUNT_COMMISSION_PCT = _CONFIG.get("contours_account_commission_pct")
 
 
+def contour_setting(contour_id: str, key: str, default=None):
+    """Ключ ``[contours.<номер>]`` по номеру контура (refactor-broker-port); не задан — ``default``."""
+    return _CONFIG.get(f"contours_{contour_id}_{key}", default)
+
+
+def contour_env(contour_id: str, key: str) -> str | None:
+    """Значение переменной окружения, названной ключом ``[contours.<номер>] <key>`` (токен бота, канал)."""
+    name = contour_setting(contour_id, key)
+    return (os.getenv(name) or None) if name else None
+
+
 def telegram_channel_id() -> str | None:
     """Id канала Telegram контура эмуляции из переменной, названной в ``[contours.emulation]``."""
     return os.getenv(CONTOUR_EMULATION_TELEGRAM_CHANNEL_ENV) or None

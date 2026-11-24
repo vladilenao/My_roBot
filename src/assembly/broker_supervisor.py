@@ -29,11 +29,12 @@ def _now() -> datetime:
 class BrokerContourSupervisor:
     """Один контур на брокере: процесс, его выход и подъём после рестарта ядра."""
 
-    def __init__(self, *, kind: str, state_dir: Path, core_state, version: str, autostart: bool,
+    def __init__(self, *, contour_id: str, kind: str, state_dir: Path, core_state, version: str, autostart: bool,
                  heartbeat_timeout: float, heartbeat_secs: float, process_factory=ContourProcess,
                  adopt_factory=AdoptedProcess, say=print) -> None:
-        self.kind = kind
-        self.directory = contour_dir(state_dir, kind)
+        self.contour_id = contour_id    # номер контура: папка, желаемое ядра, процесс (refactor-broker-port)
+        self.kind = kind                # вид контура: sandbox · account
+        self.directory = contour_dir(state_dir, contour_id)
         self._core_state = core_state
         self._version = version
         self._autostart = autostart
@@ -57,31 +58,32 @@ class BrokerContourSupervisor:
             self.ready = True
             plan = self._plan()
             if plan.action == contour_recovery.REPLACE:
-                self._say(f"Контур {self.kind} (pid {plan.pid}) другой версии или уже выходит — ядро ждёт его выхода")
+                self._say(f"Контур {self.contour_id} (pid {plan.pid}) другой версии или уже выходит — "
+                          "ядро ждёт его выхода")
                 if not wait_exit(plan.pid, STOP_TIMEOUT_SECS + self._heartbeat_secs):
-                    log.error("Контур %s pid %s не вышел — завершается принудительно", self.kind, plan.pid)
+                    log.error("Контур %s pid %s не вышел — завершается принудительно", self.contour_id, plan.pid)
                     terminate_pid(plan.pid)
                     wait_exit(plan.pid, 5)
                 plan = self._plan()
                 if plan.action in (contour_recovery.ADOPT, contour_recovery.REPLACE):
                     plan = contour_recovery.RecoveryPlan(contour_recovery.BLOCKED, plan.pid, plan.status)
-            desired = self._core_state.desired(self.kind)
+            desired = self._core_state.desired(self.contour_id)
             if plan.action == contour_recovery.BLOCKED:
                 message = (f"Папка контура {self.directory} занята процессом pid {plan.pid}, который не подтверждает "
-                           f"себя как контур робота. Контур {self.kind} не запускается; эмуляция и API работают.")
+                           f"себя как контур робота. Контур {self.contour_id} не запускается; эмуляция и API работают.")
                 print(message)
                 log.error("%s", message)
             elif plan.action == contour_recovery.ADOPT:
                 self._adopt(plan.pid)
-                self._say(f"Контур {self.kind} подхвачен: pid {plan.pid}, поколение {desired.generation}")
+                self._say(f"Контур {self.contour_id} подхвачен: pid {plan.pid}, поколение {desired.generation}")
             elif plan.action == contour_recovery.AUTOSTART or self._should_autostart(desired, plan):
                 self._start(desired, recovery=contour_recovery.RECOVERY_AUTOSTART)
-                self._say(f"Контур {self.kind} поднимается без команды: поколение {desired.generation}")
+                self._say(f"Контур {self.contour_id} поднимается без команды: поколение {desired.generation}")
             return plan.action
 
     def _plan(self):
         return contour_recovery.plan_recovery(self.directory, version=self._version,
-                                              desired=self._core_state.desired(self.kind), explicit=False,
+                                              desired=self._core_state.desired(self.contour_id), explicit=False,
                                               autostart=self._autostart, timeout=self._timeout)
 
     def _should_autostart(self, desired, plan) -> bool:
@@ -118,15 +120,15 @@ class BrokerContourSupervisor:
                     key: card.get(key) for key in ("label", "ticker", "instrument_type", "short_name", "uid", "family")})
             contracts.update(member.contract or {})
         write_launch(self.directory, {
-            "contour_id": self.kind, "kind": self.kind, "core_pid": os.getpid(), "core_version": self._version,
+            "contour_id": self.contour_id, "kind": self.kind, "core_pid": os.getpid(), "core_version": self._version,
             "generation": desired.generation, "bindings": [member.key for member in active],
             "instruments": list(instruments.values()), "contracts": contracts,
         })
         self.recovery, self.exit_code, self.exited_at = recovery, None, None
         self.started_at = _now().isoformat().replace("+00:00", "Z")
-        self.process = self._process_factory(self.kind, on_exit=self._exited)
+        self.process = self._process_factory(self.contour_id, on_exit=self._exited)
         pid = self.process.start()
-        log.info("Контур %s запущен: pid %s, поколение %s", self.kind, pid, desired.generation)
+        log.info("Контур %s запущен: pid %s, поколение %s", self.contour_id, pid, desired.generation)
         return pid
 
     def _adopt(self, pid: int) -> None:
@@ -143,14 +145,14 @@ class BrokerContourSupervisor:
 
         self.recovery = contour_recovery.RECOVERY_ADOPTED
         self.started_at = adopted_at.isoformat().replace("+00:00", "Z")
-        self.process = self._adopt_factory(self.kind, pid, on_exit=exited)
+        self.process = self._adopt_factory(self.contour_id, pid, on_exit=exited)
         self.process.start()
 
     def _exited(self, code, stopping) -> None:
         self.exit_code = code
         self.exited_at = _now().isoformat().replace("+00:00", "Z")
         if code not in (0, None) or code is None and not stopping:
-            log.error("Контур %s завершился с кодом %s; ядро его само не перезапускает", self.kind, code)
+            log.error("Контур %s завершился с кодом %s; ядро его само не перезапускает", self.contour_id, code)
 
     def stop(self) -> None:
         """Остановка робота: ``stop`` процессу и ожидание выхода."""

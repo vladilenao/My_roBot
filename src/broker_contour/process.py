@@ -60,6 +60,7 @@ def _admission_card(facts: dict | None) -> dict:
 @dataclass(frozen=True)
 class BrokerContourSettings:
     contour_id: str
+    kind: str                             # вид контура из описания (refactor-broker-port): sandbox · account
     broker: str
     directory: Path
     core_db: Path
@@ -107,7 +108,7 @@ class BrokerContour:
         self._clock = clock
         self._lock = threading.Lock()
         self.notifier = BrokerNotifier(bus, contour=settings.contour_id)
-        self._status = {"contour_id": settings.contour_id, "kind": settings.contour_id, "state": STARTING,
+        self._status = {"contour_id": settings.contour_id, "kind": settings.kind, "state": STARTING,
                         "applied_generation": None, "stop_mode": None, "version": settings.version, "pid": pid,
                         "members": [], "account": None, "capital": None, "positions": [], "orders": 0,
                         "stop_orders": 0, "frozen": [], "last_reconcile_at": None, "account_link": None,

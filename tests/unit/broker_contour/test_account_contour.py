@@ -151,7 +151,7 @@ def test_fingerprint_of_other_account_refused(tmp_path):
 
 def _settings(tmp_path):
     return BrokerContourSettings(
-        contour_id="account", broker="account", directory=tmp_path / "contours" / "account",
+        contour_id="account", kind="account", broker="account", directory=tmp_path / "contours" / "account",
         core_db=tmp_path / "core.sqlite3", version="9.9.9", token=TOKEN, token_env="TINKOFF_TRADE_TOKEN",
         account_id=ACCOUNT_ID, account_id_env="TINKOFF_ACCOUNT_ID", bot_token="123456:fake-bot-token-abcdef",
         bot_env="TELEGRAM_ACCOUNT_BOT_TOKEN", channel_id="-100700", channel_env="TELEGRAM_ACCOUNT_CHANNEL_ID",
@@ -269,6 +269,7 @@ def test_broker_contours_recover_in_order_and_failure_does_not_block():
     class Supervisor:
         def __init__(self, kind, fail=False):
             self.kind, self.fail = kind, fail
+            self.contour_id = kind
 
         def recover(self):
             order.append(self.kind)
