@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from decimal import Decimal
 
 import pytest
@@ -104,8 +105,47 @@ def test_read_account_accepts_consistent_snapshot():
 
 # --- процесс контура: сбойный портфель не доходит до сверки и хранителя стопа ----------
 
+class PortfolioGate:
+    """Стоп-кадр чтения счёта: контур ждёт перед ``GetPortfolio``, пока тест меняет ответы брокера.
+
+    Контур сверяется на каждом шаге (``reconcile_every_secs=0``), поэтому без стоп-кадра тест не знает,
+    сколько сверок пройдёт между его шагами: третий пропуск подряд по требованию даёт тревогу
+    «счёт недоступен», а сбой, включённый до первой сверки торговой части, не с чем сравнить.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._reads: int | None = None     # сколько чтений пропустить; None — без ограничений
+        self._parked = False
+
+    def __call__(self):                     # поток контура, перед ответом GetPortfolio
+        with self._cond:
+            if self._reads == 0:
+                self._parked = True
+                self._cond.notify_all()
+                self._cond.wait_for(lambda: self._reads != 0, timeout=5)
+                self._parked = False
+            if self._reads:
+                self._reads -= 1
+
+    def close(self):
+        with self._cond:
+            self._reads = 0
+
+    def release(self, reads=None):
+        """Пропустить ``reads`` чтений и снова встать; ``None`` — открыть совсем."""
+        with self._cond:
+            self._reads, self._parked = reads, False
+            self._cond.notify_all()
+
+    def wait_parked(self) -> bool:
+        with self._cond:
+            return self._cond.wait_for(lambda: self._parked, timeout=5)
+
+
 def test_glitched_portfolio_skips_reconcile_and_keeps_stop_guard_snapshot(tmp_path):
     broker = FakeBroker(rub=Decimal(1_000_000))
+    gate = broker.on_portfolio = PortfolioGate()
     robot_account(broker)
     _launch(tmp_path)
     stop = Stop()
@@ -129,20 +169,24 @@ def test_glitched_portfolio_skips_reconcile_and_keeps_stop_guard_snapshot(tmp_pa
     parts[0].runtime.broker.set_account_positions = lambda holdings, at=None: (seen.append(holdings),
                                                                              real(holdings, at=at))
     report_path = tmp_path / "contours/sandbox/broker.sqlite3"
+    assert _wait(lambda: parts[0].manager.frozen == set()), "торговая часть сверилась по согласованному снимку"
 
+    gate.close()
+    assert gate.wait_parked()               # контур стоит перед чтением счёта, начатые сверки закончены
+    seen.clear()
     broker.portfolio_glitch = {}            # портфель брокера пуст…
     broker.positions[NG_UID] = -3          # …а позиция на счёте есть
-    assert _wait(lambda: (read_last_report(report_path) or {}).get("result") == "skipped")
-    first_skip = read_last_report(report_path)["at"]
-    seen.clear()                            # сверка, начатая до сбоя, могла успеть передать снимок
-    assert _wait(lambda: read_last_report(report_path)["at"] > first_skip)
+    gate.release(reads=2)                   # ровно два противоречивых снимка
+    assert gate.wait_parked()
     last = read_last_report(report_path)
-    assert last["result"] == "skipped" and last["items"] == [] and last["skipped_in_row"] >= 2
+    assert last["result"] == "skipped" and last["items"] == [] and last["skipped_in_row"] == 2
     assert _status(tmp_path)["account_link"] == "lost"
     assert parts[0].manager.frozen == set(), "противоречивый снимок не замораживает инструмент"
     assert seen == [], "пока снимок противоречив, хранитель стопа держит прежний"
+    assert "reconcile_alarm" not in collector.kinds(), "противоречивый снимок не даёт тревоги расхождения"
 
     broker.portfolio_glitch = None          # брокер снова отвечает согласованно
+    gate.release()
     assert _wait(lambda: (read_last_report(report_path) or {}).get("result") == "mismatch")
     assert read_last_report(report_path)["items"][0]["account"] == -3
     assert _wait(lambda: bool(seen)) and seen[-1] == {NG_UID: -3}
