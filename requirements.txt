@@ -5,6 +5,10 @@ pandas-ta-classic==0.6.52
 # Версия должна совпадать с wheel в vendor/wheels/: CI ставит SDK оттуда,
 # tbank-индекс с GitHub Actions недоступен (docs/release/build-and-distribution.md).
 t-tech-investments==1.49.3
+# Нижние границы под gRPC-заглушки Finam Trade API (src/finam/proto, add-finam-probe):
+# код сгенерирован grpcio-tools 1.81.1 / protobuf 6.33.5; t-tech-investments держит protobuf<7.
+grpcio>=1.81.1
+protobuf>=6.33.5,<7
 ipython-autotime
 python-dotenv
 requests

@@ -30,6 +30,12 @@ TINKOFF_SANDBOX_TOKEN = os.getenv("TINKOFF_SANDBOX_TOKEN")
 # Контур «Счёт» (add-account-contour): токен только на брокерский счёт робота и его номер.
 TINKOFF_TRADE_TOKEN = os.getenv("TINKOFF_TRADE_TOKEN")
 TINKOFF_ACCOUNT_ID = os.getenv("TINKOFF_ACCOUNT_ID")
+# Finam Trade API (add-finam-probe): секрет портала и номер счёта; демо — отдельной парой,
+# демо-секрет можно не задавать, если демо-счёт выдан тем же секретом.
+FINAM_SECRET_TOKEN = os.getenv("FINAM_SECRET_TOKEN")
+FINAM_ACCOUNT_ID = os.getenv("FINAM_ACCOUNT_ID")
+FINAM_DEMO_SECRET_TOKEN = os.getenv("FINAM_DEMO_SECRET_TOKEN")
+FINAM_DEMO_ACCOUNT_ID = os.getenv("FINAM_DEMO_ACCOUNT_ID")
 MARKET_DATA_EXPORT_TOKEN = os.getenv("MARKET_DATA_EXPORT_TOKEN")
 # Ключ управления запуском через локальный API (схема ControlToken); отдельно от экспортного.
 ROBOT_CONTROL_TOKEN = os.getenv("ROBOT_CONTROL_TOKEN")
