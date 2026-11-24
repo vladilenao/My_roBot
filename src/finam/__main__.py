@@ -20,7 +20,7 @@ from src.finam.account import DEFAULT_INSTRUMENTS, AccountRun
 from src.finam.checks import Timing
 from src.finam.gateway import FinamGateway
 from src.finam.instruments import Instruments, ReferenceGateway
-from src.finam.orders import cleanup_orders
+from src.finam.orders import cancel_by_number, cleanup_orders
 from src.finam.probe import DEFAULT_INSTRUMENT, LimitProbe
 from src.finam.probe_jwt import JwtProbe, LimitsProbe
 from src.finam.probe_stops import StopProbe, TriggerProbe
@@ -47,7 +47,8 @@ USAGE = """Разведка Finam Trade API: python -m src.finam <действи
   probe-stops [инструмент] [--offset-pct P] [--side buy|sell] [--keep] [--tif unset|day|gtc]
                           стоп-заявка 1 лот в P% от рынка (NG, 10%, покупка);
                           --tif — time_in_force стопа (по умолчанию не задаётся)
-  cleanup                 снять заявки разведки, чужие не трогать
+  cleanup [--order N]     снять заявки разведки (ключ fp…), чужие не трогать;
+                          --order — снять одну заявку по номеру Финама
 
 Со сделкой (только по подтверждению):
   probe-trigger [инструмент] [--ticks N] [--side buy|sell] [--wait МИН] [--real]
@@ -145,7 +146,8 @@ def _parser() -> argparse.ArgumentParser:
     jwt.add_argument("--minutes", type=_positive, default=20)
     limits = actions.add_parser("probe-limits", add_help=False)
     limits.add_argument("--calls", type=_positive, default=250)
-    actions.add_parser("cleanup", add_help=False)
+    cleanup = actions.add_parser("cleanup", add_help=False)
+    cleanup.add_argument("--order", default="")
     for sub in actions.choices.values():
         sub.add_argument("--demo", action="store_true")
         sub.error = parser.error
@@ -213,7 +215,9 @@ def main(argv: Sequence[str] | None = None, *, env: FinamEnv | None = None,
     timing = timing or Timing()
     placeholder = "finam-demo-account" if args.demo else "finam-account"
     if args.action == "cleanup":
-        return _cleanup(secret, account_id, placeholder, gateway_factory, out)
+        reference = reference_factory(env.tinkoff_token) if env.tinkoff_token and reference_factory else None
+        return _cleanup(secret, account_id, placeholder, gateway_factory, out, order_id=args.order.strip(),
+                        reference=reference)
     stamp = timing.clock().strftime("%Y%m%d-%H%M%S")
     run_dir = directory / f"{args.action}-{stamp}"
     recorder = CallRecorder(run_dir / "responses.jsonl")
@@ -262,12 +266,16 @@ def _build(args, gateway, instruments, common: dict, secret: str):
     return LimitsProbe(gateway, instruments=instruments, calls=args.calls, **common)
 
 
-def _cleanup(secret, account_id, placeholder, gateway_factory, out) -> int:
+def _cleanup(secret, account_id, placeholder, gateway_factory, out, *, order_id: str = "", reference=None) -> int:
+    """``cleanup``: справочник Т-Инвест нужен только для коротких имён фьючерсов в выводе."""
+    from contextlib import nullcontext
+
     from src.finam.checks import Run
 
     gateway = gateway_factory(secret, account_id=account_id, account_placeholder=placeholder)
     try:
-        with gateway:
+        with gateway, (reference if reference is not None else nullcontext()):
+            names = Instruments(gateway, reference)
             check = Run(gateway, account_id=account_id, out=out)
             if not check._check_token():
                 out(check.results["Ф0.1"].detail)
@@ -275,7 +283,9 @@ def _cleanup(secret, account_id, placeholder, gateway_factory, out) -> int:
             if check.token.readonly:
                 out("Токен только на чтение — снимать заявки нельзя.")
                 return 2
-            return cleanup_orders(gateway, account_id, out, Instruments(gateway, None))
+            if order_id:
+                return cancel_by_number(gateway, account_id, order_id, out, names)
+            return cleanup_orders(gateway, account_id, out, names)
     except BrokerCallError as exc:
         out(f"Не выполнено: {exc}")
         return 1

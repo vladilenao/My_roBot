@@ -167,3 +167,22 @@ def test_finam_secrets_masked_by_robot_logging():
                    if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "_SECRETS")
     names = {item.func.id if isinstance(item, ast.Call) else item.id for item in secrets.elts}
     assert {"FINAM_SECRET_TOKEN", "FINAM_ACCOUNT_ID", "FINAM_DEMO_SECRET_TOKEN", "FINAM_DEMO_ACCOUNT_ID"} <= names
+
+
+def test_cleanup_by_order_number(run, broker):
+    """24.11: на другой день стоп разведки пришёл без client_order_id — снять его можно только по номеру."""
+    broker.trigger_after_polls = None
+    for order_id, key in (("o1", ""), ("o2", "manual-777")):
+        state = orders_pb2.OrderState(order_id=order_id, status=orders_pb2.ORDER_STATUS_WATCHING)
+        state.order.CopyFrom(orders_pb2.Order(account_id=ACCOUNT_ID, symbol=NG, quantity=d(1),
+                                              side=side_pb2.SIDE_BUY, type=orders_pb2.ORDER_TYPE_STOP,
+                                              client_order_id=key))
+        broker.orders[order_id] = state
+    assert run("cleanup").code == 0
+    assert broker.orders["o1"].status == orders_pb2.ORDER_STATUS_WATCHING  # без ключа fp… не тронута
+    result = run("cleanup", "--order", "o1")
+    assert result.code == 0
+    assert "Заявка: NG-12.26 STOP покупка 1" in result.text and "Снята: статус CANCELED" in result.text
+    assert broker.orders["o1"].status == orders_pb2.ORDER_STATUS_CANCELED
+    assert broker.orders["o2"].status == orders_pb2.ORDER_STATUS_WATCHING
+    assert run("cleanup", "--order", "nope").code == 1

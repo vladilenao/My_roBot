@@ -232,6 +232,32 @@ def events_summary(events: dict[str, list], reference_id: str) -> str:
     return "; ".join(parts)
 
 
+def cancel_by_number(gateway: FinamGateway, account_id: str, order_id: str, out: Callable[[str], None],
+                     names: Instruments | None = None) -> int:
+    """``cleanup --order N``: снять одну заявку по номеру Финама.
+
+    Нужен для стопа, оставленного на ночь: на другой день Финам отдаёт его без ``client_order_id``
+    (прогон 24.11), и снять его по ключу разведки нельзя.
+    """
+    desk = OrderDesk(gateway, account_id)
+    try:
+        state = desk.get(order_id)
+    except BrokerCallError as exc:
+        out(f"Заявка {order_id} не найдена: {exc}")
+        return 1
+    out(f"Заявка: {gateway.describe(describe(state, names))}")
+    if not is_active(state):
+        out("Заявка не активна — снимать нечего.")
+        return 0
+    try:
+        result = desk.cancel(order_id)
+    except BrokerCallError as exc:
+        out(f"Не снята: {exc}")
+        return 1
+    out(f"Снята: статус {status_name(result.status)}. Позиции не закрываются.")
+    return 0
+
+
 def cleanup_orders(gateway: FinamGateway, account_id: str, out: Callable[[str], None],
                    names: Instruments | None = None) -> int:
     """Действие ``cleanup``: снять только заявки разведки, чужие не трогать, позиции не закрывать."""
@@ -245,4 +271,6 @@ def cleanup_orders(gateway: FinamGateway, account_id: str, out: Callable[[str], 
     for state, exc in failed:
         out(f"  не снята: {gateway.describe(describe(state, names))} — {exc}")
     out(f"Чужих активных заявок: {len(foreign)} (не тронуты). Позиции не закрываются.")
+    if foreign:
+        out("Заявка разведки на другой день теряет ключ fp… — такую снимайте по номеру: cleanup --order <номер>.")
     return 1 if failed else 0
