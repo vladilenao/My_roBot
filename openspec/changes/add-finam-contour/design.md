@@ -1,11 +1,10 @@
 ## Context
 
-- Ф1 (`refactor-broker-port`, в `release/release-12`) дал порты (`src/broker_contour/port.py`) и описание контура (`contours.py`). Адаптер выбирает и передаёт только `run.py`. Для Ф2 нужен `BrokerSession`: правило счёта, факты допуска, снимок, капитал, имена.
-- Ф0 (`add-finam-probe`, ветка `feature/finam-probe`, не заархивирован) дал код и факты:
+- Ф1 (`refactor-broker-port`, в `release/release-12`) дал порты (`src/broker_contour/port.py`) и описание контура (`contours.py`). Адаптер выбирает и передаёт только `run.py`.
+- Ф0 (`add-finam-probe`, ветка `feature/finam-probe`, не заархивирован) дал:
   - `src/finam/proto/` — заглушки Finam Trade API 2.24.0;
-  - `src/finam/gateway.py` — `FinamGateway`: TLS-канал, `Auth`, JWT в `register_secrets`, `AuthService` без заголовка;
-  - `src/finam/instruments.py` — `symbol` ↔ короткое имя через справочник Т-Инвест;
-  - факты: «Факты разведки» в его design.md.
+  - разведку (`src/finam/gateway.py`, `instruments.py`, команды);
+  - факты — раздел «Факты разведки» в его design.md.
 
   До 30.11 Ф0 ещё дописывает факты и может править разведку.
 - Ф2 — только чтение. Заявки, стопы, комиссии и поток заявок — Ф3.
@@ -14,11 +13,11 @@
 
 | Тема | Факт | Что делает Ф2 |
 |---|---|---|
-| JWT | живёт 15 мин; `SubscribeJwtRenewal` присылает новый за минуту до конца; стримы при смене JWT не рвутся | стрим обновления; запасной путь — `Auth` по возрасту (уже в шлюзе Ф0) |
-| Лимит | 200 в минуту на метод, окно — минута от первого вызова; подсказки повтора в ответе нет | ждать `reset_time` квоты из `GetUsageMetrics` |
-| Окно | ежедневно 05:00–06:15 МСК API может быть недоступен | плановая недоступность, без тревоги |
-| Счёт | единый счёт `UNION`; у пустого нет `equity` и `cash`; результат сделки — второй строкой в `cash`; закрытая позиция — строкой с `quantity` 0 | деньги — сумма строк RUB; нулевые позиции отбрасываются |
-| Заявки | на другой день `GetOrders` отдаёт только активные; стоп — `ORDER_TYPE_STOP`, `WATCHING` | активные биржевые → `orders`, активные стопы → `stop_orders` |
+| JWT | живёт 15 мин; `SubscribeJwtRenewal` присылает новый за минуту до конца; стримы при смене JWT не рвутся | один `JwtSource`: стрим основной, `Auth` запасной |
+| Лимит | 200 в минуту на метод; подсказки повтора в ответе нет | ждать `reset_time` квоты из `GetUsageMetrics` |
+| Окно | ежедневно 05:00–06:15 МСК API может быть недоступен | `BrokerOutage`, без тревоги |
+| Счёт | у пустого счёта нет `equity` и `cash`; результат сделки — второй строкой в `cash`; закрытая позиция — строкой с `quantity` 0 | деньги — сумма строк RUB; нулевые позиции отбрасываются |
+| Заявки | на другой день `GetOrders` отдаёт только активные; стоп — `ORDER_TYPE_STOP` | активные биржевые → `orders`, активные стопы → `stop_orders` |
 | Символы | `SBER@MISX`, фьючерсы на RTSX; шаг совпал с Т-Инвест; лот фьючерса — `trade_lot_size` | соответствие по тикеру и площадке с проверкой шага и лота |
 | ГО | своё, плавает (NG +17 % за ночь) | `GetAssetParams` при каждом чтении, без кэша |
 
@@ -26,233 +25,300 @@
 
 **Goals:**
 
-- Контур `finam` вида «счёт» работает рядом с `account` и `sandbox`: свой процесс, каталог, база, отпечаток, канал.
-- Только чтение: допуск, снимок, сверка, `status.json`, API, UI.
-- Общий код контура не знает Финам; меняется лишь то, что нужно любому брокеру с плановым окном обслуживания.
+- Контур `finam` вида «счёт» работает рядом с `account` и `sandbox`: свой процесс, каталог, база, отпечаток, канал. Только чтение: допуск, снимок, сверка, `status.json`, API, UI.
+- Общий код не ветвится по брокеру и номеру контура — ни в процессе, ни в конфиге, ни в API. Различия — данные описания или то, что передаёт `run.py`.
+- Рабочий код не зависит от кода разведки Ф0, а адаптер Финама — от адаптера Т-Инвест.
+- Ф3 добавляет торговлю Финама, не трогая общий код.
 
 **Non-Goals:**
 
-- Заявки, стопы, комиссии, `OrderFeed` Финама — Ф3. `trading()` у сессии Финама в Ф2 отказывает.
+- Заявки, стопы, комиссии, `OrderFeed` Финама — Ф3.
 - Предохранители, сравнение `finam` с другими контурами, перенос привязок — Ф4.
-- Демо-счёт Финама: поддержка не ответила.
+- Разбор `BrokerContour` и `SandboxControl` на части сверх нужного здесь.
+- Демо-счёт Финама.
 
 ## Decisions
 
-### 1. Код Ф0 — merge-коммитом `feature/finam-probe`
+### 1. Схема зависимостей
 
 ```
-release/release-12 ──●──────────────────────────────►
-                      \                \
- feature/finam-probe   ●─●─●─ b4fa5c5 ─┼─●─● (факты до 30.11)
-                                        \   \
- feature/finam-contour                   M───●───●──M' (повторное слияние без конфликтов)
-                                         │
-                       src/finam/{proto,gateway,instruments} ◄── src/broker_contour/finam/ (адаптер)
+ run.py — точка сборки
+   │
+   ├─ tinvest.catalog(TINKOFF_TOKEN) ──► InstrumentCatalog (порт: карточки ядра)
+   │                                          │ передаётся
+   ├─ finam.adapter(secret, account_id, catalog) ──► BrokerSession (чтение)
+   │      src/broker_contour/finam/
+   │        transport.py  канал, JwtSource, лимит, окно ──► src/finam/proto (заглушки)
+   │        account.py · admission.py · symbols.py
+   │
+   └─ BrokerContour(session_factory)            общий код: port.py, process.py, reconcile.py …
+                                                 знает только порты
+
+ Разведка Ф0 (src/finam/gateway.py, instruments.py, команды) — сама по себе; адаптер её не импортирует.
 ```
 
-- Сейчас — `git merge --no-ff feature/finam-probe`. Заглушки, шлюз и справочник имён остаются одной копией в `src/finam/`. Адаптер их импортирует, а не копирует.
-- Ф2 не правит файлы Ф0. Поэтому новые коммиты Ф0 (факты в его design.md, правки разведки) вливаются повторным `merge` без конфликтов.
-- Нижние границы `grpcio>=1.81.1`, `protobuf>=6.33.5,<7` в `requirements.txt` приходят из Ф0 вместе с заглушками.
-- Порядок PR: сначала Ф0 в `release/release-12` (после 30.11), затем Ф2. Если Ф2 окажется первым, его PR принесёт и коммиты Ф0 — тоже merge-коммитами, без переписывания истории.
+Направления зависимостей:
+
+- общий код → порты;
+- адаптер → порты и заглушки proto;
+- `run.py` → все.
+
+Адаптер Финама не импортирует `src.broker_contour.tinvest`, `src.sandbox`, `t_tech` и разведку `src.finam` (кроме `src.finam.proto`). Это проверяет тест границ, как в Ф1.
+
+### 2. Код Ф0 — merge-коммит ради заглушек
+
+- `git merge --no-ff feature/finam-probe`. Из Ф0 адаптеру нужны только `src/finam/proto/` и нижние границы `grpcio`/`protobuf` в `requirements.txt`. Разведка остаётся владельцу как инструмент.
+- Ф2 не правит файлы Ф0. Факты и правки Ф0 до 30.11 вливаются повторным `merge` без конфликтов: адаптер не зависит от шлюза разведки, поэтому её правки его не ломают.
+- Порядок PR: Ф0 в `release/release-12` раньше Ф2. Если Ф2 окажется первым, его PR несёт коммиты Ф0 merge-коммитами.
 
 **Отклонено:**
 
-- *Перенести заглушки и шлюз в `src/broker_contour/finam/`.* Две копии ~8 тыс. строк сгенерированного кода. Факты и правки Ф0 после 30.11 пришлось бы переносить руками. После архива Ф0 одна копия стала бы мёртвой.
+- *Адаптер на `FinamGateway` и `Instruments` разведки.* Рабочий код зависел бы от инструмента разведки, который ещё меняется. Унаследованные повтор и обновление JWT пришлось бы выключать (`retry=False`), а `Instruments` тянет закрытые `_family` и `_Service` из `src.sandbox`.
+- *Заново сгенерировать заглушки в `src/broker_contour/finam/proto/`.* Две копии ~8 тыс. строк сгенерированного кода.
 - *Ждать архива Ф0.* Ф2 стоял бы до 30.11 и дольше.
 
-### 2. Адаптер `src/broker_contour/finam/`
+Своего кода у транспорта около 150 строк. Из разведки в него переходят только идеи, проверенные прогонами: `AuthService` без заголовка, разбор текста ошибки Финама. Позже разведку можно перевести на транспорт адаптера отдельной задачей, а можно оставить как есть.
+
+### 3. Порт сессии делится на чтение и торговлю (ISP, LSP)
 
 ```
- BrokerContour (общий код)          src/broker_contour/finam/                      src/finam/ (Ф0)
-   admit_account ─► BrokerSession ─► session.py  FinamSession ──────────────┐
-   _serve        ─►                  ├ api.py       FinamApi: лимит, окно ───┼──► gateway.py FinamGateway ─► api.finam.ru
-   Reconciler                        ├ jwt.py       JwtRenewal: стрим JWT ───┤      (TLS, Auth, JWT-секреты)
-                                     ├ account.py   правило счёта, снимок    │
-                                     ├ admission.py факты допуска            │
-                                     └ symbols.py   UID ↔ symbol, ГО ────────┴──► instruments.py (справочник Т-Инвест)
-                                                                                    TINKOFF_TOKEN, только instruments.*
+ BrokerSession (чтение)            TradingSession(BrokerSession)
+   find_account                       capital
+   read_facts                         short_name
+   read_account                       trading → TradingLink
+   fee_probes → None | разведка
+       ▲                                  ▲
+   FinamSession (Ф2)                 TInvestSession (как есть)     FinamSession (Ф3)
 ```
+
+- `BrokerContour._serve` требует `BrokerSession`, `_serve_trading` — `TradingSession`.
+- В описании контура появляется `trading: bool`, то есть умеет ли адаптер заявки. `run.py` собирает контур с `orders = true`, только если `trading`. Загрузка конфига отклоняет `[contours.<номер>] orders = true` у описания с `trading = False`. Правило одно для всех контуров, без упоминания Финама.
+- `TInvestSession` не меняется: она уже реализует оба протокола.
+- `fee_probes` остаётся необязательной возможностью чтения, как в Ф1. Финам отдаёт `None`.
+
+### 4. Порт `InstrumentCatalog` — карточки ядра
+
+«Карточка ядра» — карточка Т-Инвест: по ней ядро строит свечи и сигналы. Адаптер Финама получает каталог из `run.py`, а не ходит к Т-Инвест сам (DIP).
+
+```python
+@dataclass(frozen=True)
+class InstrumentCard:          # port.py
+    uid: str                   # UID Т-Инвест — ключ инструмента ядра и журнала
+    ticker: str                # биржевой тикер
+    kind: str                  # share · future
+    short_name: str            # SBER · Si-12.26
+    lot: int
+    price_step: Decimal
+
+class InstrumentCatalog(Protocol):
+    def by_uid(self, uid: str) -> InstrumentCard | None: ...
+    def by_ticker(self, ticker: str, kind: str) -> InstrumentCard | None: ...
+```
+
+- Реализация — `src/broker_contour/tinvest/catalog.py`. Шлюз Т-Инвест на `TINKOFF_TOKEN` пропускает только `instruments.*`, остальное отклоняет до сети. Короткое имя каталог берёт из существующей `short_name_by_uid`, а не пишет третью копию правила. Карточки кэшируются на процесс.
+- В Ф3 тот же каталог понадобится торговле Финама для заявок по UID журнала.
+
+### 5. Адаптер `src/broker_contour/finam/`
 
 | Модуль | Что делает |
 |---|---|
-| `api.py` — `FinamApi` | все вызовы адаптера; повтор по лимиту; окно обслуживания |
-| `jwt.py` — `JwtRenewal` | стрим `SubscribeJwtRenewal` в потоке-демоне; переподписка после обрыва |
-| `account.py` | `account_rule` (`TokenDetails`), `read_account` (`GetAccount` + `GetOrders`), `capital` |
-| `admission.py` | `read_facts`: права, квоты, предупреждения |
-| `symbols.py` — `FinamSymbols` | `symbol` по карточке Т-Инвест и обратно, проверка шага и лота, `margin(symbol)` |
-| `session.py` | `FinamSession` (`BrokerSession`) и `adapter(...)` для `run.py` |
+| `transport.py` — `FinamTransport` | TLS-канал `api.finam.ru:443`; `call(method, request)`; ошибки → `BrokerCallError` с текстом Финама в одну строку; повтор по лимиту; окно обслуживания |
+| `transport.py` — `JwtSource` | единственный владелец JWT (см. 6) |
+| `symbols.py` — `FinamSymbols` | `symbol` по карточке каталога и обратно, проверка шага и лота, `margin(symbol)` |
+| `account.py` | правило счёта (`TokenDetails`), снимок (`GetAccount` + `GetOrders`) |
+| `admission.py` | факты допуска (см. 9) |
+| `session.py` | `FinamSession` (`BrokerSession`), `adapter(secret, account_id, catalog_factory)` |
 
-### 3. JWT
-
-- `FinamGateway.__enter__` делает `Auth` и регистрирует первый JWT. Затем `JwtRenewal` открывает `SubscribeJwtRenewal(secret)` (без заголовка, как требует `AuthService`).
-- Каждый JWT из стрима проходит `gateway.adopt_jwt(token)`, и только потом используется: `register_secrets` → заглушка `jwt#N` → текущий JWT шлюза.
-- Стрим оборвался → переподписка через 5, 10, 30, 60 с. Пока стрима нет, работает запасной путь шлюза Ф0: JWT старше 10 минут → новый `Auth` перед вызовом.
-- В Ф2 стримов заявок нет. В Ф3 они живут на старом JWT: по факту ж Финам проверяет JWT только при открытии стрима.
-
-### 4. Снимок счёта
+### 6. JWT — один источник
 
 ```
-GetAccount ─┬─ cash[]:  RUB 30000, RUB −8,21    ──► rub = Σ RUB = 29 991,79   (пустой счёт: cash нет → 0)
-            ├─ equity                           ──► liquid_portfolio            (пустой счёт: нет → None)
-            └─ positions[]: symbol, quantity    ──► quantity ≠ 0 → (короткое имя, лоты)
-GetOrders ──┬─ активные биржевые                ──► orders      (короткое имя на заявку)
-            └─ активные ORDER_TYPE_STOP/STOP_LIMIT ► stop_orders (короткое имя на стоп)
+ JwtSource ── lock ── current JWT ◄─┬─ стрим SubscribeJwtRenewal (поток-демон): новый JWT за минуту до конца
+                                    └─ Auth(secret): при входе и если стрима нет, а JWT старше 10 мин
+ каждый JWT: register_secrets → потом current
+ FinamTransport.call() ──► JwtSource.token() ──► metadata authorization
 ```
 
-- Активная заявка — статус не из конечных Ф0 (`FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`, `EXECUTED` …). Список берётся из `src/finam/orders.py`.
-- Лоты позиции:
-  - фьючерс — `quantity` контрактов (`trade_lot_size = 1`);
-  - акция — `quantity` штук ÷ лот карточки Т-Инвест; нецелое — `BrokerCallError(INCONSISTENT)`, как противоречивый снимок Т-Инвест.
-- Валюта, отличная от RUB, в `cash` в Ф2 не складывается с рублями: строки не-RUB пишутся в лог числом, без сумм.
-- `names`: UID Т-Инвест → короткое имя, когда соответствие найдено; иначе `symbol` → имя справочника или «инструмент не указан».
+- Один объект владеет JWT. Чтение и запись — под замком; вызов никогда не видит JWT, который ещё не стал секретом.
+- Стрим оборвался → переподписка через 5, 10, 30, 60 с. Пока стрима нет, `token()` при необходимости делает `Auth` сам.
+- Стримы Ф3 открываются с текущим JWT и при смене не переоткрываются (факт ж).
 
-### 5. Соответствие инструментов — `symbols.py`
+### 7. Лимит и окно обслуживания — в транспорте, один раз
 
-«Карточка ядра» — карточка Т-Инвест: по ней ядро строит свечи и сигналы. Финам о ней не знает, поэтому соответствие строится по биржевому тикеру.
+```
+call(method)
+   ├─ ок ─────────────────────────────────────────────────────────► ответ
+   ├─ RESOURCE_EXHAUSTED ─► GetUsageMetrics ─► reset_time квоты метода
+   │      ─► ждать до reset_time + 1 с (не дольше 65 с; нет квоты — 60 с) ─► повтор (до 2) ─► BrokerCallError
+   └─ UNAVAILABLE · DEADLINE_EXCEEDED · отказ Auth
+          ├─ 05:00–06:15 МСК ─► BrokerOutage(BrokerCallError)   плановое окно
+          └─ иначе ───────────► BrokerCallError                 как есть
+```
+
+`BrokerOutage` — подкласс `BrokerCallError` в `port.py`. Общий код, который не знает о нём, видит обычную ошибку вызова. Окно задано константой адаптера.
+
+### 8. Плановое окно в общем коде — в одном месте
+
+Сейчас процесс ловит `BrokerCallError` при чтении счёта в трёх местах: `_reconcile`, `_reconcile_trading`, `_final_account`. Ф2 сводит их в один метод, а не добавляет четвёртую проверку:
+
+```python
+def _read(self, session, account) -> AccountRead:        # snapshot | lost | maintenance
+```
+
+| Исход | `status.json` | сверщик |
+|---|---|---|
+| `snapshot` | `account_link: ok` | сверка |
+| `lost` (`BrokerCallError`) | `account_link: lost` | пропуск, счётчик +1, на третьем — тревога (как сейчас) |
+| `maintenance` (`BrokerOutage`) | `account_link: maintenance` | пропуск, счётчик не растёт, тревоги нет |
+
+`Reconciler.run(now, None)` получает признак плановости (`planned=True`).
+
+**Допуск.** `admit_account` бросает `BrokerOutage` наружу, а не превращает его в отказ. `BrokerContour.run` ждёт его в одном цикле: `starting`, причина «окно обслуживания брокера», повтор раз в минуту, выход по остановке.
+
+У Т-Инвест `BrokerOutage` не бывает, поэтому «Счёт» и песочница работают как прежде. Это проверяют их существующие тесты.
+
+### 9. Допуск и факты — без выдуманных полей
+
+```
+check_settings ─► секрет, номер счёта, бот, канал (без сети, без тревоги)
+find_account   ─► TokenDetails: номера → register_secrets; ровно один и = FINAM_ACCOUNT_ID
+read_facts     ─► readonly → access_level; GetUsageMetrics → limits
+check_fingerprint(broker = "finam") ─► read_account
+```
+
+Факты — общая часть плюс сведения своего брокера:
+
+| Поле | «Счёт» Т-Инвест | Финам |
+|---|---|---|
+| `access_level` | как сейчас | `read_only` / `full_access` по `readonly` |
+| `limits` | как сейчас | квоты методов, которые вызывает контур: `{"GetAccount": 200, …}` |
+| `warnings` | как сейчас | «квоты API не прочитаны», если `GetUsageMetrics` не ответил |
+| `qualified_for_work_with`, `derivatives`, `tariff` | как сейчас | нет |
+
+- В OpenAPI `AccountAdmission` не меняется. У Финама своя схема `FinamAdmission` — общие поля без полей Т-Инвест.
+- Сверка Финама — общая схема `ReconcileReport` песочницы, без `fee_probes`. `AccountReconcileReport` остаётся у «Счёта».
+
+### 10. Снимок счёта
+
+```
+GetAccount ─┬─ cash[]: RUB 30000, RUB −8,21      ──► rub = Σ RUB              (нет cash → 0)
+            ├─ equity                            ──► liquid_portfolio          (нет → None)
+            └─ positions[]: symbol, quantity ≠ 0 ──► (short_name, лоты), names[uid] = short_name
+GetOrders ──┬─ активные биржевые                 ──► orders
+            └─ активные STOP / STOP_LIMIT        ──► stop_orders
+```
+
+- Лоты: фьючерс — `quantity`; акция — `quantity` ÷ лот карточки. Нецелое — `BrokerCallError(INCONSISTENT)`, как противоречивый снимок Т-Инвест.
+- `names` — всегда UID Т-Инвест → короткое имя, как у Т-Инвест. Символ без карточки в каталоге попадает в снимок как «инструмент не указан» с тикером в логе и в `names` не входит: смешанных ключей нет.
+- Строки `cash` не в RUB с рублями не складываются; в лог пишется только их число.
+
+### 11. Инструменты — `symbols.py`
 
 | Направление | Как |
 |---|---|
-| карточка Т-Инвест → `symbol` | `Assets`: тикер совпал, не архивный, площадка RTSX у фьючерса и MISX у акции |
-| `symbol` → короткое имя и UID | тикер `symbol` → фьючерсы справочника Т-Инвест (`active_futures_with_expiry`) или акция по тикеру |
-| проверка | шаг `min_step / 10^decimals` = шаг Т-Инвест; лот: фьючерс — `trade_lot_size`, акция — `lot_size` = лот Т-Инвест |
+| карточка → `symbol` | `Assets` (раз за процесс): тикер совпал, не архивный; площадка RTSX у фьючерса, MISX у акции |
+| `symbol` → карточка | тикер из `symbol` → `catalog.by_ticker(ticker, kind по площадке)` |
+| проверка | шаг `min_step / 10^decimals` = `price_step`; лот: фьючерс — `trade_lot_size`, акция — `lot_size` = `lot` |
+| ГО | `margin(symbol)` → `GetAssetParams` при каждом вызове |
 
-- Расхождение шага или лота — `SymbolMismatch` с коротким именем и полем. В Ф2 позиция показывается, в лог идёт предупреждение. В Ф3 привязка с таким инструментом на Финаме не допускается.
-- Справочник Т-Инвест — `ReferenceGateway` Ф0 на `TINKOFF_TOKEN`: тот же токен ядра, только `instruments.*`. `Assets` читается раз за процесс, карточки — по требованию с кэшем.
-- **ГО:** `margin(symbol)` → `GetAssetParams` (`long_initial_margin`, `short_initial_margin`) при каждом вызове, без кэша. В Ф2 ГО попадает только в факты допуска по позициям счёта; потребитель — Ф3.
+- Расхождение шага или лота — `SymbolMismatch(short_name, поле)`. В Ф2: позиция в снимке, предупреждение в лог. В Ф3: привязка на Финаме не допускается.
+- В Ф2 ГО никто не вызывает, кроме тестов. Метод нужен Ф3 и делается здесь, потому что опирается на то же соответствие.
 
-### 6. Лимит и окно обслуживания — `api.py`
+### 12. Описание контура и конфиг — данные вместо веток
 
-```
-call(method) ─► gateway.call(retry=False)
-   ├─ ок ─────────────────────────────────────────────► ответ
-   ├─ RESOURCE_EXHAUSTED ─► GetUsageMetrics ─► reset_time квоты метода
-   │      ─► ждать до reset_time + 1 с (не больше 65 с) ─► повтор (до 2 раз) ─► BrokerCallError RESOURCE_EXHAUSTED
-   └─ UNAVAILABLE / DEADLINE_EXCEEDED / UNAUTHENTICATED при Auth
-          ├─ 05:00–06:15 МСК ─► BrokerCallError(code = PLANNED_OUTAGE)
-          └─ иначе ────────────► BrokerCallError(как есть)
-```
-
-- Квота ищется по имени метода (`AccountsService.GetAccount`). Нет квоты или сбой `GetUsageMetrics` → пауза 60 с.
-- Повтор шлюза Ф0 (1, 2, 4 с) адаптер выключает: `retry=False` на каждом вызове.
-- `PLANNED_OUTAGE = "PLANNED_OUTAGE"` — новая константа `port.py`. Это общий признак «брокер в плановом окне», не Финам. Общий код поступает так:
-
-| Где | Сейчас | С `PLANNED_OUTAGE` |
-|---|---|---|
-| допуск при старте | отказ, тревога, выход 2 | `starting`, причина «окно обслуживания брокера», повтор допуска раз в минуту до успеха или остановки |
-| сверка | пропуск; третий подряд — тревога «Счёт недоступен» | пропуск, счётчик не растёт, тревоги нет |
-| `status.json` | `account_link: lost` | `account_link: maintenance` |
-| снимок при остановке | `account_link: lost` | `account_link: maintenance` |
-
-Т-Инвест `PLANNED_OUTAGE` не возвращает: у «Счёта» и песочницы поведение прежнее.
-
-### 7. Допуск и отпечаток
-
-```
-check_settings ─► FINAM_SECRET_TOKEN, FINAM_ACCOUNT_ID, бот, канал          (без сети, без тревоги)
-find_account   ─► TokenDetails: account_ids ровно один и = FINAM_ACCOUNT_ID  (иначе тревога)
-                  readonly → access_level read_only | full_access
-read_facts     ─► GetUsageMetrics → limits; warnings
-check_fingerprint(broker = "finam")  в data/contours/finam/broker.sqlite3
-read_account   ─► снимок; непустой счёт на первом старте — первая тревога сверки (как у «Счёта»)
+```python
+@dataclass(frozen=True)
+class LiveContour:
+    contour_id: str; kind: str
+    broker: str            # отпечаток в broker.sqlite3 (как в Ф1): account · finam · sandbox
+    provider: str          # брокер адаптера: tinvest · finam   → status.json и API "broker"
+    adapter: str; title: str; token_env: str; account_id_env: str | None
+    trading: bool          # адаптер умеет заявки
+    defaults: dict         # значения [contours.<номер>] по умолчанию: имена переменных бота и канала
 ```
 
-- Все номера счетов из `TokenDetails` — в `register_secrets` до проверки. В причине — только последние 4 символа.
-- `facts` — та же схема, что у «Счёта», чтобы API и UI не ветвились:
+| Номер | Брокер | Провайдер | Адаптер | Заголовок | Токен | Счёт | trading |
+|---|---|---|---|---|---|---|---|
+| `account` | `account` | `tinvest` | `tinvest-account` | СЧЁТ | `TINKOFF_TRADE_TOKEN` | `TINKOFF_ACCOUNT_ID` | да |
+| `finam` | `finam` | `finam` | `finam-account` | СЧЁТ ФИНАМ | `FINAM_SECRET_TOKEN` | `FINAM_ACCOUNT_ID` | нет (Ф3) |
+| `sandbox` | `sandbox` | `tinvest` | `tinvest-sandbox` | ПЕСОЧНИЦА | `TINKOFF_SANDBOX_TOKEN` | — | да |
 
-| Поле | Финам |
-|---|---|
-| `access_level` | `read_only` или `full_access` по `readonly` |
-| `qualified_for_work_with` | `[]` — у Финама нет |
-| `derivatives` | `null` — Финам не сообщает |
-| `tariff` | `null` |
-| `limits` | `orders` и `stop_orders` — квота `PlaceOrder`, `operations` — квота `Transactions` |
-| `warnings` | «квоты API не прочитаны», если `GetUsageMetrics` не ответил |
+- Порядок подъёма: `account`, `finam`, `sandbox`.
+- **Конфиг.** `config_loader` строит набор ключей и проверки секции контура на брокере по описанию: ключи вида `account`/`sandbox` (сейчас — два одинаковых множества), имена переменных из `defaults`, `orders = true` при `trading = False` → `ConfigError` «[contours.finam] orders = true: адаптер этого контура пока не умеет заявок». Третьего множества ключей и списка имён в коде нет. Плоские имена `contours_<номер>_<ключ>` и значения у `account` и `sandbox` прежние.
+- **`run.py`:**
+  - `_broker_sessions` выбирает адаптер по `spec.adapter`;
+  - `_SECRETS` дополняется переменными из описаний (`token_env`, `account_id_env`, бот), а не списком вручную;
+  - надзиратели строятся циклом, как в Ф1.
+- **Заголовки.** `console_view` берёт метку из `CONTOUR_TITLES` — его свой словарь с «ПЕСОЧНИЦА»/«СЧЁТ» удаляется.
+- **`status.json`:** новое поле `broker` = `provider`.
 
-- При `orders = true` `read_facts` требует `full_access`. В Ф2 до этого не доходит: конфиг отклоняет `orders = true` раньше.
-
-### 8. Сборка
-
-| Что | Значение |
-|---|---|
-| описание | `LiveContour("finam", kind="account", broker="finam", adapter="finam-account", title="СЧЁТ ФИНАМ", token_env="FINAM_SECRET_TOKEN", account_id_env="FINAM_ACCOUNT_ID")` |
-| порядок подъёма | `account`, `finam`, `sandbox` |
-| надзиратель | свой `BrokerContourSupervisor` из цикла по описаниям; без целевого состояния не стартует сам |
-| каталог | `data/contours/finam/` |
-| `run.py` | `_broker_sessions`: `finam-account` → `finam.adapter(token, account_id, reference_token=TINKOFF_TOKEN)`; `_SECRETS` += `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID`, токен бота Финама |
-| конфиг | `[contours.finam]` — ключи `[contours.account]`; `orders = true` → `ConfigError` «[contours.finam] orders = true: в этой версии контур Финама только читает счёт» |
-| Telegram | свой бот и канал: `telegram_bot_env = "TELEGRAM_FINAM_BOT_TOKEN"`, `telegram_channel_env = "TELEGRAM_FINAM_CHANNEL_ID"` (имена — open question) |
-| заголовки | `CONTOUR_TITLES` из описания; `console_view` берёт метку из `CONTOUR_TITLES`, а не из своего словаря |
-| `status.json` | новое поле `broker`: `tinvest` или `finam` (у песочницы `tinvest`) |
-| PyInstaller | `run.spec`: `src.finam.proto.*` и `src.broker_contour.finam` в `hiddenimports` |
-
-Граница общего кода (тест Ф1) дополняется `src.finam`.
-
-### 9. API `/api/v1/finam/*`
-
-`AccountControl` получает параметры экземпляра вместо констант класса. Маршруты строятся от базового пути.
+### 13. API — ресурс контура получает свои части извне (OCP)
 
 ```
-                       AccountControl(contour_id, base, title, orders_enabled, section)
- /api/v1/account/* ──► account  "/api/v1/account"  «Счёт»        [contours.account]
- /api/v1/finam/*   ──► finam    "/api/v1/finam"    «Счёт Финам»  [contours.finam]   orders_enabled = False
+ run.py ─► LiveAccountResource(contour_id, base, title, provider,
+                               orders_enabled,         # из [contours.<номер>] orders
+                               reconcile_extras,       # account: fee_probes · finam: None
+                               comparison)             # account (orders): AccountComparison · finam: None
+ export_api ─► LIVE = {"/api/v1/account": ресурс, "/api/v1/finam": ресурс}
+               маршрут → ресурс.routes() → обработчик        (без if по номеру контура)
 ```
 
-| Что | Как |
-|---|---|
-| чтения | сводка, `target`, `bindings`, `reconcile`, `log`, `positions`, `performance`, `trades`, `account` — те же схемы, что у `/api/v1/account` |
-| команды состава | `409 ACCOUNT_READ_ONLY`, текст называет `[contours.finam] orders = false` |
-| запуск и остановка | как у «Счёта» при `orders = false`: `PUT …/target` `on` / `no_entries` / `close_all` + `confirm` |
-| `reconcile` | без `fee_probes` у Финама: поле `null` (разведка комиссий — только Т-Инвест) |
-| `GET /api/v1` | ключ и ссылка `finam`; сводка `finam` рядом с `account` |
-| сводка и `GET …` контура | поле `broker`: `tinvest` у `account`, `finam` у `finam` |
-| `account_link` | в перечне значений добавлено `maintenance` |
-| сравнение | `/api/v1/finam/comparison` нет (Ф4). `AccountComparison` принимает имя своей стороны вместо `"account"`; `SIDES` строятся от него |
-| `export_api` | таблица «базовый путь → ресурс контура на брокере» вместо пар `if path == views.ACCOUNT`; пути `sandbox` и `account` прежние |
-| OpenAPI | 2.13.0 → 2.14.0, тег «Счёт Финам», только добавления |
+- `AccountControl` получает параметры экземпляра вместо констант класса. Наследование от `SandboxControl` остаётся (Non-Goal), но без новых веток.
+- Ресурс сам объявляет `routes()`. `comparison` и `guards/reset` есть, если переданы сравнение и торговля, иначе `404`.
+- `export_api`:
+  - `_account_get` / `_account_command` становятся общими обработчиками ресурса по таблице `LIVE`;
+  - `GET /api/v1` перечисляет `LIVE` (ключи `account`, `finam`) со сводками;
+  - ресурсы торговли (`positions`, `trades`, `performance`, `account`) — по той же таблице.
+- `AccountComparison` принимает имя своей стороны, `SIDES` строятся от него; путь и ответ `account` прежние.
+- Сводка и `GET` контура — поле `broker` (`provider`); `account_link` — плюс `maintenance`.
+- Команды состава при `orders_enabled = False` — `409 ACCOUNT_READ_ONLY`, текст называет секцию контура.
+- OpenAPI 2.13.0 → 2.14.0, только добавления:
+  - тег «Счёт Финам», пути `/api/v1/finam/*`;
+  - схемы `Finam`, `FinamCurrent`, `FinamAdmission`;
+  - `broker` у `Account`;
+  - `maintenance` в `account_link`.
 
-### 10. UI (репозиторий `UI`)
+### 14. UI (репозиторий `UI`)
 
 Ветка `feature/ui-finam-contour` от текущей рабочей `feature/ui-clusters-chart`, без push.
 
-- `TradingContour`, `BrokerContour` += `'finam'`.
-- `queries.ts`: таблица `CONTOUR_BASE = {emulation, sandbox, account, finam}` вместо цепочек тернарников.
-- `AccountPage` с параметром `contour` (`account` | `finam`), маршрут `/finam`. Пункт меню «Счёт Финам» — только при ключе `finam` в `GET /api/v1`.
-- «Обзор»: карточка «Счёт Финам». «Аварийная остановка»: строка `finam`. Шапка страницы: метка брокера по `broker`.
-- Только Ant Design и уже подключённое. После правок `npm run build`. Проверка — на тестовом роботе 8102.
+- `TradingContour`, `BrokerContour` += `'finam'`; в `queries.ts` таблица `CONTOUR_BASE` вместо цепочек тернарников.
+- `AccountPage` с параметром `contour`, маршрут `/finam`, пункт меню «Счёт Финам» при ключе `finam` в `GET /api/v1`.
+- Блок допуска показывает общие поля и поля своего брокера, если они есть: без проверки «это Финам».
+- Карточка в «Обзоре», строка в «Аварийной остановке», метка брокера по `broker`.
+- Только Ant Design и уже подключённое; `npm run build`; проверка на 8102.
 
-### 11. Тесты
+### 15. Тесты
 
-- **Фейковый API Финама.** Берётся `tests/unit/finam/fakes.py` Ф0 и расширяется: `SubscribeJwtRenewal`, квоты с `reset_time`, недоступность в заданное время.
+- **Фейк Финама** — свой, в `tests/unit/broker_contour/finam/fakes.py`, на заглушках proto. Фейк разведки Ф0 не используется: тесты Ф2 не зависят от тестов Ф0.
 - **Адаптер:**
-  - правило счёта;
-  - снимок: пустой счёт, две строки `cash`, нулевая позиция, акция в штуках;
-  - активные и конечные заявки, стопы;
-  - соответствие и расхождение шага и лота;
-  - ГО без кэша;
-  - повтор по `reset_time`;
-  - окно обслуживания;
-  - смена JWT стримом и обрыв стрима.
-- **Маскирование.** `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID` и каждого JWT нет в логе, `status.json`, событиях канала и ответах API.
-- **Два живых контура.** `account` и `finam` одновременно: свои каталоги, базы и отпечатки; отпечаток `finam` не принимает счёт другого брокера.
-- **Общий код.** `PLANNED_OUTAGE` при допуске и сверке; «Счёт» без него — прежние тревоги.
-- **Конфиг `[contours.finam]`** и **API `/api/v1/finam`**: чтения, `409`, ключ `finam`, `broker`.
-- Существующие тесты проверок не меняют.
+  - транспорт: лимит по `reset_time`, окно, текст ошибки;
+  - `JwtSource`: стрим, обрыв, запасной `Auth`, JWT — секрет до использования;
+  - правило счёта, снимок (пустой счёт, две строки `cash`, нулевая позиция, акция в штуках, заявки и стопы), соответствие и расхождение, ГО без кэша.
+- **Каталог Т-Инвест** — карточки по UID и тикеру, отказ не-`instruments.*` до сети.
+- **Границы** — общий код без `src.finam`; адаптер Финама без `tinvest`, `src.sandbox`, `t_tech` и разведки.
+- **Общий код:**
+  - `BrokerOutage` при допуске, сверке и остановке;
+  - «Счёт» и песочница без него — прежние тревоги;
+  - `orders = true` у описания без `trading` — `ConfigError`.
+- **Регресс владельца** — маскирование, два живых контура, конфиг, API (см. tasks).
+- Существующие тесты проверок не меняют. Перестройка `_read` и `config_loader` проверяется именно ими.
 
 ## Risks / Trade-offs
 
-- **Ф0 ещё живой.** Если Ф0 после слияния поменяет шлюз несовместимо, адаптер сломается на повторном `merge`. Смягчение: адаптер опирается на четыре точки шлюза — `call`, `open_stream`, `adopt_jwt`, `jwt` — и тесты адаптера идут на настоящем `FinamGateway` с фейковыми заглушками.
-- **Справочник Т-Инвест в процессе Финама.** Контур `finam` вызывает `instruments.*` на `TINKOFF_TOKEN`. Нагрузка — один список фьючерсов за процесс и карточки по требованию; квоты Т-Инвест на `instruments` велики.
-- **Окно обслуживания по часам Mac.** Ошибка вне окна — обычная недоступность с тревогой. Окно задано константой; если Финам его сдвинет, правка в одном месте.
-- **Еще один процесс и канал** — ещё один бот. Если владелец выберет общий бот «Счёта», меняются только имена переменных в `[contours.finam]`.
+- **Больше переделок общего кода, чем «просто добавить контур»:** `_read` в процессе, ключи конфига по описанию, `LIVE` в `export_api`, разделение сессии. Зато Ф3 и следующий брокер не трогают общий код. Каждый шаг — коммит с зелёным полным `pytest`.
+- **Транспорт пишется заново, а не берётся из разведки.** Около 150 строк повторяют проверенные идеи Ф0 (без заголовка у `AuthService`, разбор ошибок). Это осознанный дубль ради правильного направления зависимостей; разведку можно перевести на транспорт позже.
+- **Схема фактов и сверки Финама отличается от «Счёта».** Это отход от «тех же схем»: поля «Счёта» не меняются, а Финам не отдаёт выдуманных значений. UI показывает общие поля.
+- **Справочник Т-Инвест в процессе Финама** — один список и карточки по требованию на `TINKOFF_TOKEN`, только `instruments.*`.
+- **Окно по часам Mac.** Вне окна — обычная недоступность с тревогой. Окно — одна константа.
 
 ## Migration Plan
 
 - Данные не переносятся. `data/contours/finam/` создаётся при первом старте.
-- Без `FINAM_SECRET_TOKEN` и без команды запуска контур не поднимается и ничего не пишет в канал.
-- Откат — предыдущий релиз; каталог `finam` ему не мешает.
+- Без `FINAM_SECRET_TOKEN` и команды запуска контур не поднимается.
+- Ключи и значения `[contours.account]`, `[contours.sandbox]` прежние.
+- Откат — предыдущий релиз.
 
 ## Open Questions
 
-1. **Код Ф0.** Merge-коммит `feature/finam-probe` (рекомендуется) или перенос в `src/broker_contour/finam/`?
-2. **Telegram.** Свой бот `TELEGRAM_FINAM_BOT_TOKEN` и канал `TELEGRAM_FINAM_CHANNEL_ID`? Или бот «Счёта» `TELEGRAM_ACCOUNT_BOT_TOKEN` и свой канал?
-3. **Справочник имён Финама на `TINKOFF_TOKEN`** (только `instruments.*`) — согласны?
+1. **Telegram.** Свой бот `TELEGRAM_FINAM_BOT_TOKEN` и канал `TELEGRAM_FINAM_CHANNEL_ID`? Или бот «Счёта» `TELEGRAM_ACCOUNT_BOT_TOKEN` и свой канал?
+2. **Каталог карточек на `TINKOFF_TOKEN`** (только `instruments.*`) в процессе Финама — согласны?

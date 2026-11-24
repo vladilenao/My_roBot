@@ -2,29 +2,38 @@
 
 Финам подключается вторым реальным брокером из-за комиссий Т-Инвест. Т-Инвест не заменяется: оба брокера работают одновременно, свечи и анализ остаются у ядра на Т-Инвест, Финам только исполняет. Этапы Ф0–Ф5; это **Ф2 — контур `finam` только на чтение**.
 
-Ф1 (`refactor-broker-port`) вынес брокера за порты, Ф0 (`add-finam-probe`) разведал Finam Trade API. Теперь нужен второй живой контур вида «счёт» на Финаме, который видит счёт, сверяется и показывает его в API и UI, но не ставит заявок. Так проверяется весь путь Финама до денег: допуск, JWT, лимиты, окно обслуживания, снимок, сверка.
+Ф1 (`refactor-broker-port`) вынес брокера за порты, Ф0 (`add-finam-probe`) разведал Finam Trade API. Теперь нужен второй живой контур вида «счёт» на Финаме, который видит счёт, сверяется и показывается в API и UI без заявок. Так проверяется путь Финама до денег: допуск, JWT, лимиты, окно обслуживания, снимок, сверка.
 
 ## What Changes
 
 ```
  ядро (TINKOFF_TOKEN: свечи, анализ, карточки)
    ├─ account  → Т-Инвест   data/contours/account/  СЧЁТ          (без изменений)
-   ├─ finam    → Финам      data/contours/finam/    СЧЁТ ФИНАМ    (новый, orders = false)
+   ├─ finam    → Финам      data/contours/finam/    СЧЁТ ФИНАМ    (новый, только чтение)
    └─ sandbox  → Т-Инвест   data/contours/sandbox/  ПЕСОЧНИЦА     (без изменений)
 ```
 
-- **Код Ф0 в ветку** — merge-коммитом `feature/finam-probe` (design, решение 1). Заглушки proto и шлюз остаются в `src/finam/`, адаптер их использует.
-- **Адаптер `src/broker_contour/finam/`** на чтение — `BrokerSession` порта Ф1:
-  - JWT обновляется стримом `SubscribeJwtRenewal`, каждый JWT сразу становится секретом лога;
-  - снимок счёта из `GetAccount` и `GetOrders`;
-  - соответствие инструмента Т-Инвест и `symbol` Финама;
-  - ГО из `GetAssetParams` при каждом чтении;
-  - повтор по лимиту ждёт `reset_time` из `GetUsageMetrics`;
-  - окно обслуживания 05:00–06:15 МСК — плановая недоступность без тревоги.
+- **Заглушки proto из Ф0** — merge-коммитом `feature/finam-probe`. Разведку адаптер не импортирует.
+- **Адаптер `src/broker_contour/finam/`** на чтение:
+  - свой транспорт: один источник JWT (стрим `SubscribeJwtRenewal`, запасной `Auth`), повтор по `reset_time` из `GetUsageMetrics`, окно 05:00–06:15 МСК → `BrokerOutage`;
+  - снимок из `GetAccount` и `GetOrders`;
+  - соответствие `symbol` ↔ карточка ядра; ГО из `GetAssetParams` при каждом чтении.
+- **Порты (развитие Ф1):**
+  - `BrokerSession` делится на чтение и `TradingSession`;
+  - новый порт `InstrumentCatalog` — карточки ядра; его собирает `run.py` из Т-Инвест и передаёт адаптеру Финама;
+  - `BrokerOutage` — плановая недоступность брокера.
+- **Общий код без веток по брокеру:**
+  - чтение счёта в процессе сведено в один метод с исходом «снимок / потерян / окно»;
+  - ключи `[contours.<номер>]` и секреты лога выводятся из описаний контуров;
+  - `orders = true` отклоняется у описания без торговли.
 - **Допуск:** токен видит ровно один счёт `FINAM_ACCOUNT_ID`; права по `TokenDetails.readonly`; отпечаток `broker = finam`; отказ — тревогой в канал.
-- **Сборка:** описание контура `finam`, свой надзиратель ядра, `[contours.finam]` с ключами `[contours.account]`, свой бот и канал, заголовок «СЧЁТ ФИНАМ». `orders = true` в Ф2 отклоняется при загрузке конфига.
-- **API `/api/v1/finam/*`** — зеркало `/api/v1/account/*` с теми же схемами. Команды состава — `409 ACCOUNT_READ_ONLY`. В `GET /api/v1` — ключ `finam`; у `account` и `finam` — поле `broker`. OpenAPI 2.13.0 → 2.14.0, только добавления.
-- **Обобщение по `contour_id`:** `account_control`, `comparison_view`, `export_api`. Пути `sandbox` и `account` не меняются.
+- **Сборка:** описание `finam` (`provider = finam`, `trading = false`), свой надзиратель, `[contours.finam]`, свой бот и канал, заголовок «СЧЁТ ФИНАМ», `broker` в `status.json`.
+- **API `/api/v1/finam/*`** — тот же ресурс, что `/api/v1/account/*`, собранный с другими частями:
+  - команды состава — `409 ACCOUNT_READ_ONLY`;
+  - факты и сверка Финама — общие поля, без полей Т-Инвест;
+  - `GET /api/v1` — ключ `finam`; `broker` у `account` и `finam`;
+  - `account_link` — плюс `maintenance`;
+  - OpenAPI 2.14.0, только добавления.
 - **UI** (отдельный репозиторий): страница «Счёт Финам», карточка в «Обзоре», строка в «Аварийной остановке», метка брокера.
 
 **Не входит:** заявки, стопы, комиссии, поток заявок — Ф3; предохранители, сравнение, перенос привязок — Ф4.
@@ -33,25 +42,24 @@
 
 ### New Capabilities
 
-- `finam-contour`: контур `finam` на Финаме — адаптер на чтение, допуск, снимок, JWT, лимиты, окно обслуживания, соответствие инструментов.
+- `finam-contour`: контур `finam` на Финаме — транспорт, JWT, лимит, окно обслуживания, допуск, снимок, соответствие инструментов.
 
 ### Modified Capabilities
 
-- `broker-contour`: третий контур на брокере в порядке подъёма; плановая недоступность брокера при сверке; граница общего кода включает `src.finam`.
-- `control-api`: ресурс `/api/v1/finam`, поле `broker` у контуров на брокере, значение `maintenance` у `account_link`.
-- `configuration`: секция `[contours.finam]`.
+- `broker-contour`: описание контура (`provider`, `trading`, порядок подъёма), порты `TradingSession` и `InstrumentCatalog`, плановая недоступность брокера, граница общего кода.
+- `control-api`: ресурс `/api/v1/finam`, `broker` у контуров на брокере, `account_link: maintenance`.
+- `configuration`: `[contours.finam]`; ключи секций контуров на брокере — по описанию; `orders = true` у контура без торговли.
 
 ## Impact
 
 - **Код:**
-  - новые `src/broker_contour/finam/`;
-  - `src/broker_contour/contours.py`, `process.py`, `reconcile.py`, `port.py`;
-  - `run.py`, `src/config.py`, `src/config_loader.py`;
-  - `src/bot/account_control.py`, `control_views.py`, `comparison_view.py`;
-  - `src/data/export_api.py`;
+  - новые `src/broker_contour/finam/`, `src/broker_contour/tinvest/catalog.py`;
+  - `src/broker_contour/port.py`, `contours.py`, `process.py`, `reconcile.py`, `admission.py`;
+  - `run.py`, `src/config.py`, `src/config_loader.py`, `default.toml`;
+  - `src/bot/account_control.py`, `control_views.py`, `comparison_view.py`, `src/data/export_api.py`;
   - `src/notifier/templates/console_view.py`;
   - `run.spec`, `docs/api/openapi.yaml`.
-- **Код Ф0** приходит merge-коммитом. PR этой ветки несёт и коммиты Ф0: Ф0 лучше влить в `release/release-12` раньше (после 30.11).
-- **Окружение:** `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID` (из Ф0), бот и канал Финама (имена — open question).
-- **«Счёт», «Песочница», эмуляция:** поведение, пути, файлы и тексты не меняются.
+- **Ф0** приходит merge-коммитом ради заглушек; PR Ф0 в `release/release-12` лучше раньше Ф2.
+- **Окружение:** `FINAM_SECRET_TOKEN`, `FINAM_ACCOUNT_ID` (из Ф0), бот и канал Финама.
+- **«Счёт», «Песочница», эмуляция:** поведение, пути, ключи, файлы и тексты не меняются; добавлено только поле `broker`.
 - **Ветки:** `feature/finam-contour` от `release/release-12` без upstream; UI — своя ветка. Push и PR делает владелец.
