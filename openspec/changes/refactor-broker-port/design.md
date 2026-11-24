@@ -38,24 +38,29 @@
 
 ### 1. Схема
 
+Оба брокера нужны одновременно, Т-Инвест не заменяется. Контуры вида «счёт» с разными брокерами работают рядом. У каждого свой процесс, каталог, база, отпечаток счёта и канал. Код Т-Инвест в Ф1 только переезжает за порт.
+
 ```
-            общий код (не знает SDK)                      адаптеры
- ┌─────────────────────────────────────────────┐
- │ process.py  BrokerContour ── LiveContour ───┼──► описание: id, вид, брокер,
- │   │                         (описание)      │    окружение, канал, заголовок
- │   ├─ admission.py ──────┐                   │
- │   ├─ reconcile, guards  │ BrokerAccess ◄────┼──── tinvest/access.py   (Ф2: finam/access.py)
- │   │                     │  счёт, допуск,    │       правило счёта, факты допуска,
- │   │                     │  снимок, капитал  │       снимок, капитал, имена
- │   └─ LiveBroker ────────┤                   │
- │       ├─ stops.py       │ BrokerApi ◄───────┼──── tinvest/api.py      (Ф3: finam/api.py)
- │       ├─ fees.py        │  заявки, стопы,   │       TInvestApi, разбор 30057/30079
- │       └─ stream.py      │  операции, цены   │
- │                         │ BrokerTraits ◄────┼──── свойства профиля (таблица ниже)
- │   port.py: отчёты, OrderFailure,            │
- │            BrokerCallError, AccountSnapshot │    tinvest/gateway.py ── t_tech SDK
- └─────────────────────────────────────────────┘
+ контуры (процессы)          общий код                порт            адаптеры (пакеты)
+ ─────────────────          ─────────                ────            ─────────────────
+ sandbox ─┐                                                       ┌─► tinvest/   Т-Инвест
+ data/contours/sandbox/     LiveBroker               BrokerApi    │   api, gateway, account,
+ broker.sqlite3, канал ПЕСОЧН.  stops, fees, stream ─► BrokerAccess ─┤   admission, access
+          ├─► LiveContour ─► BrokerContour       ─► BrokerTraits  │   (Ф1: переезд без правок
+ account ─┤   (описание)    admission, reconcile,                 │    логики)
+ data/contours/account/     guards, control                      │
+ broker.sqlite3, канал СЧЁТ                                        └─► finam/     Финам
+          │                 не знает ни tinvest/,                    api, gateway (JWT),
+ finam ───┘ (Ф2)            ни finam/ — только порт                  account, access
+ data/contours/finam/                                                (Ф2–Ф3, рядом)
+ broker.sqlite3, канал ФИНАМ
+
+ profiles.py (сборка): профиль описания → адаптер. tinvest-sandbox, tinvest-account; Ф2: finam-account
 ```
+
+- **Контур** — процесс `run.py --contour <номер>` со своим каталогом, базой `broker.sqlite3`, журналом сделок, отпечатком счёта и каналом. Процессы друг друга не ждут, сбой одного не останавливает остальных.
+- **Общий код** работает только с портом. Ни `tinvest/`, ни `finam/` он не импортирует.
+- **Адаптер выбирает сборка.** Реестр `src/broker_contour/profiles.py` по профилю описания (решение 6) отдаёт `BrokerAccess` и `BrokerTraits`. Только он знает пакеты адаптеров и импортирует их лениво.
 
 ### 2. Порт — `src/broker_contour/port.py`
 
@@ -116,7 +121,13 @@
 
 Модули `src/broker_contour/api.py`, `src/broker_contour/account.py`, `src/account/account.py`, `src/account/admission.py` удаляются. Их импорты в коде и тестах переходят на `port` и `tinvest`.
 
-**Граница проверяется тестом:** модули `broker`, `stops`, `fees`, `stream`, `process`, `admission`, `prices`, `orders`, `reconcile`, `guards`, `control`, `notify`, `fingerprint`, `store`, `bindings`, `port` не импортируют `t_tech`, `grpc` и `src.sandbox`. Проверяются и импорты внутри функций — разбором AST.
+**Граница проверяется тестом:** модули `broker`, `stops`, `fees`, `stream`, `process`, `admission`, `prices`, `orders`, `reconcile`, `guards`, `control`, `notify`, `fingerprint`, `store`, `bindings`, `port`, `contours` не импортируют:
+
+- `t_tech`, `grpc`;
+- `src.sandbox`;
+- пакеты адаптеров `src.broker_contour.tinvest` и `src.broker_contour.finam`.
+
+Проверяются и импорты внутри функций — разбором AST. Пакеты адаптеров знает только реестр `profiles.py`. `BrokerContour` берёт доступ у реестра по `settings.profile`, а прежние параметры конструктора (`gateway_factory`, `find_account`, `read_facts`) остаются переопределениями для тестов.
 
 ### 4. Свойства брокера — `BrokerTraits`
 

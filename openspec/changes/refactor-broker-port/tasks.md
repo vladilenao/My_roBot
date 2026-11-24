@@ -14,14 +14,14 @@
 
 ## 2. Описание контура
 
-- [ ] 2.1 `src/broker_contour/contours.py`: `LiveContour`, `LIVE_CONTOURS` (`account`, `sandbox`), чтение `[contours.<id>]` по номеру.
+- [ ] 2.1 `src/broker_contour/contours.py`: `LiveContour`, `LIVE_CONTOURS` (`account`, `sandbox`), чтение `[contours.<id>]` по номеру. Реестр `src/broker_contour/profiles.py`: профиль → адаптер (`tinvest-sandbox`, `tinvest-account`), единственный, кто знает пакеты адаптеров.
 - [ ] 2.2 `run.py`: одна функция запуска контура на брокере по описанию; надзиратели циклом по описаниям; `BrokerContourSupervisor(contour_id, kind)`; `BrokerContourSettings.kind` в `status.json`; заголовки карточек из описания.
 
 ## 3. Тесты
 
 - [ ] 3.1 Существующие тесты `tests/unit/` проходят. Меняются только импорты и необязательные параметры фейков, проверки — нет.
 - [ ] 3.2 `tests/unit/broker_contour/test_broker_port.py`:
-  - общий код не импортирует `t_tech`, `grpc`, `src.sandbox` (AST, и внутри функций);
+  - общий код не импортирует `t_tech`, `grpc`, `src.sandbox` и пакеты адаптеров `tinvest`, `finam` (AST, и внутри функций);
   - `TInvestApi` и фейк удовлетворяют `BrokerApi`;
   - контрактный сценарий: вход, цель, стоп у брокера, срабатывание, рестарт, досверка — на фейке Т-Инвест;
   - ветки `order_lookup = number` и `stop_lookup = key` на фейке.
@@ -30,7 +30,8 @@
   - `status.json` у `sandbox` и `account` с прежними `contour_id` и `kind`;
   - `launch.json` прежний;
   - заголовки «ПЕСОЧНИЦА» и «СЧЁТ»;
-  - «Счёт» поднимается первым.
+  - «Счёт» поднимается первым;
+  - у каждого контура свой каталог, база, отпечаток и канал — контуры независимы.
 - [ ] 3.5 Полный `pytest` и `ruff check src tests run.py`.
 - [ ] 3.6 Сборка PyInstaller `run.spec` проходит; собранный `--contour sandbox` на тестовых данных доходит до допуска без `ImportError`.
 
