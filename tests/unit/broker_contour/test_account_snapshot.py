@@ -13,7 +13,7 @@ from decimal import Decimal
 import pytest
 from t_tech.invest import schemas as s
 
-from src.broker_contour.account import INCONSISTENT, position_conflicts, read_account
+from src.broker_contour.tinvest.account import INCONSISTENT, position_conflicts, read_account
 from src.broker_contour.store import read_last_report
 from src.events.bus import EventBus
 from src.sandbox.gateway import BrokerCallError

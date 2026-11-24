@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from src.broker.port import ExecutionStatus
-from src.broker_contour.api import OrderFailure
+from src.broker_contour.port import OrderFailure
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import CANCELLED, CANCELLING, OrderLedger, order_key
 from src.broker_contour.prices import (PriceCard, entry_limit, executed_lots, exit_limit, fill_average, points_from_rub,
@@ -123,7 +123,7 @@ def _stream_fill(h, key, lots, price, trade_id="exch-stream-1"):
     """Событие стрима «исполнена» со сделкой биржи на все лоты."""
     from dataclasses import replace
 
-    from src.broker_contour.api import BrokerTrade
+    from src.broker_contour.port import BrokerTrade
 
     return replace(h.api.orders[key], status="fill", lots_executed=lots, executed_rub=None,
                    trades=(BrokerTrade(trade_id, D(price), lots, NOW),))
@@ -621,7 +621,7 @@ def test_api_max_lots_takes_larger_of_cash_and_margin_for_side():
     """Ответ счёта …7029 18.11 по BR: без плеча 0, с плечом 2 — лимит 2; запрос с ценой заявки."""
     from t_tech.invest import schemas as s
 
-    from src.broker_contour.api import TInvestApi
+    from src.broker_contour.tinvest.api import TInvestApi
 
     class Gateway:
         def __init__(self):

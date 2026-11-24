@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from src.broker_contour.admission import AdmissionError
-from src.sandbox.gateway import BrokerCallError
+from src.broker_contour.port import BrokerCallError
 
 DERIVATIVES = "derivative"       # строка допуска к срочным контрактам; сверить по списку на первом старте
 # Лимиты методов, которые вызывает контур: у сервиса операций тяжёлые методы (отчёт брокера) ограничены

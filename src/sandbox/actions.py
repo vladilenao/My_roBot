@@ -16,7 +16,7 @@ from t_tech.invest.schemas import (
 )
 from t_tech.invest.utils import decimal_to_money, money_to_decimal, quotation_to_decimal
 
-from src.sandbox.account import RobotAccount
+from src.broker_contour.port import RobotAccount
 from src.sandbox.gateway import BrokerCallError, SandboxGateway
 from src.sandbox.instruments import SandboxInstrument, short_name_by_uid
 

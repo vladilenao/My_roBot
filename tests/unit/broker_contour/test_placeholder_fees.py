@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 from t_tech.invest import schemas as s
 
-from src.broker_contour.api import OrderFailure, report_from_state
+from src.broker_contour.port import OrderFailure
+from src.broker_contour.tinvest.api import report_from_state
 from src.broker_contour.broker import fee_share
 from src.broker_contour.orders import LedgerExecution, OrderLedger, order_key
 from tests.unit.broker_contour.fake_api import NOW, FakeApi

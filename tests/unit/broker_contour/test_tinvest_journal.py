@@ -14,7 +14,7 @@ from decimal import Decimal
 import pytest
 
 from src.broker.port import ExecutionStatus
-from src.broker_contour.api import BrokerTrade
+from src.broker_contour.port import BrokerTrade
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import OrderLedger, order_key
 from src.trade_journal.storage import ReservationCandidate, Storage

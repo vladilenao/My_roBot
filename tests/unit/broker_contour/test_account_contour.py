@@ -11,10 +11,10 @@ from functools import partial
 import pytest
 from t_tech.invest import schemas as s
 
-from src.account.account import account_by_id
-from src.account.admission import NO_DERIVATIVES, read_facts
+from src.broker_contour.tinvest.account import account_by_id
+from src.broker_contour.tinvest.admission import NO_DERIVATIVES, read_facts
 from src.account.fee_probes import FeeProbes, read_fee_probes
-from src.broker_contour.account import AccountSnapshot
+from src.broker_contour.port import AccountSnapshot
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.process import BrokerContour, BrokerContourSettings
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore
@@ -113,7 +113,7 @@ def test_read_only_token_refused_with_orders():
 
 
 def test_limits_of_contour_methods_only():
-    from src.account.admission import _limits
+    from src.broker_contour.tinvest.admission import _limits
 
     prefix = "tinkoff.public.invest.api.contract.v1."
     response = s.GetUserTariffResponse(unary_limits=[

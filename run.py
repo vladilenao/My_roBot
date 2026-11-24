@@ -280,8 +280,8 @@ def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, ki
     """Процесс контура «Счёт»: только чтение счёта (add-account-contour) или торговля привязками (enable-live-trading)."""
     from functools import partial
 
-    from src.account.account import account_by_id
-    from src.account.admission import read_facts
+    from src.broker_contour.tinvest.account import account_by_id
+    from src.broker_contour.tinvest.admission import read_facts
     from src.account.fee_probes import FeeProbes
     from src.assembly.pulse import CorePulse
     from src.broker_contour import ACCOUNT

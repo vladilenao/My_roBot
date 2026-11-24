@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from src.broker.port import ExecutionStatus
-from src.broker_contour.api import OrderFailure
+from src.broker_contour.port import OrderFailure
 from src.broker_contour.broker import ExitPolicy, TInvestBroker
 from src.broker_contour.orders import OrderLedger, order_key
 from src.broker_contour.stops import ACTIVE, EXECUTED, LOST, UNKNOWN, StopLedger
@@ -428,7 +428,7 @@ def test_stopped_message_counts_broker_stops():
 
 def test_reconcile_compares_own_stops_with_account():
     """Своя стоп-заявка совпадает со счётом; лишняя на счёте — расхождение ``stop_order`` (задача 9.3)."""
-    from src.broker_contour.account import AccountSnapshot
+    from src.broker_contour.port import AccountSnapshot
     from src.broker_contour.reconcile import JournalView, compare
 
     journal = JournalView(holdings=(("NG-12.26", 2),), stop_orders=("NG-12.26",))

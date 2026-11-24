@@ -25,7 +25,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from src.broker.port import FeeAdjustment
-from src.broker_contour.api import OperationReport, OrderFailure
+from src.broker_contour.port import OperationReport, OrderFailure
 from src.broker_contour.broker import fee_share
 
 log = logging.getLogger(__name__)

@@ -1,47 +1,26 @@
-"""Снимок счёта брокера: деньги, позиции, активные заявки и стоп-заявки коротким именем."""
+"""Счёт робота у Т-Инвест (refactor-broker-port): правила счёта песочницы и «Счёта», снимок счёта.
+
+Снимок — деньги, позиции, активные заявки и стоп-заявки коротким именем. Правило песочницы —
+открытый счёт с именем ``My_roBot`` (нет — открыть); правило «Счёта» (add-account-contour, design.md
+решение 3) — токен видит ровно один открытый счёт, и это ``TINKOFF_ACCOUNT_ID``. Полные номера наружу
+не выходят — только последние четыре символа.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from decimal import Decimal
-
+from t_tech.invest.schemas import AccessLevel, AccountStatus
 from t_tech.invest.utils import money_to_decimal, quotation_to_decimal
 
-from src.logging_setup import get_logger
-from src.sandbox.account import RobotAccount
+from src.broker_contour.port import (AccountRuleError, AccountSnapshot, BrokerCallError,  # noqa: F401
+                                     RobotAccount, mask_account)
+from src.logging_setup import get_logger, register_secrets
 from src.sandbox.actions import active_orders, active_stop_orders, portfolio_positions, rub_of
-from src.sandbox.gateway import BrokerCallError
 from src.sandbox.instruments import short_name_by_uid
 
 log = get_logger(__name__)
 
 # Код «снимок противоречив» (fix-account-snapshot-cross-check): портфель и позиции брокера расходятся.
 INCONSISTENT = "INCONSISTENT"
-
-
-@dataclass(frozen=True)
-class AccountSnapshot:
-    rub: Decimal
-    liquid_portfolio: Decimal | None
-    holdings: tuple[tuple[str, int], ...] = ()       # (короткое имя, лоты)
-    orders: tuple[str, ...] = ()                      # короткое имя на каждую активную заявку
-    stop_orders: tuple[str, ...] = ()                 # короткое имя на каждую активную стоп-заявку
-    names: dict = field(default_factory=dict, compare=False)
-
-    def payload(self) -> dict:
-        """Поля ``status.json`` и события ``started``."""
-        return {
-            "capital": {"rub": _kopecks(self.rub),
-                        "liquid_portfolio": None if self.liquid_portfolio is None else _kopecks(self.liquid_portfolio)},
-            "positions": [{"name": name, "lots": lots} for name, lots in self.holdings],
-            "orders": len(self.orders),
-            "stop_orders": len(self.stop_orders),
-        }
-
-
-def _kopecks(value: Decimal) -> str:
-    """Деньги брокера до копейки: у песочницы бывают доли копейки после пополнений и комиссий."""
-    return format(value.quantize(Decimal("0.01")), "f")
 
 
 def read_account(gateway, account: RobotAccount, names: dict | None = None) -> AccountSnapshot:
@@ -115,3 +94,67 @@ def _listed(response, name: str) -> list:
 
 def _sign(value: int) -> int:
     return (value > 0) - (value < 0)
+
+
+# --- правило счёта песочницы (add-sandbox-contour) ----------------------------
+ROBOT_ACCOUNT_NAME = "My_roBot"
+
+
+class AccountConflict(AccountRuleError):
+    """Счетов песочницы с именем робота больше одного: какой закрыть, решает человек."""
+
+    def __init__(self, masked: list[str]):
+        super().__init__(masked)
+        self.masked = masked
+
+    def __str__(self) -> str:
+        return (f"Счетов песочницы {ROBOT_ACCOUNT_NAME} несколько: {', '.join(self.masked)}. "
+                "Оставьте один, остальные закройте.")
+
+
+def robot_account(gateway) -> RobotAccount:
+    """Найти счёт робота; нет — открыть; несколько — ``AccountConflict``.
+
+    Полный номер регистрируется секретом лога и заменой в записях разведки.
+    """
+    response = gateway.call("users.get_accounts")
+    ours = [account for account in response.accounts
+            if account.name == ROBOT_ACCOUNT_NAME and account.status == AccountStatus.ACCOUNT_STATUS_OPEN]
+    if len(ours) > 1:
+        register_secrets([account.id for account in ours])
+        raise AccountConflict([mask_account(account.id) for account in ours])
+    if ours:
+        result = RobotAccount(ours[0].id, opened=False)
+    else:
+        opened = gateway.call("sandbox.open_sandbox_account", name=ROBOT_ACCOUNT_NAME)
+        result = RobotAccount(opened.account_id, opened=True)
+    register_secrets([result.account_id])
+    gateway.set_account(result.account_id)
+    return result
+
+
+# --- правило счёта «Счёта» (add-account-contour, design.md решение 3) -----------
+ACCESS_LEVELS = {
+    AccessLevel.ACCOUNT_ACCESS_LEVEL_FULL_ACCESS: "full_access",
+    AccessLevel.ACCOUNT_ACCESS_LEVEL_READ_ONLY: "read_only",
+}
+
+
+def account_by_id(gateway, account_id: str) -> RobotAccount:
+    """``GetAccounts``: открытый счёт ровно один, его номер — ``account_id``, права — полный доступ или чтение."""
+    register_secrets([account_id])
+    response = gateway.call("users.get_accounts")
+    opened = [item for item in response.accounts if item.status == AccountStatus.ACCOUNT_STATUS_OPEN]
+    register_secrets([item.id for item in response.accounts])
+    if len(opened) != 1:
+        tails = ", ".join(mask_account(item.id) for item in opened) or "—"
+        raise AccountRuleError(f"Токен видит открытых счетов: {len(opened)} ({tails}), а нужен ровно один — "
+                               "счёт робота. Выпустите токен только на него.")
+    found = opened[0]
+    if found.id != account_id:
+        raise AccountRuleError(f"Токен видит счёт {mask_account(found.id)}, а TINKOFF_ACCOUNT_ID задаёт другой")
+    level = ACCESS_LEVELS.get(found.access_level)
+    if level is None:
+        raise AccountRuleError(f"У токена нет доступа к счёту {mask_account(found.id)}")
+    gateway.set_account(found.id)
+    return RobotAccount(found.id, opened=False, access_level=level)

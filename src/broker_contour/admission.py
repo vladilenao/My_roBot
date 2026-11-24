@@ -9,15 +9,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from src.broker_contour.account import AccountSnapshot, read_account
 from src.broker_contour.fingerprint import FingerprintMismatch, check_fingerprint
+from src.broker_contour.port import AccountRuleError, AccountSnapshot, BrokerCallError, RobotAccount  # noqa: F401
 from src.broker_contour.store import BrokerStore
-from src.sandbox.account import AccountConflict, RobotAccount, robot_account
-from src.sandbox.gateway import BrokerCallError
-
-
-class AccountRuleError(Exception):
-    """Счёт робота не определён правилом вида (у «Счёта» — ``src.account.account``)."""
+from src.broker_contour.tinvest.account import read_account, robot_account
 
 
 class AdmissionError(Exception):
@@ -64,7 +59,7 @@ def admit_account(gateway, store: BrokerStore, *, broker: str, find_account: Cal
     """
     try:
         account = find_account(gateway)
-    except (AccountConflict, AccountRuleError) as exc:
+    except AccountRuleError as exc:
         raise AdmissionError(str(exc), alarm=True) from None
     except BrokerCallError as exc:
         raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True) from None

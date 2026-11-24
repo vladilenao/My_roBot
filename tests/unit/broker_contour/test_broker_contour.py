@@ -11,7 +11,7 @@ import pytest
 from t_tech.invest import schemas as s
 
 from src.assembly.core_state import CoreStateStore, Member
-from src.broker_contour.account import AccountSnapshot
+from src.broker_contour.port import AccountSnapshot
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.process import BrokerContour, BrokerContourSettings
 from src.broker_contour.reconcile import JournalView, Reconciler, compare

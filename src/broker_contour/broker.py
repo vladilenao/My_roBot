@@ -23,7 +23,7 @@ from typing import Callable, Mapping
 
 from src.broker.journal_broker import JournalBroker, stop_triggered
 from src.broker.port import BrokerPort, ExecutionEvent, ExecutionStatus, FeeSource
-from src.broker_contour.api import OrderFailure, OrderReport
+from src.broker_contour.port import OrderFailure, OrderReport
 from src.broker_contour.orders import (ACCEPTED, CANCELLED, CANCELLING, FILLED, PARTIAL, REJECTED, SENDING, UNKNOWN,
                                        LedgerExecution, LedgerOrder, OrderLedger, order_key)
 from src.broker_contour.stops import StopKeeping, StopLedger

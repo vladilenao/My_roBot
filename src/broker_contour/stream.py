@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import threading
 
-from src.broker_contour.api import OrderFailure
+from src.broker_contour.port import OrderFailure
 from src.logging_setup import get_logger
-from src.sandbox.gateway import BrokerCallError
+from src.broker_contour.port import BrokerCallError
 
 log = get_logger(__name__)
 

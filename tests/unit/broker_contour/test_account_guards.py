@@ -148,7 +148,7 @@ def test_rejects_counter_survives_restart(tmp_path):
 
 def test_broker_counts_only_broker_rejects(tmp_path):
     """Отказ брокера на вход и стоп-заявку — в счётчик; проверки до отправки и «торги закрыты» — нет."""
-    from src.broker_contour.api import OrderFailure
+    from src.broker_contour.port import OrderFailure
     from src.broker_contour.broker import ExitPolicy, TInvestBroker
     from src.broker_contour.orders import order_key
     from src.broker_contour.stops import StopLedger

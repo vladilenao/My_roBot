@@ -23,7 +23,8 @@ from pathlib import Path
 
 from src.assembly.contour_control import STATUS_FILE, write_status
 from src.assembly.core_state import read_desired
-from src.broker_contour.account import AccountSnapshot, read_account
+from src.broker_contour.port import AccountSnapshot
+from src.broker_contour.tinvest.account import read_account
 from src.broker_contour.orders import ACCEPTED, PARTIAL
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.notify import BrokerNotifier
@@ -31,7 +32,7 @@ from src.broker_contour.reconcile import JournalView, Reconciler
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore
 from src.logging_setup import get_logger, register_secrets
 from src.sandbox.actions import rub_balance
-from src.sandbox.gateway import BrokerCallError
+from src.broker_contour.port import BrokerCallError
 from src.sandbox.instruments import short_name_by_uid
 
 log = get_logger(__name__)
@@ -258,7 +259,7 @@ class BrokerContour:
     # --- торговля привязками (add-tinvest-orders) -----------------------------
     def _serve_trading(self, gateway, store: BrokerStore, admitted) -> int:
         from src.assembly.contour import BrokerTrading
-        from src.broker_contour.api import TInvestApi
+        from src.broker_contour.tinvest.api import TInvestApi
         from src.broker_contour.broker import ExitPolicy, TInvestBroker
         from src.broker_contour.control import BrokerControl, assignment_index
         from src.broker_contour.fees import FeeSync
