@@ -3,6 +3,7 @@ from decimal import Decimal
 from html import escape
 from datetime import datetime, timedelta, timezone
 
+from src.broker_contour.contours import CONTOUR_TITLES  # метки контуров на брокере — из их описаний
 from src.events.types import EventType
 from src.notifier.templates.events import ingestion_summary, next_event_label, schedule_summary
 from src.notifier.templates.holds import data_reason
@@ -184,7 +185,6 @@ def _history(visual, step, unit, offset):
     return lines
 
 
-CONTOUR_TITLES = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}
 WHAT_LABELS = {"position": "позиция", "order": "заявки", "stop_order": "стоп-заявки"}
 # Предохранители контура на брокере (add-account-guards).
 GUARD_TITLES = {"daily_loss": "дневной убыток", "broker_rejects": "отказы брокера подряд"}

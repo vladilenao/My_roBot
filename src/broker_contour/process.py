@@ -5,7 +5,7 @@
 остановка любого режима — выход на шаге её применения, счёт не трогается.
 
 При ``orders = true`` после допуска поднимается торговая часть эмуляции с
-``TInvestBroker`` (design.md решение 1): до первого тика разбираются
+``LiveBroker`` (design.md решение 1): до первого тика разбираются
 незавершённые заявки и непроведённые исполнения, проходит сверка; затем бот
 работает на главном потоке, а слой брокера (исполнения, капитал, ГО, сверка,
 ``status.json``) — на границах тика и в опросе между тиками. Пульс ядра идёт
@@ -23,16 +23,13 @@ from pathlib import Path
 
 from src.assembly.contour_control import STATUS_FILE, write_status
 from src.assembly.core_state import read_desired
-from src.broker_contour.account import AccountSnapshot, read_account
-from src.broker_contour.orders import ACCEPTED, PARTIAL
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.notify import BrokerNotifier
+from src.broker_contour.orders import ACCEPTED, PARTIAL
+from src.broker_contour.port import AccountSnapshot, BrokerCallError, BrokerSession
 from src.broker_contour.reconcile import JournalView, Reconciler
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore
 from src.logging_setup import get_logger, register_secrets
-from src.sandbox.actions import rub_balance
-from src.sandbox.gateway import BrokerCallError
-from src.sandbox.instruments import short_name_by_uid
 
 log = get_logger(__name__)
 
@@ -63,6 +60,7 @@ def _admission_card(facts: dict | None) -> dict:
 @dataclass(frozen=True)
 class BrokerContourSettings:
     contour_id: str
+    kind: str                             # вид контура из описания (refactor-broker-port): sandbox · account
     broker: str
     directory: Path
     core_db: Path
@@ -84,17 +82,16 @@ class BrokerContourSettings:
 
 
 class BrokerContour:
-    """Процесс контура на брокере. ``gateway_factory(token)`` — контекстный менеджер шлюза брокера."""
+    """Процесс контура на брокере.
 
-    def __init__(self, settings: BrokerContourSettings, *, gateway_factory: Callable, bus, stop,
+    ``session_factory()`` — контекстный менеджер открытой сессии брокера (``BrokerSession``): её собирает
+    точка сборки ``run.py`` из адаптера брокера (refactor-broker-port). SDK брокера процесс не знает.
+    """
+
+    def __init__(self, settings: BrokerContourSettings, *, session_factory: Callable, bus, stop,
                  pid: int, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 trading_factory: Callable | None = None, find_account: Callable | None = None,
-                 read_facts: Callable | None = None, fee_probes_factory: Callable | None = None):
+                 trading_factory: Callable | None = None):
         self.settings = settings
-        # Вид контура задаёт сборка (add-account-contour): правило счёта, факты допуска, разведка комиссий.
-        self._find_account = find_account
-        self._read_facts = read_facts
-        self._fee_probes_factory = fee_probes_factory
         self._fee_probes = None
         # ``trading_factory(trading, control, strategies)`` — торговая часть эмуляции (run.py);
         # нужна только при ``orders = true``.
@@ -105,13 +102,13 @@ class BrokerContour:
         self._capital: Decimal | None = None
         self._guards_read: datetime | None = None
         settings.directory.mkdir(parents=True, exist_ok=True)
-        self._gateway_factory = gateway_factory
+        self._session_factory = session_factory
         self._stop = stop
         self._pid = pid
         self._clock = clock
         self._lock = threading.Lock()
         self.notifier = BrokerNotifier(bus, contour=settings.contour_id)
-        self._status = {"contour_id": settings.contour_id, "kind": settings.contour_id, "state": STARTING,
+        self._status = {"contour_id": settings.contour_id, "kind": settings.kind, "state": STARTING,
                         "applied_generation": None, "stop_mode": None, "version": settings.version, "pid": pid,
                         "members": [], "account": None, "capital": None, "positions": [], "orders": 0,
                         "stop_orders": 0, "frozen": [], "last_reconcile_at": None, "account_link": None,
@@ -146,16 +143,14 @@ class BrokerContour:
             return self._refuse(exc)
         store = BrokerStore(settings.directory / BROKER_DATABASE_FILE)
         try:
-            with self._gateway_factory(settings.token) as gateway:
+            with self._session_factory() as session:
                 try:
-                    admitted = admit_account(gateway, store, broker=settings.broker,
-                                             **({"find_account": self._find_account} if self._find_account else {}),
-                                             read_facts=self._read_facts)
+                    admitted = admit_account(session, store, broker=settings.broker)
                 except AdmissionError as exc:
                     return self._refuse(exc)
                 if settings.orders:
-                    return self._serve_trading(gateway, store, admitted)
-                return self._serve(gateway, store, admitted)
+                    return self._serve_trading(session, store, admitted)
+                return self._serve(session, store, admitted)
         except BrokerCallError as exc:
             return self._refuse(AdmissionError(f"Брокер недоступен: {exc}", alarm=True))
 
@@ -168,7 +163,7 @@ class BrokerContour:
         self._write(state=FAILED, reason=exc.reason, exited_at=_now(), exit_reason=exc.reason)
         return 2
 
-    def _serve(self, gateway, store: BrokerStore, admitted) -> int:
+    def _serve(self, session: BrokerSession, store: BrokerStore, admitted) -> int:
         settings = self.settings
         account = admitted.account
         register_secrets([account.account_id])
@@ -176,8 +171,7 @@ class BrokerContour:
         reconciler = Reconciler(store=store, notifier=self.notifier, account_tail=account.masked,
                                 every_secs=settings.reconcile_every_secs)
         reconciler.note = _first_start_note(admitted)
-        if self._fee_probes_factory is not None:
-            self._fee_probes = self._fee_probes_factory(settings.directory / BROKER_DATABASE_FILE)
+        self._fee_probes = session.fee_probes(settings.directory / BROKER_DATABASE_FILE)
         desired = read_desired(settings.core_db, settings.contour_id)
         self._apply(desired)
         self._account(admitted.snapshot)
@@ -186,24 +180,24 @@ class BrokerContour:
         self.notifier.started(admitted.snapshot, bindings=len(self._status["members"]), generation=self._generation,
                               orders_enabled=False, **_admission_card(admitted.facts))
         log.info("Контур %s запущен: счёт %s, поколение %s", settings.contour_id, account.masked, self._generation)
-        self._reconcile(reconciler, gateway, account, admitted.snapshot)
+        self._reconcile(reconciler, session, account, admitted.snapshot)
         self._write(state=RUNNING, account=account.masked, account_link="ok")
         while not self._stop.requested.wait(settings.step_secs):
-            self.step(gateway, account, reconciler)
+            self.step(session, account, reconciler)
         reason = self._stop.reason or "цикл завершён"
-        self._final_account(gateway, account)
+        self._final_account(session, account)
         self.notifier.stopped(reason)
         self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
         log.info("Контур %s остановлен: %s", settings.contour_id, reason)
         return 0
 
-    def step(self, gateway, account, reconciler: Reconciler) -> None:
+    def step(self, session: BrokerSession, account, reconciler: Reconciler) -> None:
         """Один шаг: целевое состояние, сверка по расписанию, ``status.json``."""
         self._apply(read_desired(self.settings.core_db, self.settings.contour_id))
         if self._stop.requested.is_set():
             return
         if reconciler.due(self._clock()):
-            self._reconcile(reconciler, gateway, account)
+            self._reconcile(reconciler, session, account)
         self._write()
 
     def _apply(self, desired) -> None:
@@ -223,14 +217,14 @@ class BrokerContour:
         # ``account_at`` — момент снимка: позиции и заявки в статусе верны на него, а не на «сейчас».
         self._write(**snapshot.payload(), account_link="ok", account_at=_now())
 
-    def _final_account(self, gateway, account) -> None:
+    def _final_account(self, session: BrokerSession, account) -> None:
         """Снимок счёта перед STOPPED (fix-sandbox-restart-safety): после остановки статус не обновит никто.
 
         Без него ``status.json`` показывал позиции последней сверки — до выхода ``close_all``. Брокер не
         ответил — снимок прежний, ``account_link: lost`` говорит, что он мог устареть.
         """
         try:
-            snapshot = read_account(gateway, account)
+            snapshot = session.read_account(account)
         except BrokerCallError as exc:
             log.warning("Снимок счёта при остановке не прочитан (%s)", exc.code)
             self._write(account_link="lost")
@@ -238,11 +232,12 @@ class BrokerContour:
         self._capital = snapshot.rub
         self._account(snapshot)
 
-    def _reconcile(self, reconciler: Reconciler, gateway, account, snapshot: AccountSnapshot | None = None) -> None:
+    def _reconcile(self, reconciler: Reconciler, session: BrokerSession, account,
+                   snapshot: AccountSnapshot | None = None) -> None:
         now = self._clock()
         if snapshot is None:
             try:
-                snapshot = read_account(gateway, account)
+                snapshot = session.read_account(account)
             except BrokerCallError as exc:
                 log.warning("Сверка пропущена: счёт не прочитан (%s)", exc.code)
                 report = reconciler.run(now, None)
@@ -253,17 +248,16 @@ class BrokerContour:
         self._write(frozen=report["frozen"], last_reconcile_at=report["at"])
         if self._fee_probes is not None:
             self._fee_probes.observe(now, snapshot)
-            self._fee_probes.run(gateway, account.account_id, now)
+            self._fee_probes.run(account, now)
 
     # --- торговля привязками (add-tinvest-orders) -----------------------------
-    def _serve_trading(self, gateway, store: BrokerStore, admitted) -> int:
+    def _serve_trading(self, session: BrokerSession, store: BrokerStore, admitted) -> int:
         from src.assembly.contour import BrokerTrading
-        from src.broker_contour.api import TInvestApi
-        from src.broker_contour.broker import ExitPolicy, TInvestBroker
+        from src.broker_contour.broker import ExitPolicy, LiveBroker
         from src.broker_contour.control import BrokerControl, assignment_index
-        from src.broker_contour.fees import FeeSync
         from src.broker_contour.guards import Guards, GuardStore
         from src.broker_contour.orders import OrderLedger
+        from src.broker_contour.prices import PriceBook
         from src.broker_contour.stops import StopLedger
         from src.broker_contour.stream import OrderStream
         from src.config import FUTURE_STRATEGIES, SHARE_STRATEGIES
@@ -274,7 +268,8 @@ class BrokerContour:
         admitted_at = self._clock()         # снимок допуска не новее: сделки, разобранные дальше, — после него
         register_secrets([account.account_id])
         self.notifier.account_tail = account.masked
-        api = TInvestApi(gateway, account.account_id)
+        book = PriceBook()                  # карточки цен — общие у брокера контура и адаптера
+        link = session.trading(account, book)
         ledger = OrderLedger(settings.directory / BROKER_DATABASE_FILE)
         stops = StopLedger(ledger)          # стоп у брокера (add-broker-protection)
         guards = Guards(GuardStore(ledger), max_daily_loss_pct=settings.max_daily_loss_pct,
@@ -296,20 +291,22 @@ class BrokerContour:
                     "SELECT 1 FROM fills WHERE execution_id=? UNION SELECT 1 FROM events WHERE event_id=?",
                     (execution_id, execution_id)).fetchone() is not None
 
-            broker = TInvestBroker(api, ledger, contour=settings.contour_id,
-                                   policy=settings.exit_policy or ExitPolicy(), publish=self._bus.publish,
-                                   journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
-                                   stops=stops, order_outcome=guards.order_outcome,
-                                   ask_max_lots=settings.contour_id == "account")
+            broker = LiveBroker(link.api, ledger, contour=settings.contour_id, book=book,
+                                fills_prefix=link.fills_prefix, margin_every=link.margin_every,
+                                margin_limits=link.margin_limits,
+                                policy=settings.exit_policy or ExitPolicy(), publish=self._bus.publish,
+                                journal_has=journal_has, entry_ttl=_entry_ttl_seconds, clock=self._clock,
+                                stops=stops, order_outcome=guards.order_outcome)
             holder["broker"] = broker
-            holder["fees"] = FeeSync(api, lambda: storage.connection)   # add-account-vs-emulation-report
+            # Настоящие комиссии брокера (add-account-vs-emulation-report): источник — у адаптера.
+            holder["fees"] = None if link.fee_source is None else link.fee_source(lambda: storage.connection)
             return broker
 
         strategies: tuple[dict, dict] = ({}, {})
         control = BrokerControl(
             core_db=settings.core_db, contour_id=settings.contour_id,
             index=assignment_index(SHARE_STRATEGIES, FUTURE_STRATEGIES), strategies=strategies,
-            request_stop=self._stop.request, status=self._write, poll=lambda: self._poll(holder, gateway, account,
+            request_stop=self._stop.request, status=self._write, poll=lambda: self._poll(holder, session, account,
                                                                                          reconciler),
             broker_busy=lambda: holder["broker"].busy() if "broker" in holder else False,
             core_lost=lambda: self._core_link == "lost")
@@ -340,8 +337,8 @@ class BrokerContour:
             broker.set_account_positions(self._positions_by_uid(admitted.snapshot), at=admitted_at)
             broker.service(self._clock())
             self._consume(broker, manager)
-            self._reconcile_trading(reconciler, gateway, account, broker, manager)
-            stream = OrderStream(api, broker, stop=self._stop.requested)
+            self._reconcile_trading(reconciler, session, account, broker, manager)
+            stream = OrderStream(link.api, broker, stop=self._stop.requested)
             stream.start()
             desired = read_desired(settings.core_db, settings.contour_id)
             self.notifier.started(admitted.snapshot, bindings=0 if desired is None else
@@ -359,7 +356,7 @@ class BrokerContour:
         broker = holder.get("broker")
         positions = sum(1 for lots in broker.open_positions().values() if lots) if broker is not None else 0
         broker_stops = len(broker.active_stops()) if broker is not None else 0
-        self._final_account(gateway, account)
+        self._final_account(session, account)
         self.notifier.stopped(reason, open_positions=positions, broker_stops=broker_stops)
         self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
         ledger.close()
@@ -406,7 +403,7 @@ class BrokerContour:
             manager.consume(event)
         return len(events)
 
-    def _poll(self, holder: dict, gateway, account, reconciler: Reconciler) -> None:
+    def _poll(self, holder: dict, session: BrokerSession, account, reconciler: Reconciler) -> None:
         """Опрос между тиками и граница тика: исполнения, капитал, ГО, сверка, доставка команд."""
         broker, manager = holder.get("broker"), holder.get("manager")
         if broker is None or manager is None:
@@ -417,13 +414,13 @@ class BrokerContour:
         if broker.fills_since_capital:
             broker.fills_since_capital = False
             try:
-                self._capital = rub_balance(gateway, account)
+                self._capital = session.capital(account)
             except BrokerCallError as exc:
                 log.warning("Капитал после исполнения не прочитан (%s)", exc.code)
         broker.refresh_margins(now)
         self._guards_tick(holder)
         if reconciler.due(now):
-            self._reconcile_trading(reconciler, gateway, account, broker, manager)
+            self._reconcile_trading(reconciler, session, account, broker, manager)
         try:
             manager.dispatch(now)
         except Exception as exc:  # noqa: BLE001 — доставка повторится на следующем опросе
@@ -432,7 +429,7 @@ class BrokerContour:
         positions, _ = manager.contour_remainder()
         self._write(trades=positions, orders_in_flight=len(broker.live_orders()), stream_link=broker.stream_link)
 
-    def _reconcile_trading(self, reconciler: Reconciler, gateway, account, broker, manager,
+    def _reconcile_trading(self, reconciler: Reconciler, session: BrokerSession, account, broker, manager,
                            snapshot: AccountSnapshot | None = None) -> None:
         """Сверка со своим журналом: позиции сделок, заявки в работе; «в пути» не сравнивается."""
         now = self._clock()
@@ -442,7 +439,7 @@ class BrokerContour:
         snapshot_at = self._clock()
         if snapshot is None:
             try:
-                snapshot = read_account(gateway, account)
+                snapshot = session.read_account(account)
             except BrokerCallError as exc:
                 log.warning("Сверка пропущена: счёт не прочитан (%s)", exc.code)
                 report = reconciler.run(now, None)
@@ -455,7 +452,7 @@ class BrokerContour:
 
         def name(uid: str) -> str:
             try:
-                return short_name_by_uid(gateway, uid, names)
+                return session.short_name(uid, names)
             except BrokerCallError:
                 return uid
 

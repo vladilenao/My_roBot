@@ -10,12 +10,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from src.broker_contour.port import mask_account  # noqa: F401 — маска номера счёта общая с контуром
+
 ACCOUNT_PLACEHOLDER = "sandbox-account"
-
-
-def mask_account(account_id: str) -> str:
-    """Номер счёта для человека: только последние четыре символа."""
-    return f"…{str(account_id)[-4:]}"
 
 
 def jsonable(value: Any) -> Any:

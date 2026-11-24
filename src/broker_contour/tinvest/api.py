@@ -1,10 +1,10 @@
-"""Узкий адаптер API Т-Инвест для контура на брокере (add-tinvest-orders).
+"""Узкий адаптер API Т-Инвест для контура на брокере (add-tinvest-orders, refactor-broker-port).
 
-``TInvestBroker`` не знает SDK: он получает отчёты ``OrderReport`` и ошибки
-``OrderFailure`` с понятным видом. Котировка без валюты (``Quotation``) — цена
-в пунктах; сумма с валютой (``MoneyValue``) у фьючерса — рубли за контракт,
-их переводит ``prices.points_from_rub``. Разведка С1: цены сделок биржи в
-стриме приходят в пунктах, суммы заявки — в рублях.
+``TInvestApi`` — единственное место вызовов SDK у брокера контура: отчёты Т-Инвест
+(``TInvestOrderReport``) и ошибки ``OrderFailure`` с понятным видом. Котировка без валюты
+(``Quotation``) — цена в пунктах; сумма с валютой (``MoneyValue``) у фьючерса — рубли за
+контракт, их переводит в пункты ``TInvestPort`` (``tinvest/prices.py``). Разведка С1: цены
+сделок биржи в стриме приходят в пунктах, суммы заявки — в рублях.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Iterator
 from t_tech.invest import schemas as s
 from t_tech.invest.utils import money_to_decimal, quotation_to_decimal
 
-from src.sandbox.gateway import BrokerCallError
+from src.broker_contour.port import BrokerCallError, OrderFailure
 
 # Обрыв или тайм-аут: брокер мог принять заявку — её ищут по ключу (design.md, решение 8).
 TRANSPORT_CODES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "UNKNOWN", "CANCELLED", "ABORTED"})
@@ -51,8 +51,9 @@ _STOP_STATUS = {
 }
 
 
+# --- отчёты Т-Инвест как прислал брокер; в пункты их переводит ``TInvestPort`` ----------
 @dataclass(frozen=True)
-class BrokerTrade:
+class TInvestTrade:
     """Сделка биржи по заявке: номер, цена, количество (как прислал брокер), время.
 
     ``in_rub`` — цена пришла суммой (``OrderStage`` в ``GetOrderState``): у фьючерса это рубли за
@@ -67,7 +68,7 @@ class BrokerTrade:
 
 
 @dataclass(frozen=True)
-class OrderReport:
+class TInvestOrderReport:
     """Состояние заявки у брокера: из ответа ``PostOrder``, ``GetOrderState`` или стрима."""
 
     broker_order_id: str
@@ -76,7 +77,7 @@ class OrderReport:
     lots_requested: int
     lots_executed: int
     instrument_uid: str = ""
-    trades: tuple[BrokerTrade, ...] = ()
+    trades: tuple[TInvestTrade, ...] = ()
     executed_rub: Decimal | None = None   # сумма исполнения ``executed_order_price`` (рубли у фьючерса)
     initial_rub: Decimal | None = None    # сумма заявки ``initial_order_price``: запрошенные лоты × цена лота
     temporary: bool = False               # первое событие стрима с временным номером заявки
@@ -89,11 +90,11 @@ class OrderReport:
 
 
 @dataclass(frozen=True)
-class StopReport:
+class TInvestStopReport:
     """Стоп-заявка у брокера из ``GetStopOrders``.
 
     ``stop_price`` — как прислал брокер: у фьючерса это может быть рубли за контракт, а не пункты
-    (разведка П19); брокер контура сравнивает оба прочтения. Нашего ключа у стоп-заявки в ответе нет.
+    (разведка П19); поиск сравнивает оба прочтения. Нашего ключа у стоп-заявки в ответе нет.
     """
 
     stop_order_id: str
@@ -124,21 +125,8 @@ class OperationReport:
     trades: tuple[tuple[str, int], ...] = ()
 
 
-class OrderFailure(Exception):
-    """Отказ вызова заявки: ``unknown`` — судьба неизвестна, ``duplicate`` — ключ уже был,
-    ``rate_limited`` — повторы шлюза исчерпаны, ``not_found`` — по ключу пусто, ``rejected`` — отказ брокера."""
-
-    def __init__(self, kind: str, code: str = "", details: str = "", message: str = ""):
-        super().__init__(kind, code, details, message)
-        self.kind, self.code, self.details, self.message = kind, code, details, message
-
-    def __str__(self) -> str:
-        return " ".join(part for part in (self.code, self.details, self.message) if part) or self.kind
-
-    @property
-    def reason(self) -> str:
-        """Причина отказа для журнала: ``broker:<код>``."""
-        return f"broker:{self.details or self.code or self.kind}"
+# Прежние имена отчётов внутри адаптера Т-Инвест.
+BrokerTrade, OrderReport, StopReport = TInvestTrade, TInvestOrderReport, TInvestStopReport
 
 
 def classify(error: BrokerCallError) -> OrderFailure:

@@ -42,8 +42,8 @@ class FakeAdopted(FakeProcess):
 
 def _supervisor(tmp_path, store, autostart=True):
     FakeProcess.started = []
-    return BrokerContourSupervisor(kind="sandbox", state_dir=tmp_path, core_state=store, version="9.9.9",
-                                   autostart=autostart, heartbeat_timeout=30, heartbeat_secs=5,
+    return BrokerContourSupervisor(contour_id="sandbox", kind="sandbox", state_dir=tmp_path, core_state=store,
+                                   version="9.9.9", autostart=autostart, heartbeat_timeout=30, heartbeat_secs=5,
                                    process_factory=FakeProcess, adopt_factory=FakeAdopted, say=lambda text: None)
 
 

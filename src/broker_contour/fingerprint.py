@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 
+from src.broker_contour.port import mask_account
 from src.broker_contour.store import BrokerStore, Fingerprint
-from src.sandbox.records import mask_account
 
 
 class FingerprintMismatch(Exception):

@@ -14,8 +14,9 @@ from src.bot import control_views as views
 from src.bot.trades_view import ContourTrades
 from src.broker import ExecutionEvent, ExecutionStatus
 from src.broker.port import FeeSource
-from src.broker_contour.api import OperationReport, OrderFailure, TInvestApi
-from src.broker_contour.fees import FeeSync, adjustments
+from src.broker_contour.port import OrderFailure
+from src.broker_contour.tinvest.api import OperationReport, TInvestApi
+from src.broker_contour.tinvest.fees import FeeSync, adjustments
 from src.broker_contour.process import BrokerContour
 from src.sandbox.gateway import BrokerCallError
 from src.trade_management.actions import CloseTrade, OpenTrade

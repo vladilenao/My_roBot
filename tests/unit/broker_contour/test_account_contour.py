@@ -11,14 +11,15 @@ from functools import partial
 import pytest
 from t_tech.invest import schemas as s
 
-from src.account.account import account_by_id
-from src.account.admission import NO_DERIVATIVES, read_facts
+from src.broker_contour.tinvest.account import account_by_id
+from src.broker_contour.tinvest.admission import NO_DERIVATIVES, read_facts
 from src.account.fee_probes import FeeProbes, read_fee_probes
-from src.broker_contour.account import AccountSnapshot
+from src.broker_contour.port import AccountSnapshot
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.process import BrokerContour, BrokerContourSettings
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore
 from src.events.bus import EventBus
+from src.broker_contour.tinvest.session import TInvestSession, adapter
 from src.sandbox.gateway import SANDBOX_ONLY, AccountGateway, BrokerCallError
 from tests.unit.broker_contour.test_broker_contour import TRADING_CALLS as WRITE_METHODS, Collector, Stop
 from tests.unit.sandbox.fakes import NG_UID, NOW, FakeBroker, FakeClient, money
@@ -40,6 +41,12 @@ def _gateway(broker):
 
 def _find(gateway):
     return account_by_id(gateway, ACCOUNT_ID)
+
+
+def _sessions(broker, *, orders):
+    """Сессии Т-Инвест «Счёта» на фейковом брокере (refactor-broker-port)."""
+    return adapter("account", token=TOKEN, account_id=ACCOUNT_ID, orders=orders, gateway_factory=_gateway(broker),
+                   rule=_find, facts=partial(read_facts, orders=orders))
 
 
 # --- шлюз ---------------------------------------------------------------------
@@ -75,7 +82,7 @@ def test_one_open_account_with_read_only_access():
 def test_account_rule_refusals(tmp_path, accounts, text):
     broker = FakeBroker(accounts=accounts)
     with _gateway(broker)(TOKEN) as gateway, pytest.raises(AdmissionError) as exc:
-        admit_account(gateway, BrokerStore(tmp_path / BROKER_DATABASE_FILE), broker="account", find_account=_find)
+        admit_account(TInvestSession(gateway, rule=_find), BrokerStore(tmp_path / BROKER_DATABASE_FILE), broker="account")
     assert text in exc.value.reason and exc.value.alarm
     assert ACCOUNT_ID not in exc.value.reason and "2000555-other-0002" not in exc.value.reason
 
@@ -113,7 +120,7 @@ def test_read_only_token_refused_with_orders():
 
 
 def test_limits_of_contour_methods_only():
-    from src.account.admission import _limits
+    from src.broker_contour.tinvest.admission import _limits
 
     prefix = "tinkoff.public.invest.api.contract.v1."
     response = s.GetUserTariffResponse(unary_limits=[
@@ -135,8 +142,8 @@ def test_fingerprint_of_other_account_refused(tmp_path):
     store = BrokerStore(tmp_path / BROKER_DATABASE_FILE)
     store.save_fingerprint(fingerprint_of("account", "2000123456-real-4a1b"))
     with _gateway(FakeBroker(accounts=[_account()]))(TOKEN) as gateway, pytest.raises(AdmissionError) as exc:
-        admit_account(gateway, store, broker="account", find_account=_find,
-                      read_facts=partial(read_facts, orders=False))
+        admit_account(TInvestSession(gateway, rule=_find, facts=partial(read_facts, orders=False)), store,
+                      broker="account")
     assert "другому счёту …4a1b" in exc.value.reason
 
 
@@ -144,7 +151,7 @@ def test_fingerprint_of_other_account_refused(tmp_path):
 
 def _settings(tmp_path):
     return BrokerContourSettings(
-        contour_id="account", broker="account", directory=tmp_path / "contours" / "account",
+        contour_id="account", kind="account", broker="account", directory=tmp_path / "contours" / "account",
         core_db=tmp_path / "core.sqlite3", version="9.9.9", token=TOKEN, token_env="TINKOFF_TRADE_TOKEN",
         account_id=ACCOUNT_ID, account_id_env="TINKOFF_ACCOUNT_ID", bot_token="123456:fake-bot-token-abcdef",
         bot_env="TELEGRAM_ACCOUNT_BOT_TOKEN", channel_id="-100700", channel_env="TELEGRAM_ACCOUNT_CHANNEL_ID",
@@ -154,8 +161,8 @@ def _settings(tmp_path):
 def _run(tmp_path, broker, steps=3):
     collector, bus, stop = Collector(), EventBus(), Stop()
     bus.subscribe_all([collector])
-    contour = BrokerContour(_settings(tmp_path), gateway_factory=_gateway(broker), bus=bus, stop=stop, pid=4242,
-                            find_account=_find, read_facts=partial(read_facts, orders=False))
+    contour = BrokerContour(_settings(tmp_path), session_factory=_sessions(broker, orders=False), bus=bus, stop=stop,
+                            pid=4242)
     thread = threading.Thread(target=contour.run)
     thread.start()
     for _ in range(500):
@@ -262,6 +269,7 @@ def test_broker_contours_recover_in_order_and_failure_does_not_block():
     class Supervisor:
         def __init__(self, kind, fail=False):
             self.kind, self.fail = kind, fail
+            self.contour_id = kind
 
         def recover(self):
             order.append(self.kind)
@@ -290,8 +298,8 @@ def test_wrong_account_id_sends_refused_card(tmp_path):
     collector, bus, stop = Collector(), EventBus(), Stop()
     bus.subscribe_all([collector])
     broker = FakeBroker(accounts=[_account("2000555-other-0002")])
-    contour = BrokerContour(_settings(tmp_path), gateway_factory=_gateway(broker), bus=bus, stop=stop, pid=4242,
-                            find_account=_find, read_facts=partial(read_facts, orders=False))
+    contour = BrokerContour(_settings(tmp_path), session_factory=_sessions(broker, orders=False), bus=bus, stop=stop,
+                            pid=4242)
     assert contour.run() == 2
     assert collector.kinds() == ["refused"]
     assert collector.events[0].get("reason") == "Токен видит счёт …0002, а TINKOFF_ACCOUNT_ID задаёт другой"
@@ -320,8 +328,8 @@ def test_account_with_orders_builds_trading_part(tmp_path):
 
     from dataclasses import replace
     settings = replace(_settings(tmp_path), orders=True)
-    contour = BrokerContour(settings, gateway_factory=_gateway(broker), bus=bus, stop=stop, pid=4242,
-                            find_account=_find, read_facts=partial(read_facts, orders=True), trading_factory=factory)
+    contour = BrokerContour(settings, session_factory=_sessions(broker, orders=True), bus=bus, stop=stop,
+                            pid=4242, trading_factory=factory)
     thread, result = _run_in_thread(contour)
     status_path = tmp_path / "contours" / "account" / "status.json"
     assert _wait(lambda: status_path.exists() and json.loads(status_path.read_text()).get("stream_link") == "ok")

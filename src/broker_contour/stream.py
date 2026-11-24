@@ -1,6 +1,6 @@
 """Поток ``OrderStateStream`` контура на брокере (add-tinvest-orders, design.md решение 7).
 
-Поток только пишет журнал заявок через ``TInvestBroker.ingest``: ``trades.sqlite3``
+Поток только пишет журнал заявок через ``LiveBroker.ingest``: ``trades.sqlite3``
 он не трогает, ``consume`` вызывает главный поток. Обрыв — переподключение с
 паузой 1, 2, 4… до 30 с; после каждого подключения незавершённые заявки
 досверяются по ключу (``resync``), чтобы не потерять сделки, пришедшие без стрима.
@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import threading
 
-from src.broker_contour.api import OrderFailure
+from src.broker_contour.port import OrderFailure
 from src.logging_setup import get_logger
-from src.sandbox.gateway import BrokerCallError
+from src.broker_contour.port import BrokerCallError
 
 log = get_logger(__name__)
 

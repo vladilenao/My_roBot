@@ -28,10 +28,6 @@ from src.config import (
     TINKOFF_ACCOUNT_ID,
     account_bot_token,
     sandbox_bot_token,
-    sandbox_channel_id,
-    CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
-    CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
-    CONTOUR_SANDBOX_RECONCILE_EVERY_MIN,
     LOGGING_SERVICE_UID,
     LOGGING_FILE,
     LOGGING_LEVEL,
@@ -135,15 +131,15 @@ def _run_contour(kind: str, args=()) -> int:
     from src.bot.run_session import StoppableRunSession
     from src.data.market_store import MarketDataStore
 
-    from src.broker_contour import ACCOUNT, SANDBOX
+    from src.broker_contour.contours import LIVE_CONTOURS, live_contour
 
     if kind == MODE_HISTORY:
         return _run_history_contour(args[0] if args else "")
-    if kind in (SANDBOX, ACCOUNT):
+    if live_contour(kind) is not None:
         return _run_broker_contour(kind)
     if kind != MODE_EMULATION:
-        print(f"Неизвестный вид контура {kind!r}: поддерживаются {MODE_EMULATION}, {MODE_HISTORY}, {SANDBOX} "
-              f"и {ACCOUNT}.")
+        names = [MODE_EMULATION, MODE_HISTORY, *sorted((contour.contour_id for contour in LIVE_CONTOURS), reverse=True)]
+        print(f"Неизвестный вид контура {kind!r}: поддерживаются {', '.join(names[:-1])} и {names[-1]}.")
         return 2
     data_dir = runtime_dir()
     directory = contour_dir(data_dir, kind)
@@ -203,8 +199,13 @@ def _run_contour(kind: str, args=()) -> int:
     return 0
 
 
-def _run_broker_contour(kind: str) -> int:
-    """Процесс контура на брокере (add-sandbox-contour): на С2 — песочница, только чтение счёта."""
+def _run_broker_contour(contour_id: str) -> int:
+    """Процесс контура на брокере по его описанию (refactor-broker-port): песочница, «Счёт», на Ф2 — Финам.
+
+    Настройки — из ``[contours.<номер>]``, токен и номер счёта — из окружения по именам описания, адаптер
+    брокера — ``_broker_sessions``. При ``orders = false`` — только чтение счёта, при ``true`` — торговля
+    привязками (add-tinvest-orders, enable-live-trading).
+    """
     import signal
 
     from src.assembly.process import LaunchFileError, StdinStop, read_launch
@@ -212,17 +213,15 @@ def _run_broker_contour(kind: str) -> int:
     from src.broker_contour.broker import ExitPolicy
     from src.broker_contour.notify import build_channels
     from src.broker_contour.process import BrokerContour, BrokerContourSettings
-    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_SANDBOX_EXIT_OFFSET_STEPS,
-                            CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
-                            CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
-                            CONTOUR_SANDBOX_ORDERS, CONTOUR_SANDBOX_STOP_PLACE_SECS, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
-                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT)
+    from src.broker_contour.contours import live_contour
+    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
+                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT, contour_env, contour_setting)
     from src.events.bus import EventBus
     from src.notifier.factory import close_channels
-    from src.sandbox.gateway import SandboxGateway
 
+    spec = live_contour(contour_id)
     data_dir = runtime_dir()
-    directory = contour_dir(data_dir, kind)
+    directory = contour_dir(data_dir, contour_id)
     directory.mkdir(parents=True, exist_ok=True)
     try:
         acquire_runtime_lock(directory)
@@ -231,10 +230,10 @@ def _run_broker_contour(kind: str) -> int:
         return 1
     setup_logging(service_uid=LOGGING_SERVICE_UID, log_file=str(directory / LOGGING_FILE), secrets=_SECRETS,
                   **_log_settings(False, None))
-    log.info("Контур %s v%s запущен", kind, __version__)
+    log.info("Контур %s v%s запущен", contour_id, __version__)
     _log_open_files()
     try:
-        launch = read_launch(directory, kind)
+        launch = read_launch(directory, contour_id)
     except LaunchFileError as exc:
         log.error("%s", exc)
         print(str(exc))
@@ -242,30 +241,35 @@ def _run_broker_contour(kind: str) -> int:
     stop = StdinStop()
     stop.start()
     signal.signal(signal.SIGINT, lambda *_: stop.request("Ctrl+C"))
-    from src.broker_contour import ACCOUNT
 
-    if kind == ACCOUNT:
-        return _run_account_contour(directory, data_dir, stop, launch, kind)
+    def setting(key: str):
+        return contour_setting(contour_id, key)
+
+    orders = bool(setting("orders"))       # true — настоящие заявки (enable-live-trading); включает владелец
     settings = BrokerContourSettings(
-        orders=CONTOUR_SANDBOX_ORDERS,
-        max_daily_loss_pct=CONTOUR_SANDBOX_MAX_DAILY_LOSS_PCT, max_rejects_in_row=CONTOUR_SANDBOX_MAX_REJECTS_IN_ROW,
-        exit_policy=ExitPolicy(CONTOUR_SANDBOX_EXIT_OFFSET_STEPS, CONTOUR_SANDBOX_EXIT_REQUOTE_SECS,
-                               CONTOUR_SANDBOX_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_SANDBOX_STOP_PLACE_SECS),
-        contour_id=kind, broker=kind, directory=directory, core_db=data_dir / CORE_DATABASE_FILE,
-        version=__version__, token=TINKOFF_SANDBOX_TOKEN, token_env="TINKOFF_SANDBOX_TOKEN",
-        bot_token=sandbox_bot_token(), bot_env=CONTOUR_SANDBOX_TELEGRAM_BOT_ENV,
-        channel_id=sandbox_channel_id(), channel_env=CONTOUR_SANDBOX_TELEGRAM_CHANNEL_ENV,
-        reconcile_every_secs=CONTOUR_SANDBOX_RECONCILE_EVERY_MIN * 60)
+        orders=orders, max_daily_loss_pct=setting("max_daily_loss_pct"),
+        max_rejects_in_row=setting("max_rejects_in_row"),
+        exit_policy=ExitPolicy(setting("exit_offset_steps"), setting("exit_requote_secs"),
+                               setting("exit_requote_attempts"), stop_place_secs=setting("stop_place_secs")),
+        contour_id=contour_id, kind=spec.kind, broker=spec.broker, directory=directory,
+        core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=os.getenv(spec.token_env) or None,
+        token_env=spec.token_env,
+        account_id=(os.getenv(spec.account_id_env) or None) if spec.account_id_env else None,
+        account_id_env=spec.account_id_env,
+        bot_token=contour_env(contour_id, "telegram_bot_env"), bot_env=setting("telegram_bot_env"),
+        channel_id=contour_env(contour_id, "telegram_channel_env"), channel_env=setting("telegram_channel_env"),
+        reconcile_every_secs=setting("reconcile_every_min") * 60)
     bus, channels = EventBus(), []
     if settings.bot_token and settings.channel_id:
         channels = build_channels(bot_token=settings.bot_token, channel_id=settings.channel_id, directory=directory,
                                   cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
                                   request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
                                   max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
-                                  contour=kind, orders=settings.orders)
+                                  contour=contour_id, orders=orders)
         bus.subscribe_all(channels)
-    contour = BrokerContour(settings, gateway_factory=SandboxGateway, bus=bus, stop=stop, pid=os.getpid(),
-                            trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
+    contour = BrokerContour(settings, session_factory=_broker_sessions(spec, settings), bus=bus, stop=stop,
+                            pid=os.getpid(),
+                            trading_factory=_broker_trading_factory(contour_id, directory, data_dir, launch, stop, bus))
     pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
                       timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
     pulse.start()
@@ -276,63 +280,22 @@ def _run_broker_contour(kind: str) -> int:
         close_channels(channels)
 
 
-def _run_account_contour(directory: Path, data_dir: Path, stop, launch: dict, kind: str) -> int:
-    """Процесс контура «Счёт»: только чтение счёта (add-account-contour) или торговля привязками (enable-live-trading)."""
-    from functools import partial
+def _broker_sessions(spec, settings):
+    """Точка сборки адаптера брокера по описанию контура (refactor-broker-port, design.md решение 4).
 
-    from src.account.account import account_by_id
-    from src.account.admission import read_facts
-    from src.account.fee_probes import FeeProbes
-    from src.assembly.pulse import CorePulse
-    from src.broker_contour import ACCOUNT
-    from src.broker_contour.broker import ExitPolicy
-    from src.broker_contour.notify import build_channels
-    from src.broker_contour.process import BrokerContour, BrokerContourSettings
-    from src.config import (BAR_TIME_TZ_OFFSET_HOURS, CLOUDFLARE_URL, CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS,
-                            CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
-                            CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT, CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
-                            CONTOUR_ACCOUNT_ORDERS, CONTOUR_ACCOUNT_STOP_PLACE_SECS,
-                            CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN, CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
-                            CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV, NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
-                            NOTIFIER_TELEGRAM_REQUEST_TIMEOUT, account_channel_id)
-    from src.events.bus import EventBus
-    from src.notifier.factory import close_channels
-    from src.sandbox.gateway import AccountGateway
+    Единственное место, где выбирается пакет адаптера; общий код контура получает готовую фабрику сессий.
+    """
+    from src.broker_contour.tinvest.session import adapter
 
-    orders = bool(CONTOUR_ACCOUNT_ORDERS)       # true — настоящие заявки (enable-live-trading); включает владелец
-    settings = BrokerContourSettings(
-        orders=orders, max_daily_loss_pct=CONTOUR_ACCOUNT_MAX_DAILY_LOSS_PCT,
-        max_rejects_in_row=CONTOUR_ACCOUNT_MAX_REJECTS_IN_ROW,
-        exit_policy=ExitPolicy(CONTOUR_ACCOUNT_EXIT_OFFSET_STEPS, CONTOUR_ACCOUNT_EXIT_REQUOTE_SECS,
-                               CONTOUR_ACCOUNT_EXIT_REQUOTE_ATTEMPTS, stop_place_secs=CONTOUR_ACCOUNT_STOP_PLACE_SECS),
-        contour_id=ACCOUNT, broker=ACCOUNT, directory=directory,
-        core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=TINKOFF_TRADE_TOKEN,
-        token_env="TINKOFF_TRADE_TOKEN", account_id=TINKOFF_ACCOUNT_ID, account_id_env="TINKOFF_ACCOUNT_ID",
-        bot_token=account_bot_token(), bot_env=CONTOUR_ACCOUNT_TELEGRAM_BOT_ENV,
-        channel_id=account_channel_id(), channel_env=CONTOUR_ACCOUNT_TELEGRAM_CHANNEL_ENV,
-        reconcile_every_secs=CONTOUR_ACCOUNT_RECONCILE_EVERY_MIN * 60)
-    bus, channels = EventBus(), []
-    if settings.bot_token and settings.channel_id:
-        channels = build_channels(bot_token=settings.bot_token, channel_id=settings.channel_id, directory=directory,
-                                  cloudflare_url=CLOUDFLARE_URL, tz_offset_hours=BAR_TIME_TZ_OFFSET_HOURS,
-                                  request_timeout=NOTIFIER_TELEGRAM_REQUEST_TIMEOUT,
-                                  max_transport_attempts=NOTIFIER_TELEGRAM_MAX_TRANSPORT_ATTEMPTS,
-                                  contour=ACCOUNT, orders=orders)
-        bus.subscribe_all(channels)
-    contour = BrokerContour(settings, gateway_factory=AccountGateway, bus=bus, stop=stop, pid=os.getpid(),
-                            find_account=lambda gateway: account_by_id(gateway, TINKOFF_ACCOUNT_ID or ""),
-                            read_facts=partial(read_facts, orders=orders),
-                            # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
-                            fee_probes_factory=None if orders else FeeProbes,
-                            trading_factory=_broker_trading_factory(kind, directory, data_dir, launch, stop, bus))
-    pulse = CorePulse(data_dir / CORE_DATABASE_FILE, version=__version__, interval=CONTOURS_HEARTBEAT_SECS,
-                      timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS, on_stop=stop.request, on_check=contour.touch)
-    pulse.start()
-    try:
-        return contour.run()
-    finally:
-        pulse.close()
-        close_channels(channels)
+    if spec.adapter == "tinvest-sandbox":
+        return adapter("sandbox", token=settings.token)
+    if spec.adapter == "tinvest-account":
+        from src.account.fee_probes import FeeProbes
+
+        # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
+        return adapter("account", token=settings.token, account_id=settings.account_id, orders=settings.orders,
+                       fee_probes=None if settings.orders else FeeProbes)
+    raise ValueError(f"Неизвестный адаптер брокера {spec.adapter!r} контура {spec.contour_id}")
 
 
 class _BrokerTradingPart:
@@ -493,8 +456,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     core.starter = CoreStarter(core, token_required=client_provider is None)
     control.core_status = core.core_snapshot
     control.contour_busy = lambda: _contour_busy(state_dir)
-    sandbox = _sandbox_supervisor(state_dir, core_state)
-    account = _account_supervisor(state_dir, core_state)
+    supervisors = _broker_supervisors(state_dir, core_state)
+    sandbox, account = supervisors["sandbox"], supervisors["account"]
     try:
         server = core.start_control_api(control)
     except OSError as exc:
@@ -514,8 +477,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     code = 0
     try:
         if core.starter.run():
-            # Контуры на брокере — раньше эмуляции: первым «Счёт» (add-account-contour), затем песочница.
-            _recover_broker_contours(account, sandbox)
+            # Контуры на брокере — раньше эмуляции, в порядке описаний: первым «Счёт», затем песочница.
+            _recover_broker_contours(*supervisors.values())
             code = _serve_emulation(state_dir, core, core_state, control, client_provider)
         else:
             _wait_for_ctrl_c()
@@ -525,8 +488,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         # «Остановлено» в пульсе — раньше ожидания прогонов: подхваченные прогоны узнают об остановке из него.
         pulse.stop()
         history.close()
-        sandbox.stop()
-        account.stop()
+        for supervisor in supervisors.values():
+            supervisor.stop()
         core.close()
     return code
 
@@ -537,27 +500,21 @@ def _recover_broker_contours(*supervisors) -> None:
         try:
             supervisor.recover()
         except Exception as exc:  # noqa: BLE001 — сбой подъёма одного контура не держит остальные
-            log.error("Подъём контура %s не удался (%s)", supervisor.kind, type(exc).__name__)
+            log.error("Подъём контура %s не удался (%s)", supervisor.contour_id, type(exc).__name__)
 
 
-def _sandbox_supervisor(state_dir, core_state):
-    """Надзиратель контура «Песочница»: свой поток ядра рядом с эмуляцией (add-sandbox-contour)."""
+def _broker_supervisors(state_dir, core_state) -> dict:
+    """Надзиратели контуров на брокере по их описаниям (refactor-broker-port): свой поток ядра у каждого.
+
+    Порядок словаря — порядок описаний и подъёма: первым «Счёт» (add-account-contour), затем песочница.
+    """
     from src.assembly.broker_supervisor import BrokerContourSupervisor
-    from src.broker_contour import SANDBOX
+    from src.broker_contour.contours import LIVE_CONTOURS
 
-    return BrokerContourSupervisor(kind=SANDBOX, state_dir=state_dir, core_state=core_state, version=__version__,
-                                   autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
-                                   heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
-
-
-def _account_supervisor(state_dir, core_state):
-    """Надзиратель контура «Счёт» (add-account-contour): свой поток ядра, как у песочницы."""
-    from src.assembly.broker_supervisor import BrokerContourSupervisor
-    from src.broker_contour import ACCOUNT
-
-    return BrokerContourSupervisor(kind=ACCOUNT, state_dir=state_dir, core_state=core_state, version=__version__,
-                                   autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
-                                   heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say)
+    return {spec.contour_id: BrokerContourSupervisor(
+        contour_id=spec.contour_id, kind=spec.kind, state_dir=state_dir, core_state=core_state, version=__version__,
+        autostart=CONTOURS_AUTOSTART, heartbeat_timeout=CONTOURS_HEARTBEAT_TIMEOUT_SECS,
+        heartbeat_secs=CONTOURS_HEARTBEAT_SECS, say=_say) for spec in LIVE_CONTOURS}
 
 
 def _active_members(core_state, kind: str) -> set[str]:
@@ -575,7 +532,7 @@ def _account_control(supervisor, core_state, resolve_binding=None):
         desired = core_state.desired(MODE_EMULATION)
         return () if desired is None else desired.members
 
-    return AccountControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
+    return AccountControl(kind=supervisor.contour_id, core_state=core_state, supervisor=supervisor,
                           share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
                           emulation_members=emulation_members, log_file=LOGGING_FILE,
                           resolve_binding=resolve_binding, orders_enabled=bool(CONTOUR_ACCOUNT_ORDERS),
@@ -700,7 +657,7 @@ def _sandbox_control(supervisor, core_state, resolve_binding=None):
         desired = core_state.desired(MODE_EMULATION)
         return () if desired is None else desired.members
 
-    return SandboxControl(kind=supervisor.kind, core_state=core_state, supervisor=supervisor,
+    return SandboxControl(kind=supervisor.contour_id, core_state=core_state, supervisor=supervisor,
                           share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
                           emulation_members=emulation_members, log_file=LOGGING_FILE,
                           resolve_binding=resolve_binding)

@@ -8,13 +8,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from src.broker.port import ExecutionStatus
-from src.broker_contour.api import OrderFailure
-from src.broker_contour.broker import ExitPolicy, TInvestBroker
+from src.broker_contour.port import OrderFailure
+from src.broker_contour.broker import ExitPolicy
 from src.broker_contour.orders import OrderLedger, order_key
 from src.broker_contour.stops import ACTIVE, EXECUTED, LOST, UNKNOWN, StopLedger
 from src.events.types import EventType
 from src.trade_management.actions import AddToTrade, CloseTrade, EntryOrderType, MoveStop, OpenTrade, ReduceTrade
-from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi
+from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi, live_broker
 from tests.unit.broker_contour.test_tinvest_broker import _plan
 
 D = Decimal
@@ -27,7 +27,7 @@ class Harness:
         self.journal = set() if journal is None else journal
         self.ledger = OrderLedger(tmp_path / "broker.sqlite3")
         self.stops = StopLedger(self.ledger)
-        self.broker = TInvestBroker(self.api, self.ledger, contour="sandbox",
+        self.broker = live_broker(self.api, self.ledger, contour="sandbox",
                                     policy=ExitPolicy(5, 15, 2, 60, stop_place_secs=30),
                                     publish=self.published.append, journal_has=self.journal.__contains__,
                                     clock=self.clock, stops=self.stops)
@@ -428,7 +428,7 @@ def test_stopped_message_counts_broker_stops():
 
 def test_reconcile_compares_own_stops_with_account():
     """Своя стоп-заявка совпадает со счётом; лишняя на счёте — расхождение ``stop_order`` (задача 9.3)."""
-    from src.broker_contour.account import AccountSnapshot
+    from src.broker_contour.port import AccountSnapshot
     from src.broker_contour.reconcile import JournalView, compare
 
     journal = JournalView(holdings=(("NG-12.26", 2),), stop_orders=("NG-12.26",))

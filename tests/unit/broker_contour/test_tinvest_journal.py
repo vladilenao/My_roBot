@@ -1,4 +1,4 @@
-"""``TInvestBroker`` с настоящими ``Storage``, reducer и ``TradeManager`` (add-tinvest-orders).
+"""``LiveBroker`` на адаптере Т-Инвест с настоящими ``Storage``, reducer и ``TradeManager`` (add-tinvest-orders).
 
 Инцидент 02.11 (SiZ6, 10 лотов): события брокера несли номер заявки брокера в ``order_id``, а
 reducer сверяет его с заявкой журнала сделок — ACK и исполнение входа падали с
@@ -14,14 +14,14 @@ from decimal import Decimal
 import pytest
 
 from src.broker.port import ExecutionStatus
-from src.broker_contour.api import BrokerTrade
-from src.broker_contour.broker import ExitPolicy, TInvestBroker
+from src.broker_contour.tinvest.api import BrokerTrade
+from src.broker_contour.broker import ExitPolicy
 from src.broker_contour.orders import OrderLedger, order_key
 from src.trade_journal.storage import ReservationCandidate, Storage
 from src.trade_management.actions import EntryOrderType, OpenTrade
 from src.trade_management.manager import TradeManager
 from src.trade_management.models import CURRENT_ALGORITHM, CostSnapshot, ProfileSnapshot, TargetPlan, TradePlan
-from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi
+from tests.unit.broker_contour.fake_api import NG, NG_META, NOW, Clock, FakeApi, live_broker
 
 D = Decimal
 TRADE = "future-ng-macd:NG:5m:2026-10-30T10:00:00:BUY"
@@ -40,7 +40,7 @@ class Env:
     def __init__(self, tmp_path, storage):
         self.api, self.clock, self.storage = FakeApi(), Clock(), storage
         self.ledger = OrderLedger(tmp_path / "broker.sqlite3")
-        self.broker = TInvestBroker(self.api, self.ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60),
+        self.broker = live_broker(self.api, self.ledger, contour="sandbox", policy=ExitPolicy(5, 15, 2, 60),
                                     journal_has=self._journal_has, clock=self.clock)
         self.broker.set_contracts({NG: NG_META})
         self.manager = TradeManager(storage, self.broker, initial_balance=D(1_000_000), clock=self.clock)
