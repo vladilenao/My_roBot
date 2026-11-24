@@ -54,6 +54,8 @@ class FakeBroker:
     positions: dict = field(default_factory=dict)  # uid -> lots
     # GetPortfolio отдаёт это вместо ``positions`` (сбой брокера 20.11: портфель пуст при живой позиции)
     portfolio_glitch: dict | None = None  # uid -> lots
+    # Вызывается перед ответом GetPortfolio в потоке вызывающего: тест может придержать чтение счёта
+    on_portfolio: object = None  # Callable[[], None] | None
     orders: dict = field(default_factory=dict)  # order_id -> OrderState
     stops: dict = field(default_factory=dict)  # stop_id -> StopOrder
     stop_keys: dict = field(default_factory=dict)  # ключ -> stop_id
@@ -175,6 +177,8 @@ class _Api:
                      for uid, lots in self.b.positions.items()])
 
     def operations__get_portfolio(self, account_id=""):
+        if self.b.on_portfolio is not None:
+            self.b.on_portfolio()
         items = [s.PortfolioPosition(instrument_type="currency", quantity_lots=quote(self.b.rub),
                                      instrument_uid="rub", average_position_price=money(1))]
         items += [s.PortfolioPosition(instrument_type="futures", quantity_lots=quote(lots), instrument_uid=uid,
