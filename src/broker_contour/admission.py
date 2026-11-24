@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.broker_contour.fingerprint import FingerprintMismatch, check_fingerprint
-from src.broker_contour.port import AccountRuleError, AccountSnapshot, BrokerCallError, BrokerSession, RobotAccount
+from src.broker_contour.port import (AccountRuleError, AccountSnapshot, BrokerCallError, BrokerOutage, BrokerSession,
+                                     RobotAccount)
 from src.broker_contour.store import BrokerStore
 
 
@@ -51,12 +52,15 @@ def check_settings(*, token: str | None, token_env: str, bot_token: str | None, 
 def admit_account(session: BrokerSession, store: BrokerStore, *, broker: str) -> Admitted:
     """Сетевые проверки: счёт робота, факты допуска (у «Счёта»), отпечаток, снимок счёта.
 
-    Правило счёта и факты допуска — у сессии брокера; отказ фактов — ``AdmissionError``.
+    Правило счёта и факты допуска — у сессии брокера; отказ фактов — ``AdmissionError``. Плановое окно
+    брокера (``BrokerOutage``) — не отказ: оно уходит наружу, процесс ждёт конца окна.
     """
     try:
         account = session.find_account()
     except AccountRuleError as exc:
         raise AdmissionError(str(exc), alarm=True) from None
+    except BrokerOutage:
+        raise
     except BrokerCallError as exc:
         raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True) from None
     facts = session.read_facts(account)
@@ -66,6 +70,8 @@ def admit_account(session: BrokerSession, store: BrokerStore, *, broker: str) ->
         raise AdmissionError(str(exc), alarm=True, account_tail=account.masked) from None
     try:
         snapshot = session.read_account(account)
+    except BrokerOutage:
+        raise
     except BrokerCallError as exc:
         raise AdmissionError(f"Счёт брокера не прочитан: {exc.code}", alarm=True, account_tail=account.masked) from None
     return Admitted(account, snapshot, created, facts)

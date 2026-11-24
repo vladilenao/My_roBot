@@ -45,7 +45,7 @@ class TestMain:
 
     def test_unknown_contour_kind(self, capsys):
         assert run.main(["--contour", "live"]) == 2
-        assert "emulation, history, sandbox и account" in capsys.readouterr().out
+        assert "emulation, history, sandbox, finam и account" in capsys.readouterr().out   # + «Счёт Финам»
 
     @patch("run._run_broker_contour", return_value=0)
     def test_sandbox_contour_entry(self, run_broker_contour):

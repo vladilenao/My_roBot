@@ -1,7 +1,7 @@
 """Порт брокера контура на брокере (refactor-broker-port): общие типы, отчёты и ошибки.
 
 Общий код контура (``broker``, ``stops``, ``process`` …) знает брокера только через этот модуль.
-SDK брокера и пакеты адаптеров (``tinvest``, на Ф2–Ф3 ``finam``) сюда не импортируются.
+SDK брокера и пакеты адаптеров (``tinvest``, ``finam``) сюда не импортируются.
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ class BrokerCallError(Exception):
     def __str__(self) -> str:
         head = " ".join(part for part in (self.code, self.details) if part)
         return f"{head}: {self.message}" if self.message else head
+
+
+class BrokerOutage(BrokerCallError):
+    """Брокер в плановом окне обслуживания (add-finam-contour, решение 7): недоступность ожидаема.
+
+    Общий код читает его как ошибку вызова, но без тревоги: сверка пропускается без счёта пропусков,
+    допуск ждёт конца окна. Адаптер, у которого окон нет, его не бросает.
+    """
 
 
 class OrderFailure(Exception):
@@ -246,7 +254,7 @@ class TradingLink:
 
 @runtime_checkable
 class BrokerSession(Protocol):
-    """Брокер на открытом соединении: правило счёта, допуск, снимок, капитал, имена, торговля."""
+    """Брокер на открытом соединении, только чтение: правило счёта, допуск, снимок, разведка комиссий."""
 
     def find_account(self) -> RobotAccount:
         """Счёт робота; не определён — ``AccountRuleError``, сбой брокера — ``BrokerCallError``."""
@@ -258,12 +266,42 @@ class BrokerSession(Protocol):
 
     def read_account(self, account: RobotAccount, names: dict | None = None) -> AccountSnapshot: ...
 
+    def fee_probes(self, path) -> Any:
+        """Необязательная возможность: разведка комиссий на чтение или ``None``."""
+        ...
+
+
+@runtime_checkable
+class TradingSession(BrokerSession, Protocol):
+    """Сессия брокера, который умеет заявки (add-finam-contour, решение 3): капитал, имена, торговая связка.
+
+    Контур с ``orders = true`` собирается только на ней; сессия только на чтение метода торговли не имеет.
+    """
+
     def capital(self, account: RobotAccount) -> Decimal: ...
 
     def short_name(self, uid: str, names: dict) -> str: ...
 
     def trading(self, account: RobotAccount, book) -> TradingLink: ...
 
-    def fee_probes(self, path) -> Any:
-        """Разведка комиссий на чтение или ``None``."""
-        ...
+
+# --- карточки ядра (add-finam-contour, решение 4) ------------------------------
+@dataclass(frozen=True)
+class InstrumentCard:
+    """Карточка инструмента ядра: по ней ядро строит свечи и сигналы, журнал хранит ``uid``."""
+
+    uid: str
+    ticker: str          # биржевой тикер
+    kind: str            # share · future
+    short_name: str      # SBER · Si-12.26
+    lot: int
+    price_step: Decimal
+
+
+@runtime_checkable
+class InstrumentCatalog(Protocol):
+    """Каталог карточек ядра; ``None`` — инструмента нет. Сбой справочника — ``BrokerCallError``."""
+
+    def by_uid(self, uid: str) -> InstrumentCard | None: ...
+
+    def by_ticker(self, ticker: str, kind: str) -> InstrumentCard | None: ...

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping
 
+from src.broker_contour.contours import CONTOUR_TITLES  # метки контуров на брокере — из их описаний
 from src.events.event import Event
 from src.events.types import EventType
 from src.notifier.templates.holds import UNKNOWN_SCHEDULE, data_reason
@@ -382,7 +383,7 @@ def _system(event: Event, stamp: str) -> Block | None:
 
 def _broker_account(event: Event, stamp: str) -> Block:
     """Контур на брокере (add-sandbox-contour): одна строка в консоли ядра."""
-    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    label = CONTOUR_TITLES.get(event.get("contour"), "БРОКЕР")
     kind = event.get("kind")
     if kind == "reconcile_alarm":
         frozen = ", ".join(event.get("frozen") or ()) or "—"
@@ -410,7 +411,7 @@ def _broker_account(event: Event, stamp: str) -> Block:
 
 def _broker_order(event: Event, stamp: str) -> Block:
     """Заявка контура на брокере (add-tinvest-orders): одна строка в консоли."""
-    label = {"sandbox": "ПЕСОЧНИЦА", "account": "СЧЁТ"}.get(event.get("contour"), "БРОКЕР")
+    label = CONTOUR_TITLES.get(event.get("contour"), "БРОКЕР")
     alarm = event.get("kind") in {"exit_rejected", "emergency_market", "stop_failed"}
     return Block(stamp, label, f"{_name(event)} · " + order_line(event).replace("⚠️ ", ""),
                  role="warning" if alarm else "muted")

@@ -29,6 +29,7 @@ from src.decision.filters.triple_screen import TripleScreenParams, tf_hierarchy
 from src.events.types import EVENT_TYPE_NAMES
 from src.logging_setup import get_logger
 from src.instruments.futures import FAMILIES
+from src.broker_contour.contours import LIVE_CONTOURS
 
 CONFIG_FILENAME = "robot.toml"
 BUNDLED_FILENAME = "default.toml"
@@ -139,32 +140,8 @@ _EXPECTED_TYPES: dict[str, type] = {
     "market_structure_queue_maxsize": int,
     "market_structure_retention_days": int,
     "contours_emulation_telegram_channel_env": str,
-    "contours_sandbox_telegram_bot_env": str,
-    "contours_sandbox_telegram_channel_env": str,
-    "contours_sandbox_reconcile_every_min": int,
-    "contours_sandbox_orders": bool,
-    "contours_sandbox_exit_offset_steps": int,
-    "contours_sandbox_exit_requote_secs": int,
-    "contours_sandbox_exit_requote_attempts": int,
-    "contours_sandbox_stop_place_secs": int,
-    "contours_sandbox_max_daily_loss_pct": (int, float),
-    "contours_sandbox_max_rejects_in_row": int,
     "contours_emulation_portfolio_pct": (int, float),
-    "contours_sandbox_portfolio_pct": (int, float),
-    "contours_account_portfolio_pct": (int, float),
     "contours_emulation_commission_pct": (int, float),
-    "contours_sandbox_commission_pct": (int, float),
-    "contours_account_commission_pct": (int, float),
-    "contours_account_telegram_bot_env": str,
-    "contours_account_telegram_channel_env": str,
-    "contours_account_reconcile_every_min": int,
-    "contours_account_orders": bool,
-    "contours_account_exit_offset_steps": int,
-    "contours_account_exit_requote_secs": int,
-    "contours_account_exit_requote_attempts": int,
-    "contours_account_stop_place_secs": int,
-    "contours_account_max_daily_loss_pct": (int, float),
-    "contours_account_max_rejects_in_row": int,
     "contours_feed_poll_secs": int,
     "contours_demand_release_secs": int,
     "contours_heartbeat_secs": int,
@@ -635,24 +612,21 @@ def _validate(flat: dict[str, Any], path: Path) -> dict[str, Any]:
                 f"{path}: [market_structure] {option} должен быть целым числом > 0, "
                 f"получено {value!r}"
             )
-        if key in ("contours_emulation_telegram_channel_env", "contours_sandbox_telegram_bot_env",
-                   "contours_sandbox_telegram_channel_env", "contours_account_telegram_bot_env",
-                   "contours_account_telegram_channel_env") and not _ENV_NAME.fullmatch(value):
-            kind, option = key.removeprefix("contours_").split("_", 1)
+        if key in _CONTOUR_ENV_KEYS and not _ENV_NAME.fullmatch(value):
+            kind, option = _CONTOUR_ENV_KEYS[key]
             raise ConfigError(
                 f"{path}: [contours.{kind}] {option} — имя переменной окружения "
                 f"(заглавные латинские буквы, цифры и _), получено {value!r}"
             )
-        if key in ("contours_sandbox_reconcile_every_min", "contours_account_reconcile_every_min") and (
-                isinstance(value, bool) or not 1 <= value <= 60):
-            kind = key.removeprefix("contours_").split("_", 1)[0]
+        if key in _RECONCILE_KEYS and (isinstance(value, bool) or not 1 <= value <= 60):
+            kind = _RECONCILE_KEYS[key]
             raise ConfigError(f"{path}: [contours.{kind}] reconcile_every_min должен быть целым числом от 1 до 60, "
                               f"получено {value!r}")
         # Выходы лимитом (add-tinvest-orders): запас в шагах, пауза и число перевыставлений.
         if key in _SANDBOX_EXIT_RANGES:
             low, high = _SANDBOX_EXIT_RANGES[key]
             if isinstance(value, bool) or not low <= value <= high:
-                contour, option = key.removeprefix("contours_").split("_", 1)
+                contour, option = _BROKER_CONTOUR_FLAT[key]
                 kind = "числом" if option == "max_daily_loss_pct" else "целым числом"
                 raise ConfigError(f"{path}: [contours.{contour}] {option} должен быть "
                                   f"{kind} от {low} до {high}, получено {value!r}")
@@ -1041,7 +1015,7 @@ def _parse(path: Path, inherited: Mapping[str, Any] | None = None) -> dict[str, 
 def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
     """Validate constraints that span TOML sections and configuration files."""
     floor = (config.get("risk_limits") or {}).get("min_trade_risk_pct", 0) or 0
-    for kind in ("emulation", "sandbox", "account"):
+    for kind in _CONTOUR_KEYS:
         pct = config.get(f"contours_{kind}_portfolio_pct")
         if pct is not None and floor > pct:
             raise ConfigError(f"{path}: [trading.risk_limits] min_trade_risk_pct ({floor}) не может превышать "
@@ -1089,28 +1063,64 @@ def _validate_combined_config(config: Mapping[str, Any], path: Path) -> None:
                 raise ConfigError(f"{path}: [trading] database_file не должен совпадать с {key}")
 
 
+# Секции контуров на брокере (add-finam-contour, решение 12): ключи, типы, диапазоны и значения по умолчанию
+# общие; свои у контура — имена переменных бота и канала и ``orders`` — из описания ``LIVE_CONTOURS``.
+_BROKER_CONTOUR_TYPES: dict[str, Any] = {
+    "telegram_bot_env": str,
+    "telegram_channel_env": str,
+    "reconcile_every_min": int,
+    "orders": bool,
+    "exit_offset_steps": int,
+    "exit_requote_secs": int,
+    "exit_requote_attempts": int,
+    "stop_place_secs": int,
+    "max_daily_loss_pct": (int, float),
+    "max_rejects_in_row": int,
+    "portfolio_pct": (int, float),
+    "commission_pct": (int, float),
+}
+_BROKER_CONTOUR_RANGES = {
+    "exit_offset_steps": (0, 100),
+    "exit_requote_secs": (5, 300),
+    "exit_requote_attempts": (1, 10),
+    "stop_place_secs": (5, 300),
+    "max_daily_loss_pct": (0, 50),
+    "max_rejects_in_row": (1, 20),
+}
+_BROKER_CONTOUR_DEFAULTS = {
+    "reconcile_every_min": 1,
+    "exit_offset_steps": 5,
+    "exit_requote_secs": 15,
+    "exit_requote_attempts": 3,
+    "stop_place_secs": 30,
+    "max_daily_loss_pct": 3.0,
+    "max_rejects_in_row": 3,
+}
+# Плоское имя ``contours_<номер>_<ключ>`` → (номер, ключ) у всех контуров на брокере.
+_BROKER_CONTOUR_FLAT = {f"contours_{contour.contour_id}_{key}": (contour.contour_id, key)
+                        for contour in LIVE_CONTOURS for key in _BROKER_CONTOUR_TYPES}
+_EXPECTED_TYPES.update({flat: _BROKER_CONTOUR_TYPES[key] for flat, (_, key) in _BROKER_CONTOUR_FLAT.items()})
+
 _CONTOUR_KEYS = {
     "emulation": {"telegram_channel_env", "portfolio_pct", "commission_pct"},
-    # Контур на брокере (add-sandbox-contour): состав — только командами API, не в конфиге.
-    "sandbox": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
-                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct", "commission_pct"},
-    # Контур «Счёт» (add-account-contour): токен и номер счёта — только из окружения, состав — командами API.
-    "account": {"telegram_bot_env", "telegram_channel_env", "reconcile_every_min", "orders",
-                "exit_offset_steps", "exit_requote_secs", "exit_requote_attempts", "stop_place_secs",
-                "max_daily_loss_pct", "max_rejects_in_row", "portfolio_pct", "commission_pct"},
+    # Контуры на брокере: состав — только командами API; токен и номер счёта — только из окружения.
+    **{contour.contour_id: set(_BROKER_CONTOUR_TYPES) for contour in LIVE_CONTOURS},
 }
-_SANDBOX_EXIT_RANGES = {
-    "contours_sandbox_exit_offset_steps": (0, 100),
-    "contours_sandbox_exit_requote_secs": (5, 300),
-    "contours_sandbox_exit_requote_attempts": (1, 10),
-    "contours_sandbox_stop_place_secs": (5, 300),
-    "contours_sandbox_max_daily_loss_pct": (0, 50),
-    "contours_sandbox_max_rejects_in_row": (1, 20),
-}
-# Контур «Счёт» (enable-live-trading): те же диапазоны торговли, что у песочницы.
-_SANDBOX_EXIT_RANGES.update({key.replace("contours_sandbox_", "contours_account_"): value
-                             for key, value in list(_SANDBOX_EXIT_RANGES.items())})
+_SANDBOX_EXIT_RANGES = {flat: _BROKER_CONTOUR_RANGES[key] for flat, (_, key) in _BROKER_CONTOUR_FLAT.items()
+                        if key in _BROKER_CONTOUR_RANGES}
+_CONTOUR_ENV_KEYS = {"contours_emulation_telegram_channel_env": ("emulation", "telegram_channel_env"),
+                     **{flat: item for flat, item in _BROKER_CONTOUR_FLAT.items()
+                        if item[1] in ("telegram_bot_env", "telegram_channel_env")}}
+_RECONCILE_KEYS = {flat: contour for flat, (contour, key) in _BROKER_CONTOUR_FLAT.items()
+                   if key == "reconcile_every_min"}
+
+
+def broker_contour_defaults() -> dict[str, Any]:
+    """Значения ``[contours.<номер>]`` по умолчанию у всех контуров на брокере, плоскими именами."""
+    return {f"contours_{contour.contour_id}_{key}": value for contour in LIVE_CONTOURS
+            for key, value in {**_BROKER_CONTOUR_DEFAULTS, **contour.defaults}.items()}
+
+
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -1126,6 +1136,12 @@ def _parse_contour_section(kind: str, value: Any, path: Path) -> dict[str, Any]:
     if kind == "account" and "bindings" in value:
         raise ConfigError(f"{path}: [contours.account] bindings не задаётся в конфиге — состав «Счёта» задаётся "
                           f"командами API с Р2")
+    live = next((contour for contour in LIVE_CONTOURS if contour.contour_id == kind), None)
+    if live is not None and "bindings" in value:
+        raise ConfigError(f"{path}: [contours.{kind}] bindings не задаётся в конфиге — состав задаётся командами API")
+    if live is not None and not live.trading and value.get("orders") is True:
+        # Адаптер без заявок (add-finam-contour, решение 3): правило одно для всех описаний.
+        raise ConfigError(f"{path}: [contours.{kind}] orders = true: адаптер этого контура пока не умеет заявок")
     if "portfolio_pct" in value:
         # Свой риск портфеля контура (add-contour-risk-limit): 0–100, как общий [trading.risk_limits].
         _finite_number(value["portfolio_pct"], f"[contours.{kind}] portfolio_pct", path, non_negative=True)

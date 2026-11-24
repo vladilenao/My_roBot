@@ -15,7 +15,8 @@ from tests.unit.broker_contour.fake_api import FakeApi
 PACKAGE = Path(__file__).resolve().parents[3] / "src" / "broker_contour"
 COMMON = ("broker", "stops", "stream", "process", "admission", "prices", "orders", "reconcile", "guards", "control",
           "notify", "fingerprint", "store", "bindings", "port", "contours", "__init__")
-FORBIDDEN = ("t_tech", "grpc", "src.sandbox", "src.account", "src.broker_contour.tinvest", "src.broker_contour.finam")
+FORBIDDEN = ("t_tech", "grpc", "src.sandbox", "src.account", "src.broker_contour.tinvest", "src.broker_contour.finam",
+             "src.finam")   # разведка и заглушки Финама — только адаптеру (add-finam-contour)
 
 
 def _imports(path: Path) -> set[str]:
@@ -58,3 +59,10 @@ def test_session_implements_broker_session():
 
     session = TInvestSession(object(), rule=lambda gateway: None)
     assert isinstance(session, port.BrokerSession)
+
+
+def test_tinvest_session_is_a_trading_session():
+    """Сессия Т-Инвест умеет заявки (add-finam-contour, решение 3): и чтение, и торговля."""
+    from src.broker_contour.tinvest.session import TInvestSession
+
+    assert isinstance(TInvestSession(object(), rule=lambda gateway: None), port.TradingSession)

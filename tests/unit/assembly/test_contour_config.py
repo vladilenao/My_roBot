@@ -233,3 +233,50 @@ def test_commission_pct_per_contour(tmp_path):
 def test_commission_pct_rejected(tmp_path, text):
     with pytest.raises(ConfigError, match="commission_pct"):
         _load(tmp_path, text)
+
+
+# --- «Счёт Финам» и секции по описаниям (add-finam-contour) ---------------------------------
+
+def test_finam_section_defaults():
+    from src import config
+
+    assert config._DEFAULTS["contours_finam_telegram_bot_env"] == "TELEGRAM_FINAM_BOT_TOKEN"
+    assert config._DEFAULTS["contours_finam_telegram_channel_env"] == "TELEGRAM_FINAM_CHANNEL_ID"
+    assert config._DEFAULTS["contours_finam_reconcile_every_min"] == 1
+    assert config._DEFAULTS["contours_finam_orders"] is False
+
+
+def test_finam_section_values(tmp_path):
+    config = _load(tmp_path, '[contours.finam]\ntelegram_channel_env = "FINAM_CHANNEL"\nreconcile_every_min = 5\n'
+                             'orders = false\nportfolio_pct = 3\n')
+    assert config["contours_finam_telegram_channel_env"] == "FINAM_CHANNEL"
+    assert config["contours_finam_reconcile_every_min"] == 5 and config["contours_finam_orders"] is False
+    assert config["contours_finam_portfolio_pct"] == 3
+
+
+@pytest.mark.parametrize("text, match", [
+    ("orders = true", r"\[contours.finam\] orders = true: адаптер этого контура пока не умеет заявок"),
+    ('account_id = "1234567"', "незнакомые ключи"),
+    ('bindings = ["future-ng-macd"]', r"\[contours.finam\] bindings не задаётся"),
+    ("reconcile_every_min = 0", r"\[contours.finam\] reconcile_every_min.*от 1 до 60"),
+    ('telegram_bot_env = "bad name"', r"\[contours.finam\] telegram_bot_env — имя переменной окружения"),
+    ("max_rejects_in_row = 0", r"\[contours.finam\] max_rejects_in_row.*от 1 до 20"),
+])
+def test_finam_section_rejected(tmp_path, text, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, f"[contours.finam]\n{text}\n")
+
+
+def test_broker_sections_keep_previous_defaults():
+    """Значения «Счёта» и песочницы по умолчанию — прежние после перехода на описания."""
+    from src import config
+
+    expected = {"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "reconcile_every_min": 1, "exit_offset_steps": 5,
+                "exit_requote_secs": 15, "exit_requote_attempts": 3, "stop_place_secs": 30,
+                "max_daily_loss_pct": 3.0, "max_rejects_in_row": 3}
+    for kind, channel, orders in (("sandbox", "TELEGRAM_SANDBOX_CHANNEL_ID", True),
+                                  ("account", "TELEGRAM_ACCOUNT_CHANNEL_ID", False)):
+        values = {key: config._DEFAULTS[f"contours_{kind}_{key}"] for key in expected}
+        assert values == expected
+        assert config._DEFAULTS[f"contours_{kind}_telegram_channel_env"] == channel
+        assert config._DEFAULTS[f"contours_{kind}_orders"] is orders

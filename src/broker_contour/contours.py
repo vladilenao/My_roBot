@@ -1,38 +1,57 @@
-"""Описание контуров на брокере (refactor-broker-port, design.md решение 6).
+"""Описание контуров на брокере (refactor-broker-port, решение 6; add-finam-contour, решение 12).
 
-Контур на брокере собирается по описанию: номер, вид, отпечаток брокера, адаптер, заголовок карточек,
-переменные окружения токена и номера счёта. Новый экземпляр вида «счёт» (Ф2: ``finam``) — новое
-описание и адаптер, без копии функций запуска. Контуры работают одновременно, у каждого свой процесс,
-каталог ``data/contours/<номер>/``, база, отпечаток счёта и канал.
+Контур на брокере собирается по описанию: номер, вид, отпечаток брокера, брокер адаптера, адаптер,
+заголовок карточек, переменные окружения токена и номера счёта, умеет ли адаптер заявки и значения
+настроек по умолчанию. Новый экземпляр вида «счёт» — новое описание и адаптер, без копии функций запуска
+и без веток по номеру контура в общем коде, конфиге и API. Контуры работают одновременно, у каждого свой
+процесс, каталог ``data/contours/<номер>/``, база, отпечаток счёта и канал.
 
 Описание — данные: адаптеры брокеров здесь не импортируются, их выбирает точка сборки ``run.py``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 SANDBOX = "sandbox"
 ACCOUNT = "account"        # вид «счёт»: брокерский счёт робота (add-account-contour)
+FINAM = "finam"            # «Счёт Финам» (add-finam-contour)
+TINVEST = "tinvest"        # брокер адаптера Т-Инвест
 
 
 @dataclass(frozen=True)
 class LiveContour:
     contour_id: str             # номер контура: папка, ключи [contours.<номер>], спрос ядра
     kind: str                   # вид: sandbox · account
-    broker: str                 # отпечаток счёта в broker.sqlite3
-    adapter: str                # адаптер брокера для точки сборки: tinvest-sandbox · tinvest-account
-    title: str                  # метка карточек в канале контура
+    broker: str                 # отпечаток счёта в broker.sqlite3 (не менять у старых контуров)
+    adapter: str                # адаптер брокера для точки сборки: tinvest-sandbox · tinvest-account · finam-account
+    title: str                  # метка карточек в канале и консоли контура
     token_env: str              # переменная окружения токена брокера
     account_id_env: str | None = None   # переменная окружения номера счёта; у песочницы нет
+    provider: str = TINVEST     # брокер адаптера: status.json и API «broker»
+    trading: bool = True        # адаптер умеет заявки; нет — [contours.<номер>] orders = true отклоняется
+    # Значения [contours.<номер>] по умолчанию, свои у контура: имена переменных бота и канала, orders.
+    defaults: Mapping = field(default_factory=dict)
 
 
-ACCOUNT_CONTOUR = LiveContour(ACCOUNT, ACCOUNT, ACCOUNT, "tinvest-account", "СЧЁТ", "TINKOFF_TRADE_TOKEN",
-                              "TINKOFF_ACCOUNT_ID")
-SANDBOX_CONTOUR = LiveContour(SANDBOX, SANDBOX, SANDBOX, "tinvest-sandbox", "ПЕСОЧНИЦА", "TINKOFF_SANDBOX_TOKEN")
+ACCOUNT_CONTOUR = LiveContour(
+    ACCOUNT, ACCOUNT, ACCOUNT, "tinvest-account", "СЧЁТ", "TINKOFF_TRADE_TOKEN", "TINKOFF_ACCOUNT_ID",
+    defaults={"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_ACCOUNT_CHANNEL_ID",
+              "orders": False})
+# Финам только читает счёт до Ф3: адаптер без торговли (add-finam-contour, решение 3).
+FINAM_CONTOUR = LiveContour(
+    FINAM, ACCOUNT, FINAM, "finam-account", "СЧЁТ ФИНАМ", "FINAM_SECRET_TOKEN", "FINAM_ACCOUNT_ID",
+    provider=FINAM, trading=False,
+    defaults={"telegram_bot_env": "TELEGRAM_FINAM_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_FINAM_CHANNEL_ID",
+              "orders": False})
+SANDBOX_CONTOUR = LiveContour(
+    SANDBOX, SANDBOX, SANDBOX, "tinvest-sandbox", "ПЕСОЧНИЦА", "TINKOFF_SANDBOX_TOKEN",
+    defaults={"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
+              "orders": True})
 
-# Порядок — порядок подъёма при старте ядра: первым «Счёт» (add-account-contour), затем песочница.
-LIVE_CONTOURS: tuple[LiveContour, ...] = (ACCOUNT_CONTOUR, SANDBOX_CONTOUR)
+# Порядок — порядок подъёма при старте ядра: «Счёт», «Счёт Финам», затем песочница.
+LIVE_CONTOURS: tuple[LiveContour, ...] = (ACCOUNT_CONTOUR, FINAM_CONTOUR, SANDBOX_CONTOUR)
 CONTOUR_TITLES = {contour.contour_id: contour.title for contour in LIVE_CONTOURS}
 
 

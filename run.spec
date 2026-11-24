@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 import t_tech
 import os
 
@@ -19,6 +19,10 @@ tmp_ret = collect_all('pandas_ta_classic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('t_tech')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Заглушки Finam Trade API и адаптер Финама (add-finam-contour): адаптер собирается в run.py внутри функции,
+# а сгенерированные модули импортируют друг друга по полному пути — берём пакеты целиком.
+hiddenimports += collect_submodules('src.finam.proto') + collect_submodules('src.broker_contour.finam')
 
 # t_tech — namespace-пакет без __file__; каталог берём из __path__
 _ttech_certs = os.path.join(t_tech.__path__[0], 'invest', 'certs')

@@ -97,6 +97,22 @@ _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             FINAM_SECRET_TOKEN, FINAM_ACCOUNT_ID, FINAM_DEMO_SECRET_TOKEN, FINAM_DEMO_ACCOUNT_ID)
 
 
+def _live_contour_secrets() -> tuple:
+    """Секреты контуров на брокере из их описаний (add-finam-contour): токен, номер счёта, токен бота."""
+    from src.broker_contour.contours import LIVE_CONTOURS
+    from src.config import contour_env
+
+    found = []
+    for spec in LIVE_CONTOURS:
+        found += [os.getenv(spec.token_env), contour_env(spec.contour_id, "telegram_bot_env")]
+        if spec.account_id_env:
+            found.append(os.getenv(spec.account_id_env))
+    return tuple(found)
+
+
+_SECRETS += _live_contour_secrets()
+
+
 _OPEN_FILES = None  # итог подъёма предела открытых файлов при запуске процесса (fix-sqlite-connection-close)
 
 
@@ -256,7 +272,7 @@ def _run_broker_contour(contour_id: str) -> int:
         max_rejects_in_row=setting("max_rejects_in_row"),
         exit_policy=ExitPolicy(setting("exit_offset_steps"), setting("exit_requote_secs"),
                                setting("exit_requote_attempts"), stop_place_secs=setting("stop_place_secs")),
-        contour_id=contour_id, kind=spec.kind, broker=spec.broker, directory=directory,
+        contour_id=contour_id, kind=spec.kind, broker=spec.broker, provider=spec.provider, directory=directory,
         core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=os.getenv(spec.token_env) or None,
         token_env=spec.token_env,
         account_id=(os.getenv(spec.account_id_env) or None) if spec.account_id_env else None,
@@ -286,7 +302,7 @@ def _run_broker_contour(contour_id: str) -> int:
 
 
 def _broker_sessions(spec, settings):
-    """Точка сборки адаптера брокера по описанию контура (refactor-broker-port, design.md решение 4).
+    """Точка сборки адаптера брокера по описанию контура (refactor-broker-port, решение 4; add-finam-contour).
 
     Единственное место, где выбирается пакет адаптера; общий код контура получает готовую фабрику сессий.
     """
@@ -300,6 +316,13 @@ def _broker_sessions(spec, settings):
         # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
         return adapter("account", token=settings.token, account_id=settings.account_id, orders=settings.orders,
                        fee_probes=None if settings.orders else FeeProbes)
+    if spec.adapter == "finam-account":
+        from src.broker_contour.finam.session import adapter as finam_adapter
+        from src.broker_contour.tinvest.catalog import catalog
+
+        # Карточки ядра — справочник Т-Инвест на токене ядра (add-finam-contour, решение 4).
+        return finam_adapter(secret=settings.token, account_id=settings.account_id, orders=settings.orders,
+                             catalog_factory=catalog(TINKOFF_TOKEN))
     raise ValueError(f"Неизвестный адаптер брокера {spec.adapter!r} контура {spec.contour_id}")
 
 

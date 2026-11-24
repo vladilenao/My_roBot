@@ -26,7 +26,7 @@ from src.assembly.core_state import read_desired
 from src.broker_contour.admission import AdmissionError, admit_account, check_settings
 from src.broker_contour.notify import BrokerNotifier
 from src.broker_contour.orders import ACCEPTED, PARTIAL
-from src.broker_contour.port import AccountSnapshot, BrokerCallError, BrokerSession
+from src.broker_contour.port import AccountSnapshot, BrokerCallError, BrokerOutage, BrokerSession, TradingSession
 from src.broker_contour.reconcile import JournalView, Reconciler
 from src.broker_contour.store import BROKER_DATABASE_FILE, BrokerStore
 from src.logging_setup import get_logger, register_secrets
@@ -34,7 +34,11 @@ from src.logging_setup import get_logger, register_secrets
 log = get_logger(__name__)
 
 STEP_SECS = 10
+OUTAGE_RETRY_SECS = 60        # допуск в плановом окне брокера повторяется раз в минуту (add-finam-contour)
 STOPPED, FAILED, RUNNING, STARTING = "stopped", "failed", "running", "starting"
+# Связь со счётом в status.json: снимок прочитан · брокер не ответил · брокер в плановом окне обслуживания.
+LINK_OK, LINK_LOST, LINK_MAINTENANCE = "ok", "lost", "maintenance"
+OUTAGE_REASON = "окно обслуживания брокера"
 
 
 def _now() -> str:
@@ -79,6 +83,7 @@ class BrokerContourSettings:
     max_rejects_in_row: int = 3
     account_id: str | None = None         # номер счёта «Счёта» из окружения (add-account-contour); у песочницы нет
     account_id_env: str | None = None
+    provider: str | None = None           # брокер адаптера из описания: tinvest · finam (add-finam-contour)
 
 
 class BrokerContour:
@@ -108,7 +113,8 @@ class BrokerContour:
         self._clock = clock
         self._lock = threading.Lock()
         self.notifier = BrokerNotifier(bus, contour=settings.contour_id)
-        self._status = {"contour_id": settings.contour_id, "kind": settings.kind, "state": STARTING,
+        self._status = {"contour_id": settings.contour_id, "kind": settings.kind, "broker": settings.provider,
+                        "state": STARTING,
                         "applied_generation": None, "stop_mode": None, "version": settings.version, "pid": pid,
                         "members": [], "account": None, "capital": None, "positions": [], "orders": 0,
                         "stop_orders": 0, "frozen": [], "last_reconcile_at": None, "account_link": None,
@@ -142,17 +148,42 @@ class BrokerContour:
         except AdmissionError as exc:
             return self._refuse(exc)
         store = BrokerStore(settings.directory / BROKER_DATABASE_FILE)
-        try:
-            with self._session_factory() as session:
-                try:
-                    admitted = admit_account(session, store, broker=settings.broker)
-                except AdmissionError as exc:
-                    return self._refuse(exc)
-                if settings.orders:
-                    return self._serve_trading(session, store, admitted)
-                return self._serve(session, store, admitted)
-        except BrokerCallError as exc:
-            return self._refuse(AdmissionError(f"Брокер недоступен: {exc}", alarm=True))
+        while True:
+            admitted = None
+            try:
+                with self._session_factory() as session:
+                    try:
+                        admitted = admit_account(session, store, broker=settings.broker)
+                    except AdmissionError as exc:
+                        return self._refuse(exc)
+                    if settings.orders:
+                        return self._serve_trading(session, store, admitted)
+                    return self._serve(session, store, admitted)
+            except BrokerOutage as exc:
+                if admitted is not None:        # после допуска окно не ждут: прежний отказ
+                    return self._refuse(AdmissionError(f"Брокер недоступен: {exc}", alarm=True))
+                if not self._wait_outage(exc):
+                    return self._stopped_waiting()
+            except BrokerCallError as exc:
+                return self._refuse(AdmissionError(f"Брокер недоступен: {exc}", alarm=True))
+
+    def _wait_outage(self, exc: BrokerOutage) -> bool:
+        """Допуск в плановом окне брокера: без тревоги, ``starting`` с причиной, повтор через минуту.
+
+        ``False`` — пока ждали, пришла остановка (из stdin или целевого состояния ядра).
+        """
+        log.info("Контур %s ждёт конца окна обслуживания брокера (%s)", self.settings.contour_id, exc.code)
+        self._write(state=STARTING, reason=OUTAGE_REASON, account_link=LINK_MAINTENANCE)
+        self._apply(read_desired(self.settings.core_db, self.settings.contour_id))
+        if self._stop.requested.is_set():
+            return False
+        return not self._stop.requested.wait(OUTAGE_RETRY_SECS)
+
+    def _stopped_waiting(self) -> int:
+        reason = self._stop.reason or "остановка"
+        log.info("Контур %s остановлен до допуска: %s", self.settings.contour_id, reason)
+        self._write(state=STOPPED, exited_at=_now(), exit_reason=reason)
+        return 0
 
     def _refuse(self, exc: AdmissionError) -> int:
         log.error("Контур %s не стартует: %s", self.settings.contour_id, exc.reason)
@@ -181,7 +212,7 @@ class BrokerContour:
                               orders_enabled=False, **_admission_card(admitted.facts))
         log.info("Контур %s запущен: счёт %s, поколение %s", settings.contour_id, account.masked, self._generation)
         self._reconcile(reconciler, session, account, admitted.snapshot)
-        self._write(state=RUNNING, account=account.masked, account_link="ok")
+        self._write(state=RUNNING, account=account.masked, account_link=LINK_OK, reason=None)
         while not self._stop.requested.wait(settings.step_secs):
             self.step(session, account, reconciler)
         reason = self._stop.reason or "цикл завершён"
@@ -213,9 +244,23 @@ class BrokerContour:
             # С2: своих сделок нет — остановка любого режима завершает процесс; счёт не трогается.
             self._stop.request(f"остановка командой ({desired.stop_mode})")
 
+    def _read(self, session: BrokerSession, account) -> tuple[str, AccountSnapshot | None]:
+        """Снимок счёта одним методом (add-finam-contour, решение 8): ``(связь, снимок или None)``.
+
+        ``lost`` — брокер не ответил, ``maintenance`` — брокер в плановом окне обслуживания.
+        """
+        try:
+            return LINK_OK, session.read_account(account)
+        except BrokerOutage as exc:
+            log.info("Счёт не прочитан: окно обслуживания брокера (%s)", exc.code)
+            return LINK_MAINTENANCE, None
+        except BrokerCallError as exc:
+            log.warning("Счёт не прочитан (%s)", exc.code)
+            return LINK_LOST, None
+
     def _account(self, snapshot: AccountSnapshot) -> None:
         # ``account_at`` — момент снимка: позиции и заявки в статусе верны на него, а не на «сейчас».
-        self._write(**snapshot.payload(), account_link="ok", account_at=_now())
+        self._write(**snapshot.payload(), account_link=LINK_OK, account_at=_now())
 
     def _final_account(self, session: BrokerSession, account) -> None:
         """Снимок счёта перед STOPPED (fix-sandbox-restart-safety): после остановки статус не обновит никто.
@@ -223,11 +268,9 @@ class BrokerContour:
         Без него ``status.json`` показывал позиции последней сверки — до выхода ``close_all``. Брокер не
         ответил — снимок прежний, ``account_link: lost`` говорит, что он мог устареть.
         """
-        try:
-            snapshot = session.read_account(account)
-        except BrokerCallError as exc:
-            log.warning("Снимок счёта при остановке не прочитан (%s)", exc.code)
-            self._write(account_link="lost")
+        link, snapshot = self._read(session, account)
+        if snapshot is None:
+            self._write(account_link=link)
             return
         self._capital = snapshot.rub
         self._account(snapshot)
@@ -236,12 +279,10 @@ class BrokerContour:
                    snapshot: AccountSnapshot | None = None) -> None:
         now = self._clock()
         if snapshot is None:
-            try:
-                snapshot = session.read_account(account)
-            except BrokerCallError as exc:
-                log.warning("Сверка пропущена: счёт не прочитан (%s)", exc.code)
-                report = reconciler.run(now, None)
-                self._write(account_link="lost", last_reconcile_at=report["at"])
+            link, snapshot = self._read(session, account)
+            if snapshot is None:
+                report = reconciler.run(now, None, planned=link == LINK_MAINTENANCE)
+                self._write(account_link=link, last_reconcile_at=report["at"])
                 return
             self._account(snapshot)
         report = reconciler.run(now, snapshot, JournalView())
@@ -251,7 +292,7 @@ class BrokerContour:
             self._fee_probes.run(account, now)
 
     # --- торговля привязками (add-tinvest-orders) -----------------------------
-    def _serve_trading(self, session: BrokerSession, store: BrokerStore, admitted) -> int:
+    def _serve_trading(self, session: TradingSession, store: BrokerStore, admitted) -> int:
         from src.assembly.contour import BrokerTrading
         from src.broker_contour.broker import ExitPolicy, LiveBroker
         from src.broker_contour.control import BrokerControl, assignment_index
@@ -346,7 +387,7 @@ class BrokerContour:
                                   generation=None if desired is None else desired.generation, orders_enabled=True,
                                   **_admission_card(admitted.facts))
             log.info("Контур %s запущен с заявками: счёт %s", settings.contour_id, account.masked)
-            self._write(state=RUNNING, account=account.masked, account_link="ok")
+            self._write(state=RUNNING, account=account.masked, account_link=LINK_OK, reason=None)
             contour.run(contour.waiter())
         finally:
             if stream is not None:
@@ -403,7 +444,7 @@ class BrokerContour:
             manager.consume(event)
         return len(events)
 
-    def _poll(self, holder: dict, session: BrokerSession, account, reconciler: Reconciler) -> None:
+    def _poll(self, holder: dict, session: TradingSession, account, reconciler: Reconciler) -> None:
         """Опрос между тиками и граница тика: исполнения, капитал, ГО, сверка, доставка команд."""
         broker, manager = holder.get("broker"), holder.get("manager")
         if broker is None or manager is None:
@@ -429,7 +470,7 @@ class BrokerContour:
         positions, _ = manager.contour_remainder()
         self._write(trades=positions, orders_in_flight=len(broker.live_orders()), stream_link=broker.stream_link)
 
-    def _reconcile_trading(self, reconciler: Reconciler, session: BrokerSession, account, broker, manager,
+    def _reconcile_trading(self, reconciler: Reconciler, session: TradingSession, account, broker, manager,
                            snapshot: AccountSnapshot | None = None) -> None:
         """Сверка со своим журналом: позиции сделок, заявки в работе; «в пути» не сравнивается."""
         now = self._clock()
@@ -438,13 +479,11 @@ class BrokerContour:
         self._consume(broker, manager)
         snapshot_at = self._clock()
         if snapshot is None:
-            try:
-                snapshot = session.read_account(account)
-            except BrokerCallError as exc:
-                log.warning("Сверка пропущена: счёт не прочитан (%s)", exc.code)
-                report = reconciler.run(now, None)
+            link, snapshot = self._read(session, account)
+            if snapshot is None:
+                report = reconciler.run(now, None, planned=link == LINK_MAINTENANCE)
                 self._capital = None
-                self._write(account_link="lost", last_reconcile_at=report["at"])
+                self._write(account_link=link, last_reconcile_at=report["at"])
                 return
         self._capital = snapshot.rub
         self._account(snapshot)

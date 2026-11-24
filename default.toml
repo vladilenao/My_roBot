@@ -81,6 +81,14 @@ max_daily_loss_pct = 3.0  # Предел убытка торгового дня,
 max_rejects_in_row = 3  # Отказов брокера подряд до запрета входов; снимается POST /api/v1/account/guards/reset (1–20).
 # portfolio_pct = 2.0  # Свой риск портфеля «Счёта», % капитала (0–100); без ключа — [trading.risk_limits] portfolio_pct.
 
+# «Счёт Финам» — второй реальный брокер (add-finam-contour). Пока только читает счёт: orders = true отклоняется.
+# Секрет и номер счёта — FINAM_SECRET_TOKEN и FINAM_ACCOUNT_ID в .env; ключи и диапазоны — как у [contours.account].
+[contours.finam]
+telegram_bot_env = "TELEGRAM_FINAM_BOT_TOKEN"  # Имя переменной .env с токеном бота контура «Счёт Финам».
+telegram_channel_env = "TELEGRAM_FINAM_CHANNEL_ID"  # Имя переменной .env с id канала «Счёт Финам».
+reconcile_every_min = 1  # Как часто сверять счёт Финама с журналом контура, минут (1–60).
+orders = false  # Только false: заявки на Финаме появятся в следующей версии.
+
 [instruments]
 fallback_type = "future"
 fallback_ticker = "NGU6"
