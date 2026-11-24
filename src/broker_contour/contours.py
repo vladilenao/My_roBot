@@ -33,22 +33,23 @@ class LiveContour:
     trading: bool = True        # адаптер умеет заявки; нет — [contours.<номер>] orders = true отклоняется
     # Значения [contours.<номер>] по умолчанию, свои у контура: имена переменных бота и канала, orders.
     defaults: Mapping = field(default_factory=dict)
+    name: str = ""              # название для человека в API и UI: «Счёт», «Счёт Финам», «Песочница»
 
 
 ACCOUNT_CONTOUR = LiveContour(
     ACCOUNT, ACCOUNT, ACCOUNT, "tinvest-account", "СЧЁТ", "TINKOFF_TRADE_TOKEN", "TINKOFF_ACCOUNT_ID",
     defaults={"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_ACCOUNT_CHANNEL_ID",
-              "orders": False})
+              "orders": False}, name="Счёт")
 # Финам только читает счёт до Ф3: адаптер без торговли (add-finam-contour, решение 3).
 FINAM_CONTOUR = LiveContour(
     FINAM, ACCOUNT, FINAM, "finam-account", "СЧЁТ ФИНАМ", "FINAM_SECRET_TOKEN", "FINAM_ACCOUNT_ID",
     provider=FINAM, trading=False,
     defaults={"telegram_bot_env": "TELEGRAM_FINAM_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_FINAM_CHANNEL_ID",
-              "orders": False})
+              "orders": False}, name="Счёт Финам")
 SANDBOX_CONTOUR = LiveContour(
     SANDBOX, SANDBOX, SANDBOX, "tinvest-sandbox", "ПЕСОЧНИЦА", "TINKOFF_SANDBOX_TOKEN",
     defaults={"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
-              "orders": True})
+              "orders": True}, name="Песочница")
 
 # Порядок — порядок подъёма при старте ядра: «Счёт», «Счёт Финам», затем песочница.
 LIVE_CONTOURS: tuple[LiveContour, ...] = (ACCOUNT_CONTOUR, FINAM_CONTOUR, SANDBOX_CONTOUR)

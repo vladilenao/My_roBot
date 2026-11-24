@@ -2,57 +2,61 @@
 
 ## 0. Согласование
 
-- [ ] 0.1 Владелец согласовал proposal и design. Нужны ответы на open questions: имена переменных Telegram и каталог на `TINKOFF_TOKEN`.
+- [x] 0.1 Владелец согласовал proposal и design 24.11: свой бот `TELEGRAM_FINAM_BOT_TOKEN` и канал `TELEGRAM_FINAM_CHANNEL_ID`, каталог карточек на `TINKOFF_TOKEN`.
 
 ## 1. Заглушки Ф0
 
-- [ ] 1.1 `git merge --no-ff feature/finam-probe`. Полный `pytest` на слиянии.
+- [x] 1.1 `git merge --no-ff feature/finam-probe`. Полный `pytest` на слиянии.
+  Сделано 24.11 (6cc43cd): 4392 passed.
 
 ## 2. Общий код без веток по брокеру — поведение «Счёта» и песочницы не меняется
 
-- [ ] 2.1 `port.py`:
+- [x] 2.1 `port.py`:
   - `BrokerOutage(BrokerCallError)`;
   - `BrokerSession` (чтение) и `TradingSession` (капитал, имена, торговля);
   - `InstrumentCard`, `InstrumentCatalog`.
-- [ ] 2.2 `process.py`:
+- [x] 2.2 `process.py`:
   - `_read(session, account)` с исходами «снимок / потерян / окно» вместо трёх перехватов в `_reconcile`, `_reconcile_trading`, `_final_account`;
   - допуск ждёт окна одним циклом.
 
   `reconcile.py`: пропуск в окне не считается. `admission.py`: `BrokerOutage` не превращается в отказ.
-- [ ] 2.3 `contours.py`: поля `provider`, `trading`, `defaults`; `broker` в `status.json`.
-- [ ] 2.4 Конфиг: ключи и проверки `[contours.<номер>]` контуров на брокере — по описаниям; `orders = true` при `trading = False` → `ConfigError`.
-- [ ] 2.5 `run.py`:
+- [x] 2.3 `contours.py`: поля `provider`, `trading`, `defaults`; `broker` в `status.json`.
+- [x] 2.4 Конфиг: ключи и проверки `[contours.<номер>]` контуров на брокере — по описаниям; `orders = true` при `trading = False` → `ConfigError`.
+- [x] 2.5 `run.py`:
   - `_SECRETS` — из описаний;
   - сборка контура с `orders = true` только при `trading`.
 
   `console_view.py` — метка из `CONTOUR_TITLES`.
-- [ ] 2.6 Тесты 2.1–2.5:
+- [x] 2.6 Тесты 2.1–2.5:
   - `BrokerOutage` при допуске, сверке, остановке, остановка во время ожидания окна;
   - «Счёт» без `BrokerOutage` — прежние тревоги;
   - `ConfigError` для `orders` у описания без торговли;
   - значения `[contours.account]`/`[contours.sandbox]` прежние;
   - граница общего кода дополнена `src.finam`.
 
+  Сделано 24.11 одним коммитом с разделами 3 и 4 (72902fc): описание `finam` связывает конфиг, тесты описаний и адаптер, по отдельности промежуточные коммиты были бы красными. Полный `pytest` на снимке коммита — 4470 passed, `ruff` чистый.
+  Изменённые проверки существующих тестов — только из-за нового контура (новое требование «Описание контура на брокере»): порядок описаний, заголовки и надзиратели (`test_live_contours`), список контуров в сообщении `run.py` (`test_launch_entry`).
+
 ## 3. Каталог карточек ядра
 
-- [ ] 3.1 `tinvest/catalog.py` — `TInvestCatalog`: шлюз на `TINKOFF_TOKEN` только `instruments.*`, `by_uid`, `by_ticker`, короткое имя правилом `short_name_by_uid`, кэш на процесс.
-- [ ] 3.2 Тесты: карточки акции и фьючерса, отказ не-`instruments.*` до сети.
+- [x] 3.1 `tinvest/catalog.py` — `TInvestCatalog`: шлюз на `TINKOFF_TOKEN` только `instruments.*`, `by_uid`, `by_ticker`, короткое имя правилом `short_name_by_uid`, кэш на процесс.
+- [x] 3.2 Тесты: карточки акции и фьючерса, отказ не-`instruments.*` до сети.
 
 ## 4. Адаптер `src/broker_contour/finam/`
 
-- [ ] 4.1 `transport.py`:
+- [x] 4.1 `transport.py`:
   - `FinamTransport`: канал, `call`, текст ошибки в одну строку;
   - повтор по `reset_time` (до 2, не дольше 65 с, без квоты — 60 с);
   - окно 05:00–06:15 МСК → `BrokerOutage`.
-- [ ] 4.2 `transport.py` — `JwtSource`: `Auth` при входе, стрим `SubscribeJwtRenewal`, секрет до использования, замок, переподписка 5/10/30/60 с, запасной `Auth` старше 10 мин; `AuthService` без заголовка.
-- [ ] 4.3 `symbols.py` — `FinamSymbols`: `symbol` по карточке (RTSX/MISX), карточка по `symbol`, `SymbolMismatch` по шагу и лоту, `margin(symbol)` без кэша.
-- [ ] 4.4 `account.py`:
+- [x] 4.2 `transport.py` — `JwtSource`: `Auth` при входе, стрим `SubscribeJwtRenewal`, секрет до использования, замок, переподписка 5/10/30/60 с, запасной `Auth` старше 10 мин; `AuthService` без заголовка.
+- [x] 4.3 `symbols.py` — `FinamSymbols`: `symbol` по карточке (RTSX/MISX), карточка по `symbol`, `SymbolMismatch` по шагу и лоту, `margin(symbol)` без кэша.
+- [x] 4.4 `account.py`:
   - правило счёта по `TokenDetails` (номера — секреты до проверки);
   - снимок: сумма RUB, нулевые позиции, лоты акций, активные заявки и стопы, `names` только по UID.
-- [ ] 4.5 `admission.py` — факты `access_level`, `limits`, `warnings`.
-- [ ] 4.6 `session.py` — `FinamSession` (`BrokerSession`), `adapter(secret, account_id, catalog_factory)`; `run.py` — `_broker_sessions` для `finam-account`.
-- [ ] 4.7 Описание `finam` в `contours.py`; `[contours.finam]` в `default.toml`; `run.spec` — `src.finam.proto.*` и `src.broker_contour.finam`.
-- [ ] 4.8 Тесты `tests/unit/broker_contour/finam/` на своём фейке Финама:
+- [x] 4.5 `admission.py` — факты `access_level`, `limits`, `warnings`.
+- [x] 4.6 `session.py` — `FinamSession` (`BrokerSession`), `adapter(secret, account_id, catalog_factory)`; `run.py` — `_broker_sessions` для `finam-account`.
+- [x] 4.7 Описание `finam` в `contours.py`; `[contours.finam]` в `default.toml`; `run.spec` — `src.finam.proto.*` и `src.broker_contour.finam`.
+- [x] 4.8 Тесты `tests/unit/broker_contour/finam/` на своём фейке Финама:
   - всё из 4.1–4.6;
   - граница адаптера: без разведки `src.finam`, `tinvest`, `src.sandbox`, `t_tech`.
 

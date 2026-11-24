@@ -99,3 +99,22 @@ def test_assembly_builds_finam_adapter_and_secrets(monkeypatch):
     secrets = run._live_contour_secrets()
     assert {"fake-finam-secret-for-mask-0001", "FAKE-FINAM-ACC-FOR-MASK-0002",
             "999:fake-finam-bot-for-mask-0003"} <= set(secrets)
+
+
+def test_assembly_builds_live_resources(tmp_path):
+    """Ресурсы API контуров вида «счёт» собираются по описаниям (add-finam-contour, решение 13)."""
+    import run
+    from src.account.fee_probes import fee_probe_extras
+    from src.bot import control_views as views
+
+    store = CoreStateStore(tmp_path / "core.sqlite3")
+    live = run._live_supervisors(run._broker_supervisors(tmp_path, store))
+    assert list(live) == [views.ACCOUNT, views.FINAM]
+    resources = {base: run._account_control(spec, supervisor, store) for base, (spec, supervisor) in live.items()}
+    account, finam = resources[views.ACCOUNT], resources[views.FINAM]
+    assert (account.BASE, account.TITLE, account.provider) == ("/api/v1/account", "Счёт", "tinvest")
+    assert (finam.BASE, finam.TITLE, finam.provider, finam.orders_enabled) == ("/api/v1/finam", "Счёт Финам", "finam",
+                                                                               False)
+    assert account._reconcile_extras is fee_probe_extras and finam._reconcile_extras is None
+    assert ("POST", "/api/v1/account/guards/reset") in account.routes()
+    assert ("POST", "/api/v1/finam/guards/reset") not in finam.routes()

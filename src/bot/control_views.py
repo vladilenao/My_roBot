@@ -43,6 +43,9 @@ ACCOUNT_RECONCILE = ACCOUNT + "/reconcile"
 ACCOUNT_LOG = ACCOUNT + "/log"
 ACCOUNT_GUARDS_RESET = ACCOUNT + "/guards/reset"
 ACCOUNT_COMPARISON = ACCOUNT + "/comparison"
+# Контур «Счёт Финам» (add-finam-contour): тот же ресурс, что у «Счёта», на своём базовом пути.
+FINAM = "/api/v1/finam"
+LIVE_BASES = (ACCOUNT, FINAM)        # базовые пути контуров вида «счёт»: без ресурса — 404 «Контур недоступен»
 # Позиции, сделки и итоги контура по журналу сделок (add-contour-trades-api); счёт — только у эмуляции.
 TRADING_PARTS = ("positions", "trades", "performance")
 EMULATION_ACCOUNT = EMULATION + "/account"
@@ -86,6 +89,11 @@ _CORE_BRIEF = ("state", "error", "attempts", "next_retry_at")
 def binding_indicators_href(instrument: str, timeframe: str, binding_id: str) -> str:
     """``_links.indicators`` привязки (add-indicators-api): её таймфрейм на инструменте участника."""
     return f"{CANDLES}/{quote(instrument, safe='')}/{timeframe}/indicators?binding={quote(binding_id, safe='')}"
+
+
+def live_base(contour_id: str) -> str:
+    """Базовый путь ресурса контура на брокере по номеру: ``/api/v1/account``, ``/api/v1/finam``."""
+    return f"{HOME}/{contour_id}"
 
 
 def links(**items: str) -> dict:
@@ -190,25 +198,25 @@ def sandbox_action_list(names) -> list[dict]:
     return [_action(name, *table[name]) for name in names]
 
 
-def account_action_list(names) -> list[dict]:
-    """Команды «Счёта» (add-account-contour, enable-live-trading); ``close_all`` — с подтверждением."""
+def account_action_list(names, base: str = ACCOUNT, title: str = "Счёт") -> list[dict]:
+    """Команды контура вида «счёт» на ``base`` (add-account-contour, add-finam-contour); ``close_all`` — с подтверждением."""
     table = {
-        "start": ("Запустить «Счёт»", "PUT", ACCOUNT_TARGET, {"mode": MODE_ON}),
-        "stop": ("Остановить", "PUT", ACCOUNT_TARGET, {"mode": NO_ENTRIES}),
-        "stop-close-all": ("Остановить, закрыть свои сделки", "PUT", ACCOUNT_TARGET,
+        "start": (f"Запустить «{title}»", "PUT", base + "/target", {"mode": MODE_ON}),
+        "stop": ("Остановить", "PUT", base + "/target", {"mode": NO_ENTRIES}),
+        "stop-close-all": ("Остановить, закрыть свои сделки", "PUT", base + "/target",
                            {"mode": CLOSE_ALL, "confirm": True}),
-        "add-bindings": ("Добавить привязки из песочницы", "POST", ACCOUNT_BINDINGS, {"bindings": []}),
-        "guards-reset": ("Снять предохранитель «отказы брокера подряд»", "POST", ACCOUNT_GUARDS_RESET,
+        "add-bindings": ("Добавить привязки из песочницы", "POST", base + "/bindings", {"bindings": []}),
+        "guards-reset": ("Снять предохранитель «отказы брокера подряд»", "POST", base + "/guards/reset",
                          {"guards": ["broker_rejects"]}),
     }
     return [_action(name, *table[name]) for name in names]
 
 
-def account_binding_actions(binding: str, active: bool) -> list[dict]:
+def account_binding_actions(binding: str, active: bool, base: str = ACCOUNT) -> list[dict]:
     if active:
-        return [_action("remove", "Убрать со счёта", "POST", ACCOUNT_REMOVE,
+        return [_action("remove", "Убрать со счёта", "POST", base + "/bindings/remove",
                         {"bindings": [binding], "mode": NO_ENTRIES})]
-    return [_action("restore", "Вернуть на счёт", "POST", ACCOUNT_BINDINGS, {"bindings": [binding]})]
+    return [_action("restore", "Вернуть на счёт", "POST", base + "/bindings", {"bindings": [binding]})]
 
 
 def binding_action_list(binding: str, active: bool) -> list[dict]:

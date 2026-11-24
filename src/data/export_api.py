@@ -37,8 +37,15 @@ _CONTROL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 _CONTOURS = "/api/v1/contours"
 # /api/v1/history/{run_id}[/stop|/report|/log]; run_id — имя папки прогона.
 _RUN = re.compile(r"^/api/v1/history/([0-9]{8}-[0-9]{6}(?:-[0-9]+)?)(?:/(stop|report|log))?$")
-_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX, views.ACCOUNT,
+_CONTROL_PREFIXES = (_CONTOURS, views.CORE, views.EMULATION, views.HISTORY, views.SANDBOX, *views.LIVE_BASES,
                      views.CANDLES)
+
+
+def _live_path(path: str) -> bool:
+    """Путь контура вида «счёт» (``/api/v1/account…``, ``/api/v1/finam…``)."""
+    return any(path == base or path.startswith(base + "/") for base in views.LIVE_BASES)
+
+
 _OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.yaml"
 # Маршруты экспорта рыночных данных и отчёта кластеров: им нужна рыночная база ядра.
 _EXPORT_GET = ("/api/v1/market-data/source", "/api/v1/market-data/changes",
@@ -68,8 +75,9 @@ class MarketDataExportServer:
         self.core_state = None
         # Контур «Песочница» (src.bot.sandbox_control.SandboxControl, add-sandbox-contour) или None.
         self.sandbox = None
-        # Контур «Счёт» (src.bot.account_control.AccountControl, add-account-contour) или None.
-        self.account = None
+        # Контуры вида «счёт» (src.bot.account_control.AccountControl, add-account-contour, add-finam-contour):
+        # базовый путь → ресурс; контура нет в таблице — 404.
+        self.live: dict = {}
         # Позиции, сделки и итоги контуров по журналу (src.bot.trades_view.ContourTrades, add-contour-trades-api):
         # адрес контура → ресурсы; контура нет в словаре — 404.
         self.trading: dict = {}
@@ -85,6 +93,23 @@ class MarketDataExportServer:
         self.port = port
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    @property
+    def account(self):
+        """Ресурс «Счёта» (прежнее имя поля): строка таблицы ``live`` по ``/api/v1/account``."""
+        return self.live.get(views.ACCOUNT)
+
+    @account.setter
+    def account(self, resource) -> None:
+        if resource is None:
+            self.live.pop(views.ACCOUNT, None)
+        else:
+            self.live[views.ACCOUNT] = resource
+
+    def live_resource(self, path: str):
+        """Ресурс контура вида «счёт», которому принадлежит путь, или ``None``."""
+        return next((resource for base, resource in self.live.items() if path == base or path.startswith(base + "/")),
+                    None)
 
     def attach_market(self, store: MarketDataStore, clusters_report=None) -> None:
         """Ядро открыло рыночную базу: экспорт и отчёт кластеров начинают отвечать."""
@@ -219,8 +244,7 @@ class _Handler(BaseHTTPRequestHandler):
             found.update(core=views.CORE, emulation=views.EMULATION, history=views.HISTORY)
             if server.sandbox is not None:
                 found["sandbox"] = views.SANDBOX
-            if server.account is not None:
-                found["account"] = views.ACCOUNT
+            found.update({resource.kind: base for base, resource in server.live.items()})
             found["candles"] = views.CANDLES
         if export:
             found.update({"market-data": "/api/v1/market-data/source", "clusters-report": "/api/v1/clusters/report"})
@@ -232,7 +256,8 @@ class _Handler(BaseHTTPRequestHandler):
             "history": None if not control else (history.limits() if history is not None else
                                                  {"max": 0, "running": 0, "queued": 0}),
             "sandbox": server.sandbox.summary() if control and server.sandbox is not None else None,
-            "account": server.account.summary() if control and server.account is not None else None,
+            "account": None,
+            **({resource.kind: resource.summary() for resource in server.live.values()} if control else {}),
             "live": None,
             "_links": {name: {"href": href} for name, href in found.items()},
         })
@@ -258,8 +283,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == views.ACCOUNT_COMPARISON and server.account_comparison is not None:
             self._comparison_get(query, server.account_comparison)
             return
-        if path == views.ACCOUNT or path.startswith(views.ACCOUNT + "/"):
-            self._account_get(path, query)
+        live = server.live_resource(path)
+        if live is not None:
+            self._live_get(live, path, query)
+            return
+        if _live_path(path):
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур недоступен в этом процессе.")
             return
         if path == views.CANDLES or path.startswith(views.CANDLES + "/"):
             self._candles_get(path, query)
@@ -416,62 +445,54 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
 
-    def _account_get(self, path: str, query: dict[str, list[str]]) -> None:
-        """Контур «Счёт» (add-account-contour): те же чтения, что у песочницы, без отчёта сравнения."""
-        account = self.export_server.account
-        if account is None:
-            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Счёт» недоступен в этом процессе.")
-            return
-        if path == views.ACCOUNT:
-            view = account.view()
+    def _live_get(self, resource, path: str, query: dict[str, list[str]]) -> None:
+        """Контур вида «счёт» (add-account-contour, add-finam-contour): те же чтения, что у песочницы."""
+        base = resource.BASE
+        if path == base:
+            view = resource.view()
             self._json(HTTPStatus.OK, view, headers=views.etag((view["target"] or {}).get("revision")))
-        elif path == views.ACCOUNT_TARGET:
-            target = account.target()
+        elif path == base + "/target":
+            target = resource.target()
             self._json(HTTPStatus.OK, target, headers=views.etag((target or {}).get("revision")))
-        elif path == views.ACCOUNT_BINDINGS:
-            payload = account.bindings()
+        elif path == base + "/bindings":
+            payload = resource.bindings()
             self._json(HTTPStatus.OK, payload, headers=views.etag(payload["revision"]))
-        elif path == views.ACCOUNT_RECONCILE:
-            self._json(HTTPStatus.OK, account.reconcile())
-        elif path == views.ACCOUNT_LOG:
+        elif path == base + "/reconcile":
+            self._json(HTTPStatus.OK, resource.reconcile())
+        elif path == base + "/log":
             tail = self._tail(query)
             if tail is not None:
-                self._send_text(HTTPStatus.OK, account.log_tail(tail), "text/plain; charset=utf-8")
+                self._send_text(HTTPStatus.OK, resource.log_tail(tail), "text/plain; charset=utf-8")
         else:
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
 
-    def _account_command(self, path: str) -> None:
-        """Команды «Счёта»: запуск и остановка; состав до Р2 — ``409 ACCOUNT_READ_ONLY``."""
+    def _live_command(self, resource, path: str) -> None:
+        """Команды контура вида «счёт»: запуск и остановка; состав без заявок — ``409 ACCOUNT_READ_ONLY``."""
         from src.bot.account_control import parse_account_bindings, parse_account_target
         from src.bot.launch_control import BadCommand
         from src.bot.sandbox_control import parse_guards_reset
 
-        account = self.export_server.account
-        if account is None:
-            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур «Счёт» недоступен в этом процессе.")
-            return
-        routes = {("PUT", views.ACCOUNT_TARGET), ("POST", views.ACCOUNT_BINDINGS), ("POST", views.ACCOUNT_REMOVE),
-                  ("POST", views.ACCOUNT_GUARDS_RESET)}
-        if (self.command, path) not in routes:
+        base = resource.BASE
+        if (self.command, path) not in resource.routes():
             self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Эндпоинт не найден.")
             return
         expected = _if_match(self.headers.get("If-Match"))
         try:
             body = self._read_json()
-            if path == views.ACCOUNT_GUARDS_RESET:
-                status, payload = account.reset_guards(parse_guards_reset(body))
+            if path == base + "/guards/reset":
+                status, payload = resource.reset_guards(parse_guards_reset(body))
                 headers = None
-            elif path == views.ACCOUNT_TARGET:
+            elif path == base + "/target":
                 mode, bindings, confirm = parse_account_target(body)
-                status, payload = account.put_account_target(mode, bindings, confirm, expected)
+                status, payload = resource.put_account_target(mode, bindings, confirm, expected)
                 headers = views.etag((payload.get("target") or {}).get("revision")) if status < 400 else None
                 if status == HTTPStatus.ACCEPTED:
-                    headers = {**(headers or {}), "Location": views.ACCOUNT}
+                    headers = {**(headers or {}), "Location": base}
             else:
-                remove = path == views.ACCOUNT_REMOVE
+                remove = path == base + "/bindings/remove"
                 ids, mode, confirm = parse_account_bindings(body, remove=remove)
-                status, payload = account.change_account_bindings(ids, remove=remove, mode=mode, confirm=confirm,
-                                                                  expected=expected)
+                status, payload = resource.change_account_bindings(ids, remove=remove, mode=mode, confirm=confirm,
+                                                                   expected=expected)
                 headers = views.etag(payload.get("revision")) if status < 400 else None
         except BadCommand as exc:
             self._problem(HTTPStatus.BAD_REQUEST, exc.code, exc.message)
@@ -537,8 +558,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == views.SANDBOX or path.startswith(views.SANDBOX + "/"):
             self._sandbox_command(path)
             return
-        if path == views.ACCOUNT or path.startswith(views.ACCOUNT + "/"):
-            self._account_command(path)
+        live = self.export_server.live_resource(path)
+        if live is not None:
+            self._live_command(live, path)
+            return
+        if _live_path(path):
+            self._problem(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Контур недоступен в этом процессе.")
             return
         run = _RUN.match(path)
         if run is not None and run.group(2) == "stop" and self.command == "POST":
