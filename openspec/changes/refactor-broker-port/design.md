@@ -64,8 +64,8 @@
 
 | Порт | Методы | Кто пользуется |
 |---|---|---|
-| `OrderPort` | `post_limit`, `post_market`, `cancel`, `order_state(key, number)` | `LiveBroker` |
-| `StopPort` | `post_stop`, `cancel_stop`, `poll_stops(queries, known)` | `StopKeeping` |
+| `OrderPort` | `post_limit`, `post_market`, `cancel`, `order_state(uid, key, number)` | `LiveBroker` |
+| `StopPort` | `post_stop`, `cancel_stop`, `poll_stops(queries, known, since, until)` | `StopKeeping` |
 | `MarketPort` | `last_price`, `price_band`, `instrument_uid`, `futures_margin` | `LiveBroker` |
 | `OrderFeed` | `order_stream()` | `OrderStream` |
 | `MarginLimits` | `max_lots(uid, side, price)` | `LiveBroker`, если передан |
@@ -74,14 +74,16 @@
 
 `BrokerApi = OrderPort + StopPort + MarketPort + OrderFeed` — для удобства сборки. Потребители объявляют только свой узкий порт.
 
+`BrokerSession.trading(account, book)` отдаёт `TradingLink`: порты, `MarginLimits` или `None`, префикс исполнений, период ГО и фабрику `FeeSource` — всё, что адаптер даёт торговле контура. `uid` в `order_state` — инструмент строки журнала: по его карточке адаптер переводит суммы в пункты.
+
 **Намерения вместо вызовов:**
 
-- `order_state(key, number)` — «состояние моей заявки». Т-Инвест: по ключу, если он есть, иначе по номеру биржи — ровно нынешние `order_by_key` и `order_by_exchange_id` и выбор между ними в `_refresh`. Финам выберет сам: в тот же день по ключу, потом по номеру.
-- `poll_stops(queries, known)` — «где мои стоп-заявки». На вход:
+- `order_state(uid, key, number)` — «состояние моей заявки». Т-Инвест: по ключу, если он есть, иначе по номеру биржи — ровно нынешние `order_by_key` и `order_by_exchange_id` и выбор между ними в `_refresh`. Финам выберет сам: в тот же день по ключу, потом по номеру.
+- `poll_stops(queries, known, since, until)` — «где мои стоп-заявки». На вход:
   - запросы `StopQuery(key, stop_order_id, instrument_uid, side, lots, stop_price, sent_at)` по живым и «потерянным» строкам, в нынешнем порядке;
   - номера всех известных стоп-заявок (`known`).
 
-  На выход — `StopMatch(report | None, candidates)` на каждый запрос. Т-Инвест: один `GetStopOrders`, затем поиск по номеру, а без номера — по атрибутам. Сюда дословно переезжают `_candidates`, `_same_stop_price`, `FOUND_SLACK` и правило «одна привязка на стоп-заявку». Машина состояний строки остаётся в общем коде: «неизвестна → потеряна → лишняя снята / не дошла», а также сроки `STOP_LOST` и `STOP_LOST_WINDOW`. Финам по `known` спросит `GetOrder` по номеру.
+  На выход — `StopMatch(report | None, candidates, searched)` на каждый запрос; `StopQuery.search` — номер мог не прийти, `StopQuery.lost` — строка «потеряна», ищется лишняя. Т-Инвест: один `GetStopOrders`, затем поиск по номеру, а без номера — по атрибутам. Сюда дословно переезжают `_candidates`, `_same_stop_price`, `FOUND_SLACK` и правило «одна привязка на стоп-заявку». Машина состояний строки остаётся в общем коде: «неизвестна → потеряна → лишняя снята / не дошла», а также сроки `STOP_LOST` и `STOP_LOST_WINDOW`. Финам по `known` спросит `GetOrder` по номеру.
 - `FeeSource.run(now)` — «настоящие комиссии ждущих исполнений». `FeeSync` целиком, вместе с поиском по операциям, долями заглушек и `LIKE 'tinvest:%'`, переезжает в `tinvest/fees.py`. В общем коде остаётся вызов источника на сверке.
 
 **Отчёты порта — в пунктах и лотах заявки:**

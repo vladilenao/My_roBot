@@ -53,9 +53,12 @@
 
 ## 4. Сборка
 
-- [ ] 4.1 PyInstaller `run.spec` собирает с пакетом `tinvest/`; собранный `--contour sandbox` на тестовых данных доходит до допуска без `ImportError`.
+- [x] 4.1 PyInstaller `run.spec` собирает с пакетом `tinvest/`; собранный `--contour sandbox` на тестовых данных доходит до допуска без `ImportError`.
+  Сделано 24.11.2026 (macOS arm64, PyInstaller 6.22.2): все модули `port`, `contours`, `tinvest.*` в сборке; собранный `run --contour sandbox` с пустым токеном и тестовым `launch.json` вышел с кодом 2 «Не задан TINKOFF_SANDBOX_TOKEN» — адаптер импортирован, к брокеру не ходил.
 
 ## 5. Ручной регресс владельца в песочнице Т-Инвест (до ПРОМ)
+
+Пошагово — `regress.md` этого change.
 
 Тестовый робот из PyCharm на 8102. ПРОМ (8101, `~/Desktop/my_roBot_app`) не трогать.
 
