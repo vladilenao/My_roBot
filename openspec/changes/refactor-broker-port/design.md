@@ -1,221 +1,235 @@
 ## Context
 
-Контур на брокере (`src/broker_contour/`) работает в двух экземплярах: «Песочница» и «Счёт». Оба исполняют команды `TradeManager` настоящими заявками Т-Инвест через `TInvestBroker` и адаптер `TInvestApi`. Финам подключается третьим экземпляром — контуром `finam` вида «счёт» (Ф2–Ф3). Этот change — Ф1: чистый рефакторинг, после которого адаптер Финама встаёт рядом с адаптером Т-Инвест и не трогает общий код.
+Контур на брокере (`src/broker_contour/`) работает в двух экземплярах: «Песочница» и «Счёт». Оба исполняют команды `TradeManager` настоящими заявками Т-Инвест через `TInvestBroker` и `TInvestApi`. Финам подключается контуром `finam` вида «счёт» (Ф2–Ф3). Т-Инвест не заменяется: контуры на разных брокерах работают одновременно.
 
-Факты разведки Финама (Ф0, `feature/finam-probe`, `add-finam-probe/design.md`, раздел «Факты разведки»), важные для порта:
+Сейчас общий код знает Т-Инвест изнутри:
+
+- рубли за контракт переводит в пункты (`trade_price`, `fill_average`, `_same_stop_price`);
+- ищет заявку по ключу, а потерянную стоп-заявку — по атрибутам;
+- находит комиссии по операциям Т-Инвест (`FeeSync`);
+- включает `GetMaxLots` условием `contour_id == "account"`;
+- сам открывает шлюз и читает счёт вызовами SDK.
+
+Факты разведки Финама (Ф0, `add-finam-probe/design.md`, «Факты разведки»), которые порт должен выдержать:
 
 | Тема | Т-Инвест | Финам |
 |---|---|---|
-| Ключ заявки | UUID ≤ 36, ищется по ключу и на другой день | `client_order_id` ≤ 20, надёжен только в тот же день |
-| Поиск после рестарта | `GetOrderState` по ключу | в тот же день — по ключу, на другой — по номеру |
-| Стоп-заявка в ответах чтения | без ключа, ищется по атрибутам | ключ в тот же день, потом пусто |
+| Поиск заявки | по ключу, в любой день | по ключу — только в тот же день, потом по номеру |
+| Потерянная стоп-заявка | ключа в ответах нет — по атрибутам | ключ в тот же день, потом по номеру |
 | Сработавший стоп | `GetStopOrders` → `exchange_order_id` | `GetOrder` по номеру стопа отдаёт порождённую заявку |
 | Цены | у фьючерса суммы в рублях за контракт | везде пункты |
 | Временный номер в стриме | есть | нет |
-| ГО | `GetFuturesMargin`, раз в сутки | своё, плавает, берётся в момент заявки |
+| ГО | `GetFuturesMargin` раз в сутки | своё, плавает, в момент заявки |
 | Объём по обеспечению | `GetMaxLots` | нет |
-| Рыночная заявка | рыночная | IOC-лимит по границе планки |
-| Комиссия | `executed_commission`, операции | в сделке нет, позже в `Transactions` (уточняется 25.11) |
-| Авторизация | токен | JWT на 15 мин, `SubscribeJwtRenewal` |
-| Лимит | подсказка `ratelimit_reset` | 200 в минуту на метод, подсказки нет |
+| Комиссия | `executed_commission`, операции | позже в `Transactions` (уточняется 25.11) |
+| Авторизация, лимит | токен; подсказка `ratelimit_reset` | JWT 15 мин; 200/мин на метод, без подсказки |
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Общий код контура не знает SDK брокера: только порт.
-- Особенности брокера — свойства адаптера.
-- Новый экземпляр вида «счёт» добавляется данными: описанием контура.
-- Нулевое изменение поведения «Счёта» и песочницы.
+- Общий код спрашивает брокера намерениями контура («найди заявку», «где мои стопы», «комиссии этих исполнений»), а как это сделать, решает адаптер.
+- Общий код не знает SDK и пакеты адаптеров. Адаптер выбирает и передаёт одна точка сборки — `run.py`.
+- Логика Т-Инвест не меняется: она переезжает в адаптер дословно.
+- Новый экземпляр вида «счёт» добавляется описанием контура, без копии функций.
 
 **Non-Goals:**
 
-- Контур `finam`, адаптер Финама, его API, конфиг и UI — Ф2–Ф3.
-- Параметризация слоя API и UI (`account_control`, `comparison_view`, `export_api`) — Ф2, вместе с `/api/v1/finam`.
-- Перенос разведки комиссий «Счёта» (`src/account/fee_probes.py`) — она живёт только при `orders = false` и остаётся на месте.
+- Адаптер Финама, контур `finam`, его API, конфиг и UI — Ф2–Ф3. Веток и свойств «на вырост» под Финам в Ф1 нет.
+- Слой API и UI (`account_control`, `comparison_view`, `export_api`) — Ф2, вместе с `/api/v1/finam`.
+- Разбор `LiveBroker` (~1000 строк) и примеси `StopKeeping` на части — отдельная задача. Ф1 их не трогает, кроме мест вызова порта.
 
 ## Decisions
 
 ### 1. Схема
 
-Оба брокера нужны одновременно, Т-Инвест не заменяется. Контуры вида «счёт» с разными брокерами работают рядом. У каждого свой процесс, каталог, база, отпечаток счёта и канал. Код Т-Инвест в Ф1 только переезжает за порт.
-
 ```
- контуры (процессы)          общий код                порт            адаптеры (пакеты)
- ─────────────────          ─────────                ────            ─────────────────
- sandbox ─┐                                                       ┌─► tinvest/   Т-Инвест
- data/contours/sandbox/     LiveBroker               BrokerApi    │   api, gateway, account,
- broker.sqlite3, канал ПЕСОЧН.  stops, fees, stream ─► BrokerAccess ─┤   admission, access
-          ├─► LiveContour ─► BrokerContour       ─► BrokerTraits  │   (Ф1: переезд без правок
- account ─┤   (описание)    admission, reconcile,                 │    логики)
- data/contours/account/     guards, control                      │
- broker.sqlite3, канал СЧЁТ                                        └─► finam/     Финам
-          │                 не знает ни tinvest/,                    api, gateway (JWT),
- finam ───┘ (Ф2)            ни finam/ — только порт                  account, access
- data/contours/finam/                                                (Ф2–Ф3, рядом)
- broker.sqlite3, канал ФИНАМ
-
- profiles.py (сборка): профиль описания → адаптер. tinvest-sandbox, tinvest-account; Ф2: finam-account
+ контуры (процессы)                общий код                    порты                  адаптеры
+ sandbox ─ data/contours/sandbox/   LiveBroker ─────────► OrderPort  StopPort  ◄──┬── tinvest/  (Ф1: переезд)
+           broker.sqlite3, канал    ├ StopKeeping         MarketPort             │     TInvestPort ─► TInvestApi ─► SDK
+ account ─ data/contours/account/   └ OrderStream ──────► OrderFeed              │     TInvestSession
+           broker.sqlite3, канал    BrokerContour ──────► BrokerSession          │       (счёт, допуск, снимок,
+ finam   ─ data/contours/finam/      ├ admission          MarginLimits?          │        комиссии, ГО)
+   (Ф2)    broker.sqlite3, канал     ├ reconcile, guards  FeeSource?             └── finam/    (Ф2–Ф3, рядом)
+                                     └ status.json        отчёты в пунктах
+                    ▲
+ run.py — точка сборки: описание контура → адаптер → BrokerContour и LiveBroker
 ```
 
-- **Контур** — процесс `run.py --contour <номер>` со своим каталогом, базой `broker.sqlite3`, журналом сделок, отпечатком счёта и каналом. Процессы друг друга не ждут, сбой одного не останавливает остальных.
-- **Общий код** работает только с портом. Ни `tinvest/`, ни `finam/` он не импортирует.
-- **Адаптер выбирает сборка.** Реестр `src/broker_contour/profiles.py` по профилю описания (решение 6) отдаёт `BrokerAccess` и `BrokerTraits`. Только он знает пакеты адаптеров и импортирует их лениво.
+У каждого контура свой процесс `run.py --contour <номер>`, свой каталог, `broker.sqlite3`, журнал сделок, отпечаток счёта и канал. Сбой одного не останавливает остальных.
 
-### 2. Порт — `src/broker_contour/port.py`
+### 2. Порты — `src/broker_contour/port.py`
 
-**`BrokerApi`** — `typing.Protocol` с методами нынешнего `TInvestApi`:
+Порты узкие, по потребителям (ISP). Каждый описывает, что нужно контуру, а не какой вызов есть у брокера.
 
-| Группа | Методы |
-|---|---|
-| Заявки | `post_limit`, `post_market`, `cancel`, `order_by_key`, `order_by_exchange_id`, `max_lots` |
-| Стоп-заявки | `post_stop`, `cancel_stop`, `stop_orders(since, until, ids=())` |
-| Счёт | `operations`, `futures_margin` |
-| Рынок | `last_price`, `price_band`, `instrument_uid` |
-| Стрим | `order_stream` |
+| Порт | Методы | Кто пользуется |
+|---|---|---|
+| `OrderPort` | `post_limit`, `post_market`, `cancel`, `order_state(key, number)` | `LiveBroker` |
+| `StopPort` | `post_stop`, `cancel_stop`, `poll_stops(queries, known)` | `StopKeeping` |
+| `MarketPort` | `last_price`, `price_band`, `instrument_uid`, `futures_margin` | `LiveBroker` |
+| `OrderFeed` | `order_stream()` | `OrderStream` |
+| `MarginLimits` | `max_lots(uid, side, price)` | `LiveBroker`, если передан |
+| `FeeSource` | `run(now) → [FeeAdjustment]` | `BrokerContour`, если есть |
+| `BrokerSession` | `find_account()`, `read_facts(account)`, `read_account(account, names)`, `capital(account)`, `short_name(uid, names)`, `trading(account, book)`, `fee_source(account, journal)`, `fee_probes(directory)` | `BrokerContour`, `admission` |
 
-`instrument_uid` тоже в порте: `LiveBroker._card_for` переводит тикер эмуляции в номер инструмента брокера.
+`BrokerApi = OrderPort + StopPort + MarketPort + OrderFeed` — для удобства сборки. Потребители объявляют только свой узкий порт.
 
-Контракт порта не требует того, чего нет у Финама:
+**Намерения вместо вызовов:**
 
-- **Поиск по ключу** обязан работать только в тот же день. Дальше заявку ищут по номеру — решение 4, свойство `order_lookup`.
-- **`max_lots`** вызывается, только если `traits.max_lots`.
-- **Комиссия** в `OrderReport.executed_fee` и в операциях необязательна: нет её — менеджер ставит оценку (`fee_source = configured`), как сейчас.
-- **`price_band`** может вернуть `None`: коридор тогда проверяет биржа.
-- **`futures_margin`** может не вернуть стоимость шага: тогда остаётся шаг ядра.
-- **`stop_orders`** получает номера известных контуру стоп-заявок (`ids`). Т-Инвест их не использует. Финаму они нужны: на другой день `GetOrders` не показывает исполненные и снятые, а `GetOrder` по номеру — показывает.
+- `order_state(key, number)` — «состояние моей заявки». Т-Инвест: по ключу, если он есть, иначе по номеру биржи — ровно нынешние `order_by_key` и `order_by_exchange_id` и выбор между ними в `_refresh`. Финам выберет сам: в тот же день по ключу, потом по номеру.
+- `poll_stops(queries, known)` — «где мои стоп-заявки». На вход:
+  - запросы `StopQuery(key, stop_order_id, instrument_uid, side, lots, stop_price, sent_at)` по живым и «потерянным» строкам, в нынешнем порядке;
+  - номера всех известных стоп-заявок (`known`).
 
-**`BrokerAccess`** — доступ к счёту на открытом шлюзе:
+  На выход — `StopMatch(report | None, candidates)` на каждый запрос. Т-Инвест: один `GetStopOrders`, затем поиск по номеру, а без номера — по атрибутам. Сюда дословно переезжают `_candidates`, `_same_stop_price`, `FOUND_SLACK` и правило «одна привязка на стоп-заявку». Машина состояний строки остаётся в общем коде: «неизвестна → потеряна → лишняя снята / не дошла», а также сроки `STOP_LOST` и `STOP_LOST_WINDOW`. Финам по `known` спросит `GetOrder` по номеру.
+- `FeeSource.run(now)` — «настоящие комиссии ждущих исполнений». `FeeSync` целиком, вместе с поиском по операциям, долями заглушек и `LIKE 'tinvest:%'`, переезжает в `tinvest/fees.py`. В общем коде остаётся вызов источника на сверке.
 
-- `find_account()` — правило счёта;
-- `read_facts(account)` — факты допуска;
-- `read_account(account, names)` — снимок `AccountSnapshot`;
-- `capital(account)` — рубли счёта;
-- `short_name(uid, names)` — короткое имя инструмента;
-- `api(account)` — `BrokerApi` на этом счёте.
+**Отчёты порта — в пунктах и лотах заявки:**
 
-Сбой брокера — `BrokerCallError`, как сейчас.
+- `BrokerTrade(trade_id, price, quantity, at)` — без `in_rub`;
+- `OrderReport` — без `executed_rub` и `initial_rub`, но с `average`: средней исполнения в пунктах, если сделок нет. `temporary` остаётся: адаптер без временных номеров всегда ставит `False`;
+- `StopReport` — без стоп-цены, она нужна только поиску внутри адаптера.
 
-В порт переезжают общие типы:
+Перевод рублей в пункты делает адаптер Т-Инвест. Для этого он получает книгу цен `PriceBook`: карточки по номеру инструмента — шаг, его стоимость, лот, признак фьючерса. `PriceBook` выделяется из `LiveBroker` (`_cards`, `_keys`, `_card_by_uid`); брокер её заполняет, адаптер читает. `points_from_rub`, `fill_average`, `trade_price` переезжают в `tinvest/prices.py`.
 
-- отчёты `BrokerTrade`, `OrderReport`, `StopReport`, `OperationReport`;
-- ошибки `OrderFailure`, `BrokerCallError` (из `src/sandbox/gateway.py`), `AccountRuleError`;
-- счёт и снимок `RobotAccount`, `AccountSnapshot`, `mask_account`.
+**Остаётся в общем коде осознанно:** `executed_lots` и `trade_lots` — защита от лотов в штуках (песочница, GAZP 11.11). Решение «штуки или лоты» опирается на журнал заявки (лоты строки и уже записанные исполнения), а адаптер журнала не видит. У брокера, который присылает лоты, проверка ничего не делает.
 
-`StopReport` получает необязательное поле `key` (ключ стоп-заявки, если брокер его отдаёт). Т-Инвест оставляет `None`.
+**Ошибки и общие типы.** В `port.py` переезжают:
+
+- `OrderFailure` и `BrokerCallError` (из `src/sandbox/gateway.py`);
+- `AccountRuleError`, `RobotAccount`, `AccountSnapshot`, `mask_account`;
+- `StopQuery`, `StopMatch`, `PriceBook`.
 
 ### 3. Адаптер Т-Инвест — пакет `src/broker_contour/tinvest/`
 
-| Модуль | Откуда |
+Два слоя:
+
+- **`TInvestApi`** (`tinvest/api.py`) — шлюз к SDK, как сейчас. Сырые отчёты Т-Инвест (с `in_rub`, `executed_rub`), разбор ошибок `30057` и `30079`. Методы и вызовы SDK не меняются.
+- **`TInvestPort`** (`tinvest/port.py`) — адаптер поверх `TInvestApi`, реализует порты:
+  - переводит отчёты в пункты по `PriceBook`;
+  - выбирает между поиском по ключу и по номеру;
+  - ищет стоп-заявки;
+  - реализует `MarginLimits` только для «Счёта».
+
+| Модуль | Откуда переезжает |
 |---|---|
-| `api.py` | `TInvestApi`, `classify`, `report_from_state/stream` из `broker_contour/api.py` |
-| `gateway.py` | `BrokerGateway`, `SandboxGateway`, `AccountGateway` из `sandbox/gateway.py` |
-| `account.py` | `read_account`, `position_conflicts` из `broker_contour/account.py`; `robot_account` из `sandbox/account.py`; `account_by_id` из `account/account.py` |
-| `admission.py` | `read_facts`, `_limits` из `account/admission.py` |
-| `access.py` | `TInvestAccess` и профили `SANDBOX`, `ACCOUNT`: шлюз, правило счёта, факты, свойства |
+| `api.py` | `broker_contour/api.py` |
+| `port.py` | поиск стопов из `stops.py`, рублёвые места из `broker.py` |
+| `prices.py` | `points_from_rub`, `fill_average`, `trade_price` из `prices.py` |
+| `fees.py` | `broker_contour/fees.py` |
+| `gateway.py` | `sandbox/gateway.py` |
+| `account.py` | `read_account`, `position_conflicts` (`broker_contour/account.py`), `robot_account` (`sandbox/account.py`), `account_by_id` (`account/account.py`) |
+| `admission.py` | `account/admission.py` |
+| `session.py` | `TInvestSession`: правило счёта, факты, снимок, капитал (`rub_balance`), имена (`short_name_by_uid`), `trading()`, `fee_source()`, `fee_probes()` |
+| `__init__.py` | `adapter(profile, …)` — сборка для `sandbox` и `account` |
 
-Реэкспорты:
+Реэкспорты остаются только в `src/sandbox/gateway.py` и `src/sandbox/account.py`: на них стоит разведка песочницы (`python -m src.sandbox`). Удалить их можно, когда разведку переведут на новый путь. Остальные старые модули удаляются, импорты в коде и тестах переходят на новые места.
 
-- `src/sandbox/gateway.py` и `src/sandbox/account.py` — для разведки песочницы (`python -m src.sandbox`);
-- `src/broker_contour/admission.py` по-прежнему отдаёт `admit_account`, `check_settings`, `AdmissionError`; правило счёта в `admit_account` теперь обязательное.
+Фейк тестов `FakeApi` — фейк уровня `TInvestApi`. Тесты собирают брокер так: `LiveBroker(TInvestPort(FakeApi(), book), …)`. Поэтому проверки вызовов (`api.calls`, `api.posts()`) и сценарии остаются как есть, а поиск стопов и перевод рублей проверяются в настоящем адаптере, а не в фейке.
 
-Модули `src/broker_contour/api.py`, `src/broker_contour/account.py`, `src/account/account.py`, `src/account/admission.py` удаляются. Их импорты в коде и тестах переходят на `port` и `tinvest`.
+### 4. Сборка в одной точке и внедрение зависимостей
 
-**Граница проверяется тестом:** модули `broker`, `stops`, `fees`, `stream`, `process`, `admission`, `prices`, `orders`, `reconcile`, `guards`, `control`, `notify`, `fingerprint`, `store`, `bindings`, `port`, `contours` не импортируют:
+- `BrokerContour(settings, session_factory, …)`. `session_factory()` — контекстный менеджер открытого `BrokerSession`. Т-Инвест по умолчанию нет, реестра адаптеров и ленивых импортов нет.
+- `LiveBroker(port, ledger, *, book, margin_limits=None, fills_prefix, margin_every, …)`. Объём по обеспечению спрашивается, только если передан `margin_limits`: условие `contour_id == "account"` и флаг `ask_max_lots` уходят.
+- `run.py` — точка сборки (composition root). По описанию контура она строит адаптер `tinvest.adapter("sandbox" | "account", …)` и передаёт его в `BrokerContour`. На Ф2 рядом встанет `finam.adapter(…)`.
 
-- `t_tech`, `grpc`;
-- `src.sandbox`;
-- пакеты адаптеров `src.broker_contour.tinvest` и `src.broker_contour.finam`.
+**Данные брокера, которые остаются параметрами** (не поведение):
 
-Проверяются и импорты внутри функций — разбором AST. Пакеты адаптеров знает только реестр `profiles.py`. `BrokerContour` берёт доступ у реестра по `settings.profile`, а прежние параметры конструктора (`gateway_factory`, `find_account`, `read_facts`) остаются переопределениями для тестов.
+| Параметр | Т-Инвест | Зачем |
+|---|---|---|
+| `fills_prefix` | `tinvest` | номера исполнений `tinvest:<сделка>`, `tinvest-order:<заявка>:<лоты>` |
+| `margin_every` | 1 сутки | как часто перечитывать ГО |
 
-### 4. Свойства брокера — `BrokerTraits`
+Префикс Т-Инвест не меняется. Иначе старые базы «Счёта» и песочницы задвоили бы исполнения: `journal_has` и `_settle` сравнивают номер целиком.
 
-| Свойство | Где сейчас | Т-Инвест «Песочница» | Т-Инвест «Счёт» | Финам (Ф3, ожидаемо) |
-|---|---|---|---|---|
-| `fills_prefix` — префикс исполнений | `broker.py:50`, `fees.py:33`, `removeprefix` в командах целей и стопа | `tinvest` | `tinvest` | `finam` |
-| `rub_amounts` — суммы и стоп-цена бывают в рублях за контракт | `stops._same_stop_price` | да | да | нет |
-| `max_lots` — спрашивать объём по обеспечению | `process.py:303` (`contour_id == "account"`) | нет | да | нет |
-| `margin_every` — как часто читать ГО брокера | `broker.MARGIN_EVERY` | сутки | сутки | короче — решит Ф3 |
-| `order_lookup` — как досверять заявку | `broker._refresh`: всегда по ключу | `key` | `key` | `number` |
-| `stop_lookup` — как искать стоп-заявку с потерянным ответом | `stops._candidates`: по атрибутам | `attributes` | `attributes` | `key` |
-| `fees` — откуда настоящие комиссии | `process.py` всегда `FeeSync` | `operations` | `operations` | решит Ф3 |
-
-Из префикса выводятся два вида номеров исполнений: `tinvest:<сделка биржи>` и `tinvest-order:<заявка>:<лоты>`. Префикс Т-Инвест не меняется. Иначе старые базы «Счёта» и песочницы задвоили бы исполнения: `journal_has` и `_settle` сравнивают номер строки целиком, а `FeeSync` ищет ждущие исполнения по `LIKE 'tinvest:%'`.
-
-Временный номер стрима свойством не нужен: это уже поле отчёта `OrderReport.temporary`. Адаптер без временных номеров всегда ставит `False`, общий код ветки не меняет.
-
-`order_lookup = number`: досверка заявки с известным номером идёт через `order_by_exchange_id`, без номера — по ключу. `stop_lookup = key`: потерянная стоп-заявка ищется по `StopReport.key`, а не по атрибутам. Обе ветки на Ф1 покрываются контрактными тестами на фейке. Т-Инвест идёт прежним путём.
-
-`LiveBroker(api, ledger, *, traits=TINVEST, ask_max_lots=None, …)`. `ask_max_lots=None` берёт `traits.max_lots`; явное значение остаётся для тестов. Без `traits` — свойства Т-Инвест, поэтому прежние вызовы ведут себя как сейчас.
+**Тесты меняют сборку объектов, а не проверки.** Конструкторы требуют адаптер явно, поэтому меняются фейки, фикстуры и строки сборки в тестах. Сами проверки (`assert`, ожидаемые вызовы, сценарии) не меняются. Если тесту понадобится новая проверка, она отдельная и названа в tasks.
 
 ### 5. `LiveBroker`
 
-`TInvestBroker` переименовывается в `LiveBroker`. `TInvestBroker = LiveBroker` остаётся алиасом в `broker.py`: на него ссылаются тесты и документы архивных change. Примесь `StopKeeping` и `FeeSync` получают свойства от брокера.
+`TInvestBroker` переименовывается в `LiveBroker`. Алиаса нет: он закреплял бы имя брокера в общем коде. Имя в архивных change остаётся историей.
 
-### 6. Описание контура на брокере — `src/broker_contour/contours.py`
+### 6. Описание контура — `src/broker_contour/contours.py`
 
 ```python
 @dataclass(frozen=True)
 class LiveContour:
-    contour_id: str        # sandbox · account        (Ф2: finam)
-    kind: str              # sandbox · account        (Ф2: account)
-    broker: str            # отпечаток в broker.sqlite3: sandbox · account
-    profile: str           # адаптер: tinvest-sandbox · tinvest-account
-    title: str             # ПЕСОЧНИЦА · СЧЁТ
-    token_env: str         # TINKOFF_SANDBOX_TOKEN · TINKOFF_TRADE_TOKEN
-    account_id_env: str | None   # — · TINKOFF_ACCOUNT_ID
+    contour_id: str             # sandbox · account        (Ф2: finam)
+    kind: str                   # sandbox · account        (Ф2: account)
+    broker: str                 # отпечаток в broker.sqlite3: sandbox · account
+    adapter: str                # tinvest-sandbox · tinvest-account
+    title: str                  # ПЕСОЧНИЦА · СЧЁТ
+    token_env: str              # TINKOFF_SANDBOX_TOKEN · TINKOFF_TRADE_TOKEN
+    account_id_env: str | None  # — · TINKOFF_ACCOUNT_ID
 ```
 
-`LIVE_CONTOURS` — кортеж из двух описаний. Порядок задаёт порядок подъёма: «Счёт» первым.
+`LIVE_CONTOURS` — «Счёт», затем песочница: это порядок подъёма. Описание — данные, без импортов адаптеров.
 
 По описанию работают:
 
-- **`run.py`.** `_run_broker_contour(contour_id)` собирает настройки из `[contours.<id>]` общим чтением ключей `contours_<id>_<ключ>`, а шлюз, правило счёта и факты — из профиля. `_run_account_contour` и её копия для песочницы сливаются в одну функцию. Надзиратели строятся циклом по `LIVE_CONTOURS`.
-- **`BrokerContourSupervisor(contour_id, kind)`.** `launch.json` пишет оба поля, как сейчас.
-- **`BrokerContourSettings`** получает `kind`. В `status.json` поле `kind` берётся из него, а не из `contour_id`; значения у двух контуров прежние.
-- **Заголовок уведомлений** (`CONTOUR_TITLES` в `notify.py` и `telegram_templates.py`) берётся из описания.
+- **`run.py`:** одна функция запуска контура на брокере и надзиратели циклом по описаниям;
+- **`BrokerContourSupervisor(contour_id, kind)`:** пишет `launch.json`;
+- **`status.json`:** `kind` берётся из описания;
+- **настройки:** `[contours.<номер>]` читаются по номеру;
+- **заголовки карточек:** `CONTOUR_TITLES` в `notify.py` и `telegram_templates.py` строятся из описаний.
 
-Значения у `sandbox` и `account` прежние, поэтому файлы, пути, ключи, события и тексты не меняются.
+У `sandbox` и `account` значения прежние: файлы, пути, ключи, события и тексты не меняются.
 
-### 7. Как на порт встанет Финам
+### 7. Три шага, каждый — коммит с зелёным `pytest`
 
-**Ф2 — контур `finam`, только чтение:**
+| Шаг | Что | Логика |
+|---|---|---|
+| 1. Переносы | пакет `tinvest/` (`api`, `gateway`, `account`, `admission`); общие типы в `port.py`; реэкспорты в `src/sandbox` | не меняется ни одна строка тел функций |
+| 2. Порты | `TInvestPort`, `PriceBook`, `TInvestSession`, `FeeSource`; `LiveBroker` и `BrokerContour` на портах; граница «общий код без SDK и адаптеров» | код Т-Инвест переезжает дословно, меняется место вызова |
+| 3. Описание контура | `LiveContour`, `run.py`, надзиратели, `status.json`, заголовки | значения у двух контуров прежние |
 
-- описание `LiveContour("finam", "account", "finam", "finam-account", …)`;
-- `src/broker_contour/finam/access.py`: шлюз Финама с обновлением JWT по `SubscribeJwtRenewal` (стримы не переоткрываются), правило счёта «один счёт токена = `FINAM_ACCOUNT_ID`», снимок из `GetAccount` без нулевых позиций, капитал из `cash` с учётом строк вариационной маржи;
-- API `/api/v1/finam`, `[contours.finam]` и страница «Счёт» с параметром контура.
+Граница проверяется тестом на шаге 2. Модули `broker`, `stops`, `stream`, `process`, `admission`, `prices`, `orders`, `reconcile`, `guards`, `control`, `notify`, `fingerprint`, `store`, `bindings`, `port`, `contours` не импортируют (разбором AST, в том числе внутри функций):
 
-**Ф3 — заявки и стопы:** `src/broker_contour/finam/api.py`, реализация `BrokerApi`.
+- `t_tech`, `grpc`;
+- `src.sandbox`;
+- `src.broker_contour.tinvest`, `src.broker_contour.finam`.
 
-| Метод порта | Финам |
+### 8. Контрактные тесты порта
+
+Общий набор `tests/unit/broker_contour/contract/`, параметризованный адаптером. Сценарии:
+
+- вход и исполнение;
+- цель;
+- стоп у брокера и его срабатывание;
+- потерянный ответ на постановку заявки и стопа;
+- рестарт с досверкой;
+- снятие.
+
+В Ф1 набор гоняется на `TInvestPort(FakeApi)`. На Ф3 тот же набор — на фейке Финама: так проверяется, что адаптер Финама выполняет тот же контракт.
+
+### 9. Как встанет Финам (Ф2–Ф3)
+
+| Порт | Финам |
 |---|---|
-| ключ заявки | `client_order_id` — 20 знаков из ключа журнала (`order_key`), детерминированно; журнал хранит прежний ключ |
-| `post_limit`, `post_market` | `PlaceOrder`; рыночная станет IOC-лимитом по границе — общий код уже разбирает частичное исполнение и снятие |
-| `order_by_key` | `GetOrders` по `client_order_id`, только тот же день |
-| `order_by_exchange_id` | `GetOrder` по номеру |
-| `post_stop`, `cancel_stop` | `PlaceOrder` `ORDER_TYPE_STOP`, `VALID_BEFORE_GOOD_TILL_CANCEL`, `DAY` |
-| `stop_orders(…, ids)` | `GetOrders` плюс `GetOrder` по каждому номеру из `ids`; другой номер в ответе — стоп исполнен, `exchange_order_id` — номер порождённой заявки |
-| `operations` | `Trades` и `Transactions`; источник комиссий — по итогам 25.11 |
-| `futures_margin` | ГО из `GetAssetParams`, без стоимости шага |
-| `max_lots` | не вызывается (`max_lots = False`) |
-| `order_stream` | слияние `SubscribeOrders` и `SubscribeTrades`; пустое сообщение подписки — `None` |
+| `BrokerSession` | шлюз с обновлением JWT по `SubscribeJwtRenewal` (стримы не переоткрываются); правило «один счёт токена = `FINAM_ACCOUNT_ID`»; снимок из `GetAccount` без нулевых позиций; капитал из `cash` со строками вариационной маржи |
+| `OrderPort` | `PlaceOrder`; `client_order_id` — 20 знаков из ключа журнала, детерминированно; `order_state`: тот же день — `GetOrders` по ключу, иначе `GetOrder` по номеру; рыночную заявку Финам сделает IOC-лимитом — частичное исполнение и снятие общий код уже разбирает |
+| `StopPort` | `ORDER_TYPE_STOP`, `VALID_BEFORE_GOOD_TILL_CANCEL`, `DAY`; `poll_stops`: `GetOrders` плюс `GetOrder` по `known`; другой номер в ответе — стоп исполнен |
+| `MarketPort` | `LastQuote`, ГО из `GetAssetParams` без стоимости шага; `margin_every` — по итогам Ф3 |
+| `OrderFeed` | слияние `SubscribeOrders` и `SubscribeTrades`, пустое сообщение подписки — `None` |
+| `MarginLimits` | не передаётся |
+| `FeeSource` | `Transactions` или тариф — по итогам 25.11 |
 | лимит 200/мин | повтор в шлюзе ждёт `reset_time` из `GetUsageMetrics`; исчерпан — `OrderFailure("rate_limited")` |
 
-Свойства Финама: `fills_prefix = finam`, `rub_amounts = False`, `max_lots = False`, `order_lookup = number`, `stop_lookup = key`, `margin_every` и `fees` — по итогам Ф3.
+Общий код на Ф2–Ф3 не меняется. Добавляются только пакет `finam/`, описание контура и строка сборки в `run.py`.
 
-**Ф4** (предохранители, сравнение, перенос привязок) общий код не меняет: предохранители и сверка работают через порт.
+### Отклонено
+
+- **Флаги поведения в общем коде** (`order_lookup`, `stop_lookup`, `rub_amounts`): общий код ветвился бы по брокеру, и каждый новый брокер добавлял бы ветки. Нарушает открытый-закрытый принцип.
+- **Один широкий `BrokerApi` с необязательными методами:** у Финама был бы метод `max_lots`, который нельзя вызывать. Это нарушение LSP.
+- **Реестр адаптеров с ленивыми импортами и Т-Инвест по умолчанию:** скрытые зависимости (Service Locator).
+- **Алиас `TInvestBroker` и правило «тесты меняют только импорты»:** закрепляли бы Т-Инвест в общем коде ради неизменных тестов.
 
 ## Risks / Trade-offs
 
-- **Ошибка рефакторинга в коде реальных денег.**
-  - Переносы механические, логика методов не меняется.
-  - Существующие тесты не меняют проверок.
-  - Отдельный тест на старую базу с префиксом `tinvest:`.
-  - Ручной регресс в песочнице и на «Счёте» только на чтение — до выкладки на ПРОМ.
-- **Свойства с ветками, которые Т-Инвест не использует** (`order_lookup = number`, `stop_lookup = key`) — код без живой проверки до Ф3. Его покрывают контрактные тесты на фейке; ПРОМ его не исполняет.
-- **Сборка PyInstaller** может не увидеть новый пакет при ленивых импортах. Проверка — сборка `run.spec` и запуск `--contour sandbox` из сборки на тестовых данных.
-- **Реэкспорты в `src/sandbox`** оставляют два пути к шлюзу. Убрать их можно позже, вместе с разведкой песочницы.
+- **Ошибка переноса в коде реальных денег.** Три шага с зелёным `pytest` после каждого; переносы дословные; проверки тестов не меняются. Плюс тест на старую базу и ручной регресс в песочнице и на «Счёте» только на чтение — до выкладки на ПРОМ.
+- **`average` в адаптере.** Сейчас `_refresh` считает среднюю по лотам после перевода штук в лоты по журналу (`row.lots`). Адаптер журнала не видит и переводит по `lots_requested` брокера. У Т-Инвест эти числа совпадают. Тест с GAZP (лот 10, 100 штук) проверяет одинаковый результат.
+- **Поиск стопов пачкой.** `poll_stops` получает все запросы за один опрос, в прежнем порядке «живые → потерянные», и ведёт один набор привязанных номеров — как нынешний цикл. Тесты `test_broker_stops` это покрывают.
+- **Объём изменений больше, чем у варианта с флагами:** поиск стопов, рублёвый перевод и `FeeSync` переезжают. Зато Ф3 не трогает общий код.
+- **PyInstaller** может не увидеть новый пакет. Проверка — сборка `run.spec` и запуск собранного `--contour sandbox` до допуска.
 
 ## Migration Plan
 
@@ -223,4 +237,4 @@ class LiveContour:
 
 ## Open Questions
 
-- Источник комиссий Финама (`fees`) и частота ГО (`margin_every`) — по итогам разведки 25.11 и Ф3. Ф1 оставляет место, значения у Т-Инвест прежние.
+Нет: источник комиссий и частота ГО Финама решаются на Ф3, и Ф1 не оставляет под них ни веток, ни флагов.
