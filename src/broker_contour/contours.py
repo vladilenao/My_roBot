@@ -34,6 +34,9 @@ class LiveContour:
     # Значения [contours.<номер>] по умолчанию, свои у контура: имена переменных бота и канала, orders.
     defaults: Mapping = field(default_factory=dict)
     name: str = ""              # название для человека в API и UI: «Счёт», «Счёт Финам», «Песочница»
+    # Системный DNS-резолвер gRPC процесса контура (GRPC_DNS_RESOLVER=native, src/grpc_fork.py): c-ares не
+    # пользуется системным DNS и терял api.finam.ru при сбое одного DNS-сервера (разведка Ф0, 25.11).
+    native_dns: bool = False
 
 
 ACCOUNT_CONTOUR = LiveContour(
@@ -45,7 +48,7 @@ FINAM_CONTOUR = LiveContour(
     FINAM, ACCOUNT, FINAM, "finam-account", "СЧЁТ ФИНАМ", "FINAM_SECRET_TOKEN", "FINAM_ACCOUNT_ID",
     provider=FINAM, trading=False,
     defaults={"telegram_bot_env": "TELEGRAM_FINAM_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_FINAM_CHANNEL_ID",
-              "orders": False}, name="Счёт Финам")
+              "orders": False}, name="Счёт Финам", native_dns=True)
 SANDBOX_CONTOUR = LiveContour(
     SANDBOX, SANDBOX, SANDBOX, "tinvest-sandbox", "ПЕСОЧНИЦА", "TINKOFF_SANDBOX_TOKEN",
     defaults={"telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN", "telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",

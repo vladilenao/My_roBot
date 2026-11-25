@@ -118,3 +118,32 @@ def test_assembly_builds_live_resources(tmp_path):
     assert account._reconcile_extras is fee_probe_extras and finam._reconcile_extras is None
     assert ("POST", "/api/v1/account/guards/reset") in account.routes()
     assert ("POST", "/api/v1/finam/guards/reset") not in finam.routes()
+
+
+def test_native_dns_only_for_finam_process():
+    """Системный резолвер gRPC — только процессу контура, чьё описание его просит (add-finam-contour)."""
+    from src.grpc_fork import dns_resolver_for
+
+    assert dns_resolver_for(["--contour", "finam"]) == "native"
+    assert dns_resolver_for(["--contour", "account"]) is None
+    assert dns_resolver_for(["--contour", "sandbox"]) is None
+    assert dns_resolver_for(["--contour", "emulation"]) is None
+    assert dns_resolver_for([]) is None and dns_resolver_for(["--contour"]) is None
+
+
+def test_grpc_fork_sets_resolver_before_grpc(tmp_path):
+    """Процесс ``run.py --contour finam``: GRPC_DNS_RESOLVER задан до загрузки gRPC; внешнее значение не меняется."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    code = ("import sys; sys.argv = ['run.py', '--contour', 'finam']; import src.grpc_fork, os; "
+            "print(os.environ.get('GRPC_DNS_RESOLVER'))")
+    env = {key: value for key, value in os.environ.items() if key != "GRPC_DNS_RESOLVER"}
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "native"
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, env={**env, "GRPC_DNS_RESOLVER": "ares"},
+                         capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "ares"
