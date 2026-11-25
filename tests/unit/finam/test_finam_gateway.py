@@ -114,3 +114,18 @@ def test_limits_probe_without_refusal(run, broker):
     result = run("probe-limits", "--calls", "5")
     assert result.row("Ф0.51")[0] == "не проверено"
     assert broker.clock_calls == 5
+
+
+def test_grpc_uses_system_dns_resolver():
+    """25.11: резолвер c-ares не достучался до DNS-серверов — разведка берёт системный, если не задан другой."""
+    import os
+    import subprocess
+    import sys
+
+    code = "import src.finam, os; print(os.environ['GRPC_DNS_RESOLVER'])"
+    env = {key: value for key, value in os.environ.items() if key != "GRPC_DNS_RESOLVER"}
+    assert subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                          check=True).stdout.strip() == "native"
+    env["GRPC_DNS_RESOLVER"] = "ares"
+    assert subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                          check=True).stdout.strip() == "ares"
