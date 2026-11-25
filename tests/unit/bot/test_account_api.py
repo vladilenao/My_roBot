@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.account.fee_probes import fee_probe_extras
 from src.assembly.contour_control import write_status
 from src.assembly.core_state import CoreStateStore
 from src.bot.account_control import AccountControl, parse_account_target
@@ -24,7 +25,7 @@ def _control(tmp_path):
     supervisor = FakeSupervisor(tmp_path / "contours" / "account")
     supervisor.kind = "account"
     control = AccountControl(kind="account", core_state=store, supervisor=supervisor, share_strategies=SHARES,
-                             future_strategies=FUTURES)
+                             future_strategies=FUTURES, reconcile_extras=fee_probe_extras)   # как в run.py
     return control, store, supervisor
 
 

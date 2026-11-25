@@ -32,6 +32,7 @@ log = get_logger(__name__)
 SANDBOX_TARGET = INVEST_GRPC_API_SANDBOX
 ACCOUNT_TARGET = INVEST_GRPC_API
 SANDBOX_ONLY = "SANDBOX_ONLY"
+REFERENCE_ONLY = "REFERENCE_ONLY"     # справочник ядра: только instruments.* (add-finam-contour)
 DEADLINE_SECS = 30
 # Песочница отвечает RESOURCE_EXHAUSTED и на частые заявки подряд, не только по
 # минутному лимиту (разведка 29.10: третья заявка за 200 мс). Повтор с тем же
@@ -191,3 +192,18 @@ class AccountGateway(BrokerGateway):
             error = BrokerCallError(method, SANDBOX_ONLY, "вызов песочницы недоступен на счёте")
             self._record(method, (), {}, self._monotonic(), error=error)
             raise error
+
+
+class ReferenceGateway(BrokerGateway):
+    """Справочник Т-Инвест на токене ядра (add-finam-contour, решение 4): только ``instruments.*``.
+
+    Карточки ядра для контура на другом брокере; любой другой вызов отклоняется до сети.
+    """
+
+    LABEL = "Справочник Т-Инвест"
+    TOKEN_ENV = "TINKOFF_TOKEN"
+    _default_factory = staticmethod(_account_client)
+
+    def _check(self, method: str) -> None:
+        if method.split(".", 1)[0] != "instruments":
+            raise BrokerCallError(method, REFERENCE_ONLY, "справочнику доступно только instruments.*")

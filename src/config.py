@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.data.ingestion_settings import MarketDataSettings
 from src.config_loader import (
+    broker_contour_defaults,
     HISTORY_LOGGING_DEFAULTS,
     HISTORY_SCHEDULE_DEFAULTS,
     ConfigError,
@@ -113,27 +114,9 @@ _DEFAULTS = {
     # Одновременных прогонов истории, остальные ждут в очереди (add-history-contour).
     "contours_max_history_runs": 2,
     "contours_emulation_telegram_channel_env": "TELEGRAM_CHANNEL_ID",
-    "contours_sandbox_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
-    "contours_sandbox_telegram_channel_env": "TELEGRAM_SANDBOX_CHANNEL_ID",
-    "contours_sandbox_reconcile_every_min": 1,
-    "contours_sandbox_orders": True,
-    "contours_sandbox_exit_offset_steps": 5,
-    "contours_sandbox_exit_requote_secs": 15,
-    "contours_sandbox_exit_requote_attempts": 3,
-    "contours_sandbox_stop_place_secs": 30,
-    "contours_sandbox_max_daily_loss_pct": 3.0,
-    "contours_sandbox_max_rejects_in_row": 3,
-    # Контур «Счёт» (add-account-contour): до Р2 только чтение.
-    "contours_account_telegram_bot_env": "TELEGRAM_ACCOUNT_BOT_TOKEN",
-    "contours_account_telegram_channel_env": "TELEGRAM_ACCOUNT_CHANNEL_ID",
-    "contours_account_reconcile_every_min": 1,
-    "contours_account_orders": False,
-    "contours_account_exit_offset_steps": 5,
-    "contours_account_exit_requote_secs": 15,
-    "contours_account_exit_requote_attempts": 3,
-    "contours_account_stop_place_secs": 30,
-    "contours_account_max_daily_loss_pct": 3.0,
-    "contours_account_max_rejects_in_row": 3,
+    # Контуры на брокере (add-finam-contour, решение 12): значения [contours.<номер>] по умолчанию — общие
+    # и из описаний контуров (боты, каналы, orders). «Счёт» до Р2 и «Счёт Финам» до Ф3 — только чтение.
+    **broker_contour_defaults(),
     # Live-ingestion: предварительный инженерный профиль design 11c. Значения
     # не являются SLA брокера и не наследуются от [tick] timeout_secs.
     **{f"market_data_{name}": value for name, value in MarketDataSettings().as_dict().items()},

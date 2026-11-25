@@ -133,9 +133,14 @@ def short_name_by_uid(gateway: SandboxGateway, uid: str, cache: dict[str, str]) 
     except BrokerCallError:
         cache[uid] = "контракт не указан"
         return cache[uid]
+    cache[uid] = card_short_name(card)
+    return cache[uid]
+
+
+def card_short_name(card) -> str:
+    """Короткое имя карточки Т-Инвест: акция — тикер, фьючерс — первое слово имени (``Si-12.26``)."""
     if card.instrument_type == "share":
         name = card.ticker
     else:
         name = (card.name or "").split()[0] if card.name else "контракт не указан"
-    cache[uid] = name or "контракт не указан"
-    return cache[uid]
+    return name or "контракт не указан"

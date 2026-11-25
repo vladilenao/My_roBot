@@ -97,6 +97,22 @@ _SECRETS = (TINKOFF_TOKEN, TELEGRAM_BOT_TOKEN, CLOUDFLARE_URL,
             FINAM_SECRET_TOKEN, FINAM_ACCOUNT_ID, FINAM_DEMO_SECRET_TOKEN, FINAM_DEMO_ACCOUNT_ID)
 
 
+def _live_contour_secrets() -> tuple:
+    """Секреты контуров на брокере из их описаний (add-finam-contour): токен, номер счёта, токен бота."""
+    from src.broker_contour.contours import LIVE_CONTOURS
+    from src.config import contour_env
+
+    found = []
+    for spec in LIVE_CONTOURS:
+        found += [os.getenv(spec.token_env), contour_env(spec.contour_id, "telegram_bot_env")]
+        if spec.account_id_env:
+            found.append(os.getenv(spec.account_id_env))
+    return tuple(found)
+
+
+_SECRETS += _live_contour_secrets()
+
+
 _OPEN_FILES = None  # итог подъёма предела открытых файлов при запуске процесса (fix-sqlite-connection-close)
 
 
@@ -256,7 +272,7 @@ def _run_broker_contour(contour_id: str) -> int:
         max_rejects_in_row=setting("max_rejects_in_row"),
         exit_policy=ExitPolicy(setting("exit_offset_steps"), setting("exit_requote_secs"),
                                setting("exit_requote_attempts"), stop_place_secs=setting("stop_place_secs")),
-        contour_id=contour_id, kind=spec.kind, broker=spec.broker, directory=directory,
+        contour_id=contour_id, kind=spec.kind, broker=spec.broker, provider=spec.provider, directory=directory,
         core_db=data_dir / CORE_DATABASE_FILE, version=__version__, token=os.getenv(spec.token_env) or None,
         token_env=spec.token_env,
         account_id=(os.getenv(spec.account_id_env) or None) if spec.account_id_env else None,
@@ -286,7 +302,7 @@ def _run_broker_contour(contour_id: str) -> int:
 
 
 def _broker_sessions(spec, settings):
-    """Точка сборки адаптера брокера по описанию контура (refactor-broker-port, design.md решение 4).
+    """Точка сборки адаптера брокера по описанию контура (refactor-broker-port, решение 4; add-finam-contour).
 
     Единственное место, где выбирается пакет адаптера; общий код контура получает готовую фабрику сессий.
     """
@@ -300,6 +316,13 @@ def _broker_sessions(spec, settings):
         # Разведка комиссий — только при чтении: свои сделки комиссию берут из операций сами.
         return adapter("account", token=settings.token, account_id=settings.account_id, orders=settings.orders,
                        fee_probes=None if settings.orders else FeeProbes)
+    if spec.adapter == "finam-account":
+        from src.broker_contour.finam.session import adapter as finam_adapter
+        from src.broker_contour.tinvest.catalog import catalog
+
+        # Карточки ядра — справочник Т-Инвест на токене ядра (add-finam-contour, решение 4).
+        return finam_adapter(secret=settings.token, account_id=settings.account_id, orders=settings.orders,
+                             catalog_factory=catalog(TINKOFF_TOKEN))
     raise ValueError(f"Неизвестный адаптер брокера {spec.adapter!r} контура {spec.contour_id}")
 
 
@@ -462,7 +485,8 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
     control.core_status = core.core_snapshot
     control.contour_busy = lambda: _contour_busy(state_dir)
     supervisors = _broker_supervisors(state_dir, core_state)
-    sandbox, account = supervisors["sandbox"], supervisors["account"]
+    sandbox = supervisors["sandbox"]
+    live = _live_supervisors(supervisors)
     try:
         server = core.start_control_api(control)
     except OSError as exc:
@@ -471,8 +495,9 @@ def _run_robot(state_dir: Path | None = None, client_provider=None) -> int:
         pulse.stop()
         return 2
     server.sandbox = _sandbox_control(sandbox, core_state, resolve_binding=_binding_resolver(core))
-    server.account = _account_control(account, core_state, resolve_binding=_binding_resolver(core))
-    server.trading = _contour_trading(state_dir, sandbox, account)
+    server.live = {base: _account_control(spec, supervisor, core_state, resolve_binding=_binding_resolver(core))
+                   for base, (spec, supervisor) in live.items()}
+    server.trading = _contour_trading(state_dir, sandbox, {base: supervisor for base, (_, supervisor) in live.items()})
     server.comparison = _contour_comparison(server.trading, core_state)
     server.account_comparison = _account_comparison(server.trading, core_state)
     server.indicators = _indicators_view()
@@ -527,21 +552,41 @@ def _active_members(core_state, kind: str) -> set[str]:
     return set() if desired is None else {member.key for member in desired.members if member.active}
 
 
-def _account_control(supervisor, core_state, resolve_binding=None):
-    """Ресурс «Счёта»: состав — только из состава песочницы, заявки — по [contours.account] (enable-live-trading)."""
+def _live_supervisors(supervisors: dict) -> dict:
+    """Контуры вида «счёт» по описаниям (add-finam-contour): базовый путь API → (описание, надзиратель)."""
+    from src.bot import control_views as views
+    from src.broker_contour import ACCOUNT
+    from src.broker_contour.contours import LIVE_CONTOURS
+
+    return {views.live_base(spec.contour_id): (spec, supervisors[spec.contour_id])
+            for spec in LIVE_CONTOURS if spec.kind == ACCOUNT}
+
+
+def _account_control(spec, supervisor, core_state, resolve_binding=None):
+    """Ресурс контура вида «счёт» (add-account-contour, add-finam-contour): состав — только из состава песочницы,
+    заявки — по ``[contours.<номер>] orders`` (enable-live-trading); свои части — по описанию и адаптеру."""
+    from src.bot import control_views as views
     from src.bot.account_control import AccountControl
     from src.broker_contour import SANDBOX
-    from src.config import CONTOUR_ACCOUNT_ORDERS
+    from src.config import contour_setting
 
     def emulation_members():
         desired = core_state.desired(MODE_EMULATION)
         return () if desired is None else desired.members
 
+    extras = None
+    if spec.adapter == "tinvest-account":
+        from src.account.fee_probes import fee_probe_extras
+
+        extras = fee_probe_extras         # разведка комиссий на чужих сделках — только у Т-Инвест
     return AccountControl(kind=supervisor.contour_id, core_state=core_state, supervisor=supervisor,
                           share_strategies=SHARE_STRATEGIES, future_strategies=FUTURE_STRATEGIES,
                           emulation_members=emulation_members, log_file=LOGGING_FILE,
-                          resolve_binding=resolve_binding, orders_enabled=bool(CONTOUR_ACCOUNT_ORDERS),
-                          sandbox_members=lambda: _active_members(core_state, SANDBOX))
+                          resolve_binding=resolve_binding, orders_enabled=bool(contour_setting(spec.contour_id, "orders")),
+                          sandbox_members=lambda: _active_members(core_state, SANDBOX),
+                          base=views.live_base(spec.contour_id), title=spec.name,
+                          provider=spec.provider, section=spec.contour_id, reconcile_extras=extras,
+                          comparison=spec.trading, guards=spec.trading)
 
 
 def _account_comparison(trading: dict, core_state):
@@ -570,8 +615,9 @@ def _indicators_view():
                           triple_screen=TRIPLE_SCREEN_PARAMS, ladder=tuple(TIMEFRAMES), depth=ANALYSIS_DEPTH)
 
 
-def _contour_trading(state_dir, sandbox, account=None):
-    """Позиции, сделки и итоги эмуляции, песочницы и «Счёта» по журналам контуров (add-contour-trades-api)."""
+def _contour_trading(state_dir, sandbox, live=None):
+    """Позиции, сделки и итоги эмуляции, песочницы и контуров вида «счёт» по журналам контуров
+    (add-contour-trades-api, add-finam-contour); ``live`` — базовый путь → надзиратель."""
     from src.bot import control_views as views
     from src.bot.trades_view import ContourTrades
     from src.broker_contour.bindings import binding_catalog
@@ -585,9 +631,10 @@ def _contour_trading(state_dir, sandbox, account=None):
                                        initial_deposit=INITIAL_DEPOSIT),
         views.SANDBOX: ContourTrades(base=views.SANDBOX, journal=lambda: sandbox.directory / DATABASE_FILE,
                                      catalog=catalog, broker_db=lambda: sandbox.directory / BROKER_DATABASE_FILE),
-        **({} if account is None else {
-            views.ACCOUNT: ContourTrades(base=views.ACCOUNT, journal=lambda: account.directory / DATABASE_FILE,
-                                         catalog=catalog, broker_db=lambda: account.directory / BROKER_DATABASE_FILE)}),
+        **{base: ContourTrades(base=base, journal=lambda supervisor=supervisor: supervisor.directory / DATABASE_FILE,
+                               catalog=catalog,
+                               broker_db=lambda supervisor=supervisor: supervisor.directory / BROKER_DATABASE_FILE)
+           for base, supervisor in (live or {}).items()},
     }
 
 

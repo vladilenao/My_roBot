@@ -135,3 +135,10 @@ def read_fee_probes(path: Path) -> list[dict]:
         except sqlite3.OperationalError:
             return []
     return [json.loads(row[0]) for row in rows]
+
+
+def fee_probe_extras(directory: Path) -> dict:
+    """Дополнение отчёта сверки «Счёта» (add-finam-contour, решение 13): разведка комиссий из базы контура."""
+    from src.broker_contour.store import BROKER_DATABASE_FILE
+
+    return {"fee_probes": read_fee_probes(Path(directory) / BROKER_DATABASE_FILE)}

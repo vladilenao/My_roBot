@@ -1,23 +1,24 @@
-"""Ресурс API ``/api/v1/account``: контур «Счёт» на брокерском счёте робота.
+"""Ресурс API контура вида «счёт»: ``/api/v1/account`` («Счёт») и ``/api/v1/finam`` («Счёт Финам»).
 
 Тот же ресурс, что у песочницы (add-account-contour), кроме: в ``current`` —
 факты допуска; в состав принимаются только привязки из состава песочницы, а при
 ``orders = false`` команды состава отвечают ``409 ACCOUNT_READ_ONLY``
 (enable-live-trading); ``close_all`` — остановка и снятие привязки — только с
-``confirm: true``; отчёт сверки — вместе с разведкой комиссий.
+``confirm: true``. Свои части экземпляра (add-finam-contour, решение 13) передаёт точка
+сборки: базовый путь, заголовок, брокер, секция конфига, дополнения сверки (у «Счёта» —
+разведка комиссий), есть ли сравнение. Веток по номеру контура здесь нет.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from http import HTTPStatus
+from pathlib import Path
 
-from src.account.fee_probes import read_fee_probes
 from src.assembly.core_state import CLOSE_ALL, STOP_MODES
 from src.bot import control_views as views
 from src.bot.launch_control import BadCommand
 from src.bot.sandbox_control import MODES, SandboxControl, _ids
-from src.broker_contour.store import BROKER_DATABASE_FILE
 
 NOT_IN_SANDBOX = "Привязки нет в составе песочницы: путь эмуляция → песочница → счёт."
 
@@ -63,20 +64,32 @@ class AccountControl(SandboxControl):
     TRADES_IN = "account"
 
     def __init__(self, *, orders_enabled: bool = False, sandbox_members: Callable[[], set[str]] = lambda: set(),
-                 **kwargs) -> None:
+                 base: str | None = None, title: str | None = None, provider: str | None = None,
+                 section: str | None = None, reconcile_extras: Callable[[Path], dict] | None = None,
+                 comparison: bool = True, guards: bool = True, **kwargs) -> None:
         super().__init__(**kwargs)
         self.orders_enabled = orders_enabled
         self._sandbox_members = sandbox_members
+        if base is not None:
+            self.BASE = base
+        if title is not None:
+            self.TITLE = title
+        self.TRADES_IN = self.kind
+        self.provider = provider                     # брокер адаптера: tinvest · finam
+        self.section = section or self.kind          # секция [contours.<номер>] в тексте «только чтение»
+        self._reconcile_extras = reconcile_extras    # у «Счёта» — разведка комиссий (точка сборки)
+        self.comparison = comparison and orders_enabled   # сравнение с песочницей и эмуляцией — с заявками
+        self.guards = guards                              # сброс предохранителя «отказы подряд»
 
     def _links(self) -> dict:
-        extra = {"comparison": views.ACCOUNT_COMPARISON} if self.orders_enabled else {}
-        return views.links(self=views.ACCOUNT, target=views.ACCOUNT_TARGET, bindings=views.ACCOUNT_BINDINGS,
-                           reconcile=views.ACCOUNT_RECONCILE, log=views.ACCOUNT_LOG, **extra,
-                           **views.trading_links(views.ACCOUNT))
+        extra = {"comparison": self.BASE + "/comparison"} if self.comparison else {}
+        return views.links(self=self.BASE, target=self.BASE + "/target", bindings=self.BASE + "/bindings",
+                           reconcile=self.BASE + "/reconcile", log=self.BASE + "/log", **extra,
+                           **views.trading_links(self.BASE))
 
     def _action_list(self, names) -> list[dict]:
         allowed = ("start", "stop", "stop-close-all") + (("add-bindings", "guards-reset") if self.orders_enabled else ())
-        return views.account_action_list([name for name in names if name in allowed])
+        return views.account_action_list([name for name in names if name in allowed], self.BASE, self.TITLE)
 
     @staticmethod
     def _current(status) -> dict | None:
@@ -87,25 +100,41 @@ class AccountControl(SandboxControl):
 
     def _member_view(self, member, status, running: bool) -> dict:
         view = super()._member_view(member, status, running)
-        view["_actions"] = views.account_binding_actions(member.key, member.active) if self.orders_enabled else []
+        view["_actions"] = (views.account_binding_actions(member.key, member.active, self.BASE)
+                            if self.orders_enabled else [])
         return view
+
+    def view(self) -> dict:
+        return {**super().view(), "broker": self.provider}
+
+    def summary(self) -> dict:
+        return {**super().summary(), "broker": self.provider}
 
     def bindings(self) -> dict:
         payload = super().bindings()
-        payload["_links"] = views.links(self=views.ACCOUNT_BINDINGS, account=views.ACCOUNT)
-        payload["_actions"] = views.account_action_list(("add-bindings",)) if self.orders_enabled else []
+        payload["_links"] = views.links(self=self.BASE + "/bindings", account=self.BASE)
+        payload["_actions"] = (views.account_action_list(("add-bindings",), self.BASE, self.TITLE)
+                               if self.orders_enabled else [])
         return payload
 
     def reconcile(self) -> dict | None:
         report = super().reconcile()
-        if report is None:
-            return None
-        return {**report, "fee_probes": read_fee_probes(self.directory / BROKER_DATABASE_FILE)}
+        if report is None or self._reconcile_extras is None:
+            return report
+        return {**report, **self._reconcile_extras(self.directory)}
+
+    def routes(self) -> set[tuple[str, str]]:
+        """Команды ресурса: запуск и состав всегда (ответ решает ресурс), сброс предохранителя — если он есть."""
+        found = {("PUT", self.BASE + "/target"), ("POST", self.BASE + "/bindings"),
+                 ("POST", self.BASE + "/bindings/remove")}
+        if self.guards:
+            found.add(("POST", self.BASE + "/guards/reset"))
+        return found
 
     # --- команды --------------------------------------------------------------
     def _read_only(self) -> tuple[int, dict]:
         return self._problem(HTTPStatus.CONFLICT, "ACCOUNT_READ_ONLY",
-                             "Заявки на счёте выключены ([contours.account] orders = false): состав не меняется.")
+                             f"Заявки на счёте выключены ([contours.{self.section}] orders = false): состав не меняется.")
 
     def _not_confirmed(self) -> tuple[int, dict]:
         return self._problem(HTTPStatus.CONFLICT, "CONFIRM_REQUIRED",

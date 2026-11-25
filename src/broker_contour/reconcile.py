@@ -66,8 +66,10 @@ class Reconciler:
         return self.last_at is None or (now - self.last_at).total_seconds() >= self._every
 
     def run(self, now: datetime, snapshot: AccountSnapshot | None, journal: JournalView = JournalView(),
-            in_flight=frozenset()) -> dict:
+            in_flight=frozenset(), *, planned: bool = False) -> dict:
         """Одна сверка; ``snapshot=None`` — счёт не прочитан, сверка пропущена.
+
+        ``planned`` — брокер в плановом окне обслуживания (add-finam-contour): пропуск без счёта и тревоги.
 
         Инструменты ``in_flight`` (заявка «в пути» или непроведённое исполнение) в этой сверке не
         сравниваются: брокер уже исполнил, а журнал ещё не провёл — это не расхождение.
@@ -76,10 +78,11 @@ class Reconciler:
         self.last_at = now
         stamp = now.isoformat().replace("+00:00", "Z")
         if snapshot is None:
-            self.skipped_in_row += 1
+            if not planned:
+                self.skipped_in_row += 1
             report = {"at": stamp, "account": self._account, "result": SKIPPED, "items": [],
                       "in_flight": in_flight, "frozen": list(self.frozen), "skipped_in_row": self.skipped_in_row}
-            if self.skipped_in_row == UNREACHABLE_ALARM_AFTER:
+            if not planned and self.skipped_in_row == UNREACHABLE_ALARM_AFTER:
                 self._notifier.alarm([], self.frozen, reason="Счёт недоступен: три сверки подряд пропущены.")
             self._store.add_report(report)
             return report

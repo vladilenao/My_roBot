@@ -312,16 +312,22 @@ def _side_total(items: list[dict], contour: str) -> dict:
 
 # --- «Счёт» против песочницы и эмуляции (enable-live-trading) -------------------------------
 
-SIDES = ("account", "sandbox", "emulation")
+OTHERS = ("sandbox", "emulation")   # стороны, с которыми сравнивается контур вида «счёт»; своя — ``own``
 
 
 class AccountComparison:
-    """``GET /api/v1/account/comparison``: сигналы привязок «Счёта», три стороны, расхождения от счёта."""
+    """``GET /api/v1/<контур>/comparison``: сигналы привязок контура вида «счёт», три стороны, расхождения от счёта.
+
+    ``own`` — имя своей стороны и ключей ``<own>_vs_sandbox``, ``<own>_vs_emulation`` (add-finam-contour):
+    у «Счёта» ``account``; базовый путь ссылок — ``base``.
+    """
 
     def __init__(self, *, account: ContourTrades, sandbox: ContourTrades, emulation: ContourTrades,
                  members: Callable[[], set[str]], catalog: dict[str, dict],
-                 clock: Callable[[], datetime] | None = None) -> None:
-        self._trades = {"account": account, "sandbox": sandbox, "emulation": emulation}
+                 clock: Callable[[], datetime] | None = None, own: str = "account", base: str = views.ACCOUNT) -> None:
+        self._own, self._base = own, base
+        self.sides = (own, *OTHERS)
+        self._trades = {own: account, "sandbox": sandbox, "emulation": emulation}
         self._members = members
         self._catalog = catalog
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -334,13 +340,14 @@ class AccountComparison:
         instrument = _instrument_filter(query)
         binding = (query.get("binding") or [None])[0]
         trades = self._trades
-        with trades["account"]._snapshot() as account_journal, trades["sandbox"]._snapshot() as sandbox_journal, \
+        own = self._own
+        with trades[own]._snapshot() as account_journal, trades["sandbox"]._snapshot() as sandbox_journal, \
                 trades["emulation"]._snapshot() as emulation_journal:
-            contours = {"account": _Contour(account_journal), "sandbox": _Contour(sandbox_journal),
+            contours = {own: _Contour(account_journal), "sandbox": _Contour(sandbox_journal),
                         "emulation": _Contour(emulation_journal)}
             in_period = lambda row: (lower is None or _utc(row["created_at"]) >= lower) and \
                 _utc(row["created_at"]) < upper  # noqa: E731
-            bindings = set(self._members()) | {str(row["assignment_id"]) for row in contours["account"].trades.values()
+            bindings = set(self._members()) | {str(row["assignment_id"]) for row in contours[own].trades.values()
                                                if in_period(row)}
             if binding is not None and binding not in bindings and binding not in self._catalog:
                 raise _bad(f"Привязки {binding!r} нет в конфигурации и на счёте.")
@@ -356,24 +363,25 @@ class AccountComparison:
                     continue
                 items.append(item)
         items.sort(key=lambda item: (item["signal"]["at"], item["_signal"]), reverse=True)
-        summary = _account_summary(items)
+        summary = _account_summary(items, own)
         page = items[:limit]
         for item in items:
             for key in ("_signal", "_raw"):
                 item.pop(key, None)
-        href = views.ACCOUNT_COMPARISON
+        href = self._base + "/comparison"
         pairs = [(key, value) for key, values in query.items() for value in values]
         return {"currency": CURRENCY, "as_of": _iso(now), "period": {"name": name, "from": _iso(lower), "to": _iso(upper)},
                 "summary": summary, "items": page, "earlier": len(items) > len(page),
                 "_links": views.links(self=href + (f"?{urlencode(pairs, safe=':')}" if pairs else ""))}
 
     def _item(self, signal: str, contours: dict[str, _Contour]) -> dict:
-        rows = {name: contours[name].traded(signal) for name in SIDES}
-        first = next(name for name in SIDES if rows[name] is not None)
+        sides, own = self.sides, self._own
+        rows = {name: contours[name].traded(signal) for name in sides}
+        first = next(name for name in sides if rows[name] is not None)
         row, journal = rows[first], contours[first].journal
         parsed = parse_signal(signal)
         side = str(row["side"] or parsed["side"] or "").upper()
-        instrument = next((contours[name].journal.name(str(row["instrument_id"])) for name in SIDES
+        instrument = next((contours[name].journal.name(str(row["instrument_id"])) for name in sides
                            if contours[name].journal is not None), None)
         item = {
             "_signal": signal,
@@ -384,33 +392,34 @@ class AccountComparison:
             "missing": {},
             "_raw": {},
         }
-        for name in SIDES:
+        for name in sides:
             item[name] = None if rows[name] is None else contours[name].journal.side(str(rows[name]["trade_id"]))
             if rows[name] is None:
                 code, label = contours[name].missing_reason(signal)
                 item["missing"][name] = {"code": code, "label": label}
-        for other in ("sandbox", "emulation"):
-            key = f"account_vs_{other}"
-            if rows["account"] is None or rows[other] is None:
+        for other in OTHERS:
+            key = f"{own}_vs_{other}"
+            if rows[own] is None or rows[other] is None:
                 item[key] = None
                 continue
-            step = _decimal(rows["account"]["price_step"]) or _decimal(rows[other]["price_step"])
-            diffs, raw = _diffs_between(other, item[other], "account", item["account"], step, side)
+            step = _decimal(rows[own]["price_step"]) or _decimal(rows[other]["price_step"])
+            diffs, raw = _diffs_between(other, item[other], own, item[own], step, side)
             item[key] = {"diffs": diffs, "steps_unknown": not step}
             item["_raw"][other] = raw
         return item
 
 
-def _account_summary(items: list[dict]) -> dict:
-    trades = {name: sum(1 for item in items if item[name] is not None) for name in SIDES}
+def _account_summary(items: list[dict], own: str = "account") -> dict:
+    sides = (own, *OTHERS)
+    trades = {name: sum(1 for item in items if item[name] is not None) for name in sides}
     missing: dict[tuple[str, str], dict] = {}
     for item in items:
         for contour, reason in item["missing"].items():
             entry = missing.setdefault((contour, reason["code"]), {"contour": contour, **reason, "count": 0})
             entry["count"] += 1
     comparisons = {}
-    for other in ("sandbox", "emulation"):
-        key = f"account_vs_{other}"
+    for other in OTHERS:
+        key = f"{own}_vs_{other}"
         paired = [item for item in items if item[key] is not None]
         diffs: dict[str, int] = {}
         entry_steps, exit_steps = [], []
@@ -425,7 +434,7 @@ def _account_summary(items: list[dict]) -> dict:
         comparisons[key] = {"pairs": len(paired), "diffs": diffs, "entry_steps": _stats(entry_steps),
                             "exit_steps": _stats(exit_steps)}
     totals = {name: _side_total([item for item in items if item[name] is not None and item[name]["state"] == "closed"],
-                                name) for name in SIDES}
+                                name) for name in sides}
     return {"trades": trades, **comparisons, "closed_result": totals,
             "missing_reasons": sorted(missing.values(), key=lambda entry: (-entry["count"], entry["contour"],
                                                                             entry["code"]))}

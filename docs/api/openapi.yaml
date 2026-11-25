@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: My Robot — локальный API
-  version: 2.13.0
+  version: 2.14.0
   description: |
     Локальный API робота: управление контурами, состояние ядра, экспорт
     рыночных данных и отчёт кластеров. Swagger UI — `/docs`. Обзор
@@ -41,6 +41,10 @@ info:
     * `POST /api/v1/history/preflight` (2.13.0) — проверка прогона истории
       без постановки в очередь; `bindings` — связки прогона у `HistoryRun`
       и `HistoryReport`.
+    * `/api/v1/finam` (2.14.0, add-finam-contour) — контур «Счёт Финам» на
+      втором брокере: тот же ресурс, что `/api/v1/account`, пока только на
+      чтение; `broker` (`tinvest` / `finam`) у контуров вида «счёт»,
+      `account_link: maintenance` — брокер в плановом окне обслуживания.
     Общие части (целевое и текущее состояние, процесс, участник
     состава, ошибки) — общие схемы. Будущий контур «Счёт» встанет рядом на
     них же.
@@ -99,6 +103,8 @@ tags:
     description: Контур на брокере в песочнице Т-Инвест — один, состав из привязок, сверка счёта.
   - name: Счёт
     description: Контур на брокерском счёте робота (2.11.0, add-account-contour); с 2.12.0 (enable-live-trading) — заявки по привязкам из состава песочницы, если [contours.account] orders = true.
+  - name: Счёт Финам
+    description: Контур на счёте робота у брокера Финам (2.14.0, add-finam-contour) — тот же ресурс, что «Счёт»; пока только читает счёт и сверяет его, команды состава отвечают 409 ACCOUNT_READ_ONLY.
   - name: Свечи
     description: Свечи рядов рыночной базы ядра для графиков UI — только чтение.
   - name: Индикаторы
@@ -1501,6 +1507,295 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenHost'}
         '503': {$ref: '#/components/responses/JournalUnavailable'}
 
+  /api/v1/finam:
+    get:
+      tags: [Счёт Финам]
+      summary: Контур «Счёт Финам»
+      description: |
+        Контур на брокерском счёте робота: общее, целевое и текущее состояние с
+        фактами допуска, запуск, процесс, состав и доступные действия. Пока
+        контур только читает счёт и сверяет его с журналом. `ETag` — ревизия
+        целевого состояния.
+      operationId: getFinam
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Контур «Счёт Финам».
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Finam'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/finam/target:
+    get:
+      tags: [Счёт Финам]
+      summary: Целевое состояние «Счёта Финам»
+      operationId: getFinamTarget
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Целевое состояние; `null` — контур ни разу не запускали.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradingTarget'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    put:
+      tags: [Счёт Финам]
+      summary: Запустить или остановить «Счёт Финам»
+      description: |
+        **Запустить** `{"mode": "on"}`; с `bindings` — `409 ACCOUNT_READ_ONLY`: контур пока только читает счёт.
+
+        **Остановить** `{"mode": "no_entries"}` или `{"mode": "close_all", "confirm": true}`.
+        Без `confirm` у `close_all` — `409 CONFIRM_REQUIRED`. Оба режима
+        завершают процесс и позиции, заявки, стоп-заявки на счёте не трогают.
+      operationId: putFinamTarget
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountTargetRequest'}
+            examples:
+              start:
+                summary: Запустить на чтение
+                value: {mode: 'on'}
+              stop:
+                summary: Остановить
+                value: {mode: no_entries}
+      responses:
+        '202':
+          description: Целевое состояние записано новой ревизией; следить — `GET /api/v1/finam`.
+          headers:
+            Location: {$ref: '#/components/headers/FinamLocation'}
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Finam'}
+        '200':
+          description: Повтор той же остановки; ревизия прежняя.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Finam'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '409':
+          description: '`CONFIRM_REQUIRED`, `ALREADY_RUNNING`, `STOPPING`, `NOT_RUNNING`, `CORE_NOT_READY`, `CONTOUR_DIR_BUSY`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+
+  /api/v1/finam/bindings:
+    get:
+      tags: [Счёт Финам]
+      summary: Состав «Счёта Финам» и все привязки конфигурации
+      description: Пока состав пуст; у привязок отметки, где каждая торгует (`emulation`, `sandbox`, `account`).
+      operationId: getFinamBindings
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Состав и привязки.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+    post:
+      tags: [Счёт Финам]
+      summary: Добавить привязки из состава песочницы
+      description: |
+        Принимаются только привязки, которые сейчас в составе песочницы
+        (путь эмуляция → песочница → счёт); иначе `422 BINDINGS_REJECTED`.
+        Подтверждение не нужно. При `[contours.finam] orders = false` —
+        `409 ACCOUNT_READ_ONLY`.
+      operationId: addFinamBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountBindingsAddRequest'}
+      responses:
+        '202':
+          description: Состав записан новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '409':
+          description: '`ACCOUNT_READ_ONLY` — заявки на счёте выключены.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/finam/bindings/remove:
+    post:
+      tags: [Счёт Финам]
+      summary: Убрать привязки со счёта
+      description: |
+        `mode = no_entries` — сделки доживают со стопом у брокера, без подтверждения.
+        `mode = close_all` — сделки закрываются, только с `"confirm": true`, иначе
+        `409 CONFIRM_REQUIRED`.
+      operationId: removeFinamBindings
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountBindingsRemoveRequest'}
+      responses:
+        '202':
+          description: Состав записан новой ревизией.
+          headers:
+            ETag: {$ref: '#/components/headers/RevisionETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '200':
+          description: Без изменений.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BindingsView'}
+        '409':
+          description: '`CONFIRM_REQUIRED`, `ACCOUNT_READ_ONLY`, `MODE_CONFLICT`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '412': {$ref: '#/components/responses/RevisionChanged'}
+        '422': {$ref: '#/components/responses/BindingsRejected'}
+
+  /api/v1/finam/reconcile:
+    get:
+      tags: [Счёт Финам]
+      summary: Последний отчёт сверщика «Счёта Финам»
+      operationId: getFinamReconcile
+      security:
+        - ControlToken: []
+      responses:
+        '200':
+          description: Отчёт; `null` — сверок ещё не было.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconcileReport'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/finam/log:
+    get:
+      tags: [Счёт Финам]
+      summary: Хвост лога «Счёта Финам»
+      operationId: getFinamLog
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Tail'
+      responses:
+        '200': {$ref: '#/components/responses/LogTail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/finam/positions:
+    get:
+      tags: [Счёт Финам]
+      summary: Открытые позиции журнала «Счёта Финам» (пока пусто)
+      operationId: getFinamPositions
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradeInstrument'
+      responses:
+        '200': {$ref: '#/components/responses/Positions'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+
+  /api/v1/finam/trades:
+    get:
+      tags: [Счёт Финам]
+      summary: Закрытые сделки за окно
+      description: |
+        Сделки в фазе `CLOSED` с исполненным входом, по `closed_at`, новые
+        сверху. Последние `limit` сделок окна `[from, to)`; `_links.earlier` —
+        предыдущая страница. Сделки с тем же `closed_at`, что у последней
+        отданной, идут в той же странице целиком. `ETag` — номер последнего
+        события журнала; `If-None-Match` с ним же → `304`.
+      operationId: getFinamTrades
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+        - $ref: '#/components/parameters/TradesLimit'
+        - $ref: '#/components/parameters/TradeInstrument'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200': {$ref: '#/components/responses/Trades'}
+        '304': {$ref: '#/components/responses/NotModified'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
+  /api/v1/finam/performance:
+    get:
+      tags: [Счёт Финам]
+      summary: Итоги периода и кривая результата
+      description: |
+        Итоги закрытых в периоде сделок, открытые позиции и кривая
+        накопленного нетто-результата. Без параметров — `day`: торговый день
+        с последних 19:00 МСК. `period` или пара `from`/`to`, не вместе.
+      operationId: getFinamPerformance
+      security:
+        - ControlToken: []
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/TradesFrom'
+        - $ref: '#/components/parameters/TradesTo'
+      responses:
+        '200': {$ref: '#/components/responses/Performance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenHost'}
+        '503': {$ref: '#/components/responses/JournalUnavailable'}
+
   /api/v1/history:
     get:
       tags: [История]
@@ -2461,6 +2756,9 @@ components:
     AccountLocation:
       description: Адрес контура «Счёт».
       schema: {type: string, example: /api/v1/account}
+    FinamLocation:
+      description: Адрес контура «Счёт Финам».
+      schema: {type: string, example: /api/v1/finam}
     SandboxLocation:
       description: Адрес контура «Песочница».
       schema: {type: string, example: /api/v1/sandbox}
@@ -3085,6 +3383,17 @@ components:
             bindings: {type: integer, minimum: 0}
             frozen: {type: integer, minimum: 0}
             reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
+            broker: {type: string, nullable: true, enum: [tinvest, finam, null], description: Брокер контура (2.14.0).}
+        finam:
+          type: object
+          nullable: true
+          description: 'Контур «Счёт Финам» (2.14.0); ключа нет — у ключа нет права на контуры или робот старше.'
+          properties:
+            state: {$ref: '#/components/schemas/TradingState'}
+            bindings: {type: integer, minimum: 0}
+            frozen: {type: integer, minimum: 0}
+            reconcile: {type: string, nullable: true, enum: [ok, mismatch, skipped, null]}
+            broker: {type: string, nullable: true, enum: [tinvest, finam, null]}
         live:
           type: object
           nullable: true
@@ -3536,7 +3845,7 @@ components:
           items: {type: string}
           description: Замороженные сверщиком инструменты коротким именем.
         last_reconcile_at: {type: string, format: date-time, nullable: true}
-        account_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        account_link: {type: string, nullable: true, enum: [ok, lost, maintenance, null], description: '`maintenance` — брокер в плановом окне обслуживания (2.14.0).'}
         core_link: {type: string, nullable: true, enum: [ok, lost, null]}
         reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
         orders_enabled: {type: boolean, description: 'Режим заявок: `true` — контур торгует привязками, `false` — только читает счёт.'}
@@ -3608,7 +3917,7 @@ components:
         management: {$ref: '#/components/schemas/BindingManagement'}
         trades_in:
           type: array
-          items: {type: string, enum: [emulation, sandbox]}
+          items: {type: string, enum: [emulation, sandbox, account, finam]}
     BindingMember:
       type: object
       additionalProperties: false
@@ -3722,7 +4031,7 @@ components:
     Account:
       type: object
       additionalProperties: false
-      required: [state, target, current, launch, process, bindings, _links, _actions]
+      required: [state, target, current, launch, process, bindings, broker, _links, _actions]
       description: |
         Контур «Счёт» на брокерском счёте робота (add-account-contour). Те же части,
         что у песочницы; до Р2 контур только читает счёт, состав пуст.
@@ -3747,6 +4056,7 @@ components:
         bindings:
           type: array
           items: {$ref: '#/components/schemas/BindingMember'}
+        broker: {type: string, nullable: true, enum: [tinvest, finam, null], description: 'Брокер контура (2.14.0): `tinvest` — Т-Инвест, `finam` — Финам.'}
         _links: {$ref: '#/components/schemas/Links'}
         _actions: {$ref: '#/components/schemas/Actions'}
     AccountCurrent:
@@ -3782,7 +4092,7 @@ components:
           items: {type: string}
           description: Замороженные сверщиком инструменты коротким именем.
         last_reconcile_at: {type: string, format: date-time, nullable: true}
-        account_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        account_link: {type: string, nullable: true, enum: [ok, lost, maintenance, null], description: '`maintenance` — брокер в плановом окне обслуживания (2.14.0).'}
         core_link: {type: string, nullable: true, enum: [ok, lost, null]}
         reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
         orders_enabled: {type: boolean, description: 'Режим заявок: `true` — контур торгует привязками, `false` — только читает счёт.'}
@@ -3821,6 +4131,126 @@ components:
             действует, новые входы и доборы запрещены, выходы, стоп и цели у брокера работают.
           items: {$ref: '#/components/schemas/SandboxGuard'}
         admission: {$ref: '#/components/schemas/AccountAdmission'}
+    Finam:
+      type: object
+      additionalProperties: false
+      required: [state, target, current, launch, process, bindings, broker, _links, _actions]
+      description: |
+        Контур «Счёт Финам» на счёте робота у брокера Финам (add-finam-contour). Тот же ресурс,
+        что «Счёт»; пока контур только читает счёт, состав пуст.
+      properties:
+        state: {$ref: '#/components/schemas/TradingState'}
+        target:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingTarget'}]
+          nullable: true
+        current:
+          type: object
+          allOf: [{$ref: '#/components/schemas/FinamCurrent'}]
+          nullable: true
+        launch:
+          type: object
+          allOf: [{$ref: '#/components/schemas/TradingLaunch'}]
+          nullable: true
+        process:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ContourProcess'}]
+          nullable: true
+        bindings:
+          type: array
+          items: {$ref: '#/components/schemas/BindingMember'}
+        broker: {type: string, nullable: true, enum: [tinvest, finam, null], description: 'Брокер контура (2.14.0): `tinvest` — Т-Инвест, `finam` — Финам.'}
+        _links: {$ref: '#/components/schemas/Links'}
+        _actions: {$ref: '#/components/schemas/Actions'}
+    FinamCurrent:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [state, applied_revision, account, capital, positions, orders, stop_orders, frozen, last_reconcile_at, account_link, core_link, reason, orders_enabled, trades, orders_in_flight, stream_link, account_at, execution_holds, guards, admission]
+      description: 'Текущее состояние из `status.json` контура «Счёт Финам» — поля «Счёта», факты допуска Финама в `admission`.'
+      properties:
+        state: {type: string, nullable: true, enum: [running, stopped, failed, null]}
+        applied_revision: {type: integer, minimum: 0, nullable: true}
+        account: {type: string, nullable: true, description: 'Последние четыре символа номера счёта, например `…09c3`.'}
+        capital:
+          type: object
+          nullable: true
+          additionalProperties: false
+          properties:
+            rub: {type: string, description: 'Рубли на счёте из GetPositions, десятичная строка.'}
+            liquid_portfolio: {type: string, nullable: true, description: Из GetMarginAttributes; показывается рядом.}
+        positions:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, lots]
+            properties:
+              name: {type: string, description: Короткое имя контракта или тикер акции.}
+              lots: {type: integer}
+        orders: {type: integer, minimum: 0}
+        stop_orders: {type: integer, minimum: 0}
+        frozen:
+          type: array
+          items: {type: string}
+          description: Замороженные сверщиком инструменты коротким именем.
+        last_reconcile_at: {type: string, format: date-time, nullable: true}
+        account_link: {type: string, nullable: true, enum: [ok, lost, maintenance, null], description: '`maintenance` — брокер в плановом окне обслуживания (2.14.0).'}
+        core_link: {type: string, nullable: true, enum: [ok, lost, null]}
+        reason: {type: string, nullable: true, description: Причина отказа допуска или выхода.}
+        orders_enabled: {type: boolean, description: 'Режим заявок: `true` — контур торгует привязками, `false` — только читает счёт.'}
+        trades: {type: integer, minimum: 0, description: Открытые сделки журнала контура.}
+        orders_in_flight: {type: integer, minimum: 0, description: Незавершённые заявки журнала заявок брокера.}
+        stream_link: {type: string, nullable: true, enum: [ok, lost, null], description: Стрим исполнений OrderStateStream.}
+        account_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Момент снимка счёта, на который верны `capital`, `positions`, `orders` и `stop_orders`
+            (2.6.0, fix-sandbox-restart-safety). Снимок берётся при старте, на каждой сверке
+            и перед остановкой процесса. У процесса, убитого без остановки, — момент последнего
+            снимка; `account_link: lost` у остановленного — снимок при остановке не прочитан.
+        execution_holds:
+          type: array
+          description: |
+            Инструменты со сделками, у которых исполнение 1m стоит дольше 5 минут: барьер покрытия
+            держит полученные минутки, и стоп по инструменту не проверяется (2.6.0,
+            fix-sandbox-restart-safety). Пусто — исполнение идёт.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, since, minutes, executed, received]
+            properties:
+              name: {type: string, description: Короткое имя контракта.}
+              since: {type: string, format: date-time, description: С какого момента процесс видит удержание.}
+              minutes: {type: integer, minimum: 0}
+              executed: {type: string, format: date-time, nullable: true, description: Последняя исполненная минута.}
+              received: {type: string, format: date-time, nullable: true, description: Последняя полученная минута.}
+        guards:
+          type: array
+          description: |
+            Сработавшие предохранители (2.9.0, add-account-guards); пусто — всё чисто. Пока предохранитель
+            действует, новые входы и доборы запрещены, выходы, стоп и цели у брокера работают.
+          items: {$ref: '#/components/schemas/SandboxGuard'}
+        admission: {$ref: '#/components/schemas/FinamAdmission'}
+    FinamAdmission:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [access_level, limits, warnings]
+      description: Факты допуска «Счёта Финам» — общая часть фактов контура вида «счёт», без полей Т-Инвест.
+      properties:
+        access_level: {type: string, enum: [full_access, read_only], description: 'Права токена по `TokenDetails.readonly`.'}
+        limits:
+          type: object
+          nullable: true
+          additionalProperties: {type: integer}
+          description: 'Квоты в минуту методов контура из `GetUsageMetrics` (`GetAccount`, `GetOrders`, `PlaceOrder`, `CancelOrder`).'
+        warnings:
+          type: array
+          items: {type: string}
+          description: Предупреждения, не мешающие старту на чтение.
     AccountAdmission:
       type: object
       nullable: true
