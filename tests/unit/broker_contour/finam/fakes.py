@@ -160,9 +160,18 @@ class FakeFinam:
         now = self.clock() if self.clock else NOW
         return metrics_pb2.GetUsageMetricsResponse(quotas=[
             metrics_pb2.GetUsageMetricsResponse.QuotaUsage(
-                name=f"grpc.tradeapi.v1.Service/{name}", limit=limit, remaining=limit,
+                name=quota_name(name), limit=limit, remaining=limit,
                 reset_time=stamp(now + timedelta(seconds=self.reset_in.get(name, 60))))
             for name, limit in self.quotas.items()])
+
+
+SERVICES = {"GetAccount": "AccountsService", "GetOrders": "OrdersService", "PlaceOrder": "OrdersService",
+            "CancelOrder": "OrdersService", "Assets": "AssetsService", "GetUsageMetrics": "UsageMetricsService"}
+
+
+def quota_name(method: str) -> str:
+    """Имя квоты, как его отдаёт Финам: ``AccountsService.getAccount`` — метод с маленькой буквы."""
+    return f"{SERVICES.get(method, 'Service')}.{method[0].lower()}{method[1:]}"
 
 
 class _Stream:

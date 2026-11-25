@@ -22,7 +22,7 @@ def read_facts(transport, account, *, orders: bool) -> dict:
     warnings = []
     try:
         quotas = transport.quotas()
-        limits = {method: quotas[method] for method in LIMIT_METHODS if method in quotas}
+        limits = {method: quotas[method.lower()] for method in LIMIT_METHODS if method.lower() in quotas}
     except BrokerOutage:
         raise
     except BrokerCallError as exc:

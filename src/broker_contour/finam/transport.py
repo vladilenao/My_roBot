@@ -196,9 +196,12 @@ class FinamTransport:
         return min(max(wait, 1.0), RATE_LIMIT_MAX_WAIT_SECS)
 
     def quotas(self) -> dict[str, int]:
-        """Квоты методов в минуту: последний сегмент имени → лимит."""
+        """Квоты методов в минуту: имя метода в нижнем регистре → лимит.
+
+        Финам называет квоту ``AccountsService.getAccount`` — метод с маленькой буквы (проверка 25.11).
+        """
         response = self.call("metrics.GetUsageMetrics", usage_metrics_service_pb2.GetUsageMetricsRequest())
-        return {item.name.replace("/", ".").rsplit(".", 1)[-1]: int(item.limit) for item in response.quotas}
+        return {item.name.replace("/", ".").rsplit(".", 1)[-1].lower(): int(item.limit) for item in response.quotas}
 
 
 class JwtSource:
