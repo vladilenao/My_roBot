@@ -236,3 +236,32 @@ class TestGrpcForkHandlers:
         tree = ast.parse((ROOT / "run.py").read_text(encoding="utf-8"))
         first = next(node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom)))
         assert isinstance(first, ast.Import) and first.names[0].name == "src.grpc_fork"
+
+
+class TestGrpcDnsResolver:
+    """fix-grpc-system-dns: адрес брокера ищется системным поиском, а не c-ares."""
+
+    @staticmethod
+    def _resolver(**preset):
+        env = {key: value for key, value in os.environ.items() if key != "GRPC_DNS_RESOLVER"}
+        env.update(preset)
+        code = "import src.grpc_fork, os; print(os.environ['GRPC_DNS_RESOLVER'])"
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True,
+                                timeout=60, check=True)
+        return result.stdout.strip()
+
+    def test_system_resolver_by_default(self):
+        assert self._resolver() == "native"
+
+    def test_external_value_kept(self):
+        assert self._resolver(GRPC_DNS_RESOLVER="ares") == "ares"
+
+    def test_contour_process_inherits_resolver(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GRPC_DNS_RESOLVER", "native")
+        output = tmp_path / "contour.txt"
+        code = (f"import os, sys; sys.stdin.read(); "
+                f"open({str(output)!r}, 'w').write(os.environ.get('GRPC_DNS_RESOLVER', 'нет'))")
+        contour = ContourProcess("emulation", command=[sys.executable, "-c", code])
+        contour.start()
+        contour.stop()
+        assert output.read_text() == "native"
